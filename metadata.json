@@ -1,0 +1,6 @@
+{
+  "name": "VideoRisk — Pre-Publish Video Risk Intelligence",
+  "description": "Know the risk before you publish. VideoRisk analyzes video evidence, connects signals to platform policies, explains risks, and guides actionable fixes.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
