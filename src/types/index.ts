@@ -336,6 +336,14 @@ export interface PasswordResetRecord {
   createdAt: string;
 }
 
+export class FencingError extends Error {
+  constructor(message: string = 'Worker ownership/lease fencing token is invalid or has been superseded') {
+    super(message);
+    this.name = 'FencingError';
+    Object.setPrototypeOf(this, FencingError.prototype);
+  }
+}
+
 export interface JobQueueRecord {
   id: string;
   scanId: string;
@@ -345,6 +353,8 @@ export interface JobQueueRecord {
   runAt: string;
   lockedAt?: string | null;
   lockedBy?: string | null;
+  leaseToken?: string | null;
+  leaseDurationMs?: number | null;
   lastError?: string | null;
   createdAt: string;
   updatedAt: string;

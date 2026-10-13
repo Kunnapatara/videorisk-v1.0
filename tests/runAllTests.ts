@@ -10,6 +10,7 @@ import { runEvidenceIntegrityHardeningTests } from './evidence_integrity_hardeni
 import { runSqliteStorageAndQueueTests } from './sqlite_storage_and_queue.test';
 import { runPasswordRecoveryTests } from './password_recovery.test';
 import { runSecurityRetentionAndE2ETests } from './security_retention_and_e2e.test';
+import { runLeaseFencingAndHeartbeatTests } from './lease_fencing_and_heartbeat.test';
 
 async function main() {
   console.log('######################################################');
@@ -46,6 +47,9 @@ async function main() {
 
     // Run Suite 9: Security, Retention & Real Media E2E
     await runSecurityRetentionAndE2ETests();
+
+    // Run Suite 10: Lease Fencing, Heartbeat & Stale Worker Protection
+    await runLeaseFencingAndHeartbeatTests();
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log(`\n🎉 ALL AUTOMATED VERIFICATION SUITES COMPLETED SUCCESSFULLY in ${elapsed}s!`);

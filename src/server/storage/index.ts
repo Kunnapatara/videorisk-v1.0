@@ -13,7 +13,8 @@ import {
   ChannelContextProfile,
   PasswordResetRecord,
   JobQueueRecord,
-  OperationalMetrics
+  OperationalMetrics,
+  FencingError
 } from '../../types';
 
 export interface IPasswordResetRepository {
@@ -27,10 +28,10 @@ export interface IPasswordResetRepository {
 export interface IJobQueueRepository {
   enqueueJob(scanId: string, runAt?: string): Promise<JobQueueRecord>;
   claimNextJob(workerId: string, leaseDurationMs?: number): Promise<JobQueueRecord | null>;
-  completeJob(id: string, workerId?: string): Promise<void>;
-  failJob(id: string, error: string, retryable: boolean, backoffMs?: number, workerId?: string): Promise<void>;
+  completeJob(id: string, workerId?: string, leaseToken?: string): Promise<void>;
+  failJob(id: string, error: string, retryable: boolean, backoffMs?: number, workerId?: string, leaseToken?: string): Promise<void>;
   recoverStaleJobs(leaseTimeoutMs?: number): Promise<number>;
-  renewLease(id: string, workerId: string): Promise<boolean>;
+  renewLease(id: string, workerId: string, leaseToken?: string, leaseDurationMs?: number): Promise<boolean>;
   retryJob(scanId: string): Promise<JobQueueRecord>;
   getJobByScanId(scanId: string): Promise<JobQueueRecord | null>;
 }
@@ -61,18 +62,18 @@ export interface IScanRepository {
   createScan(scan: ScanJob): Promise<ScanJob>;
   getScan(id: string): Promise<ScanJob | null>;
   getAllScans(userId?: string): Promise<ScanJob[]>;
-  updateScan(id: string, updates: Partial<ScanJob>): Promise<ScanJob | null>;
-  saveReport(scanId: string, report: RiskReport): Promise<void>;
+  updateScan(id: string, updates: Partial<ScanJob>, leaseToken?: string): Promise<ScanJob | null>;
+  saveReport(scanId: string, report: RiskReport, leaseToken?: string): Promise<void>;
   getReport(scanId: string): Promise<RiskReport | null>;
-  saveComparison(comparison: ReScanComparison): Promise<void>;
+  saveComparison(comparison: ReScanComparison, leaseToken?: string): Promise<void>;
   getComparison(revisedScanId: string): Promise<ReScanComparison | null>;
-  deductScanCredits(scanId: string, userId: string, amount: number): Promise<boolean>;
-  refundScanCredits(scanId: string, hintAmount?: number): Promise<{ refunded: boolean; amount: number }>;
+  deductScanCredits(scanId: string, userId: string, amount: number, leaseToken?: string): Promise<boolean>;
+  refundScanCredits(scanId: string, hintAmount?: number, leaseToken?: string): Promise<{ refunded: boolean; amount: number }>;
   deleteScan(id: string): Promise<boolean>;
 }
 
 export interface IEvidenceRepository {
-  saveEvidence(scanId: string, items: EvidenceItem[]): Promise<void>;
+  saveEvidence(scanId: string, items: EvidenceItem[], leaseToken?: string): Promise<void>;
   getEvidence(scanId: string): Promise<EvidenceItem[]>;
 }
 
@@ -483,6 +484,14 @@ export class InMemoryStorageRepository implements IStorageRepository {
     }
   };
 
+  private validateLeaseFence(scanId: string, leaseToken?: string): void {
+    if (!leaseToken) return;
+    const job = this.state.jobQueue[scanId];
+    if (!job || job.status !== 'RUNNING' || job.leaseToken !== leaseToken) {
+      throw new FencingError(`Fencing violation for scan ${scanId}: worker lease token is invalid, superseded, or expired`);
+    }
+  }
+
   public scans: IScanRepository = {
     createScan: async (scan: ScanJob) => {
       this.state.scans[scan.id] = scan;
@@ -504,29 +513,33 @@ export class InMemoryStorageRepository implements IStorageRepository {
       }
       return list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
     },
-    updateScan: async (id: string, updates: Partial<ScanJob>) => {
+    updateScan: async (id: string, updates: Partial<ScanJob>, leaseToken?: string) => {
+      this.validateLeaseFence(id, leaseToken);
       const scan = this.state.scans[id];
       if (!scan) return null;
       Object.assign(scan, updates);
       this.save();
       return scan;
     },
-    saveReport: async (scanId: string, report: RiskReport) => {
+    saveReport: async (scanId: string, report: RiskReport, leaseToken?: string) => {
+      this.validateLeaseFence(scanId, leaseToken);
       this.state.reports[scanId] = report;
       this.save();
     },
     getReport: async (scanId: string) => {
       return this.state.reports[scanId] || null;
     },
-    saveComparison: async (comparison: ReScanComparison) => {
+    saveComparison: async (comparison: ReScanComparison, leaseToken?: string) => {
+      this.validateLeaseFence(comparison.revisedScanId, leaseToken);
       this.state.comparisons[comparison.revisedScanId] = comparison;
       this.save();
     },
     getComparison: async (revisedScanId: string) => {
       return this.state.comparisons[revisedScanId] || null;
     },
-    deductScanCredits: async (scanId: string, userId: string, amount: number) => {
+    deductScanCredits: async (scanId: string, userId: string, amount: number, leaseToken?: string) => {
       return await this.runTransaction(async (state) => {
+        this.validateLeaseFence(scanId, leaseToken);
         const user = state.users[userId];
         if (!user) throw new Error(`User not found: ${userId}`);
         const scan = state.scans[scanId];
@@ -550,8 +563,9 @@ export class InMemoryStorageRepository implements IStorageRepository {
         return true;
       });
     },
-    refundScanCredits: async (scanId: string, hintAmount?: number) => {
+    refundScanCredits: async (scanId: string, hintAmount?: number, leaseToken?: string) => {
       return await this.runTransaction(async (state) => {
+        this.validateLeaseFence(scanId, leaseToken);
         const scan = state.scans[scanId];
         if (!scan) {
           return { refunded: false, amount: 0 };
@@ -601,7 +615,8 @@ export class InMemoryStorageRepository implements IStorageRepository {
   };
 
   public evidence: IEvidenceRepository = {
-    saveEvidence: async (scanId: string, items: EvidenceItem[]) => {
+    saveEvidence: async (scanId: string, items: EvidenceItem[], leaseToken?: string) => {
+      this.validateLeaseFence(scanId, leaseToken);
       this.state.evidence[scanId] = items;
       this.save();
     },
@@ -869,7 +884,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
       return rec;
     },
 
-    claimNextJob: async (workerId: string, _leaseDurationMs: number = 60000): Promise<JobQueueRecord | null> => {
+    claimNextJob: async (workerId: string, leaseDurationMs: number = 60000): Promise<JobQueueRecord | null> => {
       const now = new Date();
       const nowIso = now.toISOString();
 
@@ -879,32 +894,44 @@ export class InMemoryStorageRepository implements IStorageRepository {
 
       if (!candidate) return null;
 
+      const leaseToken = `lease_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
       candidate.status = 'RUNNING';
       candidate.attempts += 1;
       candidate.lockedAt = nowIso;
       candidate.lockedBy = workerId;
+      candidate.leaseToken = leaseToken;
+      candidate.leaseDurationMs = leaseDurationMs;
       candidate.updatedAt = nowIso;
       this.save();
       return candidate;
     },
 
-    completeJob: async (id: string, workerId?: string): Promise<void> => {
+    completeJob: async (id: string, workerId?: string, leaseToken?: string): Promise<void> => {
       const job = Object.values(this.state.jobQueue).find(j => j.id === id);
       if (job && job.status === 'RUNNING') {
+        if (leaseToken && job.leaseToken !== leaseToken) {
+          throw new FencingError(`Failed to complete job ${id}: lease token expired or superseded`);
+        }
         if (workerId && job.lockedBy !== workerId) {
           return;
         }
         job.status = 'COMPLETED';
         job.lockedAt = null;
         job.lockedBy = null;
+        job.leaseToken = null;
         job.updatedAt = new Date().toISOString();
         this.save();
+      } else if (leaseToken) {
+        throw new FencingError(`Failed to complete job ${id}: job is not RUNNING or was superseded`);
       }
     },
 
-    failJob: async (id: string, error: string, retryable: boolean, backoffMs: number = 5000, workerId?: string): Promise<void> => {
+    failJob: async (id: string, error: string, retryable: boolean, backoffMs: number = 5000, workerId?: string, leaseToken?: string): Promise<void> => {
       const job = Object.values(this.state.jobQueue).find(j => j.id === id);
       if (job && job.status === 'RUNNING') {
+        if (leaseToken && job.leaseToken !== leaseToken) {
+          throw new FencingError(`Failed to fail job ${id}: lease token expired or superseded`);
+        }
         if (workerId && job.lockedBy !== workerId) {
           return;
         }
@@ -913,9 +940,12 @@ export class InMemoryStorageRepository implements IStorageRepository {
         job.runAt = new Date(now.getTime() + backoffMs).toISOString();
         job.lockedAt = null;
         job.lockedBy = null;
+        job.leaseToken = null;
         job.lastError = error;
         job.updatedAt = now.toISOString();
         this.save();
+      } else if (leaseToken) {
+        throw new FencingError(`Failed to fail job ${id}: job is not RUNNING or was superseded`);
       }
     },
 
@@ -934,6 +964,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
           job.status = 'RETRYABLE';
           job.lockedAt = null;
           job.lockedBy = null;
+          job.leaseToken = null;
           job.updatedAt = now;
           recovered++;
         }
@@ -942,9 +973,9 @@ export class InMemoryStorageRepository implements IStorageRepository {
       return recovered;
     },
 
-    renewLease: async (id: string, workerId: string): Promise<boolean> => {
+    renewLease: async (id: string, workerId: string, leaseToken?: string, _leaseDurationMs?: number): Promise<boolean> => {
       const job = Object.values(this.state.jobQueue).find(j => j.id === id);
-      if (job && job.status === 'RUNNING' && job.lockedBy === workerId) {
+      if (job && job.status === 'RUNNING' && job.lockedBy === workerId && (!leaseToken || job.leaseToken === leaseToken)) {
         const now = new Date().toISOString();
         job.lockedAt = now;
         job.updatedAt = now;
@@ -971,6 +1002,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
       job.runAt = now;
       job.lockedAt = null;
       job.lockedBy = null;
+      job.leaseToken = null;
       job.lastError = null;
       job.updatedAt = now;
 

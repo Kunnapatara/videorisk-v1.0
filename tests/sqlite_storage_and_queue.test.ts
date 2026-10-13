@@ -3,7 +3,8 @@ import fs from 'fs';
 import os from 'os';
 import { DatabaseSync } from 'node:sqlite';
 import { SqliteStorageRepository, migrateJsonToSqlite } from '../src/server/storage/sqliteStorage';
-import { ScanJob } from '../src/types';
+import { InMemoryStorageRepository } from '../src/server/storage/index';
+import { ScanJob, FencingError, RiskReport, EvidenceItem, ReScanComparison } from '../src/types';
 
 function assert(condition: boolean, message: string) {
   if (!condition) {
@@ -244,6 +245,276 @@ export async function runSqliteStorageAndQueueTests() {
       completedRetryCaught = true;
     }
     assert(completedRetryCaught, 'retryJob on COMPLETED job is rejected (re-scan required)');
+
+    // Drain previous test job from queue so 3.2 starts with a clean queue
+    const drainJob = await storage.queue.claimNextJob('cleanup_worker', 1000);
+    if (drainJob) {
+      await storage.queue.completeJob(drainJob.id, 'cleanup_worker');
+    }
+
+    // ---------------------------------------------------------
+    // 3.2 Lease Fencing & Stale Worker Protection
+    // ---------------------------------------------------------
+    console.log('\n[3.2 Lease Fencing & Stale Worker Protection]');
+
+    // Create test scan for fencing verification
+    const fenceUser = await storage.users.createUser('fence_user@videorisk.com', 'h', 's', 20, 'creator');
+    const fencedScan: ScanJob = {
+      id: `scan_fenced_${Date.now()}`,
+      userId: fenceUser.id,
+      videoTitle: 'Fenced Concurrency Video',
+      videoFilename: 'fenced.mp4',
+      videoPath: '/tmp/fenced.mp4',
+      scanMode: 'standard',
+      status: 'QUEUED',
+      currentStage: 'Upload',
+      completedStages: ['Upload'],
+      creditsUsed: 0,
+      createdAt: new Date().toISOString()
+    };
+    await storage.scans.createScan(fencedScan);
+
+    // Generation 1: Worker 1 claims job
+    const worker1Claim = await storage.queue.claimNextJob('worker_1', 10000);
+    assert(worker1Claim !== null && worker1Claim.scanId === fencedScan.id, 'Worker 1 successfully claimed job');
+    assert(typeof worker1Claim?.leaseToken === 'string' && worker1Claim.leaseToken.startsWith('lease_'), 'Claim generates unique leaseToken');
+    const worker1Token = worker1Claim!.leaseToken!;
+
+    // Worker 1 can perform updates with valid lease token
+    const updatedByWorker1 = await storage.scans.updateScan(fencedScan.id, {
+      status: 'INSPECTING',
+      currentStage: 'Media inspection'
+    }, worker1Token);
+    assert(updatedByWorker1?.status === 'INSPECTING', 'Worker 1 updates scan status with valid lease token');
+
+    // Worker 1 deducts credits with valid lease token
+    const initialUserCredits = (await storage.users.getUser(fenceUser.id))!.creditsRemaining;
+    const worker1Deduct = await storage.scans.deductScanCredits(fencedScan.id, fenceUser.id, 5, worker1Token);
+    assert(worker1Deduct === true, 'Worker 1 successfully deducts credits with valid lease token');
+    const userCreditsAfterWorker1Deduct = (await storage.users.getUser(fenceUser.id))!.creditsRemaining;
+    assert(userCreditsAfterWorker1Deduct === initialUserCredits - 5, 'User balance decreased by 5');
+
+    // Simulate lease expiration on Worker 1 and recovery
+    const staleTime = new Date(Date.now() - 30000).toISOString();
+    storage.db.prepare('UPDATE job_queue SET locked_at = ? WHERE scan_id = ?').run(staleTime, fencedScan.id);
+    const recoveredFenced = await storage.queue.recoverStaleJobs(5000);
+    assert(recoveredFenced === 1, 'Worker 1 expired lease recovered by queue recovery');
+
+    // Generation 2: Worker 2 claims recovered job
+    const worker2Claim = await storage.queue.claimNextJob('worker_2', 15000);
+    assert(worker2Claim !== null && worker2Claim.scanId === fencedScan.id, 'Worker 2 claimed recovered job');
+    assert(worker2Claim?.leaseToken !== worker1Token, 'Worker 2 assigned fresh, unique leaseToken superseding Worker 1');
+    const worker2Token = worker2Claim!.leaseToken!;
+
+    // 1. Stale Worker 1 attempting scan update is fenced
+    let worker1UpdateFailed = false;
+    try {
+      await storage.scans.updateScan(fencedScan.id, {
+        status: 'PROCESSING_AUDIO',
+        currentStage: 'Audio & transcript'
+      }, worker1Token);
+    } catch (err: any) {
+      if (err instanceof FencingError || err.name === 'FencingError') worker1UpdateFailed = true;
+    }
+    assert(worker1UpdateFailed, 'Stale Worker 1 is fenced from updating scan status (FencingError thrown)');
+    const scanAfterBlockedUpdate = await storage.scans.getScan(fencedScan.id);
+    assert(scanAfterBlockedUpdate?.status === 'INSPECTING', 'Scan status remained intact after stale update attempt');
+
+    // 2. Stale Worker 1 attempting credit deduction is fenced
+    let worker1DeductFailed = false;
+    try {
+      await storage.scans.deductScanCredits(fencedScan.id, fenceUser.id, 5, worker1Token);
+    } catch (err: any) {
+      if (err instanceof FencingError || err.name === 'FencingError') worker1DeductFailed = true;
+    }
+    assert(worker1DeductFailed, 'Stale Worker 1 is fenced from deducting credits');
+    const userCreditsAfterBlockedDeduct = (await storage.users.getUser(fenceUser.id))!.creditsRemaining;
+    assert(userCreditsAfterBlockedDeduct === userCreditsAfterWorker1Deduct, 'User credit balance untouched by stale worker deduction');
+
+    // 3. Stale Worker 1 attempting refund is fenced
+    let worker1RefundFailed = false;
+    try {
+      await storage.scans.refundScanCredits(fencedScan.id, undefined, worker1Token);
+    } catch (err: any) {
+      if (err instanceof FencingError || err.name === 'FencingError') worker1RefundFailed = true;
+    }
+    assert(worker1RefundFailed, 'Stale Worker 1 is fenced from refunding scan credits');
+    const userCreditsAfterBlockedRefund = (await storage.users.getUser(fenceUser.id))!.creditsRemaining;
+    assert(userCreditsAfterBlockedRefund === userCreditsAfterWorker1Deduct, 'User credit balance untouched by stale worker refund');
+
+    // 4. Stale Worker 1 attempting to save evidence is fenced
+    let worker1EvidenceFailed = false;
+    try {
+      await storage.evidence.saveEvidence(fencedScan.id, [{
+        id: 'stale_ev_1',
+        scanId: fencedScan.id,
+        timestamp: 1.5,
+        type: 'visual',
+        title: 'Stale Evidence',
+        severity: 'critical',
+        explanation: 'Should be rejected'
+      } as any], worker1Token);
+    } catch (err: any) {
+      if (err instanceof FencingError || err.name === 'FencingError') worker1EvidenceFailed = true;
+    }
+    assert(worker1EvidenceFailed, 'Stale Worker 1 is fenced from saving evidence');
+    const evidenceAfterBlockedSave = await storage.evidence.getEvidence(fencedScan.id);
+    assert(evidenceAfterBlockedSave.length === 0, 'No evidence written by stale worker');
+
+    // 5. Stale Worker 1 attempting to save report is fenced
+    let worker1ReportFailed = false;
+    try {
+      await storage.scans.saveReport(fencedScan.id, {
+        scanId: fencedScan.id,
+        overallRisk: 'HIGH_RISK',
+        riskSummary: 'Stale report',
+        disclaimer: 'test',
+        domainReports: {},
+        riskCategories: {},
+        topIssues: [],
+        policyConnections: [],
+        timeline: []
+      } as any, worker1Token);
+    } catch (err: any) {
+      if (err instanceof FencingError || err.name === 'FencingError') worker1ReportFailed = true;
+    }
+    assert(worker1ReportFailed, 'Stale Worker 1 is fenced from saving report');
+    const reportAfterBlockedSave = await storage.scans.getReport(fencedScan.id);
+    assert(reportAfterBlockedSave === null, 'No report written by stale worker');
+
+    // 6. Stale Worker 1 attempting completeJob or failJob is fenced
+    let worker1CompleteFailed = false;
+    try {
+      await storage.queue.completeJob(worker2Claim!.id, 'worker_1', worker1Token);
+    } catch (err: any) {
+      if (err instanceof FencingError || err.name === 'FencingError') worker1CompleteFailed = true;
+    }
+    assert(worker1CompleteFailed, 'Stale Worker 1 is fenced from completing job (FencingError thrown)');
+
+    let worker1FailJobFailed = false;
+    try {
+      await storage.queue.failJob(worker2Claim!.id, 'stale failure', false, 0, 'worker_1', worker1Token);
+    } catch (err: any) {
+      if (err instanceof FencingError || err.name === 'FencingError') worker1FailJobFailed = true;
+    }
+    assert(worker1FailJobFailed, 'Stale Worker 1 is fenced from failing job (FencingError thrown)');
+
+    // 7. Legitimate Worker 2 succeeds with its active lease token across all operations
+    await storage.evidence.saveEvidence(fencedScan.id, [{
+      id: 'legit_ev_1',
+      scanId: fencedScan.id,
+      timestamp: 2.0,
+      type: 'audio',
+      title: 'Legitimate Evidence',
+      severity: 'medium',
+      explanation: 'Verified by Worker 2'
+    } as any], worker2Token);
+    const legitEvidence = await storage.evidence.getEvidence(fencedScan.id);
+    assert(legitEvidence.length === 1 && legitEvidence[0].id === 'legit_ev_1', 'Worker 2 successfully writes evidence');
+
+    await storage.scans.saveReport(fencedScan.id, {
+      scanId: fencedScan.id,
+      overallRisk: 'LOW_RISK',
+      riskSummary: 'Clean scan report by Worker 2',
+      disclaimer: 'Verified',
+      domainReports: {},
+      riskCategories: {},
+      topIssues: [],
+      policyConnections: [],
+      timeline: []
+    } as any, worker2Token);
+    const legitReport = await storage.scans.getReport(fencedScan.id);
+    assert(legitReport !== null && legitReport.riskSummary === 'Clean scan report by Worker 2', 'Worker 2 successfully saves report');
+
+    await storage.scans.updateScan(fencedScan.id, {
+      status: 'COMPLETED',
+      completedAt: new Date().toISOString()
+    }, worker2Token);
+    const completedScanRecord = await storage.scans.getScan(fencedScan.id);
+    assert(completedScanRecord?.status === 'COMPLETED', 'Worker 2 successfully updates scan to COMPLETED');
+
+    await storage.queue.completeJob(worker2Claim!.id, 'worker_2', worker2Token);
+    const completedQueueRecord = await storage.queue.getJobByScanId(fencedScan.id);
+    assert(completedQueueRecord?.status === 'COMPLETED', 'Worker 2 successfully completes job with matching token');
+    assert(completedQueueRecord?.leaseToken === null, 'Lease token cleared on completion');
+
+    // ---------------------------------------------------------
+    // 3.3 In-Memory Storage Fencing Parity Check
+    // ---------------------------------------------------------
+    console.log('\n[3.3 In-Memory Storage Lease Fencing Behavioral Parity]');
+    const memStorage = new InMemoryStorageRepository();
+    const memUser = await memStorage.users.createUser('mem_user@videorisk.com', 'h', 's', 20, 'creator');
+    const memScan: ScanJob = {
+      id: `mem_scan_${Date.now()}`,
+      userId: memUser.id,
+      videoTitle: 'Mem Fenced Scan',
+      videoFilename: 'mem.mp4',
+      videoPath: '/tmp/mem.mp4',
+      scanMode: 'standard',
+      status: 'QUEUED',
+      currentStage: 'Upload',
+      completedStages: ['Upload'],
+      creditsUsed: 0,
+      createdAt: new Date().toISOString()
+    };
+    await memStorage.scans.createScan(memScan);
+
+    const memClaim1 = await memStorage.queue.claimNextJob('mem_worker_1', 1000);
+    assert(memClaim1 !== null && typeof memClaim1.leaseToken === 'string', 'In-memory claim sets unique leaseToken');
+    const memToken1 = memClaim1!.leaseToken!;
+
+    // Fast-forward lockedAt to simulate timeout and recover
+    (memStorage as any).state.jobQueue[memScan.id].lockedAt = new Date(Date.now() - 5000).toISOString();
+    await memStorage.queue.recoverStaleJobs(1000);
+
+    const memClaim2 = await memStorage.queue.claimNextJob('mem_worker_2', 1000);
+    assert(memClaim2 !== null && memClaim2.leaseToken !== memToken1, 'In-memory second claim has new leaseToken');
+    const memToken2 = memClaim2!.leaseToken!;
+
+    let memStaleUpdateCaught = false;
+    try {
+      await memStorage.scans.updateScan(memScan.id, { status: 'FAILED' }, memToken1);
+    } catch (err: any) {
+      if (err instanceof FencingError) memStaleUpdateCaught = true;
+    }
+    assert(memStaleUpdateCaught, 'In-memory storage fences stale worker from updateScan');
+
+    let memStaleDeductCaught = false;
+    try {
+      await memStorage.scans.deductScanCredits(memScan.id, memUser.id, 5, memToken1);
+    } catch (err: any) {
+      if (err instanceof FencingError) memStaleDeductCaught = true;
+    }
+    assert(memStaleDeductCaught, 'In-memory storage fences stale worker from deductScanCredits');
+
+    let memStaleRefundCaught = false;
+    try {
+      await memStorage.scans.refundScanCredits(memScan.id, 5, memToken1);
+    } catch (err: any) {
+      if (err instanceof FencingError) memStaleRefundCaught = true;
+    }
+    assert(memStaleRefundCaught, 'In-memory storage fences stale worker from refundScanCredits');
+
+    let memStaleEvidenceCaught = false;
+    try {
+      await memStorage.evidence.saveEvidence(memScan.id, [], memToken1);
+    } catch (err: any) {
+      if (err instanceof FencingError) memStaleEvidenceCaught = true;
+    }
+    assert(memStaleEvidenceCaught, 'In-memory storage fences stale worker from saveEvidence');
+
+    let memStaleReportCaught = false;
+    try {
+      await memStorage.scans.saveReport(memScan.id, {} as any, memToken1);
+    } catch (err: any) {
+      if (err instanceof FencingError) memStaleReportCaught = true;
+    }
+    assert(memStaleReportCaught, 'In-memory storage fences stale worker from saveReport');
+
+    // Legitimate owner completes in-memory job
+    await memStorage.queue.completeJob(memClaim2!.id, 'mem_worker_2', memToken2);
+    const completedMemJob = await memStorage.queue.getJobByScanId(memScan.id);
+    assert(completedMemJob?.status === 'COMPLETED', 'In-memory legitimate worker completes job successfully');
 
     // ---------------------------------------------------------
     // 4. Durability Across Restart

@@ -1,4 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -14,7 +15,8 @@ import {
   ChannelContextProfile,
   PasswordResetRecord,
   JobQueueRecord,
-  OperationalMetrics
+  OperationalMetrics,
+  FencingError
 } from '../../types';
 import {
   IStorageRepository,
@@ -39,7 +41,8 @@ export interface MigrationRecord {
 export class SqliteStorageRepository implements IStorageRepository {
   public db: DatabaseSync;
   public dbPath: string;
-  private transactionDepth = 0;
+  private txQueue: Promise<void> = Promise.resolve();
+  private static asyncLocalStorage = new AsyncLocalStorage<{ depth: number }>();
 
   constructor(customPath?: string) {
     if (customPath) {
@@ -71,15 +74,7 @@ export class SqliteStorageRepository implements IStorageRepository {
   }
 
   public async runTransaction<T>(operation: (context: any) => T | Promise<T>): Promise<T> {
-    const isTopLevel = this.transactionDepth === 0;
-    const savepointName = `sp_${this.transactionDepth}`;
-    this.transactionDepth++;
-
-    if (isTopLevel) {
-      this.db.exec('BEGIN IMMEDIATE;');
-    } else {
-      this.db.exec(`SAVEPOINT ${savepointName};`);
-    }
+    const parentTx = SqliteStorageRepository.asyncLocalStorage.getStore();
 
     const mutatedUsers = new Map<string, any>();
     const usersProxy = new Proxy({}, {
@@ -193,33 +188,46 @@ export class SqliteStorageRepository implements IStorageRepository {
       }
     };
 
-    const commitTx = () => {
-      flushMutations();
-      if (isTopLevel) {
-        this.db.exec('COMMIT;');
-      } else {
+    if (!parentTx) {
+      // Top-level transaction: serialize top-level transactions on this single SQLite connection
+      let releaseLock!: () => void;
+      const nextLock = new Promise<void>(r => { releaseLock = r; });
+      const currentQueue = this.txQueue;
+      this.txQueue = currentQueue.then(() => nextLock);
+      await currentQueue;
+
+      try {
+        return await SqliteStorageRepository.asyncLocalStorage.run({ depth: 1 }, async () => {
+          this.db.exec('BEGIN IMMEDIATE;');
+          try {
+            const result = await operation(txContext);
+            flushMutations();
+            this.db.exec('COMMIT;');
+            return result;
+          } catch (err) {
+            this.db.exec('ROLLBACK;');
+            throw err;
+          }
+        });
+      } finally {
+        releaseLock();
+      }
+    } else {
+      // Nested transaction within the same async context: use SQLite savepoint
+      const savepointName = `sp_${parentTx.depth}`;
+      parentTx.depth++;
+      this.db.exec(`SAVEPOINT ${savepointName};`);
+      try {
+        const result = await operation(txContext);
+        flushMutations();
         this.db.exec(`RELEASE ${savepointName};`);
-      }
-      this.transactionDepth--;
-    };
-
-    const rollbackTx = (err: any): never => {
-      if (isTopLevel) {
-        this.db.exec('ROLLBACK;');
-      } else {
+        parentTx.depth--;
+        return result;
+      } catch (err) {
         this.db.exec(`ROLLBACK TO ${savepointName}; RELEASE ${savepointName};`);
+        parentTx.depth--;
+        throw err;
       }
-      this.transactionDepth--;
-      throw err;
-    };
-
-    try {
-      const result = await operation(txContext);
-      commitTx();
-      return result;
-    } catch (err) {
-      rollbackTx(err);
-      throw err;
     }
   }
 
@@ -335,6 +343,7 @@ export class SqliteStorageRepository implements IStorageRepository {
             run_at TEXT NOT NULL,
             locked_at TEXT,
             locked_by TEXT,
+            lease_token TEXT,
             last_error TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -402,6 +411,26 @@ export class SqliteStorageRepository implements IStorageRepository {
       } catch (err) {
         this.db.exec('ROLLBACK;');
         throw new Error(`Failed to apply migration 1: ${err}`);
+      }
+    }
+
+    // Migration 2: Lease fencing token for durable job queue
+    if (!appliedVersions.has(2)) {
+      this.db.exec('BEGIN IMMEDIATE;');
+      try {
+        const columns = this.db.prepare("PRAGMA table_info(job_queue)").all() as Array<{ name: string }>;
+        const hasLeaseToken = columns.some(c => c.name === 'lease_token');
+        if (!hasLeaseToken) {
+          this.db.exec('ALTER TABLE job_queue ADD COLUMN lease_token TEXT;');
+        }
+        this.db.exec(`
+          INSERT INTO schema_migrations (version, name, applied_at)
+          VALUES (2, '002_job_queue_lease_fencing', datetime('now'));
+        `);
+        this.db.exec('COMMIT;');
+      } catch (err) {
+        this.db.exec('ROLLBACK;');
+        throw new Error(`Failed to apply migration 2: ${err}`);
       }
     }
   }
@@ -688,6 +717,14 @@ export class SqliteStorageRepository implements IStorageRepository {
     }
   };
 
+  private validateLeaseFence(db: any, scanId: string, leaseToken?: string): void {
+    if (!leaseToken) return;
+    const job = db.prepare('SELECT status, locked_by, lease_token FROM job_queue WHERE scan_id = ?').get(scanId) as any;
+    if (!job || job.status !== 'RUNNING' || job.lease_token !== leaseToken) {
+      throw new FencingError(`Fencing violation for scan ${scanId}: worker lease token is invalid, superseded, or expired`);
+    }
+  }
+
   // -------------------------------------------------------------
   // SCANS REPOSITORY
   // -------------------------------------------------------------
@@ -761,40 +798,51 @@ export class SqliteStorageRepository implements IStorageRepository {
       return rows.map(r => this.mapScan(r));
     },
 
-    updateScan: async (id: string, updates: Partial<ScanJob>): Promise<ScanJob | null> => {
-      const existing = await this.scans.getScan(id);
-      if (!existing) return null;
+    updateScan: async (id: string, updates: Partial<ScanJob>, leaseToken?: string): Promise<ScanJob | null> => {
+      return await this.runTransaction(async db => {
+        if (leaseToken) {
+          this.validateLeaseFence(db, id, leaseToken);
+        }
 
-      const fields: string[] = [];
-      const values: any[] = [];
+        const existing = await this.scans.getScan(id);
+        if (!existing) return null;
 
-      if (updates.status !== undefined) { fields.push('status = ?'); values.push(updates.status); }
-      if (updates.currentStage !== undefined) { fields.push('current_stage = ?'); values.push(updates.currentStage); }
-      if (updates.completedStages !== undefined) { fields.push('completed_stages_json = ?'); values.push(JSON.stringify(updates.completedStages)); }
-      if (updates.creditsUsed !== undefined) { fields.push('credits_used = ?'); values.push(updates.creditsUsed); }
-      if (updates.creditsDeducted !== undefined) { fields.push('credits_deducted = ?'); values.push(updates.creditsDeducted); }
-      if (updates.creditsRefunded !== undefined) { fields.push('credits_refunded = ?'); values.push(updates.creditsRefunded ? 1 : 0); }
-      if (updates.creditsRefundedAmount !== undefined) { fields.push('credits_refunded_amount = ?'); values.push(updates.creditsRefundedAmount); }
-      if (updates.metadata !== undefined) { fields.push('metadata_json = ?'); values.push(JSON.stringify(updates.metadata)); }
-      if (updates.proxyPath !== undefined) { fields.push('proxy_path = ?'); values.push(updates.proxyPath); }
-      if (updates.thumbnailMetadata !== undefined) { fields.push('thumbnail_metadata_json = ?'); values.push(JSON.stringify(updates.thumbnailMetadata)); }
-      if (updates.error !== undefined) { fields.push('error = ?'); values.push(updates.error); }
-      if (updates.completedAt !== undefined) { fields.push('completed_at = ?'); values.push(updates.completedAt); }
+        const fields: string[] = [];
+        const values: any[] = [];
 
-      if (fields.length > 0) {
-        values.push(id);
-        this.db.prepare(`UPDATE scans SET ${fields.join(', ')} WHERE id = ?`).run(...values);
-      }
+        if (updates.status !== undefined) { fields.push('status = ?'); values.push(updates.status); }
+        if (updates.currentStage !== undefined) { fields.push('current_stage = ?'); values.push(updates.currentStage); }
+        if (updates.completedStages !== undefined) { fields.push('completed_stages_json = ?'); values.push(JSON.stringify(updates.completedStages)); }
+        if (updates.creditsUsed !== undefined) { fields.push('credits_used = ?'); values.push(updates.creditsUsed); }
+        if (updates.creditsDeducted !== undefined) { fields.push('credits_deducted = ?'); values.push(updates.creditsDeducted); }
+        if (updates.creditsRefunded !== undefined) { fields.push('credits_refunded = ?'); values.push(updates.creditsRefunded ? 1 : 0); }
+        if (updates.creditsRefundedAmount !== undefined) { fields.push('credits_refunded_amount = ?'); values.push(updates.creditsRefundedAmount); }
+        if (updates.metadata !== undefined) { fields.push('metadata_json = ?'); values.push(JSON.stringify(updates.metadata)); }
+        if (updates.proxyPath !== undefined) { fields.push('proxy_path = ?'); values.push(updates.proxyPath); }
+        if (updates.thumbnailMetadata !== undefined) { fields.push('thumbnail_metadata_json = ?'); values.push(JSON.stringify(updates.thumbnailMetadata)); }
+        if (updates.error !== undefined) { fields.push('error = ?'); values.push(updates.error); }
+        if (updates.completedAt !== undefined) { fields.push('completed_at = ?'); values.push(updates.completedAt); }
 
-      return (await this.scans.getScan(id))!;
+        if (fields.length > 0) {
+          values.push(id);
+          db.prepare(`UPDATE scans SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+        }
+
+        return (await this.scans.getScan(id))!;
+      });
     },
 
-    saveReport: async (scanId: string, report: RiskReport): Promise<void> => {
-      this.db.prepare(`
-        INSERT INTO reports (scan_id, data_json, created_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(scan_id) DO UPDATE SET data_json = excluded.data_json
-      `).run(scanId, JSON.stringify(report), new Date().toISOString());
+    saveReport: async (scanId: string, report: RiskReport, leaseToken?: string): Promise<void> => {
+      await this.runTransaction(db => {
+        if (leaseToken) {
+          this.validateLeaseFence(db, scanId, leaseToken);
+        }
+        db.prepare(`
+          INSERT INTO reports (scan_id, data_json, created_at)
+          VALUES (?, ?, ?)
+          ON CONFLICT(scan_id) DO UPDATE SET data_json = excluded.data_json
+        `).run(scanId, JSON.stringify(report), new Date().toISOString());
+      });
     },
 
     getReport: async (scanId: string): Promise<RiskReport | null> => {
@@ -803,12 +851,17 @@ export class SqliteStorageRepository implements IStorageRepository {
       return JSON.parse(row.data_json);
     },
 
-    saveComparison: async (comparison: ReScanComparison): Promise<void> => {
-      this.db.prepare(`
-        INSERT INTO comparisons (revised_scan_id, original_scan_id, data_json, created_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(revised_scan_id) DO UPDATE SET data_json = excluded.data_json
-      `).run(comparison.revisedScanId, comparison.originalScanId, JSON.stringify(comparison), new Date().toISOString());
+    saveComparison: async (comparison: ReScanComparison, leaseToken?: string): Promise<void> => {
+      await this.runTransaction(db => {
+        if (leaseToken) {
+          this.validateLeaseFence(db, comparison.revisedScanId, leaseToken);
+        }
+        db.prepare(`
+          INSERT INTO comparisons (revised_scan_id, original_scan_id, data_json, created_at)
+          VALUES (?, ?, ?, ?)
+          ON CONFLICT(revised_scan_id) DO UPDATE SET data_json = excluded.data_json
+        `).run(comparison.revisedScanId, comparison.originalScanId, JSON.stringify(comparison), new Date().toISOString());
+      });
     },
 
     getComparison: async (revisedScanId: string): Promise<ReScanComparison | null> => {
@@ -817,9 +870,13 @@ export class SqliteStorageRepository implements IStorageRepository {
       return JSON.parse(row.data_json);
     },
 
-    deductScanCredits: async (scanId: string, userId: string, amount: number): Promise<boolean> => {
+    deductScanCredits: async (scanId: string, userId: string, amount: number, leaseToken?: string): Promise<boolean> => {
       let success = false;
       await this.runTransaction(db => {
+        if (leaseToken) {
+          this.validateLeaseFence(db, scanId, leaseToken);
+        }
+
         const scan = db.prepare('SELECT credits_deducted FROM scans WHERE id = ?').get(scanId) as any;
         if (!scan) return;
         if (Number(scan.credits_deducted) > 0) {
@@ -856,9 +913,13 @@ export class SqliteStorageRepository implements IStorageRepository {
       return success;
     },
 
-    refundScanCredits: async (scanId: string, hintAmount?: number): Promise<{ refunded: boolean; amount: number }> => {
+    refundScanCredits: async (scanId: string, hintAmount?: number, leaseToken?: string): Promise<{ refunded: boolean; amount: number }> => {
       let result = { refunded: false, amount: 0 };
       await this.runTransaction(db => {
+        if (leaseToken) {
+          this.validateLeaseFence(db, scanId, leaseToken);
+        }
+
         const scan = db.prepare('SELECT user_id, credits_deducted, credits_used, credits_refunded FROM scans WHERE id = ?').get(scanId) as any;
         if (!scan) return;
 
@@ -949,7 +1010,7 @@ export class SqliteStorageRepository implements IStorageRepository {
       return (await this.queue.getJobByScanId(scanId))!;
     },
 
-    claimNextJob: async (workerId: string, _leaseDurationMs: number = 60000): Promise<JobQueueRecord | null> => {
+    claimNextJob: async (workerId: string, leaseDurationMs: number = 60000): Promise<JobQueueRecord | null> => {
       let claimed: JobQueueRecord | null = null;
       await this.runTransaction(db => {
         const now = new Date();
@@ -966,15 +1027,18 @@ export class SqliteStorageRepository implements IStorageRepository {
 
         if (!eligible) return;
 
+        const leaseToken = `lease_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+
         const res = db.prepare(`
           UPDATE job_queue 
           SET status = 'RUNNING',
               attempts = attempts + 1,
               locked_at = ?,
               locked_by = ?,
+              lease_token = ?,
               updated_at = ?
           WHERE id = ? AND (status = 'QUEUED' OR status = 'RETRYABLE')
-        `).run(nowIso, workerId, nowIso, eligible.id);
+        `).run(nowIso, workerId, leaseToken, nowIso, eligible.id);
 
         if (Number(res.changes) === 0) return;
 
@@ -987,6 +1051,8 @@ export class SqliteStorageRepository implements IStorageRepository {
           runAt: eligible.run_at,
           lockedAt: nowIso,
           lockedBy: workerId,
+          leaseToken: leaseToken,
+          leaseDurationMs: leaseDurationMs,
           lastError: eligible.last_error || null,
           createdAt: eligible.created_at,
           updatedAt: nowIso
@@ -995,60 +1061,96 @@ export class SqliteStorageRepository implements IStorageRepository {
       return claimed;
     },
 
-    completeJob: async (id: string, workerId?: string): Promise<void> => {
+    completeJob: async (id: string, workerId?: string, leaseToken?: string): Promise<void> => {
       await this.runTransaction(db => {
         const now = new Date().toISOString();
-        if (workerId) {
-          db.prepare(`
+        let res;
+        if (leaseToken) {
+          res = db.prepare(`
             UPDATE job_queue 
             SET status = 'COMPLETED',
                 locked_at = NULL,
                 locked_by = NULL,
+                lease_token = NULL,
+                updated_at = ?
+            WHERE id = ? AND lease_token = ? AND status = 'RUNNING'
+          `).run(now, id, leaseToken);
+        } else if (workerId) {
+          res = db.prepare(`
+            UPDATE job_queue 
+            SET status = 'COMPLETED',
+                locked_at = NULL,
+                locked_by = NULL,
+                lease_token = NULL,
                 updated_at = ?
             WHERE id = ? AND locked_by = ? AND status = 'RUNNING'
           `).run(now, id, workerId);
         } else {
-          db.prepare(`
+          res = db.prepare(`
             UPDATE job_queue 
             SET status = 'COMPLETED',
                 locked_at = NULL,
                 locked_by = NULL,
+                lease_token = NULL,
                 updated_at = ?
             WHERE id = ? AND status = 'RUNNING'
           `).run(now, id);
         }
+
+        if (leaseToken && Number(res.changes) === 0) {
+          throw new FencingError(`Failed to complete job ${id}: lease token expired or superseded`);
+        }
       });
     },
 
-    failJob: async (id: string, error: string, retryable: boolean, backoffMs: number = 5000, workerId?: string): Promise<void> => {
+    failJob: async (id: string, error: string, retryable: boolean, backoffMs: number = 5000, workerId?: string, leaseToken?: string): Promise<void> => {
       await this.runTransaction(db => {
         const now = new Date();
         const nowIso = now.toISOString();
         const nextRun = new Date(now.getTime() + backoffMs).toISOString();
         const status = retryable ? 'RETRYABLE' : 'FAILED';
+        let res;
 
-        if (workerId) {
-          db.prepare(`
+        if (leaseToken) {
+          res = db.prepare(`
             UPDATE job_queue 
             SET status = ?,
                 run_at = ?,
                 locked_at = NULL,
                 locked_by = NULL,
+                lease_token = NULL,
+                last_error = ?,
+                updated_at = ?
+            WHERE id = ? AND lease_token = ? AND status = 'RUNNING'
+          `).run(status, nextRun, error, nowIso, id, leaseToken);
+        } else if (workerId) {
+          res = db.prepare(`
+            UPDATE job_queue 
+            SET status = ?,
+                run_at = ?,
+                locked_at = NULL,
+                locked_by = NULL,
+                lease_token = NULL,
                 last_error = ?,
                 updated_at = ?
             WHERE id = ? AND locked_by = ? AND status = 'RUNNING'
           `).run(status, nextRun, error, nowIso, id, workerId);
         } else {
-          db.prepare(`
+          res = db.prepare(`
             UPDATE job_queue 
             SET status = ?,
                 run_at = ?,
                 locked_at = NULL,
                 locked_by = NULL,
+                lease_token = NULL,
                 last_error = ?,
                 updated_at = ?
             WHERE id = ? AND status = 'RUNNING'
           `).run(status, nextRun, error, nowIso, id);
+        }
+
+        if (leaseToken && Number(res.changes) === 0) {
+          throw new FencingError(`Failed to fail job ${id}: lease token expired or superseded`);
         }
       });
     },
@@ -1075,6 +1177,7 @@ export class SqliteStorageRepository implements IStorageRepository {
           SET status = 'RETRYABLE',
               locked_at = NULL,
               locked_by = NULL,
+              lease_token = NULL,
               updated_at = ?
           WHERE status = 'RUNNING' 
             AND locked_at IS NOT NULL 
@@ -1085,15 +1188,25 @@ export class SqliteStorageRepository implements IStorageRepository {
       });
     },
 
-    renewLease: async (id: string, workerId: string): Promise<boolean> => {
+    renewLease: async (id: string, workerId: string, leaseToken?: string, _leaseDurationMs?: number): Promise<boolean> => {
       return await this.runTransaction(db => {
         const nowIso = new Date().toISOString();
-        const res = db.prepare(`
-          UPDATE job_queue 
-          SET locked_at = ?,
-              updated_at = ?
-          WHERE id = ? AND locked_by = ? AND status = 'RUNNING'
-        `).run(nowIso, nowIso, id, workerId);
+        let res;
+        if (leaseToken) {
+          res = db.prepare(`
+            UPDATE job_queue 
+            SET locked_at = ?,
+                updated_at = ?
+            WHERE id = ? AND locked_by = ? AND lease_token = ? AND status = 'RUNNING'
+          `).run(nowIso, nowIso, id, workerId, leaseToken);
+        } else {
+          res = db.prepare(`
+            UPDATE job_queue 
+            SET locked_at = ?,
+                updated_at = ?
+            WHERE id = ? AND locked_by = ? AND status = 'RUNNING'
+          `).run(nowIso, nowIso, id, workerId);
+        }
 
         return Number(res.changes) > 0;
       });
@@ -1119,6 +1232,7 @@ export class SqliteStorageRepository implements IStorageRepository {
               run_at = ?,
               locked_at = NULL,
               locked_by = NULL,
+              lease_token = NULL,
               last_error = NULL,
               updated_at = ?
           WHERE scan_id = ?
@@ -1141,6 +1255,7 @@ export class SqliteStorageRepository implements IStorageRepository {
           runAt: updated.run_at,
           lockedAt: updated.locked_at || null,
           lockedBy: updated.locked_by || null,
+          leaseToken: updated.lease_token || null,
           lastError: updated.last_error || null,
           createdAt: updated.created_at,
           updatedAt: updated.updated_at
@@ -1160,6 +1275,7 @@ export class SqliteStorageRepository implements IStorageRepository {
         runAt: row.run_at,
         lockedAt: row.locked_at || null,
         lockedBy: row.locked_by || null,
+        leaseToken: row.lease_token || null,
         lastError: row.last_error || null,
         createdAt: row.created_at,
         updatedAt: row.updated_at
@@ -1171,8 +1287,11 @@ export class SqliteStorageRepository implements IStorageRepository {
   // EVIDENCE REPOSITORY
   // -------------------------------------------------------------
   public evidence: IEvidenceRepository = {
-    saveEvidence: async (scanId: string, items: EvidenceItem[]): Promise<void> => {
+    saveEvidence: async (scanId: string, items: EvidenceItem[], leaseToken?: string): Promise<void> => {
       await this.runTransaction(db => {
+        if (leaseToken) {
+          this.validateLeaseFence(db, scanId, leaseToken);
+        }
         db.prepare('DELETE FROM evidence WHERE scan_id = ?').run(scanId);
         const stmt = db.prepare(`
           INSERT INTO evidence (id, scan_id, data_json, created_at)
@@ -1476,7 +1595,9 @@ export function migrateJsonToSqlite(jsonFilePath: string, sqliteDb: SqliteStorag
   let migratedSubscriptions = 0;
   let migratedUploads = 0;
 
-  sqliteDb.runTransaction(db => {
+  const db = sqliteDb.db;
+  db.exec('BEGIN IMMEDIATE;');
+  try {
     // 1. Users
     if (data.users && typeof data.users === 'object') {
       const userStmt = db.prepare(`
@@ -1611,7 +1732,11 @@ export function migrateJsonToSqlite(jsonFilePath: string, sqliteDb: SqliteStorag
         } catch {}
       }
     }
-  });
+    db.exec('COMMIT;');
+  } catch (err) {
+    db.exec('ROLLBACK;');
+    throw err;
+  }
 
   return {
     migratedUsers,
