@@ -30,6 +30,8 @@ export interface IJobQueueRepository {
   completeJob(id: string, workerId?: string): Promise<void>;
   failJob(id: string, error: string, retryable: boolean, backoffMs?: number, workerId?: string): Promise<void>;
   recoverStaleJobs(leaseTimeoutMs?: number): Promise<number>;
+  renewLease(id: string, workerId: string): Promise<boolean>;
+  retryJob(scanId: string): Promise<JobQueueRecord>;
   getJobByScanId(scanId: string): Promise<JobQueueRecord | null>;
 }
 
@@ -489,6 +491,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
         user.totalScansCount += 1;
       }
       this.save();
+      await this.queue.enqueueJob(scan.id);
       return scan;
     },
     getScan: async (id: string) => {
@@ -847,10 +850,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
       const now = new Date().toISOString();
       const existing = this.state.jobQueue[scanId];
       if (existing) {
-        existing.status = 'QUEUED';
-        existing.runAt = runAt || now;
-        existing.updatedAt = now;
-        this.save();
+        // Idempotent: repeated enqueue requests must NOT reset RUNNING or terminal jobs to QUEUED
         return existing;
       }
 
@@ -940,6 +940,48 @@ export class InMemoryStorageRepository implements IStorageRepository {
       }
       if (recovered > 0) this.save();
       return recovered;
+    },
+
+    renewLease: async (id: string, workerId: string): Promise<boolean> => {
+      const job = Object.values(this.state.jobQueue).find(j => j.id === id);
+      if (job && job.status === 'RUNNING' && job.lockedBy === workerId) {
+        const now = new Date().toISOString();
+        job.lockedAt = now;
+        job.updatedAt = now;
+        this.save();
+        return true;
+      }
+      return false;
+    },
+
+    retryJob: async (scanId: string): Promise<JobQueueRecord> => {
+      const job = this.state.jobQueue[scanId];
+      if (!job) {
+        throw new Error(`Job for scan ${scanId} not found`);
+      }
+      if (job.status === 'RUNNING' || job.status === 'QUEUED') {
+        throw new Error(`Cannot retry active or queued job for scan ${scanId} (status: ${job.status})`);
+      }
+      if (job.status === 'COMPLETED') {
+        throw new Error(`Cannot retry completed job for scan ${scanId}; please initiate an explicit re-scan instead`);
+      }
+      const now = new Date().toISOString();
+      job.status = 'QUEUED';
+      job.attempts = 0;
+      job.runAt = now;
+      job.lockedAt = null;
+      job.lockedBy = null;
+      job.lastError = null;
+      job.updatedAt = now;
+
+      const scan = this.state.scans[scanId];
+      if (scan) {
+        scan.status = 'QUEUED';
+        scan.error = undefined;
+      }
+
+      this.save();
+      return job;
     },
 
     getJobByScanId: async (scanId: string): Promise<JobQueueRecord | null> => {

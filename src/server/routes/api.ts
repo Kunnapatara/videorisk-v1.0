@@ -684,7 +684,7 @@ apiRouter.get('/billing/session-status', async (req: Request, res: Response) => 
     const verification = await billingService.verifyCheckoutSession(sessionId, user.id);
     return res.json(verification);
   } catch (err: any) {
-    const statusCode = err.statusCode || 400;
+    const statusCode = (err.statusCode && err.statusCode >= 400 && err.statusCode < 500 && err.statusCode !== 401) ? err.statusCode : 400;
     res.status(statusCode).json({ error: err.message || 'Failed to verify session status.' });
   }
 });

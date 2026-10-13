@@ -939,13 +939,11 @@ export class SqliteStorageRepository implements IStorageRepository {
       const now = new Date().toISOString();
       const targetRunAt = runAt || now;
 
+      // Idempotent: repeated enqueue calls MUST NOT reset RUNNING or terminal jobs to QUEUED
       this.db.prepare(`
         INSERT INTO job_queue (id, scan_id, status, attempts, max_attempts, run_at, created_at, updated_at)
         VALUES (?, ?, 'QUEUED', 0, 3, ?, ?, ?)
-        ON CONFLICT(scan_id) DO UPDATE SET 
-          status = 'QUEUED', 
-          run_at = excluded.run_at, 
-          updated_at = excluded.updated_at
+        ON CONFLICT(scan_id) DO NOTHING
       `).run(id, scanId, targetRunAt, now, now);
 
       return (await this.queue.getJobByScanId(scanId))!;
@@ -968,15 +966,17 @@ export class SqliteStorageRepository implements IStorageRepository {
 
         if (!eligible) return;
 
-        db.prepare(`
+        const res = db.prepare(`
           UPDATE job_queue 
           SET status = 'RUNNING',
               attempts = attempts + 1,
               locked_at = ?,
               locked_by = ?,
               updated_at = ?
-          WHERE id = ?
+          WHERE id = ? AND (status = 'QUEUED' OR status = 'RETRYABLE')
         `).run(nowIso, workerId, nowIso, eligible.id);
+
+        if (Number(res.changes) === 0) return;
 
         claimed = {
           id: eligible.id,
@@ -1082,6 +1082,69 @@ export class SqliteStorageRepository implements IStorageRepository {
         `).run(nowIso, cutoff);
 
         return Number(res.changes);
+      });
+    },
+
+    renewLease: async (id: string, workerId: string): Promise<boolean> => {
+      return await this.runTransaction(db => {
+        const nowIso = new Date().toISOString();
+        const res = db.prepare(`
+          UPDATE job_queue 
+          SET locked_at = ?,
+              updated_at = ?
+          WHERE id = ? AND locked_by = ? AND status = 'RUNNING'
+        `).run(nowIso, nowIso, id, workerId);
+
+        return Number(res.changes) > 0;
+      });
+    },
+
+    retryJob: async (scanId: string): Promise<JobQueueRecord> => {
+      return await this.runTransaction(db => {
+        const job = db.prepare('SELECT * FROM job_queue WHERE scan_id = ?').get(scanId) as any;
+        if (!job) {
+          throw new Error(`Job for scan ${scanId} not found`);
+        }
+        if (job.status === 'RUNNING' || job.status === 'QUEUED') {
+          throw new Error(`Cannot retry active or queued job for scan ${scanId} (status: ${job.status})`);
+        }
+        if (job.status === 'COMPLETED') {
+          throw new Error(`Cannot retry completed job for scan ${scanId}; please initiate an explicit re-scan instead`);
+        }
+        const nowIso = new Date().toISOString();
+        db.prepare(`
+          UPDATE job_queue 
+          SET status = 'QUEUED',
+              attempts = 0,
+              run_at = ?,
+              locked_at = NULL,
+              locked_by = NULL,
+              last_error = NULL,
+              updated_at = ?
+          WHERE scan_id = ?
+        `).run(nowIso, nowIso, scanId);
+
+        db.prepare(`
+          UPDATE scans 
+          SET status = 'QUEUED',
+              error = NULL
+          WHERE id = ?
+        `).run(scanId);
+
+        const updated = db.prepare('SELECT * FROM job_queue WHERE scan_id = ?').get(scanId) as any;
+        return {
+          id: updated.id,
+          scanId: updated.scan_id,
+          status: updated.status,
+          attempts: Number(updated.attempts),
+          maxAttempts: Number(updated.max_attempts),
+          runAt: updated.run_at,
+          lockedAt: updated.locked_at || null,
+          lockedBy: updated.locked_by || null,
+          lastError: updated.last_error || null,
+          createdAt: updated.created_at,
+          updatedAt: updated.updated_at
+        };
       });
     },
 

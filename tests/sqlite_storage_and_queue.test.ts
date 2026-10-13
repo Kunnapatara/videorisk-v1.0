@@ -169,6 +169,83 @@ export async function runSqliteStorageAndQueueTests() {
     assert(completedJob?.status === 'COMPLETED', 'Job successfully completed by legitimate Worker Beta and marked COMPLETED');
 
     // ---------------------------------------------------------
+    // 3.1 Idempotency, No-Reset Protection & Lease Renewal
+    // ---------------------------------------------------------
+    console.log('\n[3.1 Idempotency, No-Reset Protection & Lease Renewal]');
+
+    // Repeat enqueue on COMPLETED job must NOT reopen to QUEUED
+    await storage.queue.enqueueJob(scanJob.id);
+    const postCompletedReEnqueue = await storage.queue.getJobByScanId(scanJob.id);
+    assert(postCompletedReEnqueue?.status === 'COMPLETED', 'Duplicate enqueue on COMPLETED job does NOT reset status to QUEUED (Idempotent)');
+
+    // Active RUNNING job non-reset test
+    const scanJobRunning: ScanJob = {
+      id: `scan_running_${Date.now()}`,
+      userId: user.id,
+      videoTitle: 'Running Non-Reset Video',
+      videoFilename: 'test_running.mp4',
+      videoPath: '/tmp/test_running.mp4',
+      scanMode: 'standard',
+      status: 'QUEUED',
+      currentStage: 'Upload',
+      completedStages: ['Upload'],
+      creditsUsed: 0,
+      createdAt: new Date().toISOString()
+    };
+    await storage.scans.createScan(scanJobRunning);
+    const claimedRunning = await storage.queue.claimNextJob('worker_gamma', 30000);
+    assert(claimedRunning !== null && claimedRunning.scanId === scanJobRunning.id, 'Claimed running job');
+    assert(claimedRunning?.status === 'RUNNING', 'Job is in RUNNING status');
+
+    // Duplicate enqueue while RUNNING must NOT reset to QUEUED or clear lease
+    await storage.queue.enqueueJob(scanJobRunning.id);
+    const stillRunningAfterEnqueue = await storage.queue.getJobByScanId(scanJobRunning.id);
+    assert(stillRunningAfterEnqueue?.status === 'RUNNING', 'Duplicate enqueue on RUNNING job does NOT reset to QUEUED');
+    assert(stillRunningAfterEnqueue?.lockedBy === 'worker_gamma', 'Duplicate enqueue does NOT clear active worker lease');
+
+    // Lease renewal test: Worker Gamma successfully renews lease
+    const renewed = await storage.queue.renewLease(claimedRunning!.id, 'worker_gamma');
+    assert(renewed === true, 'Active worker Gamma successfully renewed lease');
+
+    // Stale worker cannot renew lease
+    const staleRenew = await storage.queue.renewLease(claimedRunning!.id, 'worker_unauthorized');
+    assert(staleRenew === false, 'Unauthorized/stale worker cannot renew lease');
+
+    // Fail job with retryable = false (terminal FAILED)
+    await storage.queue.failJob(claimedRunning!.id, 'Terminal test failure', false, 0, 'worker_gamma');
+    const failedJob = await storage.queue.getJobByScanId(scanJobRunning.id);
+    assert(failedJob?.status === 'FAILED', 'Job transitioned to terminal FAILED status');
+
+    // Duplicate enqueue on FAILED job must NOT silently reopen
+    await storage.queue.enqueueJob(scanJobRunning.id);
+    const failedJobAfterReEnqueue = await storage.queue.getJobByScanId(scanJobRunning.id);
+    assert(failedJobAfterReEnqueue?.status === 'FAILED', 'Duplicate enqueue on FAILED job does NOT reopen to QUEUED');
+
+    // Intentional retry via retryJob
+    const retriedJob = await storage.queue.retryJob(scanJobRunning.id);
+    assert(retriedJob.status === 'QUEUED', 'Explicit retryJob safely transitions FAILED job back to QUEUED');
+    assert(retriedJob.attempts === 0, 'Explicit retryJob resets attempts count to 0');
+    assert(retriedJob.lockedBy === null, 'Explicit retryJob clears worker lease');
+
+    // Attempting retryJob on active QUEUED job throws error
+    let activeRetryCaught = false;
+    try {
+      await storage.queue.retryJob(scanJobRunning.id);
+    } catch {
+      activeRetryCaught = true;
+    }
+    assert(activeRetryCaught, 'retryJob on already QUEUED job is rejected');
+
+    // Attempting retryJob on COMPLETED job throws error (must use explicit re-scan)
+    let completedRetryCaught = false;
+    try {
+      await storage.queue.retryJob(scanJob.id);
+    } catch {
+      completedRetryCaught = true;
+    }
+    assert(completedRetryCaught, 'retryJob on COMPLETED job is rejected (re-scan required)');
+
+    // ---------------------------------------------------------
     // 4. Durability Across Restart
     // ---------------------------------------------------------
     console.log('\n[4. Persistence Across Database Restarts]');

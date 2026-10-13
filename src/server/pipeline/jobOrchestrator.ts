@@ -31,6 +31,7 @@ export class JobOrchestrator {
     this.pollTimer = setInterval(() => {
       this.pollQueue();
     }, 500);
+    if (this.pollTimer.unref) this.pollTimer.unref();
 
     // Periodic stale job recovery (every 15s)
     this.staleRecoveryTimer = setInterval(() => {
@@ -38,6 +39,7 @@ export class JobOrchestrator {
         console.warn('[JobOrchestrator] Error recovering stale jobs:', err);
       });
     }, 15000);
+    if (this.staleRecoveryTimer.unref) this.staleRecoveryTimer.unref();
 
     // Initial check for recovery from server restart
     storage.queue.recoverStaleJobs(60000).catch(() => {});
@@ -56,7 +58,7 @@ export class JobOrchestrator {
   }
 
   /**
-   * Enqueues scan job durably and kicks worker
+   * Enqueues scan job durably and kicks worker (idempotent)
    */
   public startJob(scanId: string): void {
     storage.queue.enqueueJob(scanId).then(() => {
@@ -71,38 +73,52 @@ export class JobOrchestrator {
   }
 
   private async pollQueue(): Promise<void> {
-    if (!this.isWorkerRunning || this.currentRunningCount >= this.maxConcurrentJobs) {
+    if (!this.isWorkerRunning) {
       return;
     }
 
-    try {
-      const job = await storage.queue.claimNextJob(this.workerId, 60000);
-      if (!job) return;
+    while (this.isWorkerRunning && this.currentRunningCount < this.maxConcurrentJobs) {
+      try {
+        const job = await storage.queue.claimNextJob(this.workerId, 60000);
+        if (!job) break;
 
-      this.currentRunningCount++;
-      this.activeJobs.add(job.scanId);
+        this.currentRunningCount++;
+        this.activeJobs.add(job.scanId);
 
-      this.executeJob(job)
-        .catch(err => {
-          console.error(`[JobOrchestrator] Unhandled error executing job ${job.id}:`, err);
-        })
-        .finally(() => {
-          this.currentRunningCount--;
-          this.activeJobs.delete(job.scanId);
-          // Check if more jobs are waiting
-          this.triggerPoll();
-        });
-    } catch (err) {
-      console.warn('[JobOrchestrator] Queue polling error:', err);
+        this.executeJob(job)
+          .catch(err => {
+            console.error(`[JobOrchestrator] Unhandled error executing job ${job.id}:`, err);
+          })
+          .finally(() => {
+            this.currentRunningCount--;
+            this.activeJobs.delete(job.scanId);
+            // Check if more jobs are waiting
+            this.triggerPoll();
+          });
+      } catch (err) {
+        console.warn('[JobOrchestrator] Queue polling error:', err);
+        break;
+      }
     }
   }
 
   private async executeJob(job: JobQueueRecord): Promise<void> {
     const scanId = job.scanId;
+
+    // Heartbeat: renew lease periodically while executing to prevent premature reclamation on long scans
+    const heartbeatTimer = setInterval(() => {
+      storage.queue.renewLease(job.id, this.workerId).catch(err => {
+        console.warn(`[JobOrchestrator] Heartbeat renewal error for job ${job.id}:`, err);
+      });
+    }, 15000);
+    if (heartbeatTimer.unref) heartbeatTimer.unref();
+
     try {
       await this.processJob(scanId);
+      clearInterval(heartbeatTimer);
       await storage.queue.completeJob(job.id, this.workerId);
     } catch (err: any) {
+      clearInterval(heartbeatTimer);
       console.error(`[JobOrchestrator] Job ${job.id} for scan ${scanId} failed:`, err);
 
       const isTerminal = 
@@ -111,8 +127,12 @@ export class JobOrchestrator {
         job.attempts >= job.maxAttempts;
 
       if (!isTerminal) {
-        // Retryable: backoff exponentially
+        // Retryable: backoff exponentially and synchronize scan status
         const backoffMs = Math.min(30000, 2000 * Math.pow(2, job.attempts));
+        await storage.scans.updateScan(scanId, {
+          status: 'QUEUED',
+          error: `Transient issue: retrying (attempt ${job.attempts}/${job.maxAttempts})...`
+        });
         await storage.queue.failJob(job.id, err.message, true, backoffMs, this.workerId);
       } else {
         // Terminal failure: refund credits idempotently and mark scan failed
