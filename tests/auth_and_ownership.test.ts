@@ -293,6 +293,143 @@ export async function runAuthAndOwnershipTests() {
     assert(userBScanWithAFile.status === 403, 'User B cannot reference User A uploaded file in /scans (403 Forbidden)');
 
     // ---------------------------------------------------------
+    // 3b. SECURE UPLOAD MIDDLEWARE & PRE-UPLOAD AUTHORIZATION
+    // ---------------------------------------------------------
+    console.log('\n[3b. Secure Upload Middleware & Pre-Upload Authorization]');
+
+    const uploadDir = path.resolve(process.cwd(), 'uploads');
+    const getUploadFiles = () => fs.existsSync(uploadDir) ? fs.readdirSync(uploadDir) : [];
+
+    // Test 3b.1: Anonymous POST /uploads receives HTTP 401 and creates ZERO files
+    const filesBeforeAnonVideo = getUploadFiles();
+    const anonVideoForm = new FormData();
+    anonVideoForm.append('video', new Blob(['FAKE_UNAUTH_VIDEO_CONTENT'], { type: 'video/mp4' }), 'unauth_video.mp4');
+
+    const anonVideoRes = await fetch(`${baseUrl}/uploads`, {
+      method: 'POST',
+      body: anonVideoForm
+    });
+    assert(anonVideoRes.status === 401, 'Unauthenticated POST /uploads receives 401 Unauthorized');
+    const filesAfterAnonVideo = getUploadFiles();
+    assert(filesAfterAnonVideo.length === filesBeforeAnonVideo.length, 'Zero bytes/files written to uploads/ on rejected unauthenticated video upload');
+
+    // Test 3b.2: Anonymous POST /uploads/thumbnail receives HTTP 401 and creates ZERO files
+    const filesBeforeAnonThumb = getUploadFiles();
+    const anonThumbForm = new FormData();
+    anonThumbForm.append('thumbnail', new Blob(['FAKE_UNAUTH_THUMBNAIL_BYTES'], { type: 'image/jpeg' }), 'unauth_thumb.jpg');
+
+    const anonThumbRes = await fetch(`${baseUrl}/uploads/thumbnail`, {
+      method: 'POST',
+      body: anonThumbForm
+    });
+    assert(anonThumbRes.status === 401, 'Unauthenticated POST /uploads/thumbnail receives 401 Unauthorized');
+    const filesAfterAnonThumb = getUploadFiles();
+    assert(filesAfterAnonThumb.length === filesBeforeAnonThumb.length, 'Zero bytes/files written to uploads/ on rejected unauthenticated thumbnail upload');
+
+    // Test 3b.3: Anonymous POST /scans/:id/rescan receives HTTP 401 and creates ZERO files
+    const filesBeforeAnonRescan = getUploadFiles();
+    const anonRescanForm = new FormData();
+    anonRescanForm.append('video', new Blob(['FAKE_UNAUTH_RESCAN_BYTES'], { type: 'video/mp4' }), 'unauth_rescan.mp4');
+
+    const anonRescanRes = await fetch(`${baseUrl}/scans/${scanA.id}/rescan`, {
+      method: 'POST',
+      body: anonRescanForm
+    });
+    assert(anonRescanRes.status === 401, 'Unauthenticated POST /scans/:id/rescan receives 401 Unauthorized');
+    const filesAfterAnonRescan = getUploadFiles();
+    assert(filesAfterAnonRescan.length === filesBeforeAnonRescan.length, 'Zero bytes/files written to uploads/ on rejected unauthenticated rescan');
+
+    // Test 3b.4: Pre-upload Authorization: User B cannot upload a file to re-scan User A's scan (403 Forbidden)
+    const filesBeforeUserBRescan = getUploadFiles();
+    const userBRescanForm = new FormData();
+    userBRescanForm.append('video', new Blob(['USER_B_ATTEMPTED_RESCAN_VIDEO'], { type: 'video/mp4' }), 'user_b_rescan.mp4');
+
+    const userBRescanUpload = await fetch(`${baseUrl}/scans/${scanA.id}/rescan`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${tokenB}` },
+      body: userBRescanForm
+    });
+    assert(userBRescanUpload.status === 403, 'User B upload to re-scan User A video rejected with 403 Forbidden before saving');
+    const filesAfterUserBRescan = getUploadFiles();
+    assert(filesAfterUserBRescan.length === filesBeforeUserBRescan.length, 'Zero files persisted when unauthorized user attempts rescan upload');
+
+    // Test 3b.5: Pre-upload Authorization: Non-existent parent scan ID rejected with 404 before file processing
+    const filesBefore404Rescan = getUploadFiles();
+    const nonExistentRescanForm = new FormData();
+    nonExistentRescanForm.append('video', new Blob(['NON_EXISTENT_PARENT_BYTES'], { type: 'video/mp4' }), 'non_existent.mp4');
+
+    const nonExistentRescanRes = await fetch(`${baseUrl}/scans/scan_does_not_exist_99999/rescan`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${activeTokenA}` },
+      body: nonExistentRescanForm
+    });
+    assert(nonExistentRescanRes.status === 404, 'Re-scan with non-existent parent ID rejected with 404 before saving');
+    const filesAfter404Rescan = getUploadFiles();
+    assert(filesAfter404Rescan.length === filesBefore404Rescan.length, 'Zero files persisted when parent scan does not exist');
+
+    // Test 3b.6: Invalid upload format rejected with 400 and temporary files cleaned up
+    const filesBeforeInvalid = getUploadFiles();
+    const invalidForm = new FormData();
+    invalidForm.append('video', new Blob(['NOT_A_VIDEO'], { type: 'application/x-dosexec' }), 'malicious.exe');
+
+    const invalidRes = await fetch(`${baseUrl}/uploads`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${activeTokenA}` },
+      body: invalidForm
+    });
+    assert(invalidRes.status === 400, 'Invalid file format upload rejected with 400 Bad Request');
+    const filesAfterInvalid = getUploadFiles();
+    assert(filesAfterInvalid.length === filesBeforeInvalid.length, 'Zero files persisted on invalid file format upload');
+
+    // Test 3b.7: Valid authenticated thumbnail upload succeeds and records ownership
+    const testThumbFixturePath = path.resolve(uploadDir, `test_fixture_thumb_${Date.now()}.jpg`);
+    try {
+      const { execFileSync } = await import('child_process');
+      execFileSync('ffmpeg', ['-y', '-f', 'lavfi', '-i', 'color=c=blue:s=1280x720:d=1', '-vframes', '1', testThumbFixturePath]);
+      const thumbBuffer = fs.readFileSync(testThumbFixturePath);
+
+      const validThumbForm = new FormData();
+      validThumbForm.append('thumbnail', new Blob([thumbBuffer], { type: 'image/jpeg' }), 'valid_thumbnail.jpg');
+
+      const validThumbRes = await fetch(`${baseUrl}/uploads/thumbnail`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${activeTokenA}` },
+        body: validThumbForm
+      });
+      assert(validThumbRes.status === 200, 'Authenticated valid thumbnail upload succeeds (200 OK)');
+      const validThumbData = await validThumbRes.json();
+      assert(!!validThumbData.fileId, 'Upload response contains fileId');
+      assert(validThumbData.thumbnailMetadata?.isStandardAspect === true, 'Upload response contains inspected metadata');
+
+      // Verify upload record ownership in storage
+      const uploadRecord = await storage.uploads.getUpload(validThumbData.fileId);
+      assert(uploadRecord?.userId === userA.id, 'Upload record ownership is strictly tied to authenticated user');
+
+      // Clean up uploaded test thumbnail file
+      if (validThumbData.filePath && fs.existsSync(validThumbData.filePath)) {
+        try { fs.unlinkSync(validThumbData.filePath); } catch {}
+      }
+    } finally {
+      if (fs.existsSync(testThumbFixturePath)) {
+        try { fs.unlinkSync(testThumbFixturePath); } catch {}
+      }
+    }
+
+    // Test 3b.8: Re-scan without a new upload (existing functionality) preserves normal behavior
+    const noFileRescanRes = await fetch(`${baseUrl}/scans/${scanA.id}/rescan`, {
+      method: 'POST',
+      headers: { 
+        Authorization: `Bearer ${activeTokenA}`,
+        'Content-Type': 'application/json' 
+      },
+      body: JSON.stringify({})
+    });
+    assert(noFileRescanRes.status === 201, 'Authenticated re-scan without new upload succeeds (201 Created)');
+    const rescanData = await noFileRescanRes.json();
+    assert(rescanData.isRescan === true, 'Created rescan job marked as isRescan: true');
+    assert(rescanData.parentScanId === scanA.id, 'Created rescan job correctly references parentScanId');
+
+    // ---------------------------------------------------------
     // 4. CREDITS & BILLING SAFETY
     // ---------------------------------------------------------
     console.log('\n[4. Credits & Billing Safety]');

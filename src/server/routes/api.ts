@@ -1,4 +1,4 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, RequestHandler } from 'express';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
@@ -80,6 +80,44 @@ const uploadThumbnail = multer({
 });
 
 /**
+ * Type-safe middleware wrapper for video uploads.
+ * Invokes Multer to parse the 'video' field and cleanly intercepts file size and validation errors.
+ */
+const uploadVideoMiddleware: RequestHandler = (req, res, next) => {
+  upload.single('video')(req as any, res as any, (err: any) => {
+    if (err) {
+      if (err instanceof multer.MulterError) {
+        if (err.code === 'LIMIT_FILE_SIZE') {
+          return res.status(400).json({ error: 'Video file size exceeds 500 MB limit.' });
+        }
+        return res.status(400).json({ error: `Upload error: ${err.message}` });
+      }
+      return res.status(400).json({ error: err.message || 'Invalid upload.' });
+    }
+    next();
+  });
+};
+
+/**
+ * Type-safe middleware wrapper for thumbnail image uploads.
+ * Invokes Multer to parse the 'thumbnail' field and cleanly intercepts file size and validation errors.
+ */
+const uploadThumbnailMiddleware: RequestHandler = (req, res, next) => {
+  uploadThumbnail.single('thumbnail')(req as any, res as any, (err: any) => {
+    if (err) {
+      if (err instanceof multer.MulterError) {
+        if (err.code === 'LIMIT_FILE_SIZE') {
+          return res.status(400).json({ error: 'Thumbnail file size exceeds 10 MB limit.' });
+        }
+        return res.status(400).json({ error: `Upload error: ${err.message}` });
+      }
+      return res.status(400).json({ error: err.message || 'Invalid upload.' });
+    }
+    next();
+  });
+};
+
+/**
  * Validates that a file path is safely confined to the upload directory.
  * Prevents directory traversal, symlink jumping, and prefix-collision attacks.
  */
@@ -139,13 +177,72 @@ export async function getAuthenticatedUser(req: Request): Promise<UserAccount | 
  * Rejects anonymous, missing, expired, or invalid sessions with 401 Unauthorized.
  */
 export async function requireAuth(req: Request, res: Response): Promise<UserAccount | null> {
+  const existingUser = (req as any).user;
+  if (existingUser) {
+    return existingUser;
+  }
   const user = await getAuthenticatedUser(req);
   if (!user) {
     res.status(401).json({ error: 'Unauthorized: A valid active session is required.' });
     return null;
   }
+  (req as any).user = user;
   return user;
 }
+
+/**
+ * Express middleware requiring an authenticated user session.
+ * Rejects unauthenticated requests with HTTP 401 before any downstream upload/processing runs.
+ */
+export const requireAuthMiddleware: RequestHandler = async (req, res, next) => {
+  try {
+    const user = await requireAuth(req, res);
+    if (!user) {
+      return;
+    }
+    next();
+  } catch (err: any) {
+    res.status(500).json({ error: 'Authentication check failed.' });
+  }
+};
+
+/**
+ * Pre-upload authorization check for re-scanning.
+ * Ensures the parent scan exists, belongs to the authenticated user, and user has available credits
+ * before Multer parses any multipart file upload.
+ */
+export const validateRescanAuthorization: RequestHandler = async (req, res, next) => {
+  try {
+    const user = (req as any).user || await getAuthenticatedUser(req);
+    if (!user) {
+      res.status(401).json({ error: 'Unauthorized: A valid active session is required.' });
+      return;
+    }
+
+    const parentScan = await storage.scans.getScan(req.params.id);
+    if (!parentScan) {
+      res.status(404).json({ error: 'Original scan not found.' });
+      return;
+    }
+    if (parentScan.userId !== user.id) {
+      res.status(403).json({ error: 'Access denied: Cannot re-scan video belonging to another user.' });
+      return;
+    }
+
+    if (user.creditsRemaining <= 0) {
+      res.status(402).json({ 
+        error: 'Insufficient credits for re-scan. Please top up your balance.',
+        creditsRemaining: user.creditsRemaining 
+      });
+      return;
+    }
+
+    (req as any).parentScan = parentScan;
+    next();
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to authorize re-scan.' });
+  }
+};
 
 // 1. Clean Health Endpoint (Public)
 apiRouter.get('/health', (req: Request, res: Response) => {
@@ -623,12 +720,12 @@ apiRouter.get('/billing/plans', async (req: Request, res: Response) => {
 });
 
 // 5. Upload & Pre-inspection (Protected)
-apiRouter.post('/uploads', upload.single('video'), async (req: Request, res: Response) => {
+apiRouter.post('/uploads', requireAuthMiddleware, uploadVideoMiddleware, async (req: Request, res: Response) => {
   try {
     const user = await requireAuth(req, res);
     if (!user) {
       if (req.file && fs.existsSync(req.file.path)) {
-        fs.unlinkSync(req.file.path);
+        try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
       }
       return;
     }
@@ -676,12 +773,12 @@ apiRouter.post('/uploads', upload.single('video'), async (req: Request, res: Res
 });
 
 // 5b. Upload Thumbnail Image (Protected)
-apiRouter.post('/uploads/thumbnail', uploadThumbnail.single('thumbnail'), async (req: Request, res: Response) => {
+apiRouter.post('/uploads/thumbnail', requireAuthMiddleware, uploadThumbnailMiddleware, async (req: Request, res: Response) => {
   try {
     const user = await requireAuth(req, res);
     if (!user) {
       if (req.file && fs.existsSync(req.file.path)) {
-        fs.unlinkSync(req.file.path);
+        try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
       }
       return;
     }
@@ -1068,20 +1165,34 @@ apiRouter.get('/scans/:id/report', async (req: Request, res: Response) => {
 });
 
 // 13. Re-scan Endpoint (Strict IDOR protection)
-apiRouter.post('/scans/:id/rescan', upload.single('video'), async (req: Request, res: Response) => {
+apiRouter.post('/scans/:id/rescan', requireAuthMiddleware, validateRescanAuthorization, uploadVideoMiddleware, async (req: Request, res: Response) => {
   try {
     const user = await requireAuth(req, res);
-    if (!user) return;
+    if (!user) {
+      if (req.file && fs.existsSync(req.file.path)) {
+        try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
+      }
+      return;
+    }
 
-    const parentScan = await storage.scans.getScan(req.params.id);
+    const parentScan = (req as any).parentScan || await storage.scans.getScan(req.params.id);
     if (!parentScan) {
+      if (req.file && fs.existsSync(req.file.path)) {
+        try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
+      }
       return res.status(404).json({ error: 'Original scan not found.' });
     }
     if (parentScan.userId !== user.id) {
+      if (req.file && fs.existsSync(req.file.path)) {
+        try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
+      }
       return res.status(403).json({ error: 'Access denied: Cannot re-scan video belonging to another user.' });
     }
 
     if (user.creditsRemaining <= 0) {
+      if (req.file && fs.existsSync(req.file.path)) {
+        try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
+      }
       return res.status(402).json({ 
         error: 'Insufficient credits for re-scan. Please top up your balance.',
         creditsRemaining: user.creditsRemaining 
@@ -1142,6 +1253,9 @@ apiRouter.post('/scans/:id/rescan', upload.single('video'), async (req: Request,
 
     res.status(201).json(rescanJob);
   } catch (err: any) {
+    if (req.file && fs.existsSync(req.file.path)) {
+      try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
+    }
     res.status(500).json({ error: err.message || 'Failed to initiate re-scan.' });
   }
 });
