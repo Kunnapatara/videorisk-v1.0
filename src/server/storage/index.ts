@@ -72,6 +72,7 @@ export interface IScanRepository {
   deductScanCredits(scanId: string, userId: string, amount: number, leaseToken?: LeaseFencingToken): Promise<boolean>;
   refundScanCredits(scanId: string, hintAmount?: number, leaseToken?: LeaseFencingToken): Promise<{ refunded: boolean; amount: number }>;
   deleteScan(id: string): Promise<boolean>;
+  isMediaShared(filePath: string, excludeScanId: string): Promise<boolean>;
 }
 
 export interface IEvidenceRepository {
@@ -635,6 +636,17 @@ export class InMemoryStorageRepository implements IStorageRepository {
         delete state.comparisons[id];
         delete state.jobQueue[id];
         return true;
+      });
+    },
+    isMediaShared: async (filePath: string, excludeScanId: string): Promise<boolean> => {
+      if (!filePath) return false;
+      const resolved = path.resolve(filePath);
+      return Object.values(this.state.scans).some(s => {
+        if (s.id === excludeScanId) return false;
+        const v = s.videoPath ? path.resolve(s.videoPath) : '';
+        const p = s.proxyPath ? path.resolve(s.proxyPath) : '';
+        const t = s.thumbnailPath ? path.resolve(s.thumbnailPath) : '';
+        return v === resolved || p === resolved || t === resolved;
       });
     }
   };

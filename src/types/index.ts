@@ -9,7 +9,8 @@ export type JobStatus =
   | 'MAPPING_POLICY'
   | 'BUILDING_REPORT'
   | 'COMPLETED'
-  | 'FAILED';
+  | 'FAILED'
+  | 'CLEANUP_PENDING';
 
 export type ScanStage = 
   | 'Upload'

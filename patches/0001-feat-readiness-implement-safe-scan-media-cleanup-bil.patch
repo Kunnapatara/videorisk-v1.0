@@ -1,0 +1,1136 @@
+From 3e9ac02aaf009b897ae41f14fb4f0ab5e4a220f8 Mon Sep 17 00:00:00 2001
+From: Kunnapatara <kunnapatara@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 14:32:01 +0000
+Subject: [PATCH] feat(readiness): implement safe scan media cleanup, billing
+ validator, and ESM vite config
+
+---
+ package.json                                  |   3 +-
+ scripts/validate-env.ts                       | 322 +++++++++++++
+ src/server/routes/api.ts                      | 149 +++++-
+ src/server/storage/index.ts                   |  12 +
+ src/server/storage/sqliteStorage.ts           |  12 +
+ src/types/index.ts                            |   3 +-
+ tests/runAllTests.ts                          |   4 +
+ tests/scan_deletion_and_media_cleanup.test.ts | 454 ++++++++++++++++++
+ vite.config.ts                                |   3 +
+ 9 files changed, 936 insertions(+), 26 deletions(-)
+ create mode 100644 scripts/validate-env.ts
+ create mode 100644 tests/scan_deletion_and_media_cleanup.test.ts
+
+diff --git a/package.json b/package.json
+index 55a5095..4ef9a5b 100644
+--- a/package.json
++++ b/package.json
+@@ -10,7 +10,8 @@
+     "preview": "vite preview",
+     "clean": "rm -rf dist server.js",
+     "lint": "tsc --noEmit",
+-    "test": "tsx tests/runAllTests.ts"
++    "test": "tsx tests/runAllTests.ts",
++    "validate:env": "tsx scripts/validate-env.ts"
+   },
+   "dependencies": {
+     "@google/genai": "^2.4.0",
+diff --git a/scripts/validate-env.ts b/scripts/validate-env.ts
+new file mode 100644
+index 0000000..cdf1daf
+--- /dev/null
++++ b/scripts/validate-env.ts
+@@ -0,0 +1,322 @@
++/**
++ * VideoRisk.com — Production Billing & Environment Configuration Validator
++ *
++ * Validates Stripe environment variables, secret prefixes, price IDs,
++ * environment separation, and pricing tier mappings for launch readiness.
++ *
++ * Usage:
++ *   npx tsx scripts/validate-env.ts                     # Production check (default)
++ *   npx tsx scripts/validate-env.ts --mode=production  # Explicit production check
++ *   npx tsx scripts/validate-env.ts --mode=test        # Test mode check
++ *   npx tsx scripts/validate-env.ts --mode=development # Development mode check
++ *   npx tsx scripts/validate-env.ts --live-check       # Optional live Stripe API check (requires ALLOW_LIVE_STRIPE_CHECK=true)
++ */
++
++import dotenv from 'dotenv';
++import Stripe from 'stripe';
++
++dotenv.config();
++
++export interface ValidationIssue {
++  type: 'ERROR' | 'WARNING' | 'INFO';
++  variable: string;
++  message: string;
++}
++
++export interface ValidationSummary {
++  mode: 'production' | 'test' | 'development';
++  valid: boolean;
++  errorsCount: number;
++  warningsCount: number;
++  issues: ValidationIssue[];
++}
++
++export const INTENDED_PLANS = [
++  { id: 'free', name: 'Free', priceUsd: 0, credits: 10, interval: 'free_trial', envVar: null },
++  { id: 'creator', name: 'Creator', priceUsd: 9, credits: 30, interval: 'month', envVar: 'STRIPE_PRICE_CREATOR' },
++  { id: 'pro', name: 'Pro', priceUsd: 19, credits: 75, interval: 'month', envVar: 'STRIPE_PRICE_PRO' },
++  { id: 'agency', name: 'Agency', priceUsd: 99, credits: 600, interval: 'month', envVar: 'STRIPE_PRICE_AGENCY' },
++  { id: 'audit_once', name: 'One-time Audit', priceUsd: 29, credits: 60, interval: 'one-time', envVar: 'STRIPE_PRICE_AUDIT_ONCE' },
++] as const;
++
++/**
++ * Safely masks secrets so credentials never leak to logs or terminal.
++ * Returns e.g. "sk_live_...12ab" or "***"
++ */
++export function maskSecret(secret?: string | null): string {
++  if (!secret) return '(not set)';
++  const trimmed = secret.trim();
++  if (trimmed.length <= 12) return '***';
++  return `${trimmed.substring(0, 8)}...${trimmed.substring(trimmed.length - 4)}`;
++}
++
++/**
++ * Validates billing environment configuration
++ */
++export function validateBillingConfiguration(
++  mode: 'production' | 'test' | 'development' = 'production',
++  env: NodeJS.ProcessEnv = process.env
++): ValidationSummary {
++  const issues: ValidationIssue[] = [];
++
++  const secretKey = env.STRIPE_SECRET_KEY?.trim() || '';
++  const webhookSecret = env.STRIPE_WEBHOOK_SECRET?.trim() || '';
++  const paymentProvider = env.PAYMENT_PROVIDER?.trim() || '';
++  const paymentMode = env.PAYMENT_MODE?.trim() || '';
++
++  // 1. Stripe Secret Key Validation
++  if (!secretKey) {
++    if (mode === 'production') {
++      issues.push({
++        type: 'ERROR',
++        variable: 'STRIPE_SECRET_KEY',
++        message: 'Missing required Stripe secret key in production environment.',
++      });
++    } else if (mode === 'test') {
++      issues.push({
++        type: 'ERROR',
++        variable: 'STRIPE_SECRET_KEY',
++        message: 'Missing Stripe test secret key (expected sk_test_... or rk_test_...).',
++      });
++    } else {
++      issues.push({
++        type: 'WARNING',
++        variable: 'STRIPE_SECRET_KEY',
++        message: 'STRIPE_SECRET_KEY not set. Development server will operate in simulation mode.',
++      });
++    }
++  } else {
++    const isLiveKey = secretKey.startsWith('sk_live_') || secretKey.startsWith('rk_live_');
++    const isTestKey = secretKey.startsWith('sk_test_') || secretKey.startsWith('rk_test_');
++
++    if (mode === 'production') {
++      if (!isLiveKey) {
++        if (isTestKey) {
++          issues.push({
++            type: 'ERROR',
++            variable: 'STRIPE_SECRET_KEY',
++            message: `Contradictory environment configuration: Test key (${maskSecret(secretKey)}) found in production mode. Production strictly requires a live key (sk_live_... or rk_live_...).`,
++          });
++        } else {
++          issues.push({
++            type: 'ERROR',
++            variable: 'STRIPE_SECRET_KEY',
++            message: `Malformed Stripe secret key: must begin with 'sk_live_' or 'rk_live_'. Found: ${maskSecret(secretKey)}.`,
++          });
++        }
++      }
++    } else if (mode === 'test') {
++      if (!isTestKey) {
++        if (isLiveKey) {
++          issues.push({
++            type: 'ERROR',
++            variable: 'STRIPE_SECRET_KEY',
++            message: `Accidental live key (${maskSecret(secretKey)}) in test mode! Test mode must use sk_test_... or rk_test_... to prevent real credit card charges.`,
++          });
++        } else {
++          issues.push({
++            type: 'ERROR',
++            variable: 'STRIPE_SECRET_KEY',
++            message: `Malformed test key: must begin with 'sk_test_' or 'rk_test_'. Found: ${maskSecret(secretKey)}.`,
++          });
++        }
++      }
++    }
++  }
++
++  // 2. Stripe Webhook Secret Validation
++  if (!webhookSecret) {
++    if (mode === 'production') {
++      issues.push({
++        type: 'ERROR',
++        variable: 'STRIPE_WEBHOOK_SECRET',
++        message: 'Missing required STRIPE_WEBHOOK_SECRET in production. Stripe webhook signature verification will fail closed.',
++      });
++    } else if (mode === 'test') {
++      issues.push({
++        type: 'WARNING',
++        variable: 'STRIPE_WEBHOOK_SECRET',
++        message: 'STRIPE_WEBHOOK_SECRET is recommended in test mode to verify webhook signature handling with Stripe CLI.',
++      });
++    }
++  } else {
++    if (!webhookSecret.startsWith('whsec_')) {
++      issues.push({
++        type: 'ERROR',
++        variable: 'STRIPE_WEBHOOK_SECRET',
++        message: `Malformed STRIPE_WEBHOOK_SECRET: signing secrets must begin with 'whsec_'. Found: ${maskSecret(webhookSecret)}.`,
++      });
++    }
++  }
++
++  // 3. Price IDs for All Paid Plans
++  const paidPlans = INTENDED_PLANS.filter((p) => p.envVar !== null);
++  for (const plan of paidPlans) {
++    const priceId = env[plan.envVar!]?.trim() || '';
++
++    if (!priceId) {
++      if (mode === 'production') {
++        issues.push({
++          type: 'ERROR',
++          variable: plan.envVar!,
++          message: `Missing Stripe Price ID for ${plan.name} plan ($${plan.priceUsd}, ${plan.credits} credits). Set ${plan.envVar}=price_... in production.`,
++        });
++      } else if (mode === 'test') {
++        issues.push({
++          type: 'WARNING',
++          variable: plan.envVar!,
++          message: `Missing test Price ID for ${plan.name} plan. Billing service will dynamically generate test price line items.`,
++        });
++      }
++    } else {
++      if (!priceId.startsWith('price_')) {
++        issues.push({
++          type: 'ERROR',
++          variable: plan.envVar!,
++          message: `Malformed Price ID for ${plan.name}: expected 'price_...' prefix. Found: ${maskSecret(priceId)}.`,
++        });
++      }
++    }
++  }
++
++  // 4. Payment Provider & Mode Cohesion
++  if (paymentProvider && paymentProvider.toLowerCase() !== 'stripe') {
++    issues.push({
++      type: 'WARNING',
++      variable: 'PAYMENT_PROVIDER',
++      message: `PAYMENT_PROVIDER is set to '${paymentProvider}'. Only 'stripe' is natively supported in this version.`,
++    });
++  }
++
++  if (mode === 'production' && paymentMode === 'simulation') {
++    issues.push({
++      type: 'ERROR',
++      variable: 'PAYMENT_MODE',
++      message: "PAYMENT_MODE='simulation' is strictly forbidden in production mode. Set to 'live' or leave unset.",
++    });
++  }
++
++  const errorsCount = issues.filter((i) => i.type === 'ERROR').length;
++  const warningsCount = issues.filter((i) => i.type === 'WARNING').length;
++
++  return {
++    mode,
++    valid: errorsCount === 0,
++    errorsCount,
++    warningsCount,
++    issues,
++  };
++}
++
++/**
++ * Optional live Stripe API check. Only executes when explicitly requested and authorized.
++ */
++async function performLiveStripeCheck(secretKey: string): Promise<{ success: boolean; message: string }> {
++  try {
++    const stripe = new Stripe(secretKey, {
++      apiVersion: '2025-02-24.acacia' as any,
++    });
++    const balance = await stripe.balance.retrieve();
++    const livemode = balance.livemode ? 'LIVE' : 'TEST';
++    return {
++      success: true,
++      message: `Successfully connected to Stripe API in ${livemode} mode. Live balance object retrieved.`,
++    };
++  } catch (err: any) {
++    return {
++      success: false,
++      message: `Stripe API connection failed: ${err?.message || err}`,
++    };
++  }
++}
++
++/**
++ * CLI Entrypoint
++ */
++export async function runValidatorCli(): Promise<number> {
++  const args = process.argv.slice(2);
++  let mode: 'production' | 'test' | 'development' = 'production';
++
++  for (const arg of args) {
++    if (arg === '--mode=production') mode = 'production';
++    if (arg === '--mode=test') mode = 'test';
++    if (arg === '--mode=development') mode = 'development';
++  }
++
++  if (!args.some((a) => a.startsWith('--mode='))) {
++    if (process.env.NODE_ENV === 'test') mode = 'test';
++    else if (process.env.NODE_ENV === 'development') mode = 'development';
++    else mode = 'production';
++  }
++
++  console.log('======================================================================');
++  console.log('VIDEORISK.COM — BILLING & ENVIRONMENT CONFIGURATION VALIDATOR');
++  console.log(`Target Evaluation Mode: [${mode.toUpperCase()}]`);
++  console.log('======================================================================\n');
++
++  console.log('Configured Plans & Entitlements:');
++  for (const plan of INTENDED_PLANS) {
++    const status = plan.envVar ? (process.env[plan.envVar] ? maskSecret(process.env[plan.envVar]) : '(not configured)') : 'N/A (Free)';
++    console.log(`  • ${plan.name.padEnd(16)}: $${plan.priceUsd.toString().padStart(2)} / ${plan.credits.toString().padStart(3)} credits [${plan.interval}] -> ${plan.envVar || 'None'}: ${status}`);
++  }
++  console.log();
++
++  const summary = validateBillingConfiguration(mode);
++
++  if (summary.issues.length === 0) {
++    console.log(`✅ All ${mode} configuration checks PASSED with 0 errors and 0 warnings.\n`);
++  } else {
++    for (const issue of summary.issues) {
++      const icon = issue.type === 'ERROR' ? '❌' : issue.type === 'WARNING' ? '⚠️ ' : 'ℹ️ ';
++      console.log(`${icon} [${issue.type}] ${issue.variable}: ${issue.message}`);
++    }
++    console.log();
++  }
++
++  // Check if live API check was requested
++  const isLiveCheckRequested = args.includes('--live-check') || args.includes('--verify-api');
++  if (isLiveCheckRequested) {
++    if (process.env.ALLOW_LIVE_STRIPE_CHECK !== 'true') {
++      console.log('⚠️  Live API check skipped: Set ALLOW_LIVE_STRIPE_CHECK=true to authorize outbound live Stripe API calls.\n');
++    } else if (!process.env.STRIPE_SECRET_KEY) {
++      console.log('❌ Live API check failed: STRIPE_SECRET_KEY is empty.\n');
++    } else {
++      console.log('Executing authorized read-only Stripe API balance verification...');
++      const liveResult = await performLiveStripeCheck(process.env.STRIPE_SECRET_KEY);
++      if (liveResult.success) {
++        console.log(`✅ ${liveResult.message}\n`);
++      } else {
++        console.log(`❌ ${liveResult.message}\n`);
++      }
++    }
++  }
++
++  console.log('----------------------------------------------------------------------');
++  console.log('VERIFICATION BOUNDARY NOTICE:');
++  console.log('This validator verifies static environment configuration, key formats,');
++  console.log('plan price mappings, and test/live mode separation.');
++  console.log('It does NOT prove that a live payment or webhook delivery has succeeded.');
++  console.log('Before production launch, execute a test checkout using the Stripe CLI:');
++  console.log('  stripe listen --forward-to localhost:3000/api/billing/webhook');
++  console.log('  stripe trigger payment_intent.succeeded');
++  console.log('----------------------------------------------------------------------');
++
++  if (!summary.valid) {
++    console.error(`\n❌ Configuration validation FAILED with ${summary.errorsCount} error(s).\n`);
++    return 1;
++  }
++
++  console.log(`\n✅ Configuration validation SUCCESSFUL for ${mode} mode.\n`);
++  return 0;
++}
++
++if (process.argv[1] && process.argv[1].endsWith('validate-env.ts')) {
++  runValidatorCli()
++    .then((code) => {
++      if (code !== 0) process.exit(code);
++    })
++    .catch((err) => {
++      console.error('Validator execution error:', err);
++      process.exit(1);
++    });
++}
+diff --git a/src/server/routes/api.ts b/src/server/routes/api.ts
+index afb060f..652c71b 100644
+--- a/src/server/routes/api.ts
++++ b/src/server/routes/api.ts
+@@ -2,6 +2,7 @@ import { Router, Request, Response, RequestHandler } from 'express';
+ import multer from 'multer';
+ import path from 'path';
+ import fs from 'fs';
++import os from 'os';
+ import crypto from 'crypto';
+ import { storage } from '../storage';
+ import { jobOrchestrator } from '../pipeline/jobOrchestrator';
+@@ -119,18 +120,69 @@ const uploadThumbnailMiddleware: RequestHandler = (req, res, next) => {
+ 
+ /**
+  * Validates that a file path is safely confined to the upload directory.
+- * Prevents directory traversal, symlink jumping, and prefix-collision attacks.
++ * In non-production test environments, also allows temporary fixture directories.
++ * Prevents directory traversal, symlink jumping, prefix-collision attacks, and directory deletions.
+  */
+-function isSafeUploadPath(candidatePath: string): boolean {
++function validateSafeStoragePath(candidatePath: string, options: { mustExist?: boolean } = {}): { isSafe: boolean; resolvedPath: string; error?: string } {
+   try {
++    if (!candidatePath || typeof candidatePath !== 'string') {
++      return { isSafe: false, resolvedPath: '', error: 'Candidate path is empty or invalid.' };
++    }
+     const resolved = path.resolve(candidatePath);
+-    const rel = path.relative(uploadDir, resolved);
+-    return !rel.startsWith('..') && !path.isAbsolute(rel) && fs.existsSync(resolved);
+-  } catch {
+-    return false;
++
++    // Allowed storage roots: production permits uploadDir; non-production permits uploadDir and os.tmpdir()
++    const allowedRoots = [uploadDir];
++    if (process.env.NODE_ENV !== 'production') {
++      allowedRoots.push(path.resolve(os.tmpdir()));
++    }
++
++    let matchedRoot: string | null = null;
++    let relToRoot = '';
++
++    for (const root of allowedRoots) {
++      const rel = path.relative(root, resolved);
++      if (!rel.startsWith('..') && !path.isAbsolute(rel) && rel !== '' && rel !== '.') {
++        matchedRoot = root;
++        relToRoot = rel;
++        break;
++      }
++    }
++
++    if (!matchedRoot) {
++      return { isSafe: false, resolvedPath: resolved, error: 'Path escapes allowed storage directories.' };
++    }
++
++    // Prevent targeting the root storage directory or protected root subdirectories themselves
++    if (!relToRoot || relToRoot === '.' || relToRoot === 'proxies' || relToRoot === 'frames') {
++      return { isSafe: false, resolvedPath: resolved, error: 'Target path cannot be the root storage directory.' };
++    }
++
++    // If file exists, check symlink resolution to prevent symlink-based escapes
++    if (fs.existsSync(resolved)) {
++      try {
++        const realRoot = fs.realpathSync(matchedRoot);
++        const realTarget = fs.realpathSync(resolved);
++        const realRel = path.relative(realRoot, realTarget);
++        if (realRel.startsWith('..') || path.isAbsolute(realRel)) {
++          return { isSafe: false, resolvedPath: resolved, error: 'Symlink escapes allowed storage directory.' };
++        }
++      } catch {
++        return { isSafe: false, resolvedPath: resolved, error: 'Symlink resolution failed.' };
++      }
++    } else if (options.mustExist) {
++      return { isSafe: false, resolvedPath: resolved, error: 'File does not exist.' };
++    }
++
++    return { isSafe: true, resolvedPath: resolved };
++  } catch (err: any) {
++    return { isSafe: false, resolvedPath: '', error: `Path resolution error for '${candidatePath}': ${err?.message || err}` };
+   }
+ }
+ 
++function isSafeUploadPath(candidatePath: string): boolean {
++  return validateSafeStoragePath(candidatePath, { mustExist: true }).isSafe;
++}
++
+ /**
+  * Checks whether test-only account switching endpoints are permitted.
+  * In production or when ENABLE_TEST_ACCOUNT_SWITCH is not true, returns false.
+@@ -1284,7 +1336,7 @@ apiRouter.get('/scans/:id/comparison', async (req: Request, res: Response) => {
+   }
+ });
+ 
+-// 15. Secure Scan Deletion & Asset Retention Cleanup (Workstream 14)
++// 15. Secure Scan Deletion & Asset Retention Cleanup (Workstream 14 / Targeted Production Readiness)
+ apiRouter.delete('/scans/:id', async (req: Request, res: Response) => {
+   try {
+     const user = await requireAuth(req, res);
+@@ -1298,35 +1350,83 @@ apiRouter.delete('/scans/:id', async (req: Request, res: Response) => {
+       return res.status(403).json({ error: 'Access denied: Cannot delete scan belonging to another user.' });
+     }
+ 
+-    let filesRemoved = 0;
+-    if (scan.videoPath && isSafeUploadPath(scan.videoPath) && fs.existsSync(scan.videoPath)) {
+-      try {
+-        fs.unlinkSync(scan.videoPath);
+-        filesRemoved++;
+-      } catch (e) {
+-        console.warn('[Storage] Failed to unlink video file:', e);
++    // Active Job Protection: Do not delete files while job is running in a worker
++    const job = await storage.queue.getJobByScanId(scan.id);
++    if (job && job.status === 'RUNNING') {
++      return res.status(409).json({ error: 'Cannot delete scan while video analysis is actively running.' });
++    }
++
++    // Identify candidate paths for scan-owned media files and artifacts
++    const candidatePaths: string[] = [];
++    if (scan.videoPath) candidatePaths.push(scan.videoPath);
++    if (scan.thumbnailPath) candidatePaths.push(scan.thumbnailPath);
++    if (scan.proxyPath) candidatePaths.push(scan.proxyPath);
++
++    // Also check for generated proxy artifact even if proxyPath was not stored on scan record
++    if (scan.videoPath) {
++      const baseName = path.basename(scan.videoPath, path.extname(scan.videoPath));
++      const potentialProxy = path.join(uploadDir, 'proxies', `proxy_${baseName}.mp4`);
++      if (fs.existsSync(potentialProxy) && !candidatePaths.includes(potentialProxy)) {
++        candidatePaths.push(potentialProxy);
+       }
+     }
+ 
+-    if (scan.thumbnailPath && isSafeUploadPath(scan.thumbnailPath) && fs.existsSync(scan.thumbnailPath)) {
+-      try {
+-        fs.unlinkSync(scan.thumbnailPath);
+-        filesRemoved++;
+-      } catch (e) {
+-        console.warn('[Storage] Failed to unlink thumbnail file:', e);
++    // Validate path safety against directory traversal and symlink escapes for all candidates
++    for (const p of candidatePaths) {
++      const validation = validateSafeStoragePath(p);
++      if (!validation.isSafe) {
++        console.error('[Storage Security] Unsafe file path rejected during scan deletion:', validation.error);
++        return res.status(400).json({ error: 'Invalid or unsafe media path in scan record.' });
+       }
+     }
+ 
+-    if (scan.proxyPath && isSafeUploadPath(scan.proxyPath) && fs.existsSync(scan.proxyPath)) {
++    let filesRemoved = 0;
++    let cleanupFailed = false;
++
++    // Deduplicate candidate paths
++    const uniqueCandidates = Array.from(new Set(candidatePaths));
++
++    for (const p of uniqueCandidates) {
++      const resolved = path.resolve(p);
++
++      // Handle missing files idempotently
++      if (!fs.existsSync(resolved)) {
++        continue;
++      }
++
++      // Protection against deleting another scan's files:
++      // Verify if another scan shares this media file
++      const isShared = await storage.scans.isMediaShared(resolved, scan.id);
++      if (isShared) {
++        continue;
++      }
++
+       try {
+-        fs.unlinkSync(scan.proxyPath);
++        fs.unlinkSync(resolved);
+         filesRemoved++;
+-      } catch (e) {
+-        console.warn('[Storage] Failed to unlink proxy file:', e);
++      } catch (err: any) {
++        // Log cleanup failure without exposing sensitive filesystem paths to the client
++        console.error('[Storage] Filesystem cleanup failed for scan asset:', err?.code || err?.message || 'Unknown error');
++        cleanupFailed = true;
+       }
+     }
+ 
++    // Inconsistent state guard: If cleanup failed for files that remain on disk,
++    // do NOT permanently purge DB records. Mark status as CLEANUP_PENDING and return 500.
++    if (cleanupFailed) {
++      await storage.scans.updateScan(scan.id, {
++        status: 'CLEANUP_PENDING',
++        error: 'Media file cleanup failed. Files remain on disk pending retry.'
++      }, { systemBypass: true });
++
++      return res.status(500).json({
++        error: 'Failed to completely remove media files from storage. Scan marked for cleanup retry.'
++      });
++    }
++
++    // Filesystem cleanup succeeded (or files were already absent / shared). Permanently delete DB records.
+     const deleted = await storage.scans.deleteScan(req.params.id);
++
+     res.json({
+       success: deleted,
+       deletedScanId: req.params.id,
+@@ -1334,6 +1434,7 @@ apiRouter.delete('/scans/:id', async (req: Request, res: Response) => {
+       message: 'Scan and associated assets securely deleted from storage.'
+     });
+   } catch (err: any) {
++    console.error('[Storage] Unexpected error during scan deletion:', err?.message || err);
+     res.status(500).json({ error: 'Failed to delete scan.' });
+   }
+ });
+diff --git a/src/server/storage/index.ts b/src/server/storage/index.ts
+index b623b8c..44e00d6 100644
+--- a/src/server/storage/index.ts
++++ b/src/server/storage/index.ts
+@@ -72,6 +72,7 @@ export interface IScanRepository {
+   deductScanCredits(scanId: string, userId: string, amount: number, leaseToken?: LeaseFencingToken): Promise<boolean>;
+   refundScanCredits(scanId: string, hintAmount?: number, leaseToken?: LeaseFencingToken): Promise<{ refunded: boolean; amount: number }>;
+   deleteScan(id: string): Promise<boolean>;
++  isMediaShared(filePath: string, excludeScanId: string): Promise<boolean>;
+ }
+ 
+ export interface IEvidenceRepository {
+@@ -636,6 +637,17 @@ export class InMemoryStorageRepository implements IStorageRepository {
+         delete state.jobQueue[id];
+         return true;
+       });
++    },
++    isMediaShared: async (filePath: string, excludeScanId: string): Promise<boolean> => {
++      if (!filePath) return false;
++      const resolved = path.resolve(filePath);
++      return Object.values(this.state.scans).some(s => {
++        if (s.id === excludeScanId) return false;
++        const v = s.videoPath ? path.resolve(s.videoPath) : '';
++        const p = s.proxyPath ? path.resolve(s.proxyPath) : '';
++        const t = s.thumbnailPath ? path.resolve(s.thumbnailPath) : '';
++        return v === resolved || p === resolved || t === resolved;
++      });
+     }
+   };
+ 
+diff --git a/src/server/storage/sqliteStorage.ts b/src/server/storage/sqliteStorage.ts
+index 095c1f5..74a6147 100644
+--- a/src/server/storage/sqliteStorage.ts
++++ b/src/server/storage/sqliteStorage.ts
+@@ -995,6 +995,18 @@ export class SqliteStorageRepository implements IStorageRepository {
+     deleteScan: async (id: string): Promise<boolean> => {
+       const res = this.db.prepare('DELETE FROM scans WHERE id = ?').run(id);
+       return Number(res.changes) > 0;
++    },
++
++    isMediaShared: async (filePath: string, excludeScanId: string): Promise<boolean> => {
++      if (!filePath) return false;
++      const resolved = path.resolve(filePath);
++      const row = this.db.prepare(`
++        SELECT id FROM scans 
++        WHERE id != ? 
++          AND (video_path = ? OR video_path = ? OR proxy_path = ? OR proxy_path = ? OR thumbnail_path = ? OR thumbnail_path = ?)
++        LIMIT 1
++      `).get(excludeScanId, filePath, resolved, filePath, resolved, filePath, resolved);
++      return !!row;
+     }
+   };
+ 
+diff --git a/src/types/index.ts b/src/types/index.ts
+index 2882d91..9404a09 100644
+--- a/src/types/index.ts
++++ b/src/types/index.ts
+@@ -9,7 +9,8 @@ export type JobStatus =
+   | 'MAPPING_POLICY'
+   | 'BUILDING_REPORT'
+   | 'COMPLETED'
+-  | 'FAILED';
++  | 'FAILED'
++  | 'CLEANUP_PENDING';
+ 
+ export type ScanStage = 
+   | 'Upload'
+diff --git a/tests/runAllTests.ts b/tests/runAllTests.ts
+index 64e31a2..fd8e025 100644
+--- a/tests/runAllTests.ts
++++ b/tests/runAllTests.ts
+@@ -11,6 +11,7 @@ import { runSqliteStorageAndQueueTests } from './sqlite_storage_and_queue.test';
+ import { runPasswordRecoveryTests } from './password_recovery.test';
+ import { runSecurityRetentionAndE2ETests } from './security_retention_and_e2e.test';
+ import { runLeaseFencingAndHeartbeatTests } from './lease_fencing_and_heartbeat.test';
++import { runScanDeletionAndMediaCleanupTests } from './scan_deletion_and_media_cleanup.test';
+ 
+ async function main() {
+   console.log('######################################################');
+@@ -51,6 +52,9 @@ async function main() {
+     // Run Suite 10: Lease Fencing, Heartbeat & Stale Worker Protection
+     await runLeaseFencingAndHeartbeatTests();
+ 
++    // Run Suite 11: Scan Deletion & Billing Configuration
++    await runScanDeletionAndMediaCleanupTests();
++
+     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+     console.log(`\n🎉 ALL AUTOMATED VERIFICATION SUITES COMPLETED SUCCESSFULLY in ${elapsed}s!`);
+     process.exit(0);
+diff --git a/tests/scan_deletion_and_media_cleanup.test.ts b/tests/scan_deletion_and_media_cleanup.test.ts
+new file mode 100644
+index 0000000..00a64e3
+--- /dev/null
++++ b/tests/scan_deletion_and_media_cleanup.test.ts
+@@ -0,0 +1,454 @@
++import assert from 'assert';
++import path from 'path';
++import fs from 'fs';
++import express from 'express';
++import { apiRouter } from '../src/server/routes/api';
++import { storage } from '../src/server/storage';
++import { validateBillingConfiguration, maskSecret, INTENDED_PLANS } from '../scripts/validate-env';
++import { ScanJob } from '../src/types';
++
++export async function runScanDeletionAndMediaCleanupTests() {
++  console.log('\n======================================================');
++  console.log('--- TEST SUITE 11: SCAN DELETION & BILLING VALIDATION ---');
++  console.log('======================================================');
++
++  const tempDir = path.resolve(process.cwd(), `tmp_cleanup_test_${Date.now()}`);
++  fs.mkdirSync(tempDir, { recursive: true });
++
++  const tempUploads = path.resolve(process.cwd(), 'uploads');
++  const tempProxies = path.resolve(tempUploads, 'proxies');
++  fs.mkdirSync(tempProxies, { recursive: true });
++
++  const app = express();
++  app.use(express.json());
++  app.use(apiRouter);
++
++  const server = app.listen(0);
++  const port = (server.address() as any).port;
++  const baseUrl = `http://localhost:${port}`;
++
++  try {
++    // ---------------------------------------------------------
++    // Setup test users
++    // ---------------------------------------------------------
++    const userA = await storage.users.createUser(
++      `user_a_${Date.now()}@example.com`,
++      'hashA',
++      undefined,
++      30,
++      'creator'
++    );
++    const sessionTokenA = await storage.users.createSession(userA.id);
++
++    const userB = await storage.users.createUser(
++      `user_b_${Date.now()}@example.com`,
++      'hashB',
++      undefined,
++      30,
++      'creator'
++    );
++    const sessionTokenB = await storage.users.createSession(userB.id);
++
++    // ---------------------------------------------------------
++    // Test 1: Successful deletion removes unshared media & proxy & purges DB
++    // ---------------------------------------------------------
++    console.log('[Test 1: Successful Deletion & File Cleanup]');
++    const fileA1 = path.join(tempUploads, `test_video_a1_${Date.now()}.mp4`);
++    const proxyA1 = path.join(tempProxies, `proxy_test_video_a1_${Date.now()}.mp4`);
++    const thumbA1 = path.join(tempUploads, `thumb_a1_${Date.now()}.jpg`);
++    fs.writeFileSync(fileA1, 'MOCK_VIDEO_DATA_A1');
++    fs.writeFileSync(proxyA1, 'MOCK_PROXY_DATA_A1');
++    fs.writeFileSync(thumbA1, 'MOCK_THUMB_DATA_A1');
++
++    const scanId1 = `scan_test1_${Date.now()}`;
++    await storage.scans.createScan({
++      id: scanId1,
++      userId: userA.id,
++      videoTitle: 'Test Video 1',
++      videoFilename: 'test1.mp4',
++      videoPath: fileA1,
++      proxyPath: proxyA1,
++      thumbnailPath: thumbA1,
++      scanMode: 'standard',
++      status: 'COMPLETED',
++      currentStage: 'Risk report',
++      completedStages: ['Upload', 'Media inspection', 'Risk report'],
++      creditsUsed: 10,
++      createdAt: new Date().toISOString(),
++    });
++
++    const delRes1 = await fetch(`${baseUrl}/scans/${scanId1}`, {
++      method: 'DELETE',
++      headers: { Authorization: `Bearer ${sessionTokenA}` },
++    });
++    if (delRes1.status !== 200) {
++      const errText = await delRes1.text();
++      console.error(`DELETE failed with status ${delRes1.status}:`, errText);
++    }
++    assert.strictEqual(delRes1.status, 200, 'DELETE /scans/:id returns 200 OK');
++    const delData1 = await delRes1.json();
++    assert.strictEqual(delData1.success, true, 'Scan deleted successfully');
++    assert.strictEqual(delData1.deletedScanId, scanId1, 'Deleted scan ID matches');
++    assert(delData1.filesRemoved >= 2, 'Files were removed from disk');
++
++    assert(!fs.existsSync(fileA1), 'Original video file removed from disk');
++    assert(!fs.existsSync(proxyA1), 'Proxy file removed from disk');
++    assert(!fs.existsSync(thumbA1), 'Thumbnail file removed from disk');
++
++    const scanInDb1 = await storage.scans.getScan(scanId1);
++    assert.strictEqual(scanInDb1, null, 'Scan record completely purged from database');
++    console.log('  ✅ PASS: Unshared media, proxy, and thumbnail files safely removed; DB purged.');
++
++    // ---------------------------------------------------------
++    // Test 2: Missing files handled idempotently
++    // ---------------------------------------------------------
++    console.log('[Test 2: Missing Files Idempotency]');
++    const missingFilePath = path.join(tempUploads, `missing_${Date.now()}.mp4`);
++    const scanId2 = `scan_test2_${Date.now()}`;
++    await storage.scans.createScan({
++      id: scanId2,
++      userId: userA.id,
++      videoTitle: 'Missing File Video',
++      videoFilename: 'missing.mp4',
++      videoPath: missingFilePath,
++      scanMode: 'standard',
++      status: 'COMPLETED',
++      currentStage: 'Risk report',
++      completedStages: ['Upload'],
++      creditsUsed: 0,
++      createdAt: new Date().toISOString(),
++    });
++
++    const delRes2 = await fetch(`${baseUrl}/scans/${scanId2}`, {
++      method: 'DELETE',
++      headers: { Authorization: `Bearer ${sessionTokenA}` },
++    });
++    assert.strictEqual(delRes2.status, 200, 'DELETE succeeds when media file is already absent');
++    const delData2 = await delRes2.json();
++    assert.strictEqual(delData2.success, true, 'Returns success: true for missing files');
++    console.log('  ✅ PASS: Missing media files handled idempotently without error.');
++
++    // ---------------------------------------------------------
++    // Test 3: Ownership violation blocked
++    // ---------------------------------------------------------
++    console.log('[Test 3: Ownership Enforcement]');
++    const fileUserA = path.join(tempUploads, `userA_private_${Date.now()}.mp4`);
++    fs.writeFileSync(fileUserA, 'USER_A_PRIVATE_MEDIA');
++    const scanId3 = `scan_test3_${Date.now()}`;
++    await storage.scans.createScan({
++      id: scanId3,
++      userId: userA.id,
++      videoTitle: 'User A Private Scan',
++      videoFilename: 'private.mp4',
++      videoPath: fileUserA,
++      scanMode: 'standard',
++      status: 'COMPLETED',
++      currentStage: 'Risk report',
++      completedStages: ['Upload'],
++      creditsUsed: 0,
++      createdAt: new Date().toISOString(),
++    });
++
++    // User B tries to delete User A's scan
++    const delRes3 = await fetch(`${baseUrl}/scans/${scanId3}`, {
++      method: 'DELETE',
++      headers: { Authorization: `Bearer ${sessionTokenB}` },
++    });
++    assert.strictEqual(delRes3.status, 403, 'User B cannot delete User A scan (403 Forbidden)');
++    assert(fs.existsSync(fileUserA), 'File remains untouched on disk after unauthorized attempt');
++    const scanStillExists = await storage.scans.getScan(scanId3);
++    assert(scanStillExists !== null, 'Scan record preserved in DB after unauthorized attempt');
++    console.log('  ✅ PASS: Ownership violation strictly returns 403; files and DB preserved.');
++
++    // ---------------------------------------------------------
++    // Test 4: Active Running Job Protection
++    // ---------------------------------------------------------
++    console.log('[Test 4: Active Running Job Protection]');
++    const fileRunning = path.join(tempUploads, `running_${Date.now()}.mp4`);
++    fs.writeFileSync(fileRunning, 'RUNNING_VIDEO_DATA');
++    const scanId4 = `scan_running_${Date.now()}`;
++    await storage.scans.createScan({
++      id: scanId4,
++      userId: userA.id,
++      videoTitle: 'Actively Running Scan',
++      videoFilename: 'running.mp4',
++      videoPath: fileRunning,
++      scanMode: 'standard',
++      status: 'PROCESSING_VIDEO',
++      currentStage: 'Scene analysis',
++      completedStages: ['Upload', 'Media inspection'],
++      creditsUsed: 10,
++      createdAt: new Date().toISOString(),
++    });
++    // Add active job in queue and ensure it is claimed as RUNNING
++    await storage.queue.enqueueJob(scanId4);
++    let claimedJob: any = null;
++    for (let i = 0; i < 10; i++) {
++      const next = await storage.queue.claimNextJob('test_worker', 60000);
++      if (!next) break;
++      if (next.scanId === scanId4) {
++        claimedJob = next;
++        break;
++      }
++    }
++    assert(claimedJob !== null && claimedJob.scanId === scanId4, 'Job claimed and marked RUNNING');
++
++    const delRes4 = await fetch(`${baseUrl}/scans/${scanId4}`, {
++      method: 'DELETE',
++      headers: { Authorization: `Bearer ${sessionTokenA}` },
++    });
++    assert.strictEqual(delRes4.status, 409, 'Cannot delete scan while actively running (409 Conflict)');
++    assert(fs.existsSync(fileRunning), 'Active job media file is protected on disk');
++    console.log('  ✅ PASS: Active running job blocks scan deletion with 409 Conflict.');
++
++    // Complete the running job so it cleanups
++    await storage.queue.completeJob(claimedJob.id, 'test_worker', claimedJob.leaseToken!);
++
++    // ---------------------------------------------------------
++    // Test 5: Unsafe path rejection (directory traversal)
++    // ---------------------------------------------------------
++    console.log('[Test 5: Unsafe Path Traversal Rejection]');
++    const scanId5 = `scan_traversal_${Date.now()}`;
++    await storage.scans.createScan({
++      id: scanId5,
++      userId: userA.id,
++      videoTitle: 'Malicious Traversal Scan',
++      videoFilename: 'passwd.mp4',
++      videoPath: path.resolve(tempDir, '../../../etc/passwd'),
++      scanMode: 'standard',
++      status: 'COMPLETED',
++      currentStage: 'Risk report',
++      completedStages: ['Upload'],
++      creditsUsed: 0,
++      createdAt: new Date().toISOString(),
++    });
++
++    const delRes5 = await fetch(`${baseUrl}/scans/${scanId5}`, {
++      method: 'DELETE',
++      headers: { Authorization: `Bearer ${sessionTokenA}` },
++    });
++    assert.strictEqual(delRes5.status, 400, 'Unsafe path rejected with 400 Bad Request');
++    console.log('  ✅ PASS: Directory traversal path rejected before any deletion.');
++
++    // ---------------------------------------------------------
++    // Test 6: Duplicate deletion requests
++    // ---------------------------------------------------------
++    console.log('[Test 6: Duplicate Deletion Returns 404]');
++    const delRes6 = await fetch(`${baseUrl}/scans/${scanId1}`, {
++      method: 'DELETE',
++      headers: { Authorization: `Bearer ${sessionTokenA}` },
++    });
++    assert.strictEqual(delRes6.status, 404, 'Second delete returns 404 Not Found');
++    console.log('  ✅ PASS: Duplicate deletion request returns 404 Not Found.');
++
++    // ---------------------------------------------------------
++    // Test 7: Protection against deleting shared files across scans
++    // ---------------------------------------------------------
++    console.log('[Test 7: Protection for Shared Media Files Across Scans]');
++    const sharedFile = path.join(tempUploads, `shared_media_${Date.now()}.mp4`);
++    fs.writeFileSync(sharedFile, 'SHARED_VIDEO_DATA');
++
++    const scanParentId = `scan_parent_${Date.now()}`;
++    const scanChildId = `scan_child_${Date.now()}`;
++
++    // Scan A (original) uses sharedFile
++    await storage.scans.createScan({
++      id: scanParentId,
++      userId: userA.id,
++      videoTitle: 'Original Scan',
++      videoFilename: 'original.mp4',
++      videoPath: sharedFile,
++      scanMode: 'standard',
++      status: 'COMPLETED',
++      currentStage: 'Risk report',
++      completedStages: ['Upload', 'Risk report'],
++      creditsUsed: 10,
++      createdAt: new Date().toISOString(),
++    });
++
++    // Scan B (re-scan) also references sharedFile
++    await storage.scans.createScan({
++      id: scanChildId,
++      userId: userA.id,
++      videoTitle: 'Re-Scan referencing same video',
++      videoFilename: 'rescan.mp4',
++      videoPath: sharedFile,
++      parentScanId: scanParentId,
++      isRescan: true,
++      scanMode: 'standard',
++      status: 'COMPLETED',
++      currentStage: 'Risk report',
++      completedStages: ['Upload', 'Risk report'],
++      creditsUsed: 10,
++      createdAt: new Date().toISOString(),
++    });
++
++    // Delete Scan A
++    const delParentRes = await fetch(`${baseUrl}/scans/${scanParentId}`, {
++      method: 'DELETE',
++      headers: { Authorization: `Bearer ${sessionTokenA}` },
++    });
++    assert.strictEqual(delParentRes.status, 200, 'Parent scan deleted');
++
++    // Crucial assertion: shared file MUST NOT have been unlinked!
++    assert(fs.existsSync(sharedFile), 'Shared file remains intact on disk because Scan B still references it');
++    const parentInDb = await storage.scans.getScan(scanParentId);
++    assert.strictEqual(parentInDb, null, 'Parent scan removed from DB');
++    const childInDb = await storage.scans.getScan(scanChildId);
++    assert(childInDb !== null, 'Child scan remains intact in DB');
++
++    // Now delete Scan B
++    const delChildRes = await fetch(`${baseUrl}/scans/${scanChildId}`, {
++      method: 'DELETE',
++      headers: { Authorization: `Bearer ${sessionTokenA}` },
++    });
++    assert.strictEqual(delChildRes.status, 200, 'Child scan deleted');
++    assert(!fs.existsSync(sharedFile), 'Shared file is now deleted once no other scan references it');
++    console.log('  ✅ PASS: Shared media files preserved until all dependent scans are removed.');
++
++    // ---------------------------------------------------------
++    // Test 8: Cleanup failure keeps DB record in CLEANUP_PENDING state
++    // ---------------------------------------------------------
++    console.log('[Test 8: Cleanup Failure Handling & Recoverable State]');
++    const failScanFile = path.join(tempUploads, `fail_cleanup_${Date.now()}.mp4`);
++    fs.writeFileSync(failScanFile, 'FAIL_CLEANUP_DATA');
++
++    const scanFailId = `scan_fail_${Date.now()}`;
++    await storage.scans.createScan({
++      id: scanFailId,
++      userId: userA.id,
++      videoTitle: 'Fail Cleanup Video',
++      videoFilename: 'fail.mp4',
++      videoPath: failScanFile,
++      scanMode: 'standard',
++      status: 'COMPLETED',
++      currentStage: 'Risk report',
++      completedStages: ['Upload'],
++      creditsUsed: 10,
++      createdAt: new Date().toISOString(),
++    });
++
++    // Mock fs.unlinkSync to throw an EACCES / EBUSY error on this specific file
++    const originalUnlinkSync = fs.unlinkSync;
++    fs.unlinkSync = ((targetPath: fs.PathLike) => {
++      if (String(targetPath) === failScanFile) {
++        const err: any = new Error('EBUSY: resource busy or locked');
++        err.code = 'EBUSY';
++        throw err;
++      }
++      return originalUnlinkSync(targetPath);
++    }) as any;
++
++    try {
++      const delFailRes = await fetch(`${baseUrl}/scans/${scanFailId}`, {
++        method: 'DELETE',
++        headers: { Authorization: `Bearer ${sessionTokenA}` },
++      });
++      if (delFailRes.status !== 500) {
++        const t = await delFailRes.text();
++        console.error('Test 8 unexpected status:', delFailRes.status, t);
++      }
++      assert.strictEqual(delFailRes.status, 500, 'Deletion returns 500 when filesystem cleanup fails');
++      const failJson = await delFailRes.json();
++      assert(!failJson.error.includes('/'), 'Error message does not leak raw filesystem path');
++
++      // Crucial: Scan record must NOT be deleted from DB!
++      const preservedScan = await storage.scans.getScan(scanFailId);
++      assert(preservedScan !== null, 'Scan record preserved in database for recovery');
++      assert.strictEqual(preservedScan?.status, 'CLEANUP_PENDING', 'Scan transitioned to CLEANUP_PENDING');
++      assert(fs.existsSync(failScanFile), 'File remains on disk pending recovery');
++      console.log('  ✅ PASS: Filesystem cleanup failure preserves DB record with CLEANUP_PENDING status.');
++    } finally {
++      // Restore original unlinkSync
++      fs.unlinkSync = originalUnlinkSync;
++      // Clean up the file
++      if (fs.existsSync(failScanFile)) fs.unlinkSync(failScanFile);
++      await storage.scans.deleteScan(scanFailId);
++    }
++
++    // ---------------------------------------------------------
++    // Test 9: Billing Environment Configuration Validator Unit Tests
++    // ---------------------------------------------------------
++    console.log('\n[Test 9: Billing Configuration Validation Engine]');
++
++    // 9a. Production mode missing STRIPE_SECRET_KEY
++    const prodMissingRes = validateBillingConfiguration('production', {
++      NODE_ENV: 'production',
++      STRIPE_SECRET_KEY: '',
++    });
++    assert.strictEqual(prodMissingRes.valid, false, 'Production mode invalid when key is missing');
++    assert(prodMissingRes.issues.some(i => i.variable === 'STRIPE_SECRET_KEY' && i.type === 'ERROR'), 'Reports ERROR for missing key');
++
++    // 9b. Contradictory configuration: Test key in production mode
++    const prodWithTestKey = validateBillingConfiguration('production', {
++      NODE_ENV: 'production',
++      STRIPE_SECRET_KEY: 'sk_test_1234567890abcdef',
++      STRIPE_WEBHOOK_SECRET: 'whsec_abcdef123456',
++      STRIPE_PRICE_CREATOR: 'price_creator_test',
++      STRIPE_PRICE_PRO: 'price_pro_test',
++      STRIPE_PRICE_AGENCY: 'price_agency_test',
++      STRIPE_PRICE_AUDIT_ONCE: 'price_audit_test',
++    });
++    assert.strictEqual(prodWithTestKey.valid, false, 'Contradictory test key in production rejected');
++    assert(prodWithTestKey.issues.some(i => i.message.includes('Contradictory environment configuration')), 'Identifies test key in production');
++
++    // 9c. Accidental live key in test mode
++    const testWithLiveKey = validateBillingConfiguration('test', {
++      NODE_ENV: 'test',
++      STRIPE_SECRET_KEY: 'sk_live_1234567890abcdef',
++    });
++    assert.strictEqual(testWithLiveKey.valid, false, 'Live key in test mode rejected');
++    assert(testWithLiveKey.issues.some(i => i.message.includes('Accidental live key')), 'Warns about live key in test mode');
++
++    // 9d. Valid production configuration
++    const prodValidRes = validateBillingConfiguration('production', {
++      NODE_ENV: 'production',
++      STRIPE_SECRET_KEY: 'sk_live_prodkey123456789',
++      STRIPE_WEBHOOK_SECRET: 'whsec_prodwebhook123456789',
++      STRIPE_PRICE_CREATOR: 'price_creator_123',
++      STRIPE_PRICE_PRO: 'price_pro_123',
++      STRIPE_PRICE_AGENCY: 'price_agency_123',
++      STRIPE_PRICE_AUDIT_ONCE: 'price_audit_123',
++    });
++    assert.strictEqual(prodValidRes.valid, true, 'Valid production billing configuration passes');
++    assert.strictEqual(prodValidRes.errorsCount, 0, 'Zero errors in valid configuration');
++
++    // 9e. Secret masking verifies no full secrets printed
++    const masked = maskSecret('sk_live_998877665544332211');
++    assert(!masked.includes('998877665544332211'), 'Full secret is never revealed');
++    assert(masked.startsWith('sk_live_'), 'Masked string preserves prefix');
++    assert(masked.includes('...'), 'Masked string contains ellipsis');
++
++    // 9f. Intended plans and pricing integrity verified
++    assert.strictEqual(INTENDED_PLANS.length, 5, '5 intended plans mapped');
++    const creatorPlan = INTENDED_PLANS.find(p => p.id === 'creator');
++    assert.strictEqual(creatorPlan?.priceUsd, 9, 'Creator is $9');
++    assert.strictEqual(creatorPlan?.credits, 30, 'Creator is 30 credits');
++    const proPlan = INTENDED_PLANS.find(p => p.id === 'pro');
++    assert.strictEqual(proPlan?.priceUsd, 19, 'Pro is $19');
++    assert.strictEqual(proPlan?.credits, 75, 'Pro is 75 credits');
++    const agencyPlan = INTENDED_PLANS.find(p => p.id === 'agency');
++    assert.strictEqual(agencyPlan?.priceUsd, 99, 'Agency is $99');
++    assert.strictEqual(agencyPlan?.credits, 600, 'Agency is 600 credits');
++    const auditPlan = INTENDED_PLANS.find(p => p.id === 'audit_once');
++    assert.strictEqual(auditPlan?.priceUsd, 29, 'Audit is $29');
++    assert.strictEqual(auditPlan?.credits, 60, 'Audit is 60 credits');
++    console.log('  ✅ PASS: Billing validator accurately detects errors, malformations, and masks credentials.');
++
++    console.log('======================================================');
++    console.log('TEST SUITE 11 COMPLETE: All Deletion & Billing assertions passed!');
++    console.log('======================================================');
++  } finally {
++    server.close();
++    fs.rmSync(tempDir, { recursive: true, force: true });
++  }
++}
++
++if (process.argv[1] && process.argv[1].endsWith('scan_deletion_and_media_cleanup.test.ts')) {
++  runScanDeletionAndMediaCleanupTests()
++    .then(() => process.exit(0))
++    .catch((err) => {
++      console.error(err);
++      process.exit(1);
++    });
++}
+diff --git a/vite.config.ts b/vite.config.ts
+index 9eb85fa..c594c07 100644
+--- a/vite.config.ts
++++ b/vite.config.ts
+@@ -1,8 +1,11 @@
+ import tailwindcss from '@tailwindcss/vite';
+ import react from '@vitejs/plugin-react';
+ import path from 'path';
++import { fileURLToPath } from 'url';
+ import {defineConfig} from 'vite';
+ 
++const __dirname = fileURLToPath(new URL('.', import.meta.url));
++
+ export default defineConfig(() => {
+   return {
+     plugins: [react(), tailwindcss()],
+-- 
+2.34.1
+

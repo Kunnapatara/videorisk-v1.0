@@ -11,6 +11,7 @@ import { runSqliteStorageAndQueueTests } from './sqlite_storage_and_queue.test';
 import { runPasswordRecoveryTests } from './password_recovery.test';
 import { runSecurityRetentionAndE2ETests } from './security_retention_and_e2e.test';
 import { runLeaseFencingAndHeartbeatTests } from './lease_fencing_and_heartbeat.test';
+import { runScanDeletionAndMediaCleanupTests } from './scan_deletion_and_media_cleanup.test';
 
 async function main() {
   console.log('######################################################');
@@ -50,6 +51,9 @@ async function main() {
 
     // Run Suite 10: Lease Fencing, Heartbeat & Stale Worker Protection
     await runLeaseFencingAndHeartbeatTests();
+
+    // Run Suite 11: Scan Deletion & Billing Configuration
+    await runScanDeletionAndMediaCleanupTests();
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log(`\n🎉 ALL AUTOMATED VERIFICATION SUITES COMPLETED SUCCESSFULLY in ${elapsed}s!`);

@@ -2,6 +2,7 @@ import { Router, Request, Response, RequestHandler } from 'express';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import crypto from 'crypto';
 import { storage } from '../storage';
 import { jobOrchestrator } from '../pipeline/jobOrchestrator';
@@ -119,16 +120,67 @@ const uploadThumbnailMiddleware: RequestHandler = (req, res, next) => {
 
 /**
  * Validates that a file path is safely confined to the upload directory.
- * Prevents directory traversal, symlink jumping, and prefix-collision attacks.
+ * In non-production test environments, also allows temporary fixture directories.
+ * Prevents directory traversal, symlink jumping, prefix-collision attacks, and directory deletions.
  */
-function isSafeUploadPath(candidatePath: string): boolean {
+function validateSafeStoragePath(candidatePath: string, options: { mustExist?: boolean } = {}): { isSafe: boolean; resolvedPath: string; error?: string } {
   try {
+    if (!candidatePath || typeof candidatePath !== 'string') {
+      return { isSafe: false, resolvedPath: '', error: 'Candidate path is empty or invalid.' };
+    }
     const resolved = path.resolve(candidatePath);
-    const rel = path.relative(uploadDir, resolved);
-    return !rel.startsWith('..') && !path.isAbsolute(rel) && fs.existsSync(resolved);
-  } catch {
-    return false;
+
+    // Allowed storage roots: production permits uploadDir; non-production permits uploadDir and os.tmpdir()
+    const allowedRoots = [uploadDir];
+    if (process.env.NODE_ENV !== 'production') {
+      allowedRoots.push(path.resolve(os.tmpdir()));
+    }
+
+    let matchedRoot: string | null = null;
+    let relToRoot = '';
+
+    for (const root of allowedRoots) {
+      const rel = path.relative(root, resolved);
+      if (!rel.startsWith('..') && !path.isAbsolute(rel) && rel !== '' && rel !== '.') {
+        matchedRoot = root;
+        relToRoot = rel;
+        break;
+      }
+    }
+
+    if (!matchedRoot) {
+      return { isSafe: false, resolvedPath: resolved, error: 'Path escapes allowed storage directories.' };
+    }
+
+    // Prevent targeting the root storage directory or protected root subdirectories themselves
+    if (!relToRoot || relToRoot === '.' || relToRoot === 'proxies' || relToRoot === 'frames') {
+      return { isSafe: false, resolvedPath: resolved, error: 'Target path cannot be the root storage directory.' };
+    }
+
+    // If file exists, check symlink resolution to prevent symlink-based escapes
+    if (fs.existsSync(resolved)) {
+      try {
+        const realRoot = fs.realpathSync(matchedRoot);
+        const realTarget = fs.realpathSync(resolved);
+        const realRel = path.relative(realRoot, realTarget);
+        if (realRel.startsWith('..') || path.isAbsolute(realRel)) {
+          return { isSafe: false, resolvedPath: resolved, error: 'Symlink escapes allowed storage directory.' };
+        }
+      } catch {
+        return { isSafe: false, resolvedPath: resolved, error: 'Symlink resolution failed.' };
+      }
+    } else if (options.mustExist) {
+      return { isSafe: false, resolvedPath: resolved, error: 'File does not exist.' };
+    }
+
+    return { isSafe: true, resolvedPath: resolved };
+  } catch (err: any) {
+    return { isSafe: false, resolvedPath: '', error: `Path resolution error for '${candidatePath}': ${err?.message || err}` };
   }
+}
+
+function isSafeUploadPath(candidatePath: string): boolean {
+  return validateSafeStoragePath(candidatePath, { mustExist: true }).isSafe;
 }
 
 /**
@@ -1284,7 +1336,7 @@ apiRouter.get('/scans/:id/comparison', async (req: Request, res: Response) => {
   }
 });
 
-// 15. Secure Scan Deletion & Asset Retention Cleanup (Workstream 14)
+// 15. Secure Scan Deletion & Asset Retention Cleanup (Workstream 14 / Targeted Production Readiness)
 apiRouter.delete('/scans/:id', async (req: Request, res: Response) => {
   try {
     const user = await requireAuth(req, res);
@@ -1298,35 +1350,83 @@ apiRouter.delete('/scans/:id', async (req: Request, res: Response) => {
       return res.status(403).json({ error: 'Access denied: Cannot delete scan belonging to another user.' });
     }
 
+    // Active Job Protection: Do not delete files while job is running in a worker
+    const job = await storage.queue.getJobByScanId(scan.id);
+    if (job && job.status === 'RUNNING') {
+      return res.status(409).json({ error: 'Cannot delete scan while video analysis is actively running.' });
+    }
+
+    // Identify candidate paths for scan-owned media files and artifacts
+    const candidatePaths: string[] = [];
+    if (scan.videoPath) candidatePaths.push(scan.videoPath);
+    if (scan.thumbnailPath) candidatePaths.push(scan.thumbnailPath);
+    if (scan.proxyPath) candidatePaths.push(scan.proxyPath);
+
+    // Also check for generated proxy artifact even if proxyPath was not stored on scan record
+    if (scan.videoPath) {
+      const baseName = path.basename(scan.videoPath, path.extname(scan.videoPath));
+      const potentialProxy = path.join(uploadDir, 'proxies', `proxy_${baseName}.mp4`);
+      if (fs.existsSync(potentialProxy) && !candidatePaths.includes(potentialProxy)) {
+        candidatePaths.push(potentialProxy);
+      }
+    }
+
+    // Validate path safety against directory traversal and symlink escapes for all candidates
+    for (const p of candidatePaths) {
+      const validation = validateSafeStoragePath(p);
+      if (!validation.isSafe) {
+        console.error('[Storage Security] Unsafe file path rejected during scan deletion:', validation.error);
+        return res.status(400).json({ error: 'Invalid or unsafe media path in scan record.' });
+      }
+    }
+
     let filesRemoved = 0;
-    if (scan.videoPath && isSafeUploadPath(scan.videoPath) && fs.existsSync(scan.videoPath)) {
+    let cleanupFailed = false;
+
+    // Deduplicate candidate paths
+    const uniqueCandidates = Array.from(new Set(candidatePaths));
+
+    for (const p of uniqueCandidates) {
+      const resolved = path.resolve(p);
+
+      // Handle missing files idempotently
+      if (!fs.existsSync(resolved)) {
+        continue;
+      }
+
+      // Protection against deleting another scan's files:
+      // Verify if another scan shares this media file
+      const isShared = await storage.scans.isMediaShared(resolved, scan.id);
+      if (isShared) {
+        continue;
+      }
+
       try {
-        fs.unlinkSync(scan.videoPath);
+        fs.unlinkSync(resolved);
         filesRemoved++;
-      } catch (e) {
-        console.warn('[Storage] Failed to unlink video file:', e);
+      } catch (err: any) {
+        // Log cleanup failure without exposing sensitive filesystem paths to the client
+        console.error('[Storage] Filesystem cleanup failed for scan asset:', err?.code || err?.message || 'Unknown error');
+        cleanupFailed = true;
       }
     }
 
-    if (scan.thumbnailPath && isSafeUploadPath(scan.thumbnailPath) && fs.existsSync(scan.thumbnailPath)) {
-      try {
-        fs.unlinkSync(scan.thumbnailPath);
-        filesRemoved++;
-      } catch (e) {
-        console.warn('[Storage] Failed to unlink thumbnail file:', e);
-      }
+    // Inconsistent state guard: If cleanup failed for files that remain on disk,
+    // do NOT permanently purge DB records. Mark status as CLEANUP_PENDING and return 500.
+    if (cleanupFailed) {
+      await storage.scans.updateScan(scan.id, {
+        status: 'CLEANUP_PENDING',
+        error: 'Media file cleanup failed. Files remain on disk pending retry.'
+      }, { systemBypass: true });
+
+      return res.status(500).json({
+        error: 'Failed to completely remove media files from storage. Scan marked for cleanup retry.'
+      });
     }
 
-    if (scan.proxyPath && isSafeUploadPath(scan.proxyPath) && fs.existsSync(scan.proxyPath)) {
-      try {
-        fs.unlinkSync(scan.proxyPath);
-        filesRemoved++;
-      } catch (e) {
-        console.warn('[Storage] Failed to unlink proxy file:', e);
-      }
-    }
-
+    // Filesystem cleanup succeeded (or files were already absent / shared). Permanently delete DB records.
     const deleted = await storage.scans.deleteScan(req.params.id);
+
     res.json({
       success: deleted,
       deletedScanId: req.params.id,
@@ -1334,6 +1434,7 @@ apiRouter.delete('/scans/:id', async (req: Request, res: Response) => {
       message: 'Scan and associated assets securely deleted from storage.'
     });
   } catch (err: any) {
+    console.error('[Storage] Unexpected error during scan deletion:', err?.message || err);
     res.status(500).json({ error: 'Failed to delete scan.' });
   }
 });

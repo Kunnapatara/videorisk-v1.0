@@ -995,6 +995,18 @@ export class SqliteStorageRepository implements IStorageRepository {
     deleteScan: async (id: string): Promise<boolean> => {
       const res = this.db.prepare('DELETE FROM scans WHERE id = ?').run(id);
       return Number(res.changes) > 0;
+    },
+
+    isMediaShared: async (filePath: string, excludeScanId: string): Promise<boolean> => {
+      if (!filePath) return false;
+      const resolved = path.resolve(filePath);
+      const row = this.db.prepare(`
+        SELECT id FROM scans 
+        WHERE id != ? 
+          AND (video_path = ? OR video_path = ? OR proxy_path = ? OR proxy_path = ? OR thumbnail_path = ? OR thumbnail_path = ?)
+        LIMIT 1
+      `).get(excludeScanId, filePath, resolved, filePath, resolved, filePath, resolved);
+      return !!row;
     }
   };
 
