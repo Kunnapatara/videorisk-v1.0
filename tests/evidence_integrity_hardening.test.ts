@@ -196,7 +196,7 @@ export async function runEvidenceIntegrityHardeningTests() {
     await storage.scans.createScan(scanJob);
 
     // 2.3 Atomic deduction records creditsDeducted on scan record
-    const deducted = await storage.scans.deductScanCredits(scanId, testUser.id, 10);
+    const deducted = await storage.scans.deductScanCredits(scanId, testUser.id, 10, { systemBypass: true });
     assert(deducted === true, 'Credits deducted successfully');
 
     const userAfterDeduct = await storage.users.getUser(testUser.id);
@@ -209,13 +209,13 @@ export async function runEvidenceIntegrityHardeningTests() {
     assert(scanAfterDeduct!.creditsRefunded === false, 'scan.creditsRefunded is false');
 
     // 2.4 Idempotency of deduction: repeating deduction on same scan does not deduct again
-    const repeatDeduct = await storage.scans.deductScanCredits(scanId, testUser.id, 10);
+    const repeatDeduct = await storage.scans.deductScanCredits(scanId, testUser.id, 10, { systemBypass: true });
     assert(repeatDeduct === true, 'Repeat deduction call returns true idempotently');
     const userAfterRepeatDeduct = await storage.users.getUser(testUser.id);
     assert(userAfterRepeatDeduct!.creditsRemaining === 20, 'Repeat deduction does NOT decrease balance further (remains 20)');
 
     // 2.5 Failure after deduction before usage recording / during scan failure -> successful refund
-    const refundResult1 = await storage.scans.refundScanCredits(scanId);
+    const refundResult1 = await storage.scans.refundScanCredits(scanId, undefined, { systemBypass: true });
     assert(refundResult1.refunded === true, 'First refund attempt succeeds');
     assert(refundResult1.amount === 10, 'Refunded amount matches exactly 10 credits');
 
@@ -228,11 +228,11 @@ export async function runEvidenceIntegrityHardeningTests() {
     assert(scanAfterRefund!.creditsUsed === 0, 'scan.creditsUsed is cleared to 0');
 
     // 2.6 Retry / double-refund prevention
-    const refundResult2 = await storage.scans.refundScanCredits(scanId);
+    const refundResult2 = await storage.scans.refundScanCredits(scanId, undefined, { systemBypass: true });
     assert(refundResult2.refunded === false, 'Second refund attempt on same scan is rejected');
     assert(refundResult2.amount === 0, 'Second refund attempt grants 0 additional credits');
 
-    const refundResult3 = await storage.scans.refundScanCredits(scanId);
+    const refundResult3 = await storage.scans.refundScanCredits(scanId, undefined, { systemBypass: true });
     assert(refundResult3.refunded === false, 'Third refund attempt on same scan is rejected');
 
     const userAfterDoubleRefundAttempt = await storage.users.getUser(testUser.id);
@@ -260,14 +260,14 @@ export async function runEvidenceIntegrityHardeningTests() {
     assert(userPreHint!.creditsRemaining === 25, 'Deducted 5 credits');
 
     // Refund using hint amount
-    const hintRefund = await storage.scans.refundScanCredits(scanId2, 5);
+    const hintRefund = await storage.scans.refundScanCredits(scanId2, 5, { systemBypass: true });
     assert(hintRefund.refunded === true, 'Hint refund succeeds when credits were deducted');
     assert(hintRefund.amount === 5, 'Hint refund restored 5 credits');
     const userPostHint = await storage.users.getUser(testUser.id);
     assert(userPostHint!.creditsRemaining === 30, 'Balance restored to 30');
 
     // Subsequent refund is blocked
-    const repeatHintRefund = await storage.scans.refundScanCredits(scanId2, 5);
+    const repeatHintRefund = await storage.scans.refundScanCredits(scanId2, 5, { systemBypass: true });
     assert(repeatHintRefund.refunded === false, 'Repeat hint refund is blocked');
 
     // -------------------------------------------------------------------------

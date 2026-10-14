@@ -29,6 +29,7 @@ import {
   IChannelProfileRepository,
   IPasswordResetRepository,
   IJobQueueRepository,
+  LeaseFencingToken,
   UploadRecord
 } from './index';
 
@@ -433,6 +434,29 @@ export class SqliteStorageRepository implements IStorageRepository {
         throw new Error(`Failed to apply migration 2: ${err}`);
       }
     }
+
+    // Migration 3: Lease expiration boundary & durable usage ledger idempotency
+    if (!appliedVersions.has(3)) {
+      this.db.exec('BEGIN IMMEDIATE;');
+      try {
+        const jqCols = this.db.prepare("PRAGMA table_info(job_queue)").all() as Array<{ name: string }>;
+        if (!jqCols.some(c => c.name === 'lease_expires_at')) {
+          this.db.exec('ALTER TABLE job_queue ADD COLUMN lease_expires_at TEXT;');
+        }
+        if (!jqCols.some(c => c.name === 'lease_duration_ms')) {
+          this.db.exec('ALTER TABLE job_queue ADD COLUMN lease_duration_ms INTEGER DEFAULT 60000;');
+        }
+        this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_ledger_scan_id ON usage_ledger(scan_id);');
+        this.db.exec(`
+          INSERT INTO schema_migrations (version, name, applied_at)
+          VALUES (3, '003_lease_expiry_and_usage_idempotency', datetime('now'));
+        `);
+        this.db.exec('COMMIT;');
+      } catch (err) {
+        this.db.exec('ROLLBACK;');
+        throw new Error(`Failed to apply migration 3: ${err}`);
+      }
+    }
   }
 
   private seedDefaultUsersIfNeeded() {
@@ -717,11 +741,34 @@ export class SqliteStorageRepository implements IStorageRepository {
     }
   };
 
-  private validateLeaseFence(db: any, scanId: string, leaseToken?: string): void {
-    if (!leaseToken) return;
-    const job = db.prepare('SELECT status, locked_by, lease_token FROM job_queue WHERE scan_id = ?').get(scanId) as any;
-    if (!job || job.status !== 'RUNNING' || job.lease_token !== leaseToken) {
-      throw new FencingError(`Fencing violation for scan ${scanId}: worker lease token is invalid, superseded, or expired`);
+  private validateLeaseFence(db: any, scanId: string, leaseToken?: LeaseFencingToken): void {
+    if (typeof leaseToken === 'object' && leaseToken !== null && 'systemBypass' in leaseToken && leaseToken.systemBypass === true) {
+      return; // Legitimate explicit system/administrative operation
+    }
+    if (!leaseToken || typeof leaseToken !== 'string' || leaseToken.trim() === '') {
+      throw new FencingError(`Fencing violation for scan ${scanId}: worker lease token is required`);
+    }
+    const job = db.prepare('SELECT status, locked_by, lease_token, locked_at, lease_expires_at, lease_duration_ms FROM job_queue WHERE scan_id = ?').get(scanId) as any;
+    if (!job) {
+      throw new FencingError(`Fencing violation for scan ${scanId}: no job queue record found`);
+    }
+    if (job.status !== 'RUNNING') {
+      throw new FencingError(`Fencing violation for scan ${scanId}: job is not in RUNNING state (current: ${job.status})`);
+    }
+    if (job.lease_token !== leaseToken) {
+      throw new FencingError(`Fencing violation for scan ${scanId}: worker lease token is invalid or superseded`);
+    }
+    const nowIso = new Date().toISOString();
+    if (job.lease_expires_at) {
+      if (job.lease_expires_at <= nowIso) {
+        throw new FencingError(`Fencing violation for scan ${scanId}: worker lease expired at ${job.lease_expires_at}`);
+      }
+    } else if (job.locked_at) {
+      const lockedTime = new Date(job.locked_at).getTime();
+      const duration = job.lease_duration_ms ? Number(job.lease_duration_ms) : 60000;
+      if (lockedTime + duration <= Date.now()) {
+        throw new FencingError(`Fencing violation for scan ${scanId}: worker lease expired by locked_at threshold`);
+      }
     }
   }
 
@@ -798,11 +845,9 @@ export class SqliteStorageRepository implements IStorageRepository {
       return rows.map(r => this.mapScan(r));
     },
 
-    updateScan: async (id: string, updates: Partial<ScanJob>, leaseToken?: string): Promise<ScanJob | null> => {
+    updateScan: async (id: string, updates: Partial<ScanJob>, leaseToken?: LeaseFencingToken): Promise<ScanJob | null> => {
       return await this.runTransaction(async db => {
-        if (leaseToken) {
-          this.validateLeaseFence(db, id, leaseToken);
-        }
+        this.validateLeaseFence(db, id, leaseToken);
 
         const existing = await this.scans.getScan(id);
         if (!existing) return null;
@@ -832,11 +877,9 @@ export class SqliteStorageRepository implements IStorageRepository {
       });
     },
 
-    saveReport: async (scanId: string, report: RiskReport, leaseToken?: string): Promise<void> => {
+    saveReport: async (scanId: string, report: RiskReport, leaseToken?: LeaseFencingToken): Promise<void> => {
       await this.runTransaction(db => {
-        if (leaseToken) {
-          this.validateLeaseFence(db, scanId, leaseToken);
-        }
+        this.validateLeaseFence(db, scanId, leaseToken);
         db.prepare(`
           INSERT INTO reports (scan_id, data_json, created_at)
           VALUES (?, ?, ?)
@@ -851,11 +894,9 @@ export class SqliteStorageRepository implements IStorageRepository {
       return JSON.parse(row.data_json);
     },
 
-    saveComparison: async (comparison: ReScanComparison, leaseToken?: string): Promise<void> => {
+    saveComparison: async (comparison: ReScanComparison, leaseToken?: LeaseFencingToken): Promise<void> => {
       await this.runTransaction(db => {
-        if (leaseToken) {
-          this.validateLeaseFence(db, comparison.revisedScanId, leaseToken);
-        }
+        this.validateLeaseFence(db, comparison.revisedScanId, leaseToken);
         db.prepare(`
           INSERT INTO comparisons (revised_scan_id, original_scan_id, data_json, created_at)
           VALUES (?, ?, ?, ?)
@@ -870,12 +911,10 @@ export class SqliteStorageRepository implements IStorageRepository {
       return JSON.parse(row.data_json);
     },
 
-    deductScanCredits: async (scanId: string, userId: string, amount: number, leaseToken?: string): Promise<boolean> => {
+    deductScanCredits: async (scanId: string, userId: string, amount: number, leaseToken?: LeaseFencingToken): Promise<boolean> => {
       let success = false;
       await this.runTransaction(db => {
-        if (leaseToken) {
-          this.validateLeaseFence(db, scanId, leaseToken);
-        }
+        this.validateLeaseFence(db, scanId, leaseToken);
 
         const scan = db.prepare('SELECT credits_deducted FROM scans WHERE id = ?').get(scanId) as any;
         if (!scan) return;
@@ -913,12 +952,10 @@ export class SqliteStorageRepository implements IStorageRepository {
       return success;
     },
 
-    refundScanCredits: async (scanId: string, hintAmount?: number, leaseToken?: string): Promise<{ refunded: boolean; amount: number }> => {
+    refundScanCredits: async (scanId: string, hintAmount?: number, leaseToken?: LeaseFencingToken): Promise<{ refunded: boolean; amount: number }> => {
       let result = { refunded: false, amount: 0 };
       await this.runTransaction(db => {
-        if (leaseToken) {
-          this.validateLeaseFence(db, scanId, leaseToken);
-        }
+        this.validateLeaseFence(db, scanId, leaseToken);
 
         const scan = db.prepare('SELECT user_id, credits_deducted, credits_used, credits_refunded FROM scans WHERE id = ?').get(scanId) as any;
         if (!scan) return;
@@ -1015,6 +1052,7 @@ export class SqliteStorageRepository implements IStorageRepository {
       await this.runTransaction(db => {
         const now = new Date();
         const nowIso = now.toISOString();
+        const leaseExpiresAt = new Date(now.getTime() + leaseDurationMs).toISOString();
 
         // Find next eligible job: either QUEUED and run_at <= now, or RETRYABLE and run_at <= now
         const eligible = db.prepare(`
@@ -1036,9 +1074,11 @@ export class SqliteStorageRepository implements IStorageRepository {
               locked_at = ?,
               locked_by = ?,
               lease_token = ?,
+              lease_expires_at = ?,
+              lease_duration_ms = ?,
               updated_at = ?
           WHERE id = ? AND (status = 'QUEUED' OR status = 'RETRYABLE')
-        `).run(nowIso, workerId, leaseToken, nowIso, eligible.id);
+        `).run(nowIso, workerId, leaseToken, leaseExpiresAt, leaseDurationMs, nowIso, eligible.id);
 
         if (Number(res.changes) === 0) return;
 
@@ -1052,7 +1092,8 @@ export class SqliteStorageRepository implements IStorageRepository {
           lockedAt: nowIso,
           lockedBy: workerId,
           leaseToken: leaseToken,
-          leaseDurationMs: leaseDurationMs,
+          leaseExpiresAt,
+          leaseDurationMs,
           lastError: eligible.last_error || null,
           createdAt: eligible.created_at,
           updatedAt: nowIso
@@ -1062,94 +1103,64 @@ export class SqliteStorageRepository implements IStorageRepository {
     },
 
     completeJob: async (id: string, workerId?: string, leaseToken?: string): Promise<void> => {
+      if (!leaseToken || typeof leaseToken !== 'string' || leaseToken.trim() === '') {
+        throw new FencingError(`Cannot complete job ${id}: worker lease token is required`);
+      }
       await this.runTransaction(db => {
         const now = new Date().toISOString();
-        let res;
-        if (leaseToken) {
-          res = db.prepare(`
-            UPDATE job_queue 
-            SET status = 'COMPLETED',
-                locked_at = NULL,
-                locked_by = NULL,
-                lease_token = NULL,
-                updated_at = ?
-            WHERE id = ? AND lease_token = ? AND status = 'RUNNING'
-          `).run(now, id, leaseToken);
-        } else if (workerId) {
-          res = db.prepare(`
-            UPDATE job_queue 
-            SET status = 'COMPLETED',
-                locked_at = NULL,
-                locked_by = NULL,
-                lease_token = NULL,
-                updated_at = ?
-            WHERE id = ? AND locked_by = ? AND status = 'RUNNING'
-          `).run(now, id, workerId);
-        } else {
-          res = db.prepare(`
-            UPDATE job_queue 
-            SET status = 'COMPLETED',
-                locked_at = NULL,
-                locked_by = NULL,
-                lease_token = NULL,
-                updated_at = ?
-            WHERE id = ? AND status = 'RUNNING'
-          `).run(now, id);
+        let query = `
+          UPDATE job_queue 
+          SET status = 'COMPLETED',
+              locked_at = NULL,
+              locked_by = NULL,
+              lease_token = NULL,
+              lease_expires_at = NULL,
+              updated_at = ?
+          WHERE id = ? AND lease_token = ? AND status = 'RUNNING'
+        `;
+        const params: any[] = [now, id, leaseToken];
+        if (workerId) {
+          query += ' AND locked_by = ?';
+          params.push(workerId);
         }
+        const res = db.prepare(query).run(...params);
 
-        if (leaseToken && Number(res.changes) === 0) {
+        if (Number(res.changes) === 0) {
           throw new FencingError(`Failed to complete job ${id}: lease token expired or superseded`);
         }
       });
     },
 
     failJob: async (id: string, error: string, retryable: boolean, backoffMs: number = 5000, workerId?: string, leaseToken?: string): Promise<void> => {
+      if (!leaseToken || typeof leaseToken !== 'string' || leaseToken.trim() === '') {
+        throw new FencingError(`Cannot fail job ${id}: worker lease token is required`);
+      }
       await this.runTransaction(db => {
         const now = new Date();
         const nowIso = now.toISOString();
         const nextRun = new Date(now.getTime() + backoffMs).toISOString();
         const status = retryable ? 'RETRYABLE' : 'FAILED';
-        let res;
 
-        if (leaseToken) {
-          res = db.prepare(`
-            UPDATE job_queue 
-            SET status = ?,
-                run_at = ?,
-                locked_at = NULL,
-                locked_by = NULL,
-                lease_token = NULL,
-                last_error = ?,
-                updated_at = ?
-            WHERE id = ? AND lease_token = ? AND status = 'RUNNING'
-          `).run(status, nextRun, error, nowIso, id, leaseToken);
-        } else if (workerId) {
-          res = db.prepare(`
-            UPDATE job_queue 
-            SET status = ?,
-                run_at = ?,
-                locked_at = NULL,
-                locked_by = NULL,
-                lease_token = NULL,
-                last_error = ?,
-                updated_at = ?
-            WHERE id = ? AND locked_by = ? AND status = 'RUNNING'
-          `).run(status, nextRun, error, nowIso, id, workerId);
-        } else {
-          res = db.prepare(`
-            UPDATE job_queue 
-            SET status = ?,
-                run_at = ?,
-                locked_at = NULL,
-                locked_by = NULL,
-                lease_token = NULL,
-                last_error = ?,
-                updated_at = ?
-            WHERE id = ? AND status = 'RUNNING'
-          `).run(status, nextRun, error, nowIso, id);
+        let query = `
+          UPDATE job_queue 
+          SET status = ?,
+              run_at = ?,
+              locked_at = NULL,
+              locked_by = NULL,
+              lease_token = NULL,
+              lease_expires_at = NULL,
+              last_error = ?,
+              updated_at = ?
+          WHERE id = ? AND lease_token = ? AND status = 'RUNNING'
+        `;
+        const params: any[] = [status, nextRun, error, nowIso, id, leaseToken];
+        if (workerId) {
+          query += ' AND locked_by = ?';
+          params.push(workerId);
         }
+        const res = db.prepare(query).run(...params);
 
-        if (leaseToken && Number(res.changes) === 0) {
+        if (Number(res.changes) === 0) {
           throw new FencingError(`Failed to fail job ${id}: lease token expired or superseded`);
         }
       });
@@ -1178,35 +1189,37 @@ export class SqliteStorageRepository implements IStorageRepository {
               locked_at = NULL,
               locked_by = NULL,
               lease_token = NULL,
+              lease_expires_at = NULL,
               updated_at = ?
           WHERE status = 'RUNNING' 
-            AND locked_at IS NOT NULL 
-            AND locked_at <= ?
-        `).run(nowIso, cutoff);
+            AND (
+              (lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+              OR (locked_at IS NOT NULL AND locked_at <= ?)
+            )
+        `).run(nowIso, nowIso, cutoff);
 
         return Number(res.changes);
       });
     },
 
-    renewLease: async (id: string, workerId: string, leaseToken?: string, _leaseDurationMs?: number): Promise<boolean> => {
+    renewLease: async (id: string, workerId: string, leaseToken?: string, leaseDurationMs: number = 60000): Promise<boolean> => {
+      if (!leaseToken || typeof leaseToken !== 'string' || leaseToken.trim() === '') {
+        throw new FencingError(`Cannot renew lease for job ${id}: worker lease token is required`);
+      }
       return await this.runTransaction(db => {
-        const nowIso = new Date().toISOString();
-        let res;
-        if (leaseToken) {
-          res = db.prepare(`
-            UPDATE job_queue 
-            SET locked_at = ?,
-                updated_at = ?
-            WHERE id = ? AND locked_by = ? AND lease_token = ? AND status = 'RUNNING'
-          `).run(nowIso, nowIso, id, workerId, leaseToken);
-        } else {
-          res = db.prepare(`
-            UPDATE job_queue 
-            SET locked_at = ?,
-                updated_at = ?
-            WHERE id = ? AND locked_by = ? AND status = 'RUNNING'
-          `).run(nowIso, nowIso, id, workerId);
-        }
+        const now = new Date();
+        const nowIso = now.toISOString();
+        const duration = Math.min(Math.max(leaseDurationMs || 60000, 1000), 24 * 60 * 60 * 1000);
+        const leaseExpiresAt = new Date(now.getTime() + duration).toISOString();
+
+        const res = db.prepare(`
+          UPDATE job_queue 
+          SET locked_at = ?,
+              lease_expires_at = ?,
+              lease_duration_ms = ?,
+              updated_at = ?
+          WHERE id = ? AND locked_by = ? AND lease_token = ? AND status = 'RUNNING'
+        `).run(nowIso, leaseExpiresAt, duration, nowIso, id, workerId, leaseToken);
 
         return Number(res.changes) > 0;
       });
@@ -1233,6 +1246,7 @@ export class SqliteStorageRepository implements IStorageRepository {
               locked_at = NULL,
               locked_by = NULL,
               lease_token = NULL,
+              lease_expires_at = NULL,
               last_error = NULL,
               updated_at = ?
           WHERE scan_id = ?
@@ -1256,6 +1270,8 @@ export class SqliteStorageRepository implements IStorageRepository {
           lockedAt: updated.locked_at || null,
           lockedBy: updated.locked_by || null,
           leaseToken: updated.lease_token || null,
+          leaseExpiresAt: updated.lease_expires_at || null,
+          leaseDurationMs: updated.lease_duration_ms ? Number(updated.lease_duration_ms) : null,
           lastError: updated.last_error || null,
           createdAt: updated.created_at,
           updatedAt: updated.updated_at
@@ -1276,6 +1292,8 @@ export class SqliteStorageRepository implements IStorageRepository {
         lockedAt: row.locked_at || null,
         lockedBy: row.locked_by || null,
         leaseToken: row.lease_token || null,
+        leaseExpiresAt: row.lease_expires_at || null,
+        leaseDurationMs: row.lease_duration_ms ? Number(row.lease_duration_ms) : null,
         lastError: row.last_error || null,
         createdAt: row.created_at,
         updatedAt: row.updated_at
@@ -1287,11 +1305,9 @@ export class SqliteStorageRepository implements IStorageRepository {
   // EVIDENCE REPOSITORY
   // -------------------------------------------------------------
   public evidence: IEvidenceRepository = {
-    saveEvidence: async (scanId: string, items: EvidenceItem[], leaseToken?: string): Promise<void> => {
+    saveEvidence: async (scanId: string, items: EvidenceItem[], leaseToken?: LeaseFencingToken): Promise<void> => {
       await this.runTransaction(db => {
-        if (leaseToken) {
-          this.validateLeaseFence(db, scanId, leaseToken);
-        }
+        this.validateLeaseFence(db, scanId, leaseToken);
         db.prepare('DELETE FROM evidence WHERE scan_id = ?').run(scanId);
         const stmt = db.prepare(`
           INSERT INTO evidence (id, scan_id, data_json, created_at)
@@ -1315,12 +1331,16 @@ export class SqliteStorageRepository implements IStorageRepository {
   // USAGE REPOSITORY
   // -------------------------------------------------------------
   public usage: IUsageRepository = {
-    recordUsage: async (userId: string, scanId: string, durationMinutes: number, creditsDeducted: number, mode: string): Promise<void> => {
-      const id = `usg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-      this.db.prepare(`
-        INSERT INTO usage_ledger (id, user_id, scan_id, duration_minutes, credits_deducted, mode, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(id, userId, scanId, durationMinutes, creditsDeducted, mode, new Date().toISOString());
+    recordUsage: async (userId: string, scanId: string, durationMinutes: number, creditsDeducted: number, mode: string, leaseToken?: LeaseFencingToken): Promise<void> => {
+      await this.runTransaction(db => {
+        this.validateLeaseFence(db, scanId, leaseToken);
+        const id = `usg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+        db.prepare(`
+          INSERT INTO usage_ledger (id, user_id, scan_id, duration_minutes, credits_deducted, mode, timestamp)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(scan_id) DO NOTHING
+        `).run(id, userId, scanId, durationMinutes, creditsDeducted, mode, new Date().toISOString());
+      });
     },
 
     getUsageStats: async (userId: string): Promise<{ totalMinutes: number; totalCredits: number; scanCount: number }> => {

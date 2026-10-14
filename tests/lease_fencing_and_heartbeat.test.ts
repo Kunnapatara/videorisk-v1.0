@@ -175,6 +175,42 @@ export async function runLeaseFencingAndHeartbeatTests() {
     assert(completedJob1?.status === 'COMPLETED', 'Requirement 5: Worker B successfully completes job in queue');
     assert(completedJob1?.leaseToken === null, 'Requirement 5: Lease token cleared upon completion');
 
+    // 5b. DEF-02: Lease expiration check at persistence boundary without waiting for recovery
+    const scanBoundary: ScanJob = {
+      id: `scan_boundary_${Date.now()}`,
+      userId: user.id,
+      videoTitle: 'Boundary Expiry Video',
+      videoFilename: 'bound.mp4',
+      videoPath: '/tmp/bound.mp4',
+      scanMode: 'standard',
+      status: 'QUEUED',
+      currentStage: 'Upload',
+      completedStages: ['Upload'],
+      creditsUsed: 0,
+      createdAt: new Date().toISOString()
+    };
+    await storage.scans.createScan(scanBoundary);
+    const boundClaim = await storage.queue.claimNextJob('worker_bound', 5000);
+    const boundToken = boundClaim!.leaseToken!;
+
+    // Artificially expire lease in job_queue without running recovery (status remains RUNNING)
+    storage.db.prepare('UPDATE job_queue SET lease_expires_at = ? WHERE id = ?').run(
+      new Date(Date.now() - 1000).toISOString(), boundClaim!.id
+    );
+
+    let boundaryExpiryCaught = false;
+    try {
+      await storage.scans.updateScan(scanBoundary.id, { status: 'BUILDING_REPORT' }, boundToken);
+    } catch (err: any) {
+      if (err instanceof FencingError || err.name === 'FencingError') boundaryExpiryCaught = true;
+    }
+    assert(boundaryExpiryCaught, 'DEF-02: Expired lease rejected at persistence boundary even before recovery runs');
+
+    // Clean up
+    await storage.queue.recoverStaleJobs(100);
+    const drainBound = await storage.queue.claimNextJob('worker_cleanup_bound', 1000);
+    if (drainBound) await storage.queue.completeJob(drainBound.id, 'worker_cleanup_bound', drainBound.leaseToken!);
+
     // -------------------------------------------------------------------------
     // GROUP 2: HEARTBEAT (Reqs 6 - 9)
     // -------------------------------------------------------------------------
@@ -254,12 +290,77 @@ export async function runLeaseFencingAndHeartbeatTests() {
 
     // 8. Heartbeat storage error does not silently allow unbounded processing with presumed ownership
     // Verified by JobOrchestrator heartbeat fail-closed threshold: consecutiveRenewalErrors >= max
-    let orchestratorHeartbeatStopped = false;
-    const testOrchestrator = new JobOrchestrator(storage, false);
-    assert(typeof testOrchestrator.executeJob === 'function', 'Requirement 8: Orchestrator executeJob exists and protects lease boundaries');
+    const scanHbFail: ScanJob = {
+      id: `scan_hb_fail_${Date.now()}`,
+      userId: user.id,
+      videoTitle: 'HB Fail Video',
+      videoFilename: 'hbfail.mp4',
+      videoPath: '/tmp/nonexistent.mp4',
+      scanMode: 'standard',
+      status: 'QUEUED',
+      currentStage: 'Upload',
+      completedStages: ['Upload'],
+      creditsUsed: 0,
+      createdAt: new Date().toISOString()
+    };
+    await storage.scans.createScan(scanHbFail);
+    const hbClaim = await storage.queue.claimNextJob('worker_hb_fail', 5000);
+    assert(hbClaim !== null, 'Claimed job for heartbeat fail test');
+
+    let renewAttempts = 0;
+    const failingStorage = Object.create(storage);
+    failingStorage.scans = {
+      ...storage.scans,
+      getScan: async (id: string) => {
+        // Delay enough for 2 heartbeat intervals of 15ms to trigger
+        await new Promise(r => setTimeout(r, 50));
+        return storage.scans.getScan(id);
+      }
+    };
+    failingStorage.queue = {
+      ...storage.queue,
+      renewLease: async (id: string, workerId: string, leaseToken?: string, leaseDurationMs?: number) => {
+        renewAttempts++;
+        throw new Error('Database connection reset during renewal');
+      }
+    };
+
+    const orchestratorFailClosed = new JobOrchestrator(failingStorage, false);
+    await orchestratorFailClosed.executeJob(hbClaim, 15);
+    assert(renewAttempts >= 2, 'Requirement 8: Heartbeat attempted renewals and encountered storage errors');
+    const jobAfterFailClosed = await storage.queue.getJobByScanId(scanHbFail.id);
+    assert(jobAfterFailClosed?.status !== 'COMPLETED', 'Requirement 8: Job is not completed after failing closed on heartbeat error');
 
     // 9. Heartbeat resources are stopped after success, failure, and shutdown
-    assert(true, 'Requirement 9: Heartbeat resources stopped cleanly on shutdown');
+    const heartbeatTracker = { clearIntervalCalled: false };
+    const origClearInterval = global.clearInterval;
+    global.clearInterval = ((timer: any) => {
+      heartbeatTracker.clearIntervalCalled = true;
+      return origClearInterval(timer);
+    }) as any;
+
+    try {
+      const scanClean: ScanJob = {
+        id: `scan_clean_${Date.now()}`,
+        userId: user.id,
+        videoTitle: 'Clean HB Video',
+        videoFilename: 'clean.mp4',
+        videoPath: '/tmp/clean.mp4',
+        scanMode: 'standard',
+        status: 'QUEUED',
+        currentStage: 'Upload',
+        completedStages: ['Upload'],
+        creditsUsed: 0,
+        createdAt: new Date().toISOString()
+      };
+      await storage.scans.createScan(scanClean);
+      const cleanClaim = await storage.queue.claimNextJob('worker_clean', 5000);
+      const cleanOrchestrator = new JobOrchestrator(storage, false);
+      await cleanOrchestrator.executeJob(cleanClaim!, 50);
+      assert(heartbeatTracker.clearIntervalCalled === true, 'Requirement 9: clearInterval invoked and heartbeat resources stopped cleanly on shutdown');
+    } finally {
+      global.clearInterval = origClearInterval;
+    }
 
     // -------------------------------------------------------------------------
     // GROUP 3: FINANCIAL INTEGRITY (Reqs 10 - 13)
@@ -317,6 +418,25 @@ export async function runLeaseFencingAndHeartbeatTests() {
     assert(refundRes2.refunded === false && refundRes2.amount === 0, 'Requirement 13: Duplicate refund strictly blocked (refunded = false)');
     const financeUserAfterDupRefund = await storage.users.getUser(financeUser.id);
     assert(financeUserAfterDupRefund?.creditsRemaining === 30, 'Requirement 13: Balance remains strictly 30 (no double refund)');
+
+    // DEF-03: Usage Ledger Fencing & Idempotency Check
+    let staleUsageCaught = false;
+    try {
+      await storage.usage.recordUsage(financeUser.id, scanFinance.id, 10, 10, 'standard', staleTokenFin);
+    } catch (err: any) {
+      if (err instanceof FencingError || err.name === 'FencingError') staleUsageCaught = true;
+    }
+    assert(staleUsageCaught, 'DEF-03: Stale worker attempt to recordUsage is rejected with FencingError');
+
+    // Valid usage recording with tokenFin
+    await storage.usage.recordUsage(financeUser.id, scanFinance.id, 10, 10, 'standard', tokenFin);
+    const stats1 = await storage.usage.getUsageStats(financeUser.id);
+    assert(stats1.scanCount === 1, 'DEF-03: Usage recorded exactly once for valid lease');
+
+    // Repeated call for same scanId is idempotent
+    await storage.usage.recordUsage(financeUser.id, scanFinance.id, 10, 10, 'standard', tokenFin);
+    const stats2 = await storage.usage.getUsageStats(financeUser.id);
+    assert(stats2.scanCount === 1, 'DEF-03: Duplicate usage recording for same scan is idempotent');
 
     // Clean up finance job
     await storage.queue.failJob(financeClaim!.id, 'Finance test complete', false, 0, 'worker_fin', tokenFin);
@@ -446,7 +566,7 @@ export async function runLeaseFencingAndHeartbeatTests() {
       topIssues: [],
       policyConnections: [],
       timeline: []
-    } as unknown as RiskReport);
+    } as unknown as RiskReport, { systemBypass: true });
 
     const reScan: ScanJob = {
       id: `scan_rescan_${Date.now()}`,
@@ -647,6 +767,22 @@ export async function runLeaseFencingAndHeartbeatTests() {
     }
     assert(memFenceReportCaught, 'Requirement 20: In-memory fences stale saveReport');
 
+    let memFenceUsageCaught = false;
+    try {
+      await memStore.usage.recordUsage(memUser.id, memScan.id, 5, 5, 'standard', memTokenA);
+    } catch (err: any) {
+      if (err instanceof FencingError) memFenceUsageCaught = true;
+    }
+    assert(memFenceUsageCaught, 'Requirement 20: In-memory fences stale recordUsage');
+
+    await memStore.usage.recordUsage(memUser.id, memScan.id, 5, 5, 'standard', memTokenB);
+    const memStats1 = await memStore.usage.getUsageStats(memUser.id);
+    assert(memStats1.scanCount === 1, 'Requirement 20: In-memory usage recorded once');
+
+    await memStore.usage.recordUsage(memUser.id, memScan.id, 5, 5, 'standard', memTokenB);
+    const memStats2 = await memStore.usage.getUsageStats(memUser.id);
+    assert(memStats2.scanCount === 1, 'Requirement 20: In-memory duplicate usage is idempotent');
+
     // Worker B completes
     await memStore.queue.completeJob(memClaimB!.id, 'mem_B', memTokenB);
     const completedMemJob = await memStore.queue.getJobByScanId(memScan.id);
@@ -660,3 +796,11 @@ export async function runLeaseFencingAndHeartbeatTests() {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 }
+
+if (process.argv[1] && process.argv[1].endsWith('lease_fencing_and_heartbeat.test.ts')) {
+  runLeaseFencingAndHeartbeatTests().catch(err => {
+    console.error(err);
+    process.exit(1);
+  });
+}
+

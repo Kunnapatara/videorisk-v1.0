@@ -169,20 +169,20 @@ export async function runSecurityRetentionAndE2ETests() {
     await storage.scans.createScan(scanRecord);
 
     // Deduct credits
-    const deductSuccess = await storage.scans.deductScanCredits(scanId, creatorUser.id, 10);
+    const deductSuccess = await storage.scans.deductScanCredits(scanId, creatorUser.id, 10, { systemBypass: true });
     assert(deductSuccess === true, '10 credits deducted for scan');
     const creatorAfterDeduct = await storage.users.getUser(creatorUser.id);
     assert(creatorAfterDeduct?.creditsRemaining === 20, 'Creator balance decreased to 20');
 
     // First refund on failure
-    const refundResult1 = await storage.scans.refundScanCredits(scanId);
+    const refundResult1 = await storage.scans.refundScanCredits(scanId, undefined, { systemBypass: true });
     assert(refundResult1.refunded === true, 'Scan refund granted');
     assert(refundResult1.amount === 10, 'Refunded exactly 10 credits');
     const creatorAfterRefund = await storage.users.getUser(creatorUser.id);
     assert(creatorAfterRefund?.creditsRemaining === 30, 'Creator balance restored back to 30');
 
     // Duplicate refund attempt must be blocked
-    const refundResult2 = await storage.scans.refundScanCredits(scanId);
+    const refundResult2 = await storage.scans.refundScanCredits(scanId, undefined, { systemBypass: true });
     assert(refundResult2.refunded === false, 'Duplicate refund attempt strictly blocked');
     assert(refundResult2.amount === 0, 'Duplicate refund granted 0 extra credits');
     const creatorAfterDuplicate = await storage.users.getUser(creatorUser.id);
@@ -219,7 +219,7 @@ export async function runSecurityRetentionAndE2ETests() {
       !report.policyConnections.some(p => p.impact === 'Compliant'),
       'Report does NOT contain unsupported "Compliant" policy conclusions'
     );
-    await storage.scans.saveReport(scanId, report);
+    await storage.scans.saveReport(scanId, report, { systemBypass: true });
     const savedReport = await storage.scans.getReport(scanId);
     assert(savedReport !== null, 'Report safely persisted and retrieved from storage');
 
@@ -259,7 +259,7 @@ export async function runSecurityRetentionAndE2ETests() {
     assert(comparison.originalRatios.originalContribution === null, 'Original unassessed commentary preserved as null');
     assert(comparison.revisedRatios.originalContribution === null, 'Revised unassessed commentary preserved as null');
 
-    await storage.scans.saveComparison(comparison);
+    await storage.scans.saveComparison(comparison, { systemBypass: true });
     const savedComparison = await storage.scans.getComparison(revisedScanId);
     assert(savedComparison !== null, 'Re-scan comparison safely persisted and retrieved');
 

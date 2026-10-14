@@ -354,6 +354,7 @@ export interface JobQueueRecord {
   lockedAt?: string | null;
   lockedBy?: string | null;
   leaseToken?: string | null;
+  leaseExpiresAt?: string | null;
   leaseDurationMs?: number | null;
   lastError?: string | null;
   createdAt: string;

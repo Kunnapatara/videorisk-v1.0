@@ -161,7 +161,7 @@ export async function runAuthAndOwnershipTests() {
       label: 'Original Narration',
       details: 'Spoken commentary detected',
       limitations: 'Local analyzer'
-    }]);
+    }], { systemBypass: true });
 
     await storage.scans.saveReport(scanA.id, {
       scanId: scanA.id,
@@ -187,7 +187,7 @@ export async function runAuthAndOwnershipTests() {
         framesSampled: 10,
         scenesDetected: 2
       }
-    });
+    }, { systemBypass: true });
 
     // Test 2.1: User A can access own scan
     const userAReadScan = await fetch(`${baseUrl}/scans/${scanA.id}`, {

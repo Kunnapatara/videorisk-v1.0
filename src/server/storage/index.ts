@@ -58,27 +58,29 @@ export interface IUserRepository {
   deleteSession(token: string): Promise<void>;
 }
 
+export type LeaseFencingToken = string | { systemBypass: true };
+
 export interface IScanRepository {
   createScan(scan: ScanJob): Promise<ScanJob>;
   getScan(id: string): Promise<ScanJob | null>;
   getAllScans(userId?: string): Promise<ScanJob[]>;
-  updateScan(id: string, updates: Partial<ScanJob>, leaseToken?: string): Promise<ScanJob | null>;
-  saveReport(scanId: string, report: RiskReport, leaseToken?: string): Promise<void>;
+  updateScan(id: string, updates: Partial<ScanJob>, leaseToken?: LeaseFencingToken): Promise<ScanJob | null>;
+  saveReport(scanId: string, report: RiskReport, leaseToken?: LeaseFencingToken): Promise<void>;
   getReport(scanId: string): Promise<RiskReport | null>;
-  saveComparison(comparison: ReScanComparison, leaseToken?: string): Promise<void>;
+  saveComparison(comparison: ReScanComparison, leaseToken?: LeaseFencingToken): Promise<void>;
   getComparison(revisedScanId: string): Promise<ReScanComparison | null>;
-  deductScanCredits(scanId: string, userId: string, amount: number, leaseToken?: string): Promise<boolean>;
-  refundScanCredits(scanId: string, hintAmount?: number, leaseToken?: string): Promise<{ refunded: boolean; amount: number }>;
+  deductScanCredits(scanId: string, userId: string, amount: number, leaseToken?: LeaseFencingToken): Promise<boolean>;
+  refundScanCredits(scanId: string, hintAmount?: number, leaseToken?: LeaseFencingToken): Promise<{ refunded: boolean; amount: number }>;
   deleteScan(id: string): Promise<boolean>;
 }
 
 export interface IEvidenceRepository {
-  saveEvidence(scanId: string, items: EvidenceItem[], leaseToken?: string): Promise<void>;
+  saveEvidence(scanId: string, items: EvidenceItem[], leaseToken?: LeaseFencingToken): Promise<void>;
   getEvidence(scanId: string): Promise<EvidenceItem[]>;
 }
 
 export interface IUsageRepository {
-  recordUsage(userId: string, scanId: string, durationMinutes: number, creditsDeducted: number, mode: string): Promise<void>;
+  recordUsage(userId: string, scanId: string, durationMinutes: number, creditsDeducted: number, mode: string, leaseToken?: LeaseFencingToken): Promise<void>;
   getUsageStats(userId: string): Promise<{ totalMinutes: number; totalCredits: number; scanCount: number }>;
 }
 
@@ -484,11 +486,34 @@ export class InMemoryStorageRepository implements IStorageRepository {
     }
   };
 
-  private validateLeaseFence(scanId: string, leaseToken?: string): void {
-    if (!leaseToken) return;
+  private validateLeaseFence(scanId: string, leaseToken?: LeaseFencingToken): void {
+    if (typeof leaseToken === 'object' && leaseToken !== null && 'systemBypass' in leaseToken && leaseToken.systemBypass === true) {
+      return; // Legitimate explicit system/administrative operation
+    }
+    if (!leaseToken || typeof leaseToken !== 'string' || leaseToken.trim() === '') {
+      throw new FencingError(`Fencing violation for scan ${scanId}: worker lease token is required`);
+    }
     const job = this.state.jobQueue[scanId];
-    if (!job || job.status !== 'RUNNING' || job.leaseToken !== leaseToken) {
-      throw new FencingError(`Fencing violation for scan ${scanId}: worker lease token is invalid, superseded, or expired`);
+    if (!job) {
+      throw new FencingError(`Fencing violation for scan ${scanId}: no job queue record found`);
+    }
+    if (job.status !== 'RUNNING') {
+      throw new FencingError(`Fencing violation for scan ${scanId}: job is not in RUNNING state (current: ${job.status})`);
+    }
+    if (job.leaseToken !== leaseToken) {
+      throw new FencingError(`Fencing violation for scan ${scanId}: worker lease token is invalid or superseded`);
+    }
+    const nowIso = new Date().toISOString();
+    if (job.leaseExpiresAt) {
+      if (job.leaseExpiresAt <= nowIso) {
+        throw new FencingError(`Fencing violation for scan ${scanId}: worker lease expired at ${job.leaseExpiresAt}`);
+      }
+    } else if (job.lockedAt) {
+      const lockedTime = new Date(job.lockedAt).getTime();
+      const duration = job.leaseDurationMs || 60000;
+      if (lockedTime + duration <= Date.now()) {
+        throw new FencingError(`Fencing violation for scan ${scanId}: worker lease expired by lockedAt threshold`);
+      }
     }
   }
 
@@ -513,7 +538,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
       }
       return list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
     },
-    updateScan: async (id: string, updates: Partial<ScanJob>, leaseToken?: string) => {
+    updateScan: async (id: string, updates: Partial<ScanJob>, leaseToken?: LeaseFencingToken) => {
       this.validateLeaseFence(id, leaseToken);
       const scan = this.state.scans[id];
       if (!scan) return null;
@@ -521,7 +546,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
       this.save();
       return scan;
     },
-    saveReport: async (scanId: string, report: RiskReport, leaseToken?: string) => {
+    saveReport: async (scanId: string, report: RiskReport, leaseToken?: LeaseFencingToken) => {
       this.validateLeaseFence(scanId, leaseToken);
       this.state.reports[scanId] = report;
       this.save();
@@ -529,7 +554,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
     getReport: async (scanId: string) => {
       return this.state.reports[scanId] || null;
     },
-    saveComparison: async (comparison: ReScanComparison, leaseToken?: string) => {
+    saveComparison: async (comparison: ReScanComparison, leaseToken?: LeaseFencingToken) => {
       this.validateLeaseFence(comparison.revisedScanId, leaseToken);
       this.state.comparisons[comparison.revisedScanId] = comparison;
       this.save();
@@ -537,7 +562,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
     getComparison: async (revisedScanId: string) => {
       return this.state.comparisons[revisedScanId] || null;
     },
-    deductScanCredits: async (scanId: string, userId: string, amount: number, leaseToken?: string) => {
+    deductScanCredits: async (scanId: string, userId: string, amount: number, leaseToken?: LeaseFencingToken) => {
       return await this.runTransaction(async (state) => {
         this.validateLeaseFence(scanId, leaseToken);
         const user = state.users[userId];
@@ -563,7 +588,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
         return true;
       });
     },
-    refundScanCredits: async (scanId: string, hintAmount?: number, leaseToken?: string) => {
+    refundScanCredits: async (scanId: string, hintAmount?: number, leaseToken?: LeaseFencingToken) => {
       return await this.runTransaction(async (state) => {
         this.validateLeaseFence(scanId, leaseToken);
         const scan = state.scans[scanId];
@@ -615,7 +640,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
   };
 
   public evidence: IEvidenceRepository = {
-    saveEvidence: async (scanId: string, items: EvidenceItem[], leaseToken?: string) => {
+    saveEvidence: async (scanId: string, items: EvidenceItem[], leaseToken?: LeaseFencingToken) => {
       this.validateLeaseFence(scanId, leaseToken);
       this.state.evidence[scanId] = items;
       this.save();
@@ -626,7 +651,12 @@ export class InMemoryStorageRepository implements IStorageRepository {
   };
 
   public usage: IUsageRepository = {
-    recordUsage: async (userId: string, scanId: string, durationMinutes: number, creditsDeducted: number, mode: string) => {
+    recordUsage: async (userId: string, scanId: string, durationMinutes: number, creditsDeducted: number, mode: string, leaseToken?: LeaseFencingToken) => {
+      this.validateLeaseFence(scanId, leaseToken);
+      const exists = this.state.usage.some(u => u.scanId === scanId);
+      if (exists) {
+        return;
+      }
       this.state.usage.push({
         userId,
         scanId,
@@ -895,58 +925,54 @@ export class InMemoryStorageRepository implements IStorageRepository {
       if (!candidate) return null;
 
       const leaseToken = `lease_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+      const leaseExpiresAt = new Date(now.getTime() + leaseDurationMs).toISOString();
       candidate.status = 'RUNNING';
       candidate.attempts += 1;
       candidate.lockedAt = nowIso;
       candidate.lockedBy = workerId;
       candidate.leaseToken = leaseToken;
       candidate.leaseDurationMs = leaseDurationMs;
+      candidate.leaseExpiresAt = leaseExpiresAt;
       candidate.updatedAt = nowIso;
       this.save();
       return candidate;
     },
 
     completeJob: async (id: string, workerId?: string, leaseToken?: string): Promise<void> => {
-      const job = Object.values(this.state.jobQueue).find(j => j.id === id);
-      if (job && job.status === 'RUNNING') {
-        if (leaseToken && job.leaseToken !== leaseToken) {
-          throw new FencingError(`Failed to complete job ${id}: lease token expired or superseded`);
-        }
-        if (workerId && job.lockedBy !== workerId) {
-          return;
-        }
-        job.status = 'COMPLETED';
-        job.lockedAt = null;
-        job.lockedBy = null;
-        job.leaseToken = null;
-        job.updatedAt = new Date().toISOString();
-        this.save();
-      } else if (leaseToken) {
-        throw new FencingError(`Failed to complete job ${id}: job is not RUNNING or was superseded`);
+      if (!leaseToken || typeof leaseToken !== 'string' || leaseToken.trim() === '') {
+        throw new FencingError(`Cannot complete job ${id}: worker lease token is required`);
       }
+      const job = Object.values(this.state.jobQueue).find(j => j.id === id);
+      if (!job || job.status !== 'RUNNING' || job.leaseToken !== leaseToken || (workerId && job.lockedBy !== workerId)) {
+        throw new FencingError(`Failed to complete job ${id}: lease token expired or superseded`);
+      }
+      job.status = 'COMPLETED';
+      job.lockedAt = null;
+      job.lockedBy = null;
+      job.leaseToken = null;
+      job.leaseExpiresAt = null;
+      job.updatedAt = new Date().toISOString();
+      this.save();
     },
 
     failJob: async (id: string, error: string, retryable: boolean, backoffMs: number = 5000, workerId?: string, leaseToken?: string): Promise<void> => {
-      const job = Object.values(this.state.jobQueue).find(j => j.id === id);
-      if (job && job.status === 'RUNNING') {
-        if (leaseToken && job.leaseToken !== leaseToken) {
-          throw new FencingError(`Failed to fail job ${id}: lease token expired or superseded`);
-        }
-        if (workerId && job.lockedBy !== workerId) {
-          return;
-        }
-        const now = new Date();
-        job.status = retryable ? 'RETRYABLE' : 'FAILED';
-        job.runAt = new Date(now.getTime() + backoffMs).toISOString();
-        job.lockedAt = null;
-        job.lockedBy = null;
-        job.leaseToken = null;
-        job.lastError = error;
-        job.updatedAt = now.toISOString();
-        this.save();
-      } else if (leaseToken) {
-        throw new FencingError(`Failed to fail job ${id}: job is not RUNNING or was superseded`);
+      if (!leaseToken || typeof leaseToken !== 'string' || leaseToken.trim() === '') {
+        throw new FencingError(`Cannot fail job ${id}: worker lease token is required`);
       }
+      const job = Object.values(this.state.jobQueue).find(j => j.id === id);
+      if (!job || job.status !== 'RUNNING' || job.leaseToken !== leaseToken || (workerId && job.lockedBy !== workerId)) {
+        throw new FencingError(`Failed to fail job ${id}: lease token expired or superseded`);
+      }
+      const now = new Date();
+      job.status = retryable ? 'RETRYABLE' : 'FAILED';
+      job.runAt = new Date(now.getTime() + backoffMs).toISOString();
+      job.lockedAt = null;
+      job.lockedBy = null;
+      job.leaseToken = null;
+      job.leaseExpiresAt = null;
+      job.lastError = error;
+      job.updatedAt = now.toISOString();
+      this.save();
     },
 
     recoverStaleJobs: async (leaseTimeoutMs: number = 60000): Promise<number> => {
@@ -960,11 +986,12 @@ export class InMemoryStorageRepository implements IStorageRepository {
       const now = new Date().toISOString();
       let recovered = 0;
       for (const job of Object.values(this.state.jobQueue)) {
-        if (job.status === 'RUNNING' && job.lockedAt && job.lockedAt <= cutoff) {
+        if (job.status === 'RUNNING' && ((job.leaseExpiresAt && job.leaseExpiresAt <= now) || (job.lockedAt && job.lockedAt <= cutoff))) {
           job.status = 'RETRYABLE';
           job.lockedAt = null;
           job.lockedBy = null;
           job.leaseToken = null;
+          job.leaseExpiresAt = null;
           job.updatedAt = now;
           recovered++;
         }
@@ -973,11 +1000,17 @@ export class InMemoryStorageRepository implements IStorageRepository {
       return recovered;
     },
 
-    renewLease: async (id: string, workerId: string, leaseToken?: string, _leaseDurationMs?: number): Promise<boolean> => {
+    renewLease: async (id: string, workerId: string, leaseToken?: string, leaseDurationMs: number = 60000): Promise<boolean> => {
+      if (!leaseToken || typeof leaseToken !== 'string' || leaseToken.trim() === '') {
+        throw new FencingError(`Cannot renew lease for job ${id}: worker lease token is required`);
+      }
       const job = Object.values(this.state.jobQueue).find(j => j.id === id);
-      if (job && job.status === 'RUNNING' && job.lockedBy === workerId && (!leaseToken || job.leaseToken === leaseToken)) {
+      if (job && job.status === 'RUNNING' && job.lockedBy === workerId && job.leaseToken === leaseToken) {
         const now = new Date().toISOString();
+        const duration = Math.min(Math.max(leaseDurationMs || 60000, 1000), 24 * 60 * 60 * 1000);
         job.lockedAt = now;
+        job.leaseDurationMs = duration;
+        job.leaseExpiresAt = new Date(Date.now() + duration).toISOString();
         job.updatedAt = now;
         this.save();
         return true;

@@ -115,7 +115,7 @@ export class JobOrchestrator {
     }
   }
 
-  public async executeJob(job: JobQueueRecord): Promise<void> {
+  public async executeJob(job: JobQueueRecord, customHeartbeatIntervalMs?: number): Promise<void> {
     const scanId = job.scanId;
     const leaseToken = job.leaseToken || undefined;
     const leaseDurationMs = job.leaseDurationMs || 60000;
@@ -127,6 +127,7 @@ export class JobOrchestrator {
     let heartbeatTimer: NodeJS.Timeout | null = null;
 
     // Heartbeat: renew lease periodically while executing to prevent premature reclamation on long scans
+    const heartbeatInterval = customHeartbeatIntervalMs || 15000;
     heartbeatTimer = setInterval(async () => {
       try {
         const renewed = await this.storageRepo.queue.renewLease(job.id, this.workerId, leaseToken, leaseDurationMs);
@@ -155,7 +156,7 @@ export class JobOrchestrator {
           console.warn(`[JobOrchestrator] Heartbeat renewal error threshold reached; failing closed for job ${job.id}`);
         }
       }
-    }, 15000);
+    }, heartbeatInterval);
     if (heartbeatTimer.unref) heartbeatTimer.unref();
 
     try {
@@ -284,7 +285,8 @@ export class JobOrchestrator {
         scan.id, 
         creditService.formatMinutes(metadata.durationSeconds), 
         requiredCredits, 
-        scan.scanMode
+        scan.scanMode,
+        leaseToken
       );
 
       checkLease();

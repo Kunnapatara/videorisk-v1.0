@@ -159,13 +159,19 @@ export async function runSqliteStorageAndQueueTests() {
     assert(workerBetaClaimAfterRecovery?.lockedBy === 'worker_beta', 'Worker Beta now holds lease lock');
 
     // Worker Alpha (stale worker) attempts to complete the reclaimed job with its stale ownership
-    await storage.queue.completeJob(workerBetaClaimAfterRecovery!.id, 'worker_alpha');
+    let staleAlphaCaught = false;
+    try {
+      await storage.queue.completeJob(workerBetaClaimAfterRecovery!.id, 'worker_alpha', claimedJob!.leaseToken!);
+    } catch (err: any) {
+      if (err instanceof FencingError || err.name === 'FencingError') staleAlphaCaught = true;
+    }
+    assert(staleAlphaCaught, 'Stale worker Alpha is fenced from completing job owned by Worker Beta');
     const stillRunningJob = await storage.queue.getJobByScanId(scanJob.id);
-    assert(stillRunningJob?.status === 'RUNNING', 'Stale worker Alpha is fenced from completing job owned by Worker Beta');
+    assert(stillRunningJob?.status === 'RUNNING', 'Job remains in RUNNING status');
     assert(stillRunningJob?.lockedBy === 'worker_beta', 'Worker Beta still securely holds lease lock');
 
     // Legitimate owner Worker Beta completes job
-    await storage.queue.completeJob(workerBetaClaimAfterRecovery!.id, 'worker_beta');
+    await storage.queue.completeJob(workerBetaClaimAfterRecovery!.id, 'worker_beta', workerBetaClaimAfterRecovery!.leaseToken!);
     const completedJob = await storage.queue.getJobByScanId(scanJob.id);
     assert(completedJob?.status === 'COMPLETED', 'Job successfully completed by legitimate Worker Beta and marked COMPLETED');
 
@@ -205,15 +211,21 @@ export async function runSqliteStorageAndQueueTests() {
     assert(stillRunningAfterEnqueue?.lockedBy === 'worker_gamma', 'Duplicate enqueue does NOT clear active worker lease');
 
     // Lease renewal test: Worker Gamma successfully renews lease
-    const renewed = await storage.queue.renewLease(claimedRunning!.id, 'worker_gamma');
+    const renewed = await storage.queue.renewLease(claimedRunning!.id, 'worker_gamma', claimedRunning!.leaseToken!);
     assert(renewed === true, 'Active worker Gamma successfully renewed lease');
 
     // Stale worker cannot renew lease
-    const staleRenew = await storage.queue.renewLease(claimedRunning!.id, 'worker_unauthorized');
-    assert(staleRenew === false, 'Unauthorized/stale worker cannot renew lease');
+    let staleRenewCaught = false;
+    try {
+      const staleRenew = await storage.queue.renewLease(claimedRunning!.id, 'worker_unauthorized', 'stale_token_xyz');
+      if (staleRenew === false) staleRenewCaught = true;
+    } catch (err: any) {
+      if (err instanceof FencingError) staleRenewCaught = true;
+    }
+    assert(staleRenewCaught, 'Unauthorized/stale worker cannot renew lease');
 
     // Fail job with retryable = false (terminal FAILED)
-    await storage.queue.failJob(claimedRunning!.id, 'Terminal test failure', false, 0, 'worker_gamma');
+    await storage.queue.failJob(claimedRunning!.id, 'Terminal test failure', false, 0, 'worker_gamma', claimedRunning!.leaseToken!);
     const failedJob = await storage.queue.getJobByScanId(scanJobRunning.id);
     assert(failedJob?.status === 'FAILED', 'Job transitioned to terminal FAILED status');
 
@@ -249,7 +261,7 @@ export async function runSqliteStorageAndQueueTests() {
     // Drain previous test job from queue so 3.2 starts with a clean queue
     const drainJob = await storage.queue.claimNextJob('cleanup_worker', 1000);
     if (drainJob) {
-      await storage.queue.completeJob(drainJob.id, 'cleanup_worker');
+      await storage.queue.completeJob(drainJob.id, 'cleanup_worker', drainJob.leaseToken!);
     }
 
     // ---------------------------------------------------------
