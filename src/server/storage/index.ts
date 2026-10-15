@@ -526,7 +526,22 @@ export class InMemoryStorageRepository implements IStorageRepository {
         user.totalScansCount += 1;
       }
       this.save();
-      await this.queue.enqueueJob(scan.id);
+      if (scan.status === 'QUEUED') {
+        await this.queue.enqueueJob(scan.id);
+      } else {
+        const id = `job_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+        const now = new Date().toISOString();
+        this.state.jobQueue[scan.id] = {
+          id,
+          scanId: scan.id,
+          status: scan.status as any,
+          attempts: 0,
+          maxAttempts: 3,
+          runAt: now,
+          createdAt: now,
+          updatedAt: now,
+        };
+      }
       return scan;
     },
     getScan: async (id: string) => {

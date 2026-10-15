@@ -824,7 +824,17 @@ export class SqliteStorageRepository implements IStorageRepository {
       this.db.prepare('UPDATE users SET total_scans_count = total_scans_count + 1 WHERE id = ?').run(scan.userId);
 
       // Enqueue job for durable processing
-      await this.queue.enqueueJob(scan.id);
+      if (scan.status === 'QUEUED') {
+        await this.queue.enqueueJob(scan.id);
+      } else {
+        const id = `job_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+        const now = new Date().toISOString();
+        this.db.prepare(`
+          INSERT INTO job_queue (id, scan_id, status, attempts, max_attempts, run_at, created_at, updated_at)
+          VALUES (?, ?, ?, 0, 3, ?, ?, ?)
+          ON CONFLICT(scan_id) DO NOTHING
+        `).run(id, scan.id, scan.status, now, now, now);
+      }
 
       return scan;
     },
@@ -863,6 +873,8 @@ export class SqliteStorageRepository implements IStorageRepository {
         if (updates.creditsRefunded !== undefined) { fields.push('credits_refunded = ?'); values.push(updates.creditsRefunded ? 1 : 0); }
         if (updates.creditsRefundedAmount !== undefined) { fields.push('credits_refunded_amount = ?'); values.push(updates.creditsRefundedAmount); }
         if (updates.metadata !== undefined) { fields.push('metadata_json = ?'); values.push(JSON.stringify(updates.metadata)); }
+        if (updates.videoPath !== undefined) { fields.push('video_path = ?'); values.push(updates.videoPath); }
+        if (updates.thumbnailPath !== undefined) { fields.push('thumbnail_path = ?'); values.push(updates.thumbnailPath); }
         if (updates.proxyPath !== undefined) { fields.push('proxy_path = ?'); values.push(updates.proxyPath); }
         if (updates.thumbnailMetadata !== undefined) { fields.push('thumbnail_metadata_json = ?'); values.push(JSON.stringify(updates.thumbnailMetadata)); }
         if (updates.error !== undefined) { fields.push('error = ?'); values.push(updates.error); }

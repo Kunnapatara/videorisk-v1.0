@@ -288,6 +288,9 @@ export async function runScanDeletionAndMediaCleanupTests() {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${sessionTokenA}` },
     });
+    if (delParentRes.status !== 200) {
+      console.error('delParentRes failed:', delParentRes.status, await delParentRes.text());
+    }
     assert.strictEqual(delParentRes.status, 200, 'Parent scan deleted');
 
     // Crucial assertion: shared file MUST NOT have been unlinked!
