@@ -209,23 +209,47 @@ export function validateBillingConfiguration(
 }
 
 /**
+ * Strips or redacts any secret tokens (sk_..., rk_..., whsec_..., Bearer ...) from text.
+ */
+export function sanitizeLogOutput(text: string, knownSecrets: (string | undefined | null)[] = []): string {
+  let sanitized = text;
+  for (const s of knownSecrets) {
+    if (s && s.trim().length > 6) {
+      sanitized = sanitized.split(s.trim()).join(maskSecret(s));
+    }
+  }
+  sanitized = sanitized.replace(/(sk_live_|sk_test_|rk_live_|rk_test_|whsec_)[a-zA-Z0-9_]{6,}/g, (match) => maskSecret(match));
+  sanitized = sanitized.replace(/Bearer\s+([a-zA-Z0-9_\-\.]{8,})/gi, 'Bearer [REDACTED]');
+  return sanitized;
+}
+
+/**
  * Optional live Stripe API check. Only executes when explicitly requested and authorized.
  */
-async function performLiveStripeCheck(secretKey: string): Promise<{ success: boolean; message: string }> {
+export async function performLiveStripeCheck(
+  secretKey: string,
+  stripeClientFactory?: (key: string) => any
+): Promise<{ success: boolean; message: string; livemode?: boolean }> {
   try {
-    const stripe = new Stripe(secretKey, {
-      apiVersion: '2025-02-24.acacia' as any,
-    });
+    const stripe = stripeClientFactory
+      ? stripeClientFactory(secretKey)
+      : new Stripe(secretKey, {
+          apiVersion: '2025-02-24.acacia' as any,
+        });
     const balance = await stripe.balance.retrieve();
-    const livemode = balance.livemode ? 'LIVE' : 'TEST';
+    const livemode = Boolean(balance?.livemode);
+    const modeLabel = livemode ? 'LIVE' : 'TEST';
     return {
       success: true,
-      message: `Successfully connected to Stripe API in ${livemode} mode. Live balance object retrieved.`,
+      livemode,
+      message: `Successfully connected to Stripe API in ${modeLabel} mode. Live balance object retrieved.`,
     };
   } catch (err: any) {
+    const rawMsg = err?.message || String(err);
+    const sanitizedMsg = sanitizeLogOutput(rawMsg, [secretKey]);
     return {
       success: false,
-      message: `Stripe API connection failed: ${err?.message || err}`,
+      message: `Stripe API connection failed: ${sanitizedMsg}`,
     };
   }
 }
@@ -233,8 +257,13 @@ async function performLiveStripeCheck(secretKey: string): Promise<{ success: boo
 /**
  * CLI Entrypoint
  */
-export async function runValidatorCli(): Promise<number> {
-  const args = process.argv.slice(2);
+export async function runValidatorCli(
+  cliArgs?: string[],
+  cliEnv?: NodeJS.ProcessEnv,
+  stripeClientFactory?: (key: string) => any
+): Promise<number> {
+  const args = cliArgs || process.argv.slice(2);
+  const env = cliEnv || process.env;
   let mode: 'production' | 'test' | 'development' = 'production';
 
   for (const arg of args) {
@@ -244,8 +273,8 @@ export async function runValidatorCli(): Promise<number> {
   }
 
   if (!args.some((a) => a.startsWith('--mode='))) {
-    if (process.env.NODE_ENV === 'test') mode = 'test';
-    else if (process.env.NODE_ENV === 'development') mode = 'development';
+    if (env.NODE_ENV === 'test') mode = 'test';
+    else if (env.NODE_ENV === 'development') mode = 'development';
     else mode = 'production';
   }
 
@@ -256,12 +285,12 @@ export async function runValidatorCli(): Promise<number> {
 
   console.log('Configured Plans & Entitlements:');
   for (const plan of INTENDED_PLANS) {
-    const status = plan.envVar ? (process.env[plan.envVar] ? maskSecret(process.env[plan.envVar]) : '(not configured)') : 'N/A (Free)';
+    const status = plan.envVar ? (env[plan.envVar] ? maskSecret(env[plan.envVar]) : '(not configured)') : 'N/A (Free)';
     console.log(`  • ${plan.name.padEnd(16)}: $${plan.priceUsd.toString().padStart(2)} / ${plan.credits.toString().padStart(3)} credits [${plan.interval}] -> ${plan.envVar || 'None'}: ${status}`);
   }
   console.log();
 
-  const summary = validateBillingConfiguration(mode);
+  const summary = validateBillingConfiguration(mode, env);
 
   if (summary.issues.length === 0) {
     console.log(`✅ All ${mode} configuration checks PASSED with 0 errors and 0 warnings.\n`);
@@ -275,18 +304,28 @@ export async function runValidatorCli(): Promise<number> {
 
   // Check if live API check was requested
   const isLiveCheckRequested = args.includes('--live-check') || args.includes('--verify-api');
+  let liveCheckPassed = true;
+  let liveCheckError: string | null = null;
+
   if (isLiveCheckRequested) {
-    if (process.env.ALLOW_LIVE_STRIPE_CHECK !== 'true') {
-      console.log('⚠️  Live API check skipped: Set ALLOW_LIVE_STRIPE_CHECK=true to authorize outbound live Stripe API calls.\n');
-    } else if (!process.env.STRIPE_SECRET_KEY) {
-      console.log('❌ Live API check failed: STRIPE_SECRET_KEY is empty.\n');
+    const secretKey = env.STRIPE_SECRET_KEY?.trim() || '';
+    if (env.ALLOW_LIVE_STRIPE_CHECK !== 'true') {
+      liveCheckError = 'Live API check requested, but ALLOW_LIVE_STRIPE_CHECK is not set to "true". Refusing to make live calls without explicit authorization.';
+      console.error(`❌ [LIVE-CHECK ERROR] ${liveCheckError}\n`);
+      liveCheckPassed = false;
+    } else if (!secretKey) {
+      liveCheckError = 'Live API check requested, but STRIPE_SECRET_KEY is empty or not configured.';
+      console.error(`❌ [LIVE-CHECK ERROR] ${liveCheckError}\n`);
+      liveCheckPassed = false;
     } else {
       console.log('Executing authorized read-only Stripe API balance verification...');
-      const liveResult = await performLiveStripeCheck(process.env.STRIPE_SECRET_KEY);
+      const liveResult = await performLiveStripeCheck(secretKey, stripeClientFactory);
       if (liveResult.success) {
-        console.log(`✅ ${liveResult.message}\n`);
+        console.log(`✅ [LIVE-CHECK SUCCESS] ${liveResult.message}\n`);
       } else {
-        console.log(`❌ ${liveResult.message}\n`);
+        liveCheckError = liveResult.message;
+        console.error(`❌ [LIVE-CHECK ERROR] ${liveResult.message}\n`);
+        liveCheckPassed = false;
       }
     }
   }
@@ -306,7 +345,12 @@ export async function runValidatorCli(): Promise<number> {
     return 1;
   }
 
-  console.log(`\n✅ Configuration validation SUCCESSFUL for ${mode} mode.\n`);
+  if (isLiveCheckRequested && !liveCheckPassed) {
+    console.error(`\n❌ Live check failed or was unauthorized: ${liveCheckError || 'Live verification failed.'}\n`);
+    return 1;
+  }
+
+  console.log(`\n✅ Configuration validation SUCCESSFUL for ${mode} mode${isLiveCheckRequested ? ' (Live check passed)' : ''}.\n`);
   return 0;
 }
 

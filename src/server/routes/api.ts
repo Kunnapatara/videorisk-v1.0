@@ -1357,13 +1357,14 @@ apiRouter.delete('/scans/:id', async (req: Request, res: Response) => {
     }
 
     // Identify candidate paths for scan-owned media files and artifacts
+    // Identify candidate paths for scan-owned media files and artifacts
     const candidatePaths: string[] = [];
-    if (scan.videoPath) candidatePaths.push(scan.videoPath);
-    if (scan.thumbnailPath) candidatePaths.push(scan.thumbnailPath);
-    if (scan.proxyPath) candidatePaths.push(scan.proxyPath);
+    if (scan.videoPath && scan.videoPath.trim()) candidatePaths.push(scan.videoPath.trim());
+    if (scan.thumbnailPath && scan.thumbnailPath.trim()) candidatePaths.push(scan.thumbnailPath.trim());
+    if (scan.proxyPath && scan.proxyPath.trim()) candidatePaths.push(scan.proxyPath.trim());
 
     // Also check for generated proxy artifact even if proxyPath was not stored on scan record
-    if (scan.videoPath) {
+    if (scan.videoPath && scan.videoPath.trim()) {
       const baseName = path.basename(scan.videoPath, path.extname(scan.videoPath));
       const potentialProxy = path.join(uploadDir, 'proxies', `proxy_${baseName}.mp4`);
       if (fs.existsSync(potentialProxy) && !candidatePaths.includes(potentialProxy)) {
@@ -1420,15 +1421,54 @@ apiRouter.delete('/scans/:id', async (req: Request, res: Response) => {
       }, { systemBypass: true });
 
       return res.status(500).json({
-        error: 'Failed to completely remove media files from storage. Scan marked for cleanup retry.'
+        error: 'Failed to completely remove media files from storage. Scan marked for cleanup retry.',
+        scanId: scan.id,
+        status: 'CLEANUP_PENDING'
       });
     }
 
-    // Filesystem cleanup succeeded (or files were already absent / shared). Permanently delete DB records.
-    const deleted = await storage.scans.deleteScan(req.params.id);
+    // Filesystem cleanup succeeded (or files were already absent / shared).
+    // Attempt permanent database record purge.
+    let dbDeleted = false;
+    try {
+      dbDeleted = await storage.scans.deleteScan(req.params.id);
+    } catch (dbErr: any) {
+      console.error('[Storage] Database deletion failed for scan after file cleanup:', dbErr?.code || dbErr?.message || 'Database error');
+      dbDeleted = false;
+    }
+
+    if (!dbDeleted) {
+      // Partial failure state: Filesystem deletion succeeded, but DB deletion failed.
+      // Transition the scan record to a documented, detectable, and recoverable state (CLEANUP_PENDING),
+      // clear dangling file references, and record that media files were removed.
+      try {
+        await storage.scans.updateScan(scan.id, {
+          status: 'CLEANUP_PENDING',
+          videoPath: '',
+          thumbnailPath: '',
+          proxyPath: '',
+          error: 'Media assets removed from disk, but database record purge failed. Awaiting deletion retry.',
+          metadata: {
+            ...(scan.metadata || {} as any),
+            mediaCleaned: true,
+            mediaCleanedAt: new Date().toISOString(),
+            filesRemovedCount: filesRemoved
+          } as any
+        }, { systemBypass: true });
+      } catch (updateErr: any) {
+        console.error('[Storage] Failed to update scan record to CLEANUP_PENDING following database deletion error:', updateErr?.message || updateErr);
+      }
+
+      return res.status(500).json({
+        error: 'Media assets removed, but database deletion failed. Scan marked for deletion retry.',
+        scanId: scan.id,
+        status: 'CLEANUP_PENDING',
+        mediaCleaned: true
+      });
+    }
 
     res.json({
-      success: deleted,
+      success: true,
       deletedScanId: req.params.id,
       filesRemoved,
       message: 'Scan and associated assets securely deleted from storage.'

@@ -824,16 +824,16 @@ export class SqliteStorageRepository implements IStorageRepository {
       this.db.prepare('UPDATE users SET total_scans_count = total_scans_count + 1 WHERE id = ?').run(scan.userId);
 
       // Enqueue job for durable processing
-      if (scan.status === 'QUEUED') {
-        await this.queue.enqueueJob(scan.id);
-      } else {
+      if (scan.status === 'COMPLETED') {
         const id = `job_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
         const now = new Date().toISOString();
         this.db.prepare(`
           INSERT INTO job_queue (id, scan_id, status, attempts, max_attempts, run_at, created_at, updated_at)
-          VALUES (?, ?, ?, 0, 3, ?, ?, ?)
+          VALUES (?, ?, 'COMPLETED', 0, 3, ?, ?, ?)
           ON CONFLICT(scan_id) DO NOTHING
-        `).run(id, scan.id, scan.status, now, now, now);
+        `).run(id, scan.id, now, now, now);
+      } else {
+        await this.queue.enqueueJob(scan.id);
       }
 
       return scan;

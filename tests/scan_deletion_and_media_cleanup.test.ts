@@ -4,7 +4,7 @@ import fs from 'fs';
 import express from 'express';
 import { apiRouter } from '../src/server/routes/api';
 import { storage } from '../src/server/storage';
-import { validateBillingConfiguration, maskSecret, INTENDED_PLANS } from '../scripts/validate-env';
+import { validateBillingConfiguration, maskSecret, INTENDED_PLANS, runValidatorCli, sanitizeLogOutput } from '../scripts/validate-env';
 import { ScanJob } from '../src/types';
 
 export async function runScanDeletionAndMediaCleanupTests() {
@@ -370,6 +370,85 @@ export async function runScanDeletionAndMediaCleanupTests() {
     }
 
     // ---------------------------------------------------------
+    // Test 8b: Partial Failure Recovery (Files deleted, DB deletion fails, state inspectable, retry succeeds)
+    // ---------------------------------------------------------
+    console.log('[Test 8b: Partial Failure Recovery & Deletion Retry]');
+    const partialFailFile = path.join(tempUploads, `partial_fail_${Date.now()}.mp4`);
+    const partialFailProxy = path.join(tempProxies, `proxy_partial_fail_${Date.now()}.mp4`);
+    fs.writeFileSync(partialFailFile, 'PARTIAL_FAIL_ORIGINAL_DATA');
+    fs.writeFileSync(partialFailProxy, 'PARTIAL_FAIL_PROXY_DATA');
+
+    const scanPartialId = `scan_partial_${Date.now()}`;
+    await storage.scans.createScan({
+      id: scanPartialId,
+      userId: userA.id,
+      videoTitle: 'Partial Failure Scan',
+      videoFilename: 'partial.mp4',
+      videoPath: partialFailFile,
+      proxyPath: partialFailProxy,
+      scanMode: 'standard',
+      status: 'COMPLETED',
+      currentStage: 'Risk report',
+      completedStages: ['Upload'],
+      creditsUsed: 10,
+      createdAt: new Date().toISOString(),
+    });
+
+    // Intercept storage.scans.deleteScan to simulate temporary DB transaction failure
+    const realDeleteScan = storage.scans.deleteScan;
+    let shouldSimulateDbError = true;
+    storage.scans.deleteScan = async (id: string) => {
+      if (id === scanPartialId && shouldSimulateDbError) {
+        return false; // DB failure during deletion
+      }
+      return realDeleteScan(id);
+    };
+
+    try {
+      const delPartialRes = await fetch(`${baseUrl}/scans/${scanPartialId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${sessionTokenA}` },
+      });
+      assert.strictEqual(delPartialRes.status, 500, 'DELETE returns 500 when DB deletion fails');
+      const delPartialJson = await delPartialRes.json();
+      assert.strictEqual(delPartialJson.status, 'CLEANUP_PENDING', 'Response indicates CLEANUP_PENDING');
+      assert.strictEqual(delPartialJson.mediaCleaned, true, 'Response documents media was cleaned');
+
+      // Assert filesystem files WERE unlinked
+      assert(!fs.existsSync(partialFailFile), 'Original file was deleted from disk');
+      assert(!fs.existsSync(partialFailProxy), 'Proxy file was deleted from disk');
+
+      // Assert DB scan record is in documented, recoverable state (NOT healthy with dangling paths)
+      const inspectableScan = await storage.scans.getScan(scanPartialId);
+      assert(inspectableScan !== null, 'Scan remains in DB for recovery');
+      assert.strictEqual(inspectableScan?.status, 'CLEANUP_PENDING', 'Scan status is CLEANUP_PENDING');
+      assert(!inspectableScan?.videoPath, 'Scan videoPath cleared from dangling reference');
+      assert(!inspectableScan?.proxyPath, 'Scan proxyPath cleared from dangling reference');
+      assert.strictEqual((inspectableScan?.metadata as any)?.mediaCleaned, true, 'Metadata records media cleaned');
+
+      // Now simulate DB recovery and retry deletion
+      shouldSimulateDbError = false;
+      const retryRes = await fetch(`${baseUrl}/scans/${scanPartialId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${sessionTokenA}` },
+      });
+      assert.strictEqual(retryRes.status, 200, 'Deletion retry returns 200 OK after DB recovery');
+      const retryJson = await retryRes.json();
+      assert.strictEqual(retryJson.success, true, 'Retry marks success: true');
+      assert.strictEqual(retryJson.deletedScanId, scanPartialId, 'Deleted scan ID matches');
+
+      // Assert DB record is now purged
+      const purgedScan = await storage.scans.getScan(scanPartialId);
+      assert.strictEqual(purgedScan, null, 'Scan is completely purged from DB after retry');
+      console.log('  ✅ PASS: Partial deletion failure leaves detectable/recoverable state; retry cleans up DB.');
+    } finally {
+      storage.scans.deleteScan = realDeleteScan;
+      if (fs.existsSync(partialFailFile)) fs.unlinkSync(partialFailFile);
+      if (fs.existsSync(partialFailProxy)) fs.unlinkSync(partialFailProxy);
+      await storage.scans.deleteScan(scanPartialId);
+    }
+
+    // ---------------------------------------------------------
     // Test 9: Billing Environment Configuration Validator Unit Tests
     // ---------------------------------------------------------
     console.log('\n[Test 9: Billing Configuration Validation Engine]');
@@ -437,6 +516,100 @@ export async function runScanDeletionAndMediaCleanupTests() {
     assert.strictEqual(auditPlan?.priceUsd, 29, 'Audit is $29');
     assert.strictEqual(auditPlan?.credits, 60, 'Audit is 60 credits');
     console.log('  ✅ PASS: Billing validator accurately detects errors, malformations, and masks credentials.');
+
+    // ---------------------------------------------------------
+    // Test 10: CLI --live-check Reliability & Deployment Gate Tests
+    // ---------------------------------------------------------
+    console.log('\n[Test 10: CLI --live-check Reliability & Deployment Gate Tests]');
+
+    const validProdEnv = {
+      NODE_ENV: 'production',
+      ALLOW_LIVE_STRIPE_CHECK: 'true',
+      STRIPE_SECRET_KEY: 'sk_live_validmockkey12345678',
+      STRIPE_WEBHOOK_SECRET: 'whsec_validwebhook123456',
+      STRIPE_PRICE_CREATOR: 'price_creator_123',
+      STRIPE_PRICE_PRO: 'price_pro_123',
+      STRIPE_PRICE_AGENCY: 'price_agency_123',
+      STRIPE_PRICE_AUDIT_ONCE: 'price_audit_123',
+    };
+
+    // 10a. Static passes and live Stripe check succeeds -> exit code 0
+    const exit10a = await runValidatorCli(
+      ['--mode=production', '--live-check'],
+      validProdEnv,
+      () => ({
+        balance: {
+          retrieve: async () => ({ livemode: true }),
+        },
+      })
+    );
+    assert.strictEqual(exit10a, 0, 'Exit code 0 when static validation and live check succeed');
+
+    // 10b. Static passes but Stripe returns authentication or API error -> non-zero exit code
+    const exit10b = await runValidatorCli(
+      ['--mode=production', '--live-check'],
+      validProdEnv,
+      () => ({
+        balance: {
+          retrieve: async () => {
+            throw new Error('Invalid API Key provided: sk_live_validmockkey12345678');
+          },
+        },
+      })
+    );
+    assert.strictEqual(exit10b, 1, 'Non-zero exit code when Stripe returns an authentication error');
+
+    // 10c. Static passes but network/connection failure occurs -> non-zero exit code
+    const exit10c = await runValidatorCli(
+      ['--mode=production', '--live-check'],
+      validProdEnv,
+      () => ({
+        balance: {
+          retrieve: async () => {
+            const netErr: any = new Error('getaddrinfo ENOTFOUND api.stripe.com');
+            netErr.code = 'ENOTFOUND';
+            throw netErr;
+          },
+        },
+      })
+    );
+    assert.strictEqual(exit10c, 1, 'Non-zero exit code when network connection fails');
+
+    // 10d. Static validation fails -> non-zero exit code
+    const exit10d = await runValidatorCli(
+      ['--mode=production', '--live-check'],
+      {
+        ...validProdEnv,
+        STRIPE_SECRET_KEY: '', // Missing
+      }
+    );
+    assert.strictEqual(exit10d, 1, 'Non-zero exit code when static configuration is invalid');
+
+    // 10e. --live-check requested but authorization is missing (ALLOW_LIVE_STRIPE_CHECK != true) -> non-zero exit code
+    const exit10e = await runValidatorCli(
+      ['--mode=production', '--live-check'],
+      {
+        ...validProdEnv,
+        ALLOW_LIVE_STRIPE_CHECK: 'false',
+      }
+    );
+    assert.strictEqual(exit10e, 1, 'Non-zero exit code when live check requested without ALLOW_LIVE_STRIPE_CHECK=true');
+
+    // 10f. Failure output does not expose secret values
+    const rawErrorWithSecret = 'Error: Auth failed for key sk_live_secretkey987654321098 with header Bearer someToken12345678';
+    const sanitizedError = sanitizeLogOutput(rawErrorWithSecret, ['sk_live_secretkey987654321098']);
+    assert(!sanitizedError.includes('secretkey987654321098'), 'Full secret key string is not exposed');
+    assert(sanitizedError.includes('sk_live_...1098') || sanitizedError.includes('***'), 'Secret is masked');
+    assert(sanitizedError.includes('Bearer [REDACTED]'), 'Bearer token is redacted');
+
+    // 10g. Normal validation without --live-check retains intended existing behavior
+    const exit10g = await runValidatorCli(
+      ['--mode=production'],
+      validProdEnv
+    );
+    assert.strictEqual(exit10g, 0, 'Normal validation without --live-check returns 0 for valid config');
+
+    console.log('  ✅ PASS: All Stripe --live-check deployment gate and sanitization requirements verified.');
 
     console.log('======================================================');
     console.log('TEST SUITE 11 COMPLETE: All Deletion & Billing assertions passed!');
