@@ -1439,10 +1439,12 @@ apiRouter.delete('/scans/:id', async (req: Request, res: Response) => {
 
     if (!dbDeleted) {
       // Partial failure state: Filesystem deletion succeeded, but DB deletion failed.
-      // Transition the scan record to a documented, detectable, and recoverable state (CLEANUP_PENDING),
+      // Attempt to transition the scan record to a documented, detectable, and recoverable state (CLEANUP_PENDING),
       // clear dangling file references, and record that media files were removed.
+      let recoveryConfirmed = false;
+
       try {
-        await storage.scans.updateScan(scan.id, {
+        const updateResult = await storage.scans.updateScan(scan.id, {
           status: 'CLEANUP_PENDING',
           videoPath: '',
           thumbnailPath: '',
@@ -1455,15 +1457,44 @@ apiRouter.delete('/scans/:id', async (req: Request, res: Response) => {
             filesRemovedCount: filesRemoved
           } as any
         }, { systemBypass: true });
+
+        // Storage contract: updateScan returns null if record was not found or update could not be performed
+        if (updateResult) {
+          // Re-read scan record to determine its actual persisted state rather than inferring from attempted update
+          try {
+            const persistedScan = await storage.scans.getScan(scan.id);
+            if (persistedScan && persistedScan.status === 'CLEANUP_PENDING') {
+              recoveryConfirmed = true;
+            } else {
+              console.warn(`[Storage] Scan ${scan.id} status after recovery update is not CLEANUP_PENDING: ${persistedScan?.status}`);
+            }
+          } catch (readErr: any) {
+            console.error('[Storage] Failed to re-read scan to verify recovery persistence:', readErr?.message || readErr);
+          }
+        } else {
+          console.warn(`[Storage] updateScan returned null for scan ${scan.id} during deletion recovery.`);
+        }
       } catch (updateErr: any) {
-        console.error('[Storage] Failed to update scan record to CLEANUP_PENDING following database deletion error:', updateErr?.message || updateErr);
+        console.error('[Storage] Failed to update scan record during deletion recovery:', updateErr?.message || updateErr);
       }
 
+      if (recoveryConfirmed) {
+        return res.status(500).json({
+          error: 'Media assets removed, but database deletion failed. Scan marked for deletion retry.',
+          scanId: scan.id,
+          status: 'CLEANUP_PENDING',
+          mediaCleaned: true,
+          statePersisted: true
+        });
+      }
+
+      // If recovery update failed or could not be confirmed via re-read:
+      // Truthful error response: do NOT falsely claim CLEANUP_PENDING or mediaCleaned: true was persisted.
+      console.error(`[Storage] CRITICAL: Scan deletion failed and recovery state could not be confirmed for scan ${scan.id}. Files removed: ${filesRemoved}. Diagnostic information preserved for operational investigation.`);
       return res.status(500).json({
-        error: 'Media assets removed, but database deletion failed. Scan marked for deletion retry.',
+        error: 'Media assets removed, but database deletion and recovery state persistence could not be confirmed.',
         scanId: scan.id,
-        status: 'CLEANUP_PENDING',
-        mediaCleaned: true
+        statePersisted: false
       });
     }
 

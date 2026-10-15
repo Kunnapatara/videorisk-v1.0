@@ -413,6 +413,7 @@ export async function runScanDeletionAndMediaCleanupTests() {
       const delPartialJson = await delPartialRes.json();
       assert.strictEqual(delPartialJson.status, 'CLEANUP_PENDING', 'Response indicates CLEANUP_PENDING');
       assert.strictEqual(delPartialJson.mediaCleaned, true, 'Response documents media was cleaned');
+      assert.strictEqual(delPartialJson.statePersisted, true, 'Response confirms state was persisted');
 
       // Assert filesystem files WERE unlinked
       assert(!fs.existsSync(partialFailFile), 'Original file was deleted from disk');
@@ -446,6 +447,241 @@ export async function runScanDeletionAndMediaCleanupTests() {
       if (fs.existsSync(partialFailFile)) fs.unlinkSync(partialFailFile);
       if (fs.existsSync(partialFailProxy)) fs.unlinkSync(partialFailProxy);
       await storage.scans.deleteScan(scanPartialId);
+    }
+
+    // ---------------------------------------------------------
+    // Test 8c: Database deletion fails, recovery update fails (truthful response with statePersisted: false)
+    // ---------------------------------------------------------
+    console.log('[Test 8c: DB Deletion Fails and Recovery Update Fails]');
+    const failRecoveryFile = path.join(tempUploads, `fail_recovery_${Date.now()}.mp4`);
+    fs.writeFileSync(failRecoveryFile, 'FAIL_RECOVERY_DATA');
+
+    const scanFailRecoveryId = `scan_fail_rec_${Date.now()}`;
+    await storage.scans.createScan({
+      id: scanFailRecoveryId,
+      userId: userA.id,
+      videoTitle: 'Fail Recovery Scan',
+      videoFilename: 'fail_rec.mp4',
+      videoPath: failRecoveryFile,
+      scanMode: 'standard',
+      status: 'COMPLETED',
+      currentStage: 'Risk report',
+      completedStages: ['Upload'],
+      creditsUsed: 10,
+      createdAt: new Date().toISOString(),
+    });
+
+    const realDeleteScan8c = storage.scans.deleteScan;
+    const realUpdateScan8c = storage.scans.updateScan;
+
+    let simulateDbDeleteFail = true;
+    storage.scans.deleteScan = async (id: string) => {
+      if (id === scanFailRecoveryId && simulateDbDeleteFail) {
+        return false;
+      }
+      return realDeleteScan8c(id);
+    };
+
+    let simulateUpdateFail = true;
+    storage.scans.updateScan = async (id: string, updates: any, leaseToken?: any) => {
+      if (id === scanFailRecoveryId && simulateUpdateFail) {
+        throw new Error('Disk full / SQLite write error during updateScan');
+      }
+      return realUpdateScan8c(id, updates, leaseToken);
+    };
+
+    try {
+      const delRes = await fetch(`${baseUrl}/scans/${scanFailRecoveryId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${sessionTokenA}` },
+      });
+      assert.strictEqual(delRes.status, 500, 'Returns 500 when both deletion and recovery update fail');
+      const delJson = await delRes.json();
+
+      // Truthful response assertions:
+      assert.strictEqual(delJson.statePersisted, false, 'Explicitly indicates recovery persistence was not confirmed');
+      assert.strictEqual(delJson.status, undefined, 'Must NOT falsely claim status is CLEANUP_PENDING');
+      assert.strictEqual(delJson.mediaCleaned, undefined, 'Must NOT claim mediaCleaned: true when state unconfirmed');
+      assert(!delJson.error.includes('/'), 'Error message does not leak raw filesystem paths');
+
+      // Assert filesystem file WAS unlinked
+      assert(!fs.existsSync(failRecoveryFile), 'Original media file was unlinked from disk');
+
+      // Assert DB scan record retains its uncorrupted status in DB
+      const currentDbScan = await storage.scans.getScan(scanFailRecoveryId);
+      assert(currentDbScan !== null, 'Scan remains in DB');
+      assert.strictEqual(currentDbScan?.status, 'COMPLETED', 'Scan was not mutated to unpersisted recovery state');
+
+      // Test subsequent retry when DB operations recover
+      simulateDbDeleteFail = false;
+      simulateUpdateFail = false;
+      const retryRes = await fetch(`${baseUrl}/scans/${scanFailRecoveryId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${sessionTokenA}` },
+      });
+      assert.strictEqual(retryRes.status, 200, 'Subsequent retry succeeds once database recovers');
+      const retryJson = await retryRes.json();
+      assert.strictEqual(retryJson.success, true, 'Retry reports success');
+
+      const purgedScan = await storage.scans.getScan(scanFailRecoveryId);
+      assert.strictEqual(purgedScan, null, 'Scan record completely purged on retry');
+      console.log('  ✅ PASS: Recovery update failure accurately reports statePersisted: false without false claims; retry succeeds.');
+    } finally {
+      storage.scans.deleteScan = realDeleteScan8c;
+      storage.scans.updateScan = realUpdateScan8c;
+      if (fs.existsSync(failRecoveryFile)) fs.unlinkSync(failRecoveryFile);
+      await storage.scans.deleteScan(scanFailRecoveryId);
+    }
+
+    // ---------------------------------------------------------
+    // Test 8d: Database deletion fails, recovery update succeeds but re-read cannot confirm state
+    // ---------------------------------------------------------
+    console.log('[Test 8d: Recovery State Cannot Be Confirmed Via Re-Read]');
+    const unconfirmedFile = path.join(tempUploads, `unconfirmed_${Date.now()}.mp4`);
+    fs.writeFileSync(unconfirmedFile, 'UNCONFIRMED_DATA');
+
+    const scanUnconfirmedId = `scan_unconfirmed_${Date.now()}`;
+    await storage.scans.createScan({
+      id: scanUnconfirmedId,
+      userId: userA.id,
+      videoTitle: 'Unconfirmed Recovery Scan',
+      videoFilename: 'unconf.mp4',
+      videoPath: unconfirmedFile,
+      scanMode: 'standard',
+      status: 'COMPLETED',
+      currentStage: 'Risk report',
+      completedStages: ['Upload'],
+      creditsUsed: 10,
+      createdAt: new Date().toISOString(),
+    });
+
+    const realDeleteScan8d = storage.scans.deleteScan;
+    const realGetScan8d = storage.scans.getScan;
+
+    storage.scans.deleteScan = async (id: string) => {
+      if (id === scanUnconfirmedId) {
+        return false;
+      }
+      return realDeleteScan8d(id);
+    };
+
+    let getScanCallCount = 0;
+    storage.scans.getScan = async (id: string) => {
+      if (id === scanUnconfirmedId) {
+        getScanCallCount++;
+        // First call is initial route lookup -> return valid scan
+        if (getScanCallCount === 1) {
+          return realGetScan8d(id);
+        }
+        // Second call is the re-read confirmation -> simulate returning un-updated status
+        const scanObj = await realGetScan8d(id);
+        return {
+          ...scanObj!,
+          status: 'PROCESSING' as any, // Not CLEANUP_PENDING
+        };
+      }
+      return realGetScan8d(id);
+    };
+
+    try {
+      const delRes = await fetch(`${baseUrl}/scans/${scanUnconfirmedId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${sessionTokenA}` },
+      });
+      assert.strictEqual(delRes.status, 500, 'Returns 500 when recovery cannot be confirmed');
+      const delJson = await delRes.json();
+      assert.strictEqual(delJson.statePersisted, false, 'statePersisted is false when re-read does not confirm state');
+      assert.strictEqual(delJson.status, undefined, 'Does not falsely claim status is CLEANUP_PENDING');
+      console.log('  ✅ PASS: Unconfirmed re-read state correctly reports statePersisted: false.');
+    } finally {
+      storage.scans.deleteScan = realDeleteScan8d;
+      storage.scans.getScan = realGetScan8d;
+      if (fs.existsSync(unconfirmedFile)) fs.unlinkSync(unconfirmedFile);
+      await storage.scans.deleteScan(scanUnconfirmedId);
+    }
+
+    // ---------------------------------------------------------
+    // Test 8e: Retry behavior preserves shared media and enforces safe path validation
+    // ---------------------------------------------------------
+    console.log('[Test 8e: Retry Behavior with Shared Media & Path Validation]');
+    const retrySharedFile = path.join(tempUploads, `retry_shared_${Date.now()}.mp4`);
+    fs.writeFileSync(retrySharedFile, 'RETRY_SHARED_MEDIA_DATA');
+
+    const scanRetryParent = `scan_retry_parent_${Date.now()}`;
+    const scanRetryChild = `scan_retry_child_${Date.now()}`;
+
+    await storage.scans.createScan({
+      id: scanRetryParent,
+      userId: userA.id,
+      videoTitle: 'Retry Parent Scan',
+      videoFilename: 'retry_shared.mp4',
+      videoPath: retrySharedFile,
+      scanMode: 'standard',
+      status: 'COMPLETED',
+      currentStage: 'Risk report',
+      completedStages: ['Upload'],
+      creditsUsed: 10,
+      createdAt: new Date().toISOString(),
+    });
+
+    await storage.scans.createScan({
+      id: scanRetryChild,
+      userId: userA.id,
+      videoTitle: 'Retry Child Scan (Dependent)',
+      videoFilename: 'retry_shared.mp4',
+      videoPath: retrySharedFile,
+      scanMode: 'standard',
+      status: 'COMPLETED',
+      currentStage: 'Risk report',
+      completedStages: ['Upload'],
+      creditsUsed: 10,
+      createdAt: new Date().toISOString(),
+    });
+
+    const realDeleteScan8e = storage.scans.deleteScan;
+    let simulateDbError8e = true;
+    storage.scans.deleteScan = async (id: string) => {
+      if (id === scanRetryParent && simulateDbError8e) {
+        return false;
+      }
+      return realDeleteScan8e(id);
+    };
+
+    try {
+      // First attempt on parent: shared media is NOT deleted; DB deletion fails; recovery updates state
+      const firstRes = await fetch(`${baseUrl}/scans/${scanRetryParent}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${sessionTokenA}` },
+      });
+      assert.strictEqual(firstRes.status, 500, 'First delete returns 500 on DB failure');
+      assert(fs.existsSync(retrySharedFile), 'Shared file is NOT unlinked because child scan references it');
+
+      // Second attempt (retry) after DB recovers:
+      simulateDbError8e = false;
+      const retryRes = await fetch(`${baseUrl}/scans/${scanRetryParent}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${sessionTokenA}` },
+      });
+      assert.strictEqual(retryRes.status, 200, 'Retry returns 200 OK after DB recovers');
+
+      // Crucial: Shared file MUST STILL EXIST because child scan still references it!
+      assert(fs.existsSync(retrySharedFile), 'Shared file STILL exists after parent deletion retry because child still references it');
+      const parentInDb = await storage.scans.getScan(scanRetryParent);
+      assert.strictEqual(parentInDb, null, 'Parent scan is now purged from DB');
+
+      // Now delete child scan:
+      const childRes = await fetch(`${baseUrl}/scans/${scanRetryChild}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${sessionTokenA}` },
+      });
+      assert.strictEqual(childRes.status, 200, 'Child deletion returns 200');
+      assert(!fs.existsSync(retrySharedFile), 'Shared file is finally unlinked once child is also deleted');
+      console.log('  ✅ PASS: Retry preserves shared media and safely purges record without data corruption.');
+    } finally {
+      storage.scans.deleteScan = realDeleteScan8e;
+      if (fs.existsSync(retrySharedFile)) fs.unlinkSync(retrySharedFile);
+      await storage.scans.deleteScan(scanRetryParent);
+      await storage.scans.deleteScan(scanRetryChild);
     }
 
     // ---------------------------------------------------------
