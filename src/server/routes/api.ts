@@ -1476,8 +1476,8 @@ apiRouter.delete('/scans/:id', async (req: Request, res: Response) => {
               verificationIssue = 'proxyPath was not cleared';
             } else if ((persistedScan.metadata as any)?.mediaCleaned !== true) {
               verificationIssue = 'metadata.mediaCleaned is not true';
-            } else if (typeof (persistedScan.metadata as any)?.mediaCleanedAt !== 'string' || !(persistedScan.metadata as any)?.mediaCleanedAt) {
-              verificationIssue = 'metadata.mediaCleanedAt timestamp is missing';
+            } else if (typeof (persistedScan.metadata as any)?.mediaCleanedAt !== 'string' || (persistedScan.metadata as any)?.mediaCleanedAt.trim() === '') {
+              verificationIssue = 'metadata.mediaCleanedAt timestamp is missing or whitespace-only';
             } else if (typeof (persistedScan.metadata as any)?.filesRemovedCount !== 'number' || (persistedScan.metadata as any)?.filesRemovedCount !== filesRemoved) {
               verificationIssue = `metadata.filesRemovedCount mismatch (expected: ${filesRemoved}, got: ${(persistedScan.metadata as any)?.filesRemovedCount})`;
             } else {

@@ -854,6 +854,76 @@ export async function runScanDeletionAndMediaCleanupTests() {
     }
 
     // ---------------------------------------------------------
+    // Test 8d6: Whitespace-only mediaCleanedAt timestamp rejected
+    // ---------------------------------------------------------
+    console.log('[Test 8d6: Whitespace-only mediaCleanedAt Rejection]');
+    const wsTimeFile = path.join(tempUploads, `ws_time_${Date.now()}.mp4`);
+    fs.writeFileSync(wsTimeFile, 'WS_TIME_DATA');
+
+    const scanWsTimeId = `scan_ws_time_${Date.now()}`;
+    await storage.scans.createScan({
+      id: scanWsTimeId,
+      userId: userA.id,
+      videoTitle: 'Whitespace Time Scan',
+      videoFilename: 'ws_time.mp4',
+      videoPath: wsTimeFile,
+      scanMode: 'standard',
+      status: 'COMPLETED',
+      currentStage: 'Risk report',
+      completedStages: ['Upload'],
+      creditsUsed: 10,
+      createdAt: new Date().toISOString(),
+    });
+
+    const realDeleteScan8d6 = storage.scans.deleteScan;
+    const realGetScan8d6 = storage.scans.getScan;
+
+    storage.scans.deleteScan = async (id: string) => {
+      if (id === scanWsTimeId) return false;
+      return realDeleteScan8d6(id);
+    };
+
+    let callCount8d6 = 0;
+    storage.scans.getScan = async (id: string) => {
+      if (id === scanWsTimeId) {
+        callCount8d6++;
+        if (callCount8d6 === 1) return realGetScan8d6(id);
+        const scanObj = await realGetScan8d6(id);
+        return {
+          ...scanObj!,
+          status: 'CLEANUP_PENDING' as any,
+          videoPath: '',
+          thumbnailPath: '',
+          proxyPath: '',
+          metadata: {
+            mediaCleaned: true,
+            mediaCleanedAt: '   ',
+            filesRemovedCount: 1,
+          } as any,
+        };
+      }
+      return realGetScan8d6(id);
+    };
+
+    try {
+      const delRes = await fetch(`${baseUrl}/scans/${scanWsTimeId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${sessionTokenA}` },
+      });
+      assert.strictEqual(delRes.status, 500, 'Returns 500 when mediaCleanedAt contains only whitespace');
+      const delJson = await delRes.json();
+      assert.strictEqual(delJson.statePersisted, false, 'statePersisted is false when mediaCleanedAt is whitespace-only');
+      assert.strictEqual(delJson.status, undefined, 'Does not falsely claim status is CLEANUP_PENDING');
+      assert.strictEqual(delJson.mediaCleaned, undefined, 'Does not falsely claim mediaCleaned: true');
+      console.log('  ✅ PASS: Whitespace-only mediaCleanedAt timestamp rejected.');
+    } finally {
+      storage.scans.deleteScan = realDeleteScan8d6;
+      storage.scans.getScan = realGetScan8d6;
+      if (fs.existsSync(wsTimeFile)) fs.unlinkSync(wsTimeFile);
+      await storage.scans.deleteScan(scanWsTimeId);
+    }
+
+    // ---------------------------------------------------------
     // Test 8e: Retry behavior preserves shared media and enforces safe path validation
     // ---------------------------------------------------------
     console.log('[Test 8e: Retry Behavior with Shared Media & Path Validation]');
