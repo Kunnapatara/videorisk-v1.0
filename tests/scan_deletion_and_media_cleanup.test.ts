@@ -424,8 +424,11 @@ export async function runScanDeletionAndMediaCleanupTests() {
       assert(inspectableScan !== null, 'Scan remains in DB for recovery');
       assert.strictEqual(inspectableScan?.status, 'CLEANUP_PENDING', 'Scan status is CLEANUP_PENDING');
       assert(!inspectableScan?.videoPath, 'Scan videoPath cleared from dangling reference');
+      assert(!inspectableScan?.thumbnailPath, 'Scan thumbnailPath cleared from dangling reference');
       assert(!inspectableScan?.proxyPath, 'Scan proxyPath cleared from dangling reference');
       assert.strictEqual((inspectableScan?.metadata as any)?.mediaCleaned, true, 'Metadata records media cleaned');
+      assert(typeof (inspectableScan?.metadata as any)?.mediaCleanedAt === 'string', 'Metadata records cleanup timestamp');
+      assert.strictEqual((inspectableScan?.metadata as any)?.filesRemovedCount, 2, 'Metadata records exact count of files removed');
 
       // Now simulate DB recovery and retry deletion
       shouldSimulateDbError = false;
@@ -534,19 +537,19 @@ export async function runScanDeletionAndMediaCleanupTests() {
     }
 
     // ---------------------------------------------------------
-    // Test 8d: Database deletion fails, recovery update succeeds but re-read cannot confirm state
+    // Test 8d1: Status-only false positive (status: CLEANUP_PENDING, but videoPath remains uncleared)
     // ---------------------------------------------------------
-    console.log('[Test 8d: Recovery State Cannot Be Confirmed Via Re-Read]');
-    const unconfirmedFile = path.join(tempUploads, `unconfirmed_${Date.now()}.mp4`);
-    fs.writeFileSync(unconfirmedFile, 'UNCONFIRMED_DATA');
+    console.log('[Test 8d1: Status-Only False Positive (Uncleared videoPath)]');
+    const falsePosFile = path.join(tempUploads, `false_pos_vid_${Date.now()}.mp4`);
+    fs.writeFileSync(falsePosFile, 'FALSE_POS_VID_DATA');
 
-    const scanUnconfirmedId = `scan_unconfirmed_${Date.now()}`;
+    const scanFalsePosId = `scan_false_pos_${Date.now()}`;
     await storage.scans.createScan({
-      id: scanUnconfirmedId,
+      id: scanFalsePosId,
       userId: userA.id,
-      videoTitle: 'Unconfirmed Recovery Scan',
-      videoFilename: 'unconf.mp4',
-      videoPath: unconfirmedFile,
+      videoTitle: 'False Positive Video Scan',
+      videoFilename: 'false_pos.mp4',
+      videoPath: falsePosFile,
       scanMode: 'standard',
       status: 'COMPLETED',
       currentStage: 'Risk report',
@@ -555,49 +558,299 @@ export async function runScanDeletionAndMediaCleanupTests() {
       createdAt: new Date().toISOString(),
     });
 
-    const realDeleteScan8d = storage.scans.deleteScan;
-    const realGetScan8d = storage.scans.getScan;
+    const realDeleteScan8d1 = storage.scans.deleteScan;
+    const realGetScan8d1 = storage.scans.getScan;
 
     storage.scans.deleteScan = async (id: string) => {
-      if (id === scanUnconfirmedId) {
-        return false;
-      }
-      return realDeleteScan8d(id);
+      if (id === scanFalsePosId) return false;
+      return realDeleteScan8d1(id);
     };
 
-    let getScanCallCount = 0;
+    let callCount8d1 = 0;
     storage.scans.getScan = async (id: string) => {
-      if (id === scanUnconfirmedId) {
-        getScanCallCount++;
-        // First call is initial route lookup -> return valid scan
-        if (getScanCallCount === 1) {
-          return realGetScan8d(id);
-        }
-        // Second call is the re-read confirmation -> simulate returning un-updated status
-        const scanObj = await realGetScan8d(id);
+      if (id === scanFalsePosId) {
+        callCount8d1++;
+        if (callCount8d1 === 1) return realGetScan8d1(id);
+        const scanObj = await realGetScan8d1(id);
+        // Simulate re-read where status is CLEANUP_PENDING but videoPath is uncleared
         return {
           ...scanObj!,
-          status: 'PROCESSING' as any, // Not CLEANUP_PENDING
+          status: 'CLEANUP_PENDING' as any,
+          videoPath: '/var/storage/uncleared_video.mp4',
         };
       }
-      return realGetScan8d(id);
+      return realGetScan8d1(id);
     };
 
     try {
-      const delRes = await fetch(`${baseUrl}/scans/${scanUnconfirmedId}`, {
+      const delRes = await fetch(`${baseUrl}/scans/${scanFalsePosId}`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${sessionTokenA}` },
       });
-      assert.strictEqual(delRes.status, 500, 'Returns 500 when recovery cannot be confirmed');
+      assert.strictEqual(delRes.status, 500, 'Returns 500 when videoPath is not verified cleared');
       const delJson = await delRes.json();
-      assert.strictEqual(delJson.statePersisted, false, 'statePersisted is false when re-read does not confirm state');
+      assert.strictEqual(delJson.statePersisted, false, 'statePersisted is false when videoPath uncleared');
       assert.strictEqual(delJson.status, undefined, 'Does not falsely claim status is CLEANUP_PENDING');
-      console.log('  ✅ PASS: Unconfirmed re-read state correctly reports statePersisted: false.');
+      assert.strictEqual(delJson.mediaCleaned, undefined, 'Does not falsely claim mediaCleaned: true');
+      console.log('  ✅ PASS: Status-only false positive with uncleared videoPath rejected.');
     } finally {
-      storage.scans.deleteScan = realDeleteScan8d;
-      storage.scans.getScan = realGetScan8d;
-      if (fs.existsSync(unconfirmedFile)) fs.unlinkSync(unconfirmedFile);
-      await storage.scans.deleteScan(scanUnconfirmedId);
+      storage.scans.deleteScan = realDeleteScan8d1;
+      storage.scans.getScan = realGetScan8d1;
+      if (fs.existsSync(falsePosFile)) fs.unlinkSync(falsePosFile);
+      await storage.scans.deleteScan(scanFalsePosId);
+    }
+
+    // ---------------------------------------------------------
+    // Test 8d2: Thumbnail path remains stale (status: CLEANUP_PENDING, but thumbnailPath not cleared)
+    // ---------------------------------------------------------
+    console.log('[Test 8d2: Stale thumbnailPath Rejection]');
+    const staleThumbFile = path.join(tempUploads, `stale_thumb_${Date.now()}.mp4`);
+    fs.writeFileSync(staleThumbFile, 'STALE_THUMB_DATA');
+
+    const scanStaleThumbId = `scan_stale_thumb_${Date.now()}`;
+    await storage.scans.createScan({
+      id: scanStaleThumbId,
+      userId: userA.id,
+      videoTitle: 'Stale Thumbnail Scan',
+      videoFilename: 'stale_thumb.mp4',
+      videoPath: staleThumbFile,
+      scanMode: 'standard',
+      status: 'COMPLETED',
+      currentStage: 'Risk report',
+      completedStages: ['Upload'],
+      creditsUsed: 10,
+      createdAt: new Date().toISOString(),
+    });
+
+    const realDeleteScan8d2 = storage.scans.deleteScan;
+    const realGetScan8d2 = storage.scans.getScan;
+
+    storage.scans.deleteScan = async (id: string) => {
+      if (id === scanStaleThumbId) return false;
+      return realDeleteScan8d2(id);
+    };
+
+    let callCount8d2 = 0;
+    storage.scans.getScan = async (id: string) => {
+      if (id === scanStaleThumbId) {
+        callCount8d2++;
+        if (callCount8d2 === 1) return realGetScan8d2(id);
+        const scanObj = await realGetScan8d2(id);
+        return {
+          ...scanObj!,
+          status: 'CLEANUP_PENDING' as any,
+          videoPath: '',
+          thumbnailPath: '/var/storage/stale_thumbnail.jpg',
+        };
+      }
+      return realGetScan8d2(id);
+    };
+
+    try {
+      const delRes = await fetch(`${baseUrl}/scans/${scanStaleThumbId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${sessionTokenA}` },
+      });
+      assert.strictEqual(delRes.status, 500, 'Returns 500 when thumbnailPath is stale');
+      const delJson = await delRes.json();
+      assert.strictEqual(delJson.statePersisted, false, 'statePersisted is false when thumbnailPath is stale');
+      assert.strictEqual(delJson.status, undefined, 'Does not falsely claim status is CLEANUP_PENDING');
+      assert.strictEqual(delJson.mediaCleaned, undefined, 'Does not falsely claim mediaCleaned: true');
+      console.log('  ✅ PASS: Stale thumbnailPath rejected.');
+    } finally {
+      storage.scans.deleteScan = realDeleteScan8d2;
+      storage.scans.getScan = realGetScan8d2;
+      if (fs.existsSync(staleThumbFile)) fs.unlinkSync(staleThumbFile);
+      await storage.scans.deleteScan(scanStaleThumbId);
+    }
+
+    // ---------------------------------------------------------
+    // Test 8d3: Proxy path remains stale (status: CLEANUP_PENDING, but proxyPath not cleared)
+    // ---------------------------------------------------------
+    console.log('[Test 8d3: Stale proxyPath Rejection]');
+    const staleProxyFile = path.join(tempUploads, `stale_proxy_${Date.now()}.mp4`);
+    fs.writeFileSync(staleProxyFile, 'STALE_PROXY_DATA');
+
+    const scanStaleProxyId = `scan_stale_proxy_${Date.now()}`;
+    await storage.scans.createScan({
+      id: scanStaleProxyId,
+      userId: userA.id,
+      videoTitle: 'Stale Proxy Scan',
+      videoFilename: 'stale_proxy.mp4',
+      videoPath: staleProxyFile,
+      scanMode: 'standard',
+      status: 'COMPLETED',
+      currentStage: 'Risk report',
+      completedStages: ['Upload'],
+      creditsUsed: 10,
+      createdAt: new Date().toISOString(),
+    });
+
+    const realDeleteScan8d3 = storage.scans.deleteScan;
+    const realGetScan8d3 = storage.scans.getScan;
+
+    storage.scans.deleteScan = async (id: string) => {
+      if (id === scanStaleProxyId) return false;
+      return realDeleteScan8d3(id);
+    };
+
+    let callCount8d3 = 0;
+    storage.scans.getScan = async (id: string) => {
+      if (id === scanStaleProxyId) {
+        callCount8d3++;
+        if (callCount8d3 === 1) return realGetScan8d3(id);
+        const scanObj = await realGetScan8d3(id);
+        return {
+          ...scanObj!,
+          status: 'CLEANUP_PENDING' as any,
+          videoPath: '',
+          thumbnailPath: '',
+          proxyPath: '/var/storage/stale_proxy.mp4',
+        };
+      }
+      return realGetScan8d3(id);
+    };
+
+    try {
+      const delRes = await fetch(`${baseUrl}/scans/${scanStaleProxyId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${sessionTokenA}` },
+      });
+      assert.strictEqual(delRes.status, 500, 'Returns 500 when proxyPath is stale');
+      const delJson = await delRes.json();
+      assert.strictEqual(delJson.statePersisted, false, 'statePersisted is false when proxyPath is stale');
+      assert.strictEqual(delJson.status, undefined, 'Does not falsely claim status is CLEANUP_PENDING');
+      assert.strictEqual(delJson.mediaCleaned, undefined, 'Does not falsely claim mediaCleaned: true');
+      console.log('  ✅ PASS: Stale proxyPath rejected.');
+    } finally {
+      storage.scans.deleteScan = realDeleteScan8d3;
+      storage.scans.getScan = realGetScan8d3;
+      if (fs.existsSync(staleProxyFile)) fs.unlinkSync(staleProxyFile);
+      await storage.scans.deleteScan(scanStaleProxyId);
+    }
+
+    // ---------------------------------------------------------
+    // Test 8d4: Metadata is stale or missing (metadata.mediaCleaned not true)
+    // ---------------------------------------------------------
+    console.log('[Test 8d4: Stale or Missing Metadata Rejection]');
+    const staleMetaFile = path.join(tempUploads, `stale_meta_${Date.now()}.mp4`);
+    fs.writeFileSync(staleMetaFile, 'STALE_META_DATA');
+
+    const scanStaleMetaId = `scan_stale_meta_${Date.now()}`;
+    await storage.scans.createScan({
+      id: scanStaleMetaId,
+      userId: userA.id,
+      videoTitle: 'Stale Metadata Scan',
+      videoFilename: 'stale_meta.mp4',
+      videoPath: staleMetaFile,
+      scanMode: 'standard',
+      status: 'COMPLETED',
+      currentStage: 'Risk report',
+      completedStages: ['Upload'],
+      creditsUsed: 10,
+      createdAt: new Date().toISOString(),
+    });
+
+    const realDeleteScan8d4 = storage.scans.deleteScan;
+    const realGetScan8d4 = storage.scans.getScan;
+
+    storage.scans.deleteScan = async (id: string) => {
+      if (id === scanStaleMetaId) return false;
+      return realDeleteScan8d4(id);
+    };
+
+    let callCount8d4 = 0;
+    storage.scans.getScan = async (id: string) => {
+      if (id === scanStaleMetaId) {
+        callCount8d4++;
+        if (callCount8d4 === 1) return realGetScan8d4(id);
+        const scanObj = await realGetScan8d4(id);
+        return {
+          ...scanObj!,
+          status: 'CLEANUP_PENDING' as any,
+          videoPath: '',
+          thumbnailPath: '',
+          proxyPath: '',
+          metadata: { mediaCleaned: false } as any, // Not true!
+        };
+      }
+      return realGetScan8d4(id);
+    };
+
+    try {
+      const delRes = await fetch(`${baseUrl}/scans/${scanStaleMetaId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${sessionTokenA}` },
+      });
+      assert.strictEqual(delRes.status, 500, 'Returns 500 when metadata.mediaCleaned is not true');
+      const delJson = await delRes.json();
+      assert.strictEqual(delJson.statePersisted, false, 'statePersisted is false when metadata is stale/missing');
+      assert.strictEqual(delJson.status, undefined, 'Does not falsely claim status is CLEANUP_PENDING');
+      assert.strictEqual(delJson.mediaCleaned, undefined, 'Does not falsely claim mediaCleaned: true');
+      console.log('  ✅ PASS: Stale/missing metadata.mediaCleaned rejected.');
+    } finally {
+      storage.scans.deleteScan = realDeleteScan8d4;
+      storage.scans.getScan = realGetScan8d4;
+      if (fs.existsSync(staleMetaFile)) fs.unlinkSync(staleMetaFile);
+      await storage.scans.deleteScan(scanStaleMetaId);
+    }
+
+    // ---------------------------------------------------------
+    // Test 8d5: Recovery re-read fails or returns no record
+    // ---------------------------------------------------------
+    console.log('[Test 8d5: Recovery Re-read Failure or Null Record]');
+    const readFailFile = path.join(tempUploads, `read_fail_${Date.now()}.mp4`);
+    fs.writeFileSync(readFailFile, 'READ_FAIL_DATA');
+
+    const scanReadFailId = `scan_read_fail_${Date.now()}`;
+    await storage.scans.createScan({
+      id: scanReadFailId,
+      userId: userA.id,
+      videoTitle: 'Read Fail Scan',
+      videoFilename: 'read_fail.mp4',
+      videoPath: readFailFile,
+      scanMode: 'standard',
+      status: 'COMPLETED',
+      currentStage: 'Risk report',
+      completedStages: ['Upload'],
+      creditsUsed: 10,
+      createdAt: new Date().toISOString(),
+    });
+
+    const realDeleteScan8d5 = storage.scans.deleteScan;
+    const realGetScan8d5 = storage.scans.getScan;
+
+    storage.scans.deleteScan = async (id: string) => {
+      if (id === scanReadFailId) return false;
+      return realDeleteScan8d5(id);
+    };
+
+    let callCount8d5 = 0;
+    storage.scans.getScan = async (id: string) => {
+      if (id === scanReadFailId) {
+        callCount8d5++;
+        if (callCount8d5 === 1) return realGetScan8d5(id);
+        // Second call simulates database read failure / null
+        return null;
+      }
+      return realGetScan8d5(id);
+    };
+
+    try {
+      const delRes = await fetch(`${baseUrl}/scans/${scanReadFailId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${sessionTokenA}` },
+      });
+      assert.strictEqual(delRes.status, 500, 'Returns 500 when re-read yields null');
+      const delJson = await delRes.json();
+      assert.strictEqual(delJson.statePersisted, false, 'statePersisted is false when re-read yields null');
+      assert.strictEqual(delJson.status, undefined, 'Does not falsely claim status is CLEANUP_PENDING');
+      console.log('  ✅ PASS: Null recovery re-read correctly reports statePersisted: false.');
+    } finally {
+      storage.scans.deleteScan = realDeleteScan8d5;
+      storage.scans.getScan = realGetScan8d5;
+      if (fs.existsSync(readFailFile)) fs.unlinkSync(readFailFile);
+      await storage.scans.deleteScan(scanReadFailId);
     }
 
     // ---------------------------------------------------------

@@ -1442,6 +1442,7 @@ apiRouter.delete('/scans/:id', async (req: Request, res: Response) => {
       // Attempt to transition the scan record to a documented, detectable, and recoverable state (CLEANUP_PENDING),
       // clear dangling file references, and record that media files were removed.
       let recoveryConfirmed = false;
+      let verificationIssue = '';
 
       try {
         const updateResult = await storage.scans.updateScan(scan.id, {
@@ -1463,18 +1464,39 @@ apiRouter.delete('/scans/:id', async (req: Request, res: Response) => {
           // Re-read scan record to determine its actual persisted state rather than inferring from attempted update
           try {
             const persistedScan = await storage.scans.getScan(scan.id);
-            if (persistedScan && persistedScan.status === 'CLEANUP_PENDING') {
-              recoveryConfirmed = true;
+            if (!persistedScan) {
+              verificationIssue = 'scan record not found on re-read';
+            } else if (persistedScan.status !== 'CLEANUP_PENDING') {
+              verificationIssue = `status mismatch (expected: CLEANUP_PENDING, got: ${persistedScan.status})`;
+            } else if (persistedScan.videoPath && persistedScan.videoPath.trim() !== '') {
+              verificationIssue = 'videoPath was not cleared';
+            } else if (persistedScan.thumbnailPath && persistedScan.thumbnailPath.trim() !== '') {
+              verificationIssue = 'thumbnailPath was not cleared';
+            } else if (persistedScan.proxyPath && persistedScan.proxyPath.trim() !== '') {
+              verificationIssue = 'proxyPath was not cleared';
+            } else if ((persistedScan.metadata as any)?.mediaCleaned !== true) {
+              verificationIssue = 'metadata.mediaCleaned is not true';
+            } else if (typeof (persistedScan.metadata as any)?.mediaCleanedAt !== 'string' || !(persistedScan.metadata as any)?.mediaCleanedAt) {
+              verificationIssue = 'metadata.mediaCleanedAt timestamp is missing';
+            } else if (typeof (persistedScan.metadata as any)?.filesRemovedCount !== 'number' || (persistedScan.metadata as any)?.filesRemovedCount !== filesRemoved) {
+              verificationIssue = `metadata.filesRemovedCount mismatch (expected: ${filesRemoved}, got: ${(persistedScan.metadata as any)?.filesRemovedCount})`;
             } else {
-              console.warn(`[Storage] Scan ${scan.id} status after recovery update is not CLEANUP_PENDING: ${persistedScan?.status}`);
+              recoveryConfirmed = true;
+            }
+
+            if (!recoveryConfirmed) {
+              console.warn(`[Storage] Scan ${scan.id} recovery verification failed: ${verificationIssue}`);
             }
           } catch (readErr: any) {
+            verificationIssue = `re-read exception: ${readErr?.message || readErr}`;
             console.error('[Storage] Failed to re-read scan to verify recovery persistence:', readErr?.message || readErr);
           }
         } else {
+          verificationIssue = 'updateScan returned null';
           console.warn(`[Storage] updateScan returned null for scan ${scan.id} during deletion recovery.`);
         }
       } catch (updateErr: any) {
+        verificationIssue = `updateScan exception: ${updateErr?.message || updateErr}`;
         console.error('[Storage] Failed to update scan record during deletion recovery:', updateErr?.message || updateErr);
       }
 
@@ -1490,7 +1512,7 @@ apiRouter.delete('/scans/:id', async (req: Request, res: Response) => {
 
       // If recovery update failed or could not be confirmed via re-read:
       // Truthful error response: do NOT falsely claim CLEANUP_PENDING or mediaCleaned: true was persisted.
-      console.error(`[Storage] CRITICAL: Scan deletion failed and recovery state could not be confirmed for scan ${scan.id}. Files removed: ${filesRemoved}. Diagnostic information preserved for operational investigation.`);
+      console.error(`[Storage] CRITICAL: Scan deletion failed and recovery state could not be confirmed for scan ${scan.id}. Files removed: ${filesRemoved}. Issue: ${verificationIssue || 'unknown'}. Diagnostic information preserved for operational investigation.`);
       return res.status(500).json({
         error: 'Media assets removed, but database deletion and recovery state persistence could not be confirmed.',
         scanId: scan.id,
