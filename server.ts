@@ -2,7 +2,7 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
-import { apiRouter } from './src/server/routes/api';
+import { apiRouter, configureTrustProxy } from './src/server/routes/api';
 
 dotenv.config();
 
@@ -14,23 +14,8 @@ async function startServer() {
   const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
   const isProd = process.env.NODE_ENV === 'production';
 
-  // Reverse proxy configuration:
-  // By default, Express trust proxy is disabled (false) to prevent client IP spoofing via arbitrary X-Forwarded-For headers.
-  // In production deployments behind a trusted reverse proxy (e.g. Cloud Run, Nginx, AWS ALB),
-  // configure the TRUST_PROXY environment variable (e.g. '1', 'loopback', 'true').
-  const trustProxy = process.env.TRUST_PROXY;
-  if (trustProxy) {
-    const tp = trustProxy.trim();
-    if (tp === 'true') {
-      app.set('trust proxy', true);
-    } else if (tp === 'false') {
-      app.set('trust proxy', false);
-    } else if (!isNaN(Number(tp))) {
-      app.set('trust proxy', Number(tp));
-    } else {
-      app.set('trust proxy', tp);
-    }
-  }
+  // Configure and validate reverse proxy trust settings at startup
+  configureTrustProxy(app, process.env.TRUST_PROXY);
 
   app.use(express.json({
     verify: (req: any, _res, buf) => {
@@ -47,29 +32,40 @@ async function startServer() {
     next();
   });
 
-  // Mount API Router
+  // Mount API router
   app.use('/api', apiRouter);
 
-  // Serve static assets or mount Vite dev middlewares
-  if (!isProd) {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-    console.log('[VideoRisk] Dev mode: Vite middleware attached');
-  } else {
+  // Serve static assets from public / uploads (thumbnails, proxies)
+  app.use('/uploads', express.static(path.resolve(process.cwd(), 'uploads')));
+
+  // In production, serve built client from dist/
+  if (isProd) {
     const distPath = path.resolve(__dirname, 'dist');
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+
+    app.get('*', (req, res, next) => {
+      if (req.path.startsWith('/api') || req.path.startsWith('/uploads')) {
+        return next();
+      }
+      res.sendFile(path.resolve(distPath, 'index.html'));
     });
-    console.log('[VideoRisk] Prod mode: Serving static dist folder');
+  } else {
+    // Vite middleware for development
+    try {
+      const { createServer: createViteServer } = await import('vite');
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+      console.log('[VideoRisk] Dev mode: Vite middleware attached');
+    } catch (e) {
+      console.warn('[VideoRisk] Vite middleware load failed, falling back to static/API only:', e);
+    }
   }
 
-  // Graceful error handler (Never leak DLOPEN / internal stack traces to users)
-  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  // Global error handler
+  app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     console.error('[VideoRisk Error]', err);
     res.status(500).json({
       error: 'We couldn’t complete this request. Please try again.',
@@ -82,7 +78,12 @@ async function startServer() {
   });
 }
 
-startServer().catch(err => {
-  console.error('[VideoRisk] Fatal server startup error:', err);
-  process.exit(1);
-});
+// Start server when executed directly as entrypoint
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  startServer().catch(err => {
+    console.error('[VideoRisk] Fatal server startup error:', err);
+    process.exit(1);
+  });
+}
+
+export { startServer };

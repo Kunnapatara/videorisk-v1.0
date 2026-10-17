@@ -30,6 +30,7 @@ import {
   IPasswordResetRepository,
   IJobQueueRepository,
   IRateLimitRepository,
+  RateLimitStatus,
   LeaseFencingToken,
   UploadRecord
 } from './index';
@@ -726,35 +727,83 @@ export class SqliteStorageRepository implements IStorageRepository {
     checkRateLimit: async (key: string, action: string, limit: number, windowSeconds: number): Promise<boolean> => {
       return this.checkRateLimit(key, action, limit, windowSeconds);
     },
-    clearRateLimits: async (): Promise<void> => {
-      this.db.prepare('DELETE FROM rate_limits;').run();
+    consumeRateLimit: async (key: string, action: string, limit: number, windowSeconds: number): Promise<RateLimitStatus> => {
+      return this.consumeRateLimit(key, action, limit, windowSeconds);
+    },
+    clearRateLimits: async (filter?: { keyPrefix?: string; key?: string }): Promise<void> => {
+      if (process.env.NODE_ENV === 'production' && !filter?.keyPrefix && !filter?.key) {
+        throw new Error('Refusing to clear all rate limits in production environment without a target key or prefix filter.');
+      }
+
+      if (filter?.key) {
+        this.db.prepare('DELETE FROM rate_limits WHERE key = ?;').run(filter.key);
+      } else if (filter?.keyPrefix) {
+        this.db.prepare('DELETE FROM rate_limits WHERE key LIKE ?;').run(`${filter.keyPrefix}%`);
+      } else if (process.env.NODE_ENV !== 'production') {
+        // Only delete test-scoped keys by default in non-production, preserving unrelated records
+        this.db.prepare(`
+          DELETE FROM rate_limits 
+          WHERE key LIKE 'test_%' 
+             OR key LIKE 'concurrent_%'
+             OR key LIKE 'uploader_%'
+             OR key LIKE '198.51.100.%'
+             OR key LIKE '203.0.113.%'
+             OR key LIKE '192.0.2.%'
+             OR key = '127.0.0.1';
+        `).run();
+      }
+    },
+    clearTestRateLimits: async (prefix: string = 'test_'): Promise<void> => {
+      this.db.prepare('DELETE FROM rate_limits WHERE key LIKE ?;').run(`${prefix}%`);
     }
   };
 
-  public checkRateLimit = async (key: string, action: string, limit: number, windowSeconds: number): Promise<boolean> => {
+  public consumeRateLimit = async (key: string, action: string, limit: number, windowSeconds: number): Promise<RateLimitStatus> => {
     return await this.runTransaction(async () => {
       const now = Math.floor(Date.now() / 1000);
       const windowStart = now - windowSeconds;
 
-      // Clean old entries
+      // Clean old expired entries
       this.db.prepare('DELETE FROM rate_limits WHERE timestamp < ?').run(windowStart);
 
-      const count = (this.db.prepare(`
-        SELECT COUNT(*) as count 
+      const row = this.db.prepare(`
+        SELECT COUNT(*) as count, MIN(timestamp) as oldest 
         FROM rate_limits 
         WHERE key = ? AND action = ? AND timestamp >= ?
-      `).get(key, action, windowStart) as any).count;
+      `).get(key, action, windowStart) as any;
+
+      const count = row?.count || 0;
+      const oldest = row?.oldest;
 
       if (count >= limit) {
-        return false; // Rate limit exceeded
+        const retryAfter = oldest
+          ? Math.max(1, Math.ceil((oldest + windowSeconds) - now))
+          : Math.max(1, windowSeconds);
+        return {
+          allowed: false,
+          retryAfter,
+          count,
+          limit
+        };
       }
 
       this.db.prepare(`
         INSERT INTO rate_limits (key, action, timestamp)
         VALUES (?, ?, ?)
       `).run(key, action, now);
-      return true; // Allowed
+
+      return {
+        allowed: true,
+        retryAfter: 0,
+        count: count + 1,
+        limit
+      };
     });
+  };
+
+  public checkRateLimit = async (key: string, action: string, limit: number, windowSeconds: number): Promise<boolean> => {
+    const status = await this.consumeRateLimit(key, action, limit, windowSeconds);
+    return status.allowed;
   };
 
   private validateLeaseFence(db: any, scanId: string, leaseToken?: LeaseFencingToken): void {
@@ -1663,7 +1712,7 @@ export function migrateJsonToSqlite(jsonFilePath: string, sqliteDb: SqliteStorag
       const userStmt = db.prepare(`
         INSERT INTO users (id, email, plan, credits_remaining, credits_used_total, total_scans_count, created_at, password_hash, salt, free_trial_claimed, stripe_customer_id, subscription_id, subscription_status)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET 
+        ON CONFLICT(email) DO UPDATE SET 
           credits_remaining = excluded.credits_remaining,
           credits_used_total = excluded.credits_used_total,
           free_trial_claimed = excluded.free_trial_claimed

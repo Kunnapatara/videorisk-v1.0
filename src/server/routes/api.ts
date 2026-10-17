@@ -1,4 +1,4 @@
-import { Router, Request, Response, RequestHandler } from 'express';
+import express, { Router, Request, Response, RequestHandler } from 'express';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
@@ -243,6 +243,19 @@ export async function requireAuth(req: Request, res: Response): Promise<UserAcco
 }
 
 /**
+ * Safely parses positive integers from environment configuration with fallback to secure default.
+ * Guarantees that invalid, empty, negative, or zero inputs cannot silently disable rate limits.
+ */
+export function parsePositiveInt(val: string | undefined, defaultValue: number): number {
+  if (!val || typeof val !== 'string') return defaultValue;
+  const parsed = parseInt(val.trim(), 10);
+  if (isNaN(parsed) || parsed < 1 || !Number.isFinite(parsed)) {
+    return defaultValue;
+  }
+  return parsed;
+}
+
+/**
  * Safely extracts client IP address respecting Express's configured trust-proxy semantics.
  * Does NOT blindly trust unvalidated X-Forwarded-For headers.
  * Relies on req.ip (which Express securely populates only when trust proxy is configured),
@@ -254,6 +267,68 @@ export function getClientIp(req: Request): string {
     return ip.substring(7);
   }
   return ip;
+}
+
+/**
+ * Validates and configures reverse proxy trust settings for Express.
+ *
+ * Security Requirements & Assumptions:
+ * - Proxy trust is disabled by default (false) to prevent client IP spoofing via arbitrary X-Forwarded-For headers.
+ * - In production, unrestricted "true" should NOT be used unless all inbound traffic is strictly constrained
+ *   to traverse the front-end reverse proxy (e.g. AWS ALB, Cloud Run, Nginx).
+ * - Deployment Note: The application must NOT be directly reachable through an untrusted path when proxy trust is enabled.
+ * - Accepts hop counts (e.g. 1), CIDR/IP lists, or standard keywords ("loopback").
+ * - Fails safely to false if an invalid or unparseable configuration is provided.
+ */
+export function configureTrustProxy(app: express.Express, rawVal: string | undefined): void {
+  if (!rawVal || rawVal.trim() === '' || rawVal.trim().toLowerCase() === 'false') {
+    app.set('trust proxy', false);
+    return;
+  }
+
+  const trimmed = rawVal.trim();
+
+  // 1. Exact numeric hop count (e.g. "1" for a single front-end proxy layer)
+  const num = Number(trimmed);
+  if (!isNaN(num) && Number.isInteger(num) && num > 0) {
+    app.set('trust proxy', num);
+    return;
+  }
+
+  // 2. Standard Express trust proxy keywords
+  const knownKeywords = ['loopback', 'linklocal', 'uniquelocal'];
+  if (knownKeywords.includes(trimmed.toLowerCase())) {
+    app.set('trust proxy', trimmed.toLowerCase());
+    return;
+  }
+
+  // 3. Comma-separated IP addresses or CIDR subnets
+  const parts = trimmed.split(',').map(p => p.trim());
+  const isIpOrCidrList = parts.every(item =>
+    item.length > 0 && (/^([0-9]{1,3}\.){3}[0-9]{1,3}(\/[0-9]{1,2})?$/.test(item) || item.includes(':'))
+  );
+  if (isIpOrCidrList) {
+    app.set('trust proxy', trimmed);
+    return;
+  }
+
+  // 4. Boolean "true" (unrestricted trust proxy) - only permitted with explicit warning
+  if (trimmed.toLowerCase() === 'true') {
+    if (process.env.NODE_ENV === 'production') {
+      console.warn(
+        '[SECURITY WARNING] TRUST_PROXY is set to unrestricted "true". ' +
+        'This trusts all X-Forwarded-For headers from any connecting client. ' +
+        'Ensure the application is NOT directly accessible without passing through your edge proxy/load balancer. ' +
+        'Prefer configuring an exact hop count (e.g. TRUST_PROXY=1) or trusted subnet CIDR range.'
+      );
+    }
+    app.set('trust proxy', true);
+    return;
+  }
+
+  // 5. Invalid / unsupported configuration -> Fail safe to false
+  console.error(`[SECURITY ERROR] Invalid TRUST_PROXY configuration value "${rawVal}". Defaulting to trust proxy: false for security.`);
+  app.set('trust proxy', false);
 }
 
 /**
@@ -277,26 +352,54 @@ export const requireAuthMiddleware: RequestHandler = async (req, res, next) => {
  * Runs AFTER requireAuthMiddleware (ensuring the user is authenticated)
  * and BEFORE uploadVideoMiddleware (Multer), preventing unauthenticated or
  * rate-limited requests from writing large video files to the server disk.
+ *
+ * Enforces dual limits:
+ * 1. User account quota: Prevents a single authenticated user from flooding storage.
+ * 2. Client IP quota: Prevents sybil attacks spanning multiple accounts from the same IP.
  */
 export const uploadRateLimitMiddleware: RequestHandler = async (req, res, next) => {
   try {
     const user = (req as any).user;
+    if (!user) {
+      res.status(401).json({ error: 'Unauthorized: A valid active session is required.' });
+      return;
+    }
+
     const clientIp = getClientIp(req);
-    // Prefer authenticated user ID to protect legitimate users sharing NAT IPs, fallback to IP
-    const uploadKey = user?.id ? `user_${user.id}` : `ip_${clientIp}`;
 
-    const uploadLimit = process.env.UPLOAD_RATE_LIMIT ? parseInt(process.env.UPLOAD_RATE_LIMIT, 10) : 10;
-    const uploadWindow = process.env.UPLOAD_RATE_WINDOW ? parseInt(process.env.UPLOAD_RATE_WINDOW, 10) : 600; // 10 minutes
+    // 1. Authenticated user quota limit
+    const userLimit = parsePositiveInt(process.env.UPLOAD_RATE_LIMIT || process.env.UPLOAD_USER_RATE_LIMIT, 10);
+    const userWindow = parsePositiveInt(process.env.UPLOAD_RATE_WINDOW || process.env.UPLOAD_USER_RATE_WINDOW, 600); // 10 minutes
+    const userKey = `user_${user.id}`;
 
-    const allowed = await storage.rateLimits.checkRateLimit(uploadKey, 'upload_video', uploadLimit, uploadWindow);
-    if (!allowed) {
+    const userStatus = await storage.rateLimits.consumeRateLimit(userKey, 'upload_video', userLimit, userWindow);
+    if (!userStatus.allowed) {
+      res.setHeader('Retry-After', String(userStatus.retryAfter));
       res.status(429).json({ 
-        error: 'Upload rate limit exceeded. Please wait before uploading another video.' 
+        error: 'Upload rate limit exceeded for your account. Please wait before uploading another video.',
+        retryAfter: userStatus.retryAfter
       });
       return;
     }
+
+    // 2. Separate IP quota limit (prevents multi-account abuse from the same IP)
+    const ipLimit = parsePositiveInt(process.env.UPLOAD_IP_RATE_LIMIT, 20);
+    const ipWindow = parsePositiveInt(process.env.UPLOAD_IP_RATE_WINDOW, 600); // 10 minutes
+    const ipKey = `ip_${clientIp}`;
+
+    const ipStatus = await storage.rateLimits.consumeRateLimit(ipKey, 'upload_video_ip', ipLimit, ipWindow);
+    if (!ipStatus.allowed) {
+      res.setHeader('Retry-After', String(ipStatus.retryAfter));
+      res.status(429).json({ 
+        error: 'Upload rate limit exceeded for your network. Please wait before uploading another video.',
+        retryAfter: ipStatus.retryAfter
+      });
+      return;
+    }
+
     next();
   } catch (err: any) {
+    console.error('[Upload Rate Limit Error]:', err?.message || err);
     res.status(500).json({ error: 'Failed to evaluate upload rate limit.' });
   }
 };
@@ -351,15 +454,19 @@ apiRouter.get('/health', (req: Request, res: Response) => {
 apiRouter.post('/auth/register', async (req: Request, res: Response) => {
   try {
     const clientIp = getClientIp(req);
-    const registerLimit = process.env.AUTH_REGISTER_RATE_LIMIT ? parseInt(process.env.AUTH_REGISTER_RATE_LIMIT, 10) : 10;
-    const registerWindow = process.env.AUTH_REGISTER_RATE_WINDOW ? parseInt(process.env.AUTH_REGISTER_RATE_WINDOW, 10) : 900; // 15 minutes
+    const registerLimit = parsePositiveInt(process.env.AUTH_REGISTER_RATE_LIMIT, 30);
+    const registerWindow = parsePositiveInt(process.env.AUTH_REGISTER_RATE_WINDOW, 900); // 15 minutes
 
-    const allowed = await storage.rateLimits.checkRateLimit(clientIp, 'auth_register', registerLimit, registerWindow);
-    if (!allowed) {
-      return res.status(429).json({ error: 'Too many registration attempts. Please wait before trying again.' });
+    const regStatus = await storage.rateLimits.consumeRateLimit(clientIp, 'auth_register', registerLimit, registerWindow);
+    if (!regStatus.allowed) {
+      res.setHeader('Retry-After', String(regStatus.retryAfter));
+      return res.status(429).json({ 
+        error: 'Too many registration attempts. Please wait before trying again.',
+        retryAfter: regStatus.retryAfter
+      });
     }
 
-    const { email, password } = req.body;
+    const { email, password } = req.body || {};
     if (!email || typeof email !== 'string' || !email.includes('@')) {
       return res.status(400).json({ error: 'A valid email address is required.' });
     }
@@ -392,29 +499,50 @@ apiRouter.post('/auth/register', async (req: Request, res: Response) => {
       message: 'Account successfully registered.'
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Registration failed.' });
+    console.error('[Auth Register Error]:', err?.message || err);
+    res.status(500).json({ error: 'Registration service temporarily unavailable. Please try again later.' });
   }
 });
 
 apiRouter.post('/auth/login', async (req: Request, res: Response) => {
   try {
-    const clientIp = getClientIp(req);
-    const loginLimit = process.env.AUTH_LOGIN_RATE_LIMIT ? parseInt(process.env.AUTH_LOGIN_RATE_LIMIT, 10) : 10;
-    const loginWindow = process.env.AUTH_LOGIN_RATE_WINDOW ? parseInt(process.env.AUTH_LOGIN_RATE_WINDOW, 10) : 900; // 15 minutes
-
-    const allowed = await storage.rateLimits.checkRateLimit(clientIp, 'auth_login', loginLimit, loginWindow);
-    if (!allowed) {
-      return res.status(429).json({ error: 'Too many login attempts. Please wait before trying again.' });
-    }
-
-    const { email, password } = req.body;
-    if (!email || !password) {
+    const { email, password } = req.body || {};
+    if (!email || typeof email !== 'string' || !password || typeof password !== 'string') {
       return res.status(400).json({ error: 'Email and password are required.' });
     }
 
-    const normalizedEmail = String(email).toLowerCase().trim();
-    const user = await storage.users.getUserByEmail(normalizedEmail);
+    // 1. IP-based brute-force limit
+    const clientIp = getClientIp(req);
+    const loginIpLimit = parsePositiveInt(process.env.AUTH_LOGIN_RATE_LIMIT || process.env.AUTH_LOGIN_IP_RATE_LIMIT, 20);
+    const loginIpWindow = parsePositiveInt(process.env.AUTH_LOGIN_RATE_WINDOW || process.env.AUTH_LOGIN_IP_RATE_WINDOW, 900); // 15 minutes
 
+    const ipStatus = await storage.rateLimits.consumeRateLimit(clientIp, 'auth_login', loginIpLimit, loginIpWindow);
+    if (!ipStatus.allowed) {
+      res.setHeader('Retry-After', String(ipStatus.retryAfter));
+      return res.status(429).json({ 
+        error: 'Too many login attempts from this network. Please wait before trying again.',
+        retryAfter: ipStatus.retryAfter
+      });
+    }
+
+    // 2. Account identifier limit (normalized, length-limited, and SHA-256 hashed to avoid storing raw emails)
+    const normalizedEmail = email.toLowerCase().trim().slice(0, 255);
+    const accountHash = crypto.createHash('sha256').update(normalizedEmail).digest('hex').slice(0, 32);
+    const accountKey = `acct_${accountHash}`;
+    const acctLimit = parsePositiveInt(process.env.AUTH_LOGIN_ACCOUNT_RATE_LIMIT, 5);
+    const acctWindow = parsePositiveInt(process.env.AUTH_LOGIN_ACCOUNT_RATE_WINDOW, 900); // 15 minutes
+
+    const acctStatus = await storage.rateLimits.consumeRateLimit(accountKey, 'auth_login_account', acctLimit, acctWindow);
+    if (!acctStatus.allowed) {
+      res.setHeader('Retry-After', String(acctStatus.retryAfter));
+      return res.status(429).json({ 
+        error: 'Too many login attempts for this account. Please wait before trying again.',
+        retryAfter: acctStatus.retryAfter
+      });
+    }
+
+    // 3. Credential verification (applied only AFTER both rate-limit checks pass)
+    const user = await storage.users.getUserByEmail(normalizedEmail);
     if (!user || !user.passwordHash || !user.salt) {
       return res.status(401).json({ error: 'Invalid email or password.' });
     }
@@ -430,7 +558,8 @@ apiRouter.post('/auth/login', async (req: Request, res: Response) => {
       token: sessionToken,
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Sign in failed.' });
+    console.error('[Auth Login Error]:', err?.message || err);
+    res.status(500).json({ error: 'Authentication service temporarily unavailable. Please try again later.' });
   }
 });
 
@@ -463,9 +592,13 @@ apiRouter.post('/auth/forgot-password', async (req: Request, res: Response) => {
     }
 
     const clientIp = getClientIp(req);
-    const allowed = await storage.rateLimits.checkRateLimit(clientIp, 'forgot_password', 5, 900);
-    if (!allowed) {
-      return res.status(429).json({ error: 'Too many password reset requests. Please wait a few minutes before trying again.' });
+    const fpStatus = await storage.rateLimits.consumeRateLimit(clientIp, 'forgot_password', 5, 900);
+    if (!fpStatus.allowed) {
+      res.setHeader('Retry-After', String(fpStatus.retryAfter));
+      return res.status(429).json({ 
+        error: 'Too many password reset requests. Please wait a few minutes before trying again.',
+        retryAfter: fpStatus.retryAfter
+      });
     }
 
     const normalizedEmail = email.toLowerCase().trim();
@@ -513,9 +646,13 @@ apiRouter.post('/auth/reset-password', async (req: Request, res: Response) => {
     }
 
     const clientIp = getClientIp(req);
-    const allowed = await storage.rateLimits.checkRateLimit(clientIp, 'reset_password_attempt', 10, 900);
-    if (!allowed) {
-      return res.status(429).json({ error: 'Too many reset attempts. Please wait before trying again.' });
+    const rpStatus = await storage.rateLimits.consumeRateLimit(clientIp, 'reset_password_attempt', 10, 900);
+    if (!rpStatus.allowed) {
+      res.setHeader('Retry-After', String(rpStatus.retryAfter));
+      return res.status(429).json({ 
+        error: 'Too many reset attempts. Please wait before trying again.',
+        retryAfter: rpStatus.retryAfter
+      });
     }
 
     const tokenHash = crypto.createHash('sha256').update(token.trim()).digest('hex');

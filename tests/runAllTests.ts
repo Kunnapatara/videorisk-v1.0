@@ -1,30 +1,41 @@
 import path from 'path';
 import fs from 'fs';
-import os from 'os';
-import { runAuthAndOwnershipTests } from './auth_and_ownership.test';
-import { runProductCapabilitiesTests } from './product_capabilities.test';
-import { runPersistenceAndBillingHardeningTests } from './persistence_and_billing_hardening.test';
-import { runStorageFailClosedTests } from './storage_fail_closed.test';
-import { runFreeCreditHardeningTests } from './free_credit_hardening.test';
-import { runEvidenceIntegrityHardeningTests } from './evidence_integrity_hardening.test';
-import { runSqliteStorageAndQueueTests } from './sqlite_storage_and_queue.test';
-import { runPasswordRecoveryTests } from './password_recovery.test';
-import { runSecurityRetentionAndE2ETests } from './security_retention_and_e2e.test';
-import { runLeaseFencingAndHeartbeatTests } from './lease_fencing_and_heartbeat.test';
-import { runScanDeletionAndMediaCleanupTests } from './scan_deletion_and_media_cleanup.test';
-import { runRateLimitingAndAbuseProtectionTests } from './rate_limiting_and_abuse_protection.test';
-import { storage } from '../src/server/storage';
+
+// ----------------------------------------------------------------------------
+// TEST RUNNER DATABASE ISOLATION:
+// Set isolated test database environment BEFORE importing any storage or routes.
+// This guarantees that automated tests never mutate or wipe production videorisk.db!
+// ----------------------------------------------------------------------------
+if (!process.env.DATABASE_PATH) {
+  process.env.DATABASE_PATH = path.resolve(process.cwd(), 'data', 'videorisk_test.db');
+}
 
 async function main() {
   console.log('######################################################');
   console.log('# VIDEORISK.COM — MASTER VERIFICATION TEST SUITE     #');
   console.log('# Security, Isolation, Context & Capability Proofs   #');
   console.log('######################################################');
+  console.log(`[Database Isolation] Active Test Database: ${process.env.DATABASE_PATH}\n`);
 
   const startTime = Date.now();
 
   try {
-    // Clear residual rate limit entries from previous test runs so localhost tests run clean
+    // Dynamically import test suites and storage AFTER DATABASE_PATH is locked to test db
+    const { storage } = await import('../src/server/storage');
+    const { runAuthAndOwnershipTests } = await import('./auth_and_ownership.test');
+    const { runProductCapabilitiesTests } = await import('./product_capabilities.test');
+    const { runPersistenceAndBillingHardeningTests } = await import('./persistence_and_billing_hardening.test');
+    const { runStorageFailClosedTests } = await import('./storage_fail_closed.test');
+    const { runFreeCreditHardeningTests } = await import('./free_credit_hardening.test');
+    const { runEvidenceIntegrityHardeningTests } = await import('./evidence_integrity_hardening.test');
+    const { runSqliteStorageAndQueueTests } = await import('./sqlite_storage_and_queue.test');
+    const { runPasswordRecoveryTests } = await import('./password_recovery.test');
+    const { runSecurityRetentionAndE2ETests } = await import('./security_retention_and_e2e.test');
+    const { runLeaseFencingAndHeartbeatTests } = await import('./lease_fencing_and_heartbeat.test');
+    const { runScanDeletionAndMediaCleanupTests } = await import('./scan_deletion_and_media_cleanup.test');
+    const { runRateLimitingAndAbuseProtectionTests } = await import('./rate_limiting_and_abuse_protection.test');
+
+    // Narrowly scoped cleanup of test-specific rate limits (never deletes real/unrelated records)
     await storage.rateLimits.clearRateLimits?.();
 
     // Run Suite 1

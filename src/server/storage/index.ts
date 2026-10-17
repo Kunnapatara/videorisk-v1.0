@@ -17,9 +17,18 @@ import {
   FencingError
 } from '../../types';
 
+export interface RateLimitStatus {
+  allowed: boolean;
+  retryAfter: number;
+  count: number;
+  limit: number;
+}
+
 export interface IRateLimitRepository {
   checkRateLimit(key: string, action: string, limit: number, windowSeconds: number): Promise<boolean>;
-  clearRateLimits?(): Promise<void>;
+  consumeRateLimit(key: string, action: string, limit: number, windowSeconds: number): Promise<RateLimitStatus>;
+  clearRateLimits?(filter?: { keyPrefix?: string; key?: string }): Promise<void>;
+  clearTestRateLimits?(prefix?: string): Promise<void>;
 }
 
 export interface IPasswordResetRepository {
@@ -128,6 +137,7 @@ export interface IStorageRepository {
   rateLimits: IRateLimitRepository;
   queue: IJobQueueRepository;
   checkRateLimit(key: string, action: string, limit: number, windowSeconds: number): Promise<boolean>;
+  consumeRateLimit(key: string, action: string, limit: number, windowSeconds: number): Promise<RateLimitStatus>;
   getOperationalMetrics?: () => Promise<OperationalMetrics>;
   close?: () => Promise<void>;
   runTransaction<T>(operation: (state: any) => Promise<T> | T): Promise<T>;
@@ -918,25 +928,64 @@ export class InMemoryStorageRepository implements IStorageRepository {
     checkRateLimit: async (key: string, action: string, limit: number, windowSeconds: number): Promise<boolean> => {
       return this.checkRateLimit(key, action, limit, windowSeconds);
     },
-    clearRateLimits: async (): Promise<void> => {
-      this.state.rateLimits = [];
+    consumeRateLimit: async (key: string, action: string, limit: number, windowSeconds: number): Promise<RateLimitStatus> => {
+      return this.consumeRateLimit(key, action, limit, windowSeconds);
+    },
+    clearRateLimits: async (filter?: { keyPrefix?: string; key?: string }): Promise<void> => {
+      if (filter?.key) {
+        this.state.rateLimits = this.state.rateLimits.filter(r => r.key !== filter.key);
+      } else if (filter?.keyPrefix) {
+        this.state.rateLimits = this.state.rateLimits.filter(r => !r.key.startsWith(filter.keyPrefix!));
+      } else if (process.env.NODE_ENV !== 'production') {
+        // In non-prod default cleanup, only remove test-scoped entries
+        this.state.rateLimits = this.state.rateLimits.filter(r =>
+          !r.key.startsWith('test_') &&
+          !r.key.startsWith('concurrent_') &&
+          !r.key.startsWith('uploader_') &&
+          !r.key.startsWith('198.51.100.') &&
+          !r.key.startsWith('203.0.113.') &&
+          !r.key.startsWith('192.0.2.') &&
+          r.key !== '127.0.0.1'
+        );
+      }
+      this.save();
+    },
+    clearTestRateLimits: async (prefix: string = 'test_'): Promise<void> => {
+      this.state.rateLimits = this.state.rateLimits.filter(r => !r.key.startsWith(prefix));
       this.save();
     }
   };
 
-  public checkRateLimit = async (key: string, action: string, limit: number, windowSeconds: number): Promise<boolean> => {
+  public consumeRateLimit = async (key: string, action: string, limit: number, windowSeconds: number): Promise<RateLimitStatus> => {
     const now = Math.floor(Date.now() / 1000);
     const windowStart = now - windowSeconds;
     this.state.rateLimits = this.state.rateLimits.filter(e => e.timestamp >= windowStart);
 
-    const recent = this.state.rateLimits.filter(e => e.key === key && e.action === action);
-    if (recent.length >= limit) {
-      return false;
+    const matching = this.state.rateLimits.filter(e => e.key === key && e.action === action);
+    if (matching.length >= limit) {
+      const oldest = Math.min(...matching.map(m => m.timestamp));
+      const retryAfter = Math.max(1, Math.ceil((oldest + windowSeconds) - now));
+      return {
+        allowed: false,
+        retryAfter,
+        count: matching.length,
+        limit
+      };
     }
 
     this.state.rateLimits.push({ key, action, timestamp: now });
     this.save();
-    return true;
+    return {
+      allowed: true,
+      retryAfter: 0,
+      count: matching.length + 1,
+      limit
+    };
+  };
+
+  public checkRateLimit = async (key: string, action: string, limit: number, windowSeconds: number): Promise<boolean> => {
+    const status = await this.consumeRateLimit(key, action, limit, windowSeconds);
+    return status.allowed;
   };
 
   public queue: IJobQueueRepository = {

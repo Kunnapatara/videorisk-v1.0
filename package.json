@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "tsx tests/runAllTests.ts",
+    "test": "DATABASE_PATH=data/videorisk_test.db tsx tests/runAllTests.ts",
     "validate:env": "tsx scripts/validate-env.ts"
   },
   "dependencies": {
