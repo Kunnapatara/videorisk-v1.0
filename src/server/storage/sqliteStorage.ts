@@ -50,20 +50,20 @@ export class SqliteStorageRepository implements IStorageRepository {
   private txQueue: Promise<void> = Promise.resolve();
   private static asyncLocalStorage = new AsyncLocalStorage<{ depth: number }>();
 
-  constructor(customPath?: string) {
+  constructor(customPath?: string, env: NodeJS.ProcessEnv = process.env) {
     if (customPath) {
       this.dbPath = path.resolve(customPath);
-    } else if (process.env.DATABASE_PATH) {
-      this.dbPath = path.resolve(process.env.DATABASE_PATH);
-    } else if (process.env.DATA_DIR) {
-      this.dbPath = path.resolve(process.env.DATA_DIR, 'videorisk.db');
+    } else if (env.DATABASE_PATH) {
+      this.dbPath = path.resolve(env.DATABASE_PATH);
+    } else if (env.DATA_DIR) {
+      this.dbPath = path.resolve(env.DATA_DIR, 'videorisk.db');
     } else {
       this.dbPath = path.resolve(process.cwd(), 'data', 'videorisk.db');
     }
 
     // Pre-open validation: Ensure no SQLite connection opens or writes to a production database during test runs
-    if (process.env.VIDEORISK_TEST_RUN === 'true' || process.env.TEST_DATABASE_PATH || process.env.NODE_ENV === 'test') {
-      validateTestDatabaseTarget(this.dbPath);
+    if (env.VIDEORISK_TEST_RUN === 'true' || env.TEST_DATABASE_PATH || env.NODE_ENV === 'test' || process.env.VIDEORISK_TEST_RUN === 'true' || process.env.TEST_DATABASE_PATH || process.env.NODE_ENV === 'test') {
+      validateTestDatabaseTarget(this.dbPath, env);
     }
 
     const dir = path.dirname(this.dbPath);

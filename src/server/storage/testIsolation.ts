@@ -11,6 +11,79 @@ export interface TestDatabaseResolution {
 }
 
 /**
+ * Global storage for preserved production database configuration captured before test runner override.
+ */
+let preservedProductionDatabasePath: string | undefined = undefined;
+
+/**
+ * Sets or clears the preserved original production database path.
+ */
+export function setPreservedProductionDatabasePath(val: string | undefined): void {
+  preservedProductionDatabasePath = val && typeof val === 'string' && val.trim() !== '' ? val.trim() : undefined;
+}
+
+/**
+ * Gets the preserved original production database path if captured.
+ */
+export function getPreservedProductionDatabasePath(): string | undefined {
+  return preservedProductionDatabasePath;
+}
+
+/**
+ * Determines whether a given database path represents a test-specific database or test override
+ * rather than a production database target.
+ */
+export function isTestDatabasePath(candidatePath: string | undefined | null, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (!candidatePath || typeof candidatePath !== 'string' || candidatePath.trim() === '') {
+    return false;
+  }
+  const trimmed = candidatePath.trim();
+  const baseName = path.basename(trimmed);
+
+  // 1. Matches standard test basename ('videorisk_test.db')
+  if (baseName === DEFAULT_TEST_DB_BASENAME) {
+    return true;
+  }
+
+  // 2. Matches default test database path
+  const defaultTestPath = getDefaultTestDatabasePath();
+  if (path.resolve(trimmed) === defaultTestPath) {
+    return true;
+  }
+  try {
+    if (canonicalizeDatabaseTarget(trimmed) === canonicalizeDatabaseTarget(defaultTestPath)) {
+      return true;
+    }
+  } catch {
+    // If cannot canonicalize, path equality was checked above
+  }
+
+  // 3. Matches explicitly configured TEST_DATABASE_PATH
+  if (env.TEST_DATABASE_PATH && env.TEST_DATABASE_PATH.trim() !== '') {
+    const customTestPath = path.resolve(env.TEST_DATABASE_PATH.trim());
+    if (path.resolve(trimmed) === customTestPath) {
+      return true;
+    }
+    try {
+      if (canonicalizeDatabaseTarget(trimmed) === canonicalizeDatabaseTarget(customTestPath)) {
+        return true;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return false;
+}
+
+// Preserve original production DATABASE_PATH if present at module load before any test runner mutation
+if (process.env.PRODUCTION_DATABASE_PATH && process.env.PRODUCTION_DATABASE_PATH.trim() !== '') {
+  preservedProductionDatabasePath = process.env.PRODUCTION_DATABASE_PATH.trim();
+} else if (process.env.DATABASE_PATH && !isTestDatabasePath(process.env.DATABASE_PATH, process.env)) {
+  preservedProductionDatabasePath = process.env.DATABASE_PATH.trim();
+}
+
+/**
  * Resolves a database file path to its canonical filesystem target.
  * Resolves all symbolic links whether the target exists or not.
  * 
@@ -73,45 +146,96 @@ export function canonicalizeDatabaseTarget(targetPath: string, visited: Set<stri
 }
 
 /**
- * Returns the resolved path to the production database based on current configuration.
+ * Returns the resolved path to the production database based on current configuration and storage precedence:
+ * Precedence in SqliteStorageRepository:
+ * 1. DATABASE_PATH (if set and not a test override)
+ * 2. DATA_DIR/videorisk.db (if DATA_DIR is set)
+ * 3. data/videorisk.db (default)
  */
 export function getProductionDatabasePath(env: NodeJS.ProcessEnv = process.env): string {
   const cwd = process.cwd();
+
+  // 1. Explicit PRODUCTION_DATABASE_PATH override if configured
+  if (env.PRODUCTION_DATABASE_PATH && env.PRODUCTION_DATABASE_PATH.trim() !== '') {
+    return path.resolve(env.PRODUCTION_DATABASE_PATH.trim());
+  }
+
+  // 2. Custom production DATABASE_PATH if set and NOT a test database override
+  if (env.DATABASE_PATH && env.DATABASE_PATH.trim() !== '') {
+    const rawDbPath = env.DATABASE_PATH.trim();
+    if (!isTestDatabasePath(rawDbPath, env)) {
+      return path.resolve(rawDbPath);
+    }
+  }
+
+  // 3. Preserved original production database path (if captured before test runner override)
+  if (preservedProductionDatabasePath && !isTestDatabasePath(preservedProductionDatabasePath, env)) {
+    return path.resolve(preservedProductionDatabasePath);
+  }
+
+  // 4. DATA_DIR override path: DATA_DIR/videorisk.db
   if (env.DATA_DIR && env.DATA_DIR.trim() !== '') {
     return path.resolve(env.DATA_DIR.trim(), DEFAULT_PRODUCTION_DB_BASENAME);
   }
+
+  // 5. Default production path: cwd/data/videorisk.db
   return path.resolve(cwd, 'data', DEFAULT_PRODUCTION_DB_BASENAME);
 }
 
 /**
  * Returns all canonical target paths that represent production databases under current configuration.
- * Always includes both the DATA_DIR target (if configured) and the default cwd/data/videorisk.db target.
+ * Always includes:
+ * - The primary configured production database (respecting storage precedence: DATABASE_PATH -> DATA_DIR -> default)
+ * - The default cwd/data/videorisk.db target
+ * - The DATA_DIR/videorisk.db target if DATA_DIR is configured
+ * - Any preserved original production database path
  */
 export function getProductionCanonicalTargets(env: NodeJS.ProcessEnv = process.env): string[] {
   const targets: string[] = [];
   const cwd = process.cwd();
 
-  // 1. Default production path: cwd/data/videorisk.db
-  const defaultProd = path.resolve(cwd, 'data', DEFAULT_PRODUCTION_DB_BASENAME);
-  try {
-    targets.push(canonicalizeDatabaseTarget(defaultProd));
-  } catch {
-    targets.push(defaultProd);
-  }
-
-  // 2. DATA_DIR override path if set
-  if (env.DATA_DIR && env.DATA_DIR.trim() !== '') {
-    const dataDirProd = path.resolve(env.DATA_DIR.trim(), DEFAULT_PRODUCTION_DB_BASENAME);
+  const addTarget = (targetPath: string | undefined | null) => {
+    if (!targetPath || typeof targetPath !== 'string' || targetPath.trim() === '') return;
+    const resolved = path.resolve(targetPath.trim());
     try {
-      const canonicalDataDirProd = canonicalizeDatabaseTarget(dataDirProd);
-      if (!targets.includes(canonicalDataDirProd)) {
-        targets.push(canonicalDataDirProd);
+      const canonical = canonicalizeDatabaseTarget(resolved);
+      if (!targets.includes(canonical)) {
+        targets.push(canonical);
       }
     } catch {
-      if (!targets.includes(dataDirProd)) {
-        targets.push(dataDirProd);
+      if (!targets.includes(resolved)) {
+        targets.push(resolved);
       }
     }
+  };
+
+  // 1. Primary resolved production database based on current configuration and precedence
+  const primaryProd = getProductionDatabasePath(env);
+  addTarget(primaryProd);
+
+  // 2. Default production path: cwd/data/videorisk.db
+  const defaultProd = path.resolve(cwd, 'data', DEFAULT_PRODUCTION_DB_BASENAME);
+  addTarget(defaultProd);
+
+  // 3. DATA_DIR override path if set
+  if (env.DATA_DIR && env.DATA_DIR.trim() !== '') {
+    const dataDirProd = path.resolve(env.DATA_DIR.trim(), DEFAULT_PRODUCTION_DB_BASENAME);
+    addTarget(dataDirProd);
+  }
+
+  // 4. Preserved original production database path
+  if (preservedProductionDatabasePath && !isTestDatabasePath(preservedProductionDatabasePath, env)) {
+    addTarget(preservedProductionDatabasePath);
+  }
+
+  // 5. If env.DATABASE_PATH is set and is NOT a test database path, ensure it is added
+  if (env.DATABASE_PATH && env.DATABASE_PATH.trim() !== '' && !isTestDatabasePath(env.DATABASE_PATH, env)) {
+    addTarget(env.DATABASE_PATH.trim());
+  }
+
+  // 6. Explicit PRODUCTION_DATABASE_PATH if set
+  if (env.PRODUCTION_DATABASE_PATH && env.PRODUCTION_DATABASE_PATH.trim() !== '') {
+    addTarget(env.PRODUCTION_DATABASE_PATH.trim());
   }
 
   return targets;
@@ -132,7 +256,7 @@ export function isTargetingProduction(targetPath: string, env: NodeJS.ProcessEnv
   try {
     canonicalTarget = canonicalizeDatabaseTarget(targetPath);
   } catch {
-    // If path cannot be safely canonicalized, consider it unsafe
+    // If path cannot be safely canonicalized, fail closed by considering it unsafe
     return true;
   }
 
@@ -154,15 +278,20 @@ export function isTargetingProduction(targetPath: string, env: NodeJS.ProcessEnv
     }
   }
 
-  // Also check if canonical target filename matches production database filename in a production directory
+  // Check if canonical target matches production database filename in a production directory
   const baseName = path.basename(canonicalTarget);
-  if (baseName === DEFAULT_PRODUCTION_DB_BASENAME) {
-    const targetDir = path.dirname(canonicalTarget);
-    for (const prodTarget of prodTargets) {
-      if (targetDir === path.dirname(prodTarget)) {
-        return true;
-      }
+  const targetDir = path.dirname(canonicalTarget);
+  for (const prodTarget of prodTargets) {
+    const prodBase = path.basename(prodTarget);
+    const prodDir = path.dirname(prodTarget);
+    if (baseName === prodBase && targetDir === prodDir) {
+      return true;
     }
+  }
+
+  // Standard production basename ('videorisk.db') is always protected
+  if (baseName === DEFAULT_PRODUCTION_DB_BASENAME) {
+    return true;
   }
 
   return false;
@@ -198,6 +327,7 @@ export function validateTestDatabaseTarget(targetPath: string, env: NodeJS.Proce
  * Enforces test database isolation:
  * - Guarantees automated test runners cannot silently use the production database path.
  * - Explicitly establishes a dedicated test database path before importing storage or routes.
+ * - Preserves the original production database configuration before changing environment variables.
  * - Validates resolved targets against symlinks and production targets.
  * - If an externally supplied DATABASE_PATH conflicts with required test database, fails safely.
  * - Preserves explicit TEST_DATABASE_PATH override when safe.
@@ -207,6 +337,15 @@ export function enforceTestDatabaseIsolation(
   env: NodeJS.ProcessEnv = process.env
 ): TestDatabaseResolution {
   const defaultTestPath = getDefaultTestDatabasePath();
+
+  // If env.DATABASE_PATH is set and represents an original custom production database (not test db),
+  // preserve it before changing env.DATABASE_PATH:
+  if (!preservedProductionDatabasePath && env.DATABASE_PATH && env.DATABASE_PATH.trim() !== '') {
+    const candidate = env.DATABASE_PATH.trim();
+    if (!isTestDatabasePath(candidate, env)) {
+      preservedProductionDatabasePath = candidate;
+    }
+  }
 
   // 1. Explicit, documented test-only mechanism: TEST_DATABASE_PATH
   if (env.TEST_DATABASE_PATH && env.TEST_DATABASE_PATH.trim() !== '') {

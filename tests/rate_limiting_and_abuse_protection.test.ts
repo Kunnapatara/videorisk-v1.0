@@ -22,7 +22,12 @@ import {
   canonicalizeDatabaseTarget,
   validateTestDatabaseTarget,
   isTargetingProduction,
-  getProductionCanonicalTargets
+  getProductionCanonicalTargets,
+  isTestDatabasePath,
+  setPreservedProductionDatabasePath,
+  getPreservedProductionDatabasePath,
+  DEFAULT_PRODUCTION_DB_BASENAME,
+  DEFAULT_TEST_DB_BASENAME
 } from '../src/server/storage/testIsolation';
 
 function assert(condition: boolean, desc: string) {
@@ -209,6 +214,247 @@ export async function runRateLimitingAndAbuseProtectionTests() {
     assert(caughtUnresolvable, 'Unsafe or unresolvable parent directories fail closed safely');
   } finally {
     fs.rmSync(symlinkTempDir, { recursive: true, force: true });
+  }
+
+  // -------------------------------------------------------------------------
+  // Custom DATABASE_PATH Production Isolation & Symlink Regression Suite
+  // (Tests Cases 1 to 13: Custom paths, direct symlinks, parent symlinks,
+  // storage precedence, data integrity, and test override compatibility)
+  // -------------------------------------------------------------------------
+  const customProdTempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vr-custom-prod-isolation-'));
+  try {
+    const realProdDir = path.join(customProdTempDir, 'storage');
+    fs.mkdirSync(realProdDir, { recursive: true });
+    const customProdFile = path.join(realProdDir, 'live.sqlite');
+    const initialCustomBytes = Buffer.from('LIVE_PRODUCTION_SQLITE_HEADER_AND_RECORDS_' + Date.now());
+    fs.writeFileSync(customProdFile, initialCustomBytes);
+
+    const customProdEnv: NodeJS.ProcessEnv = {
+      DATABASE_PATH: customProdFile
+    };
+
+    // Case 1: Custom production DATABASE_PATH (storage/live.sqlite) is recognized as production target
+    assert(
+      getProductionDatabasePath(customProdEnv) === path.resolve(customProdFile),
+      'Custom production DATABASE_PATH (storage/live.sqlite) is recognized as production target path'
+    );
+    assert(
+      isTargetingProduction(customProdFile, customProdEnv) === true,
+      'isTargetingProduction recognizes custom production DATABASE_PATH'
+    );
+    assert(
+      getProductionCanonicalTargets(customProdEnv).includes(canonicalizeDatabaseTarget(customProdFile)),
+      'getProductionCanonicalTargets includes canonical custom production target'
+    );
+
+    // Case 2: Test database path that is a symlink directly to custom production database is rejected
+    const directSymlinkTestDb = path.join(customProdTempDir, 'direct_symlink_test.sqlite');
+    fs.symlinkSync(customProdFile, directSymlinkTestDb);
+
+    let caughtDirectSymlink = false;
+    try {
+      validateTestDatabaseTarget(directSymlinkTestDb, customProdEnv);
+    } catch (err: any) {
+      caughtDirectSymlink = err.message.includes('matches production database');
+    }
+    assert(caughtDirectSymlink, 'Direct symlink to custom production database is strictly rejected');
+
+    // Verify pre-open check blocks initialization before SQLite opens with customProdEnv
+    let caughtDirectOpen = false;
+    try {
+      new SqliteStorageRepository(directSymlinkTestDb, customProdEnv);
+    } catch (err: any) {
+      caughtDirectOpen = err.message.includes('matches production database') || err.message.includes('Refusing to use database path');
+    }
+    assert(caughtDirectOpen, 'Pre-open check blocks SqliteStorageRepository initialization on symlink to custom production');
+
+    // Also verify pre-open check blocks initialization when custom production is preserved globally
+    setPreservedProductionDatabasePath(customProdFile);
+    let caughtPreservedOpen = false;
+    try {
+      new SqliteStorageRepository(directSymlinkTestDb);
+    } catch (err: any) {
+      caughtPreservedOpen = err.message.includes('matches production database') || err.message.includes('Refusing to use database path');
+    }
+    assert(caughtPreservedOpen, 'Pre-open check blocks SqliteStorageRepository when custom production path is preserved globally');
+    setPreservedProductionDatabasePath(undefined); // clean up
+
+    // Assert production bytes remain completely untouched
+    const currentBytesCase2 = fs.readFileSync(customProdFile);
+    assert(
+      Buffer.compare(currentBytesCase2, initialCustomBytes) === 0,
+      'Data Integrity: Custom production database bytes remain strictly unchanged after rejected symlink access'
+    );
+
+    // Case 3: Test database path reaching custom production database through a symlinked parent directory is rejected
+    const symlinkedParentDir = path.join(customProdTempDir, 'symlinked_parent');
+    fs.symlinkSync(realProdDir, symlinkedParentDir);
+    const testDbViaSymlinkedParent = path.join(symlinkedParentDir, 'live.sqlite');
+
+    let caughtParentSymlink = false;
+    try {
+      validateTestDatabaseTarget(testDbViaSymlinkedParent, customProdEnv);
+    } catch (err: any) {
+      caughtParentSymlink = err.message.includes('matches production database');
+    }
+    assert(caughtParentSymlink, 'Test database path through symlinked parent directory to custom production is rejected');
+
+    let caughtParentOpen = false;
+    try {
+      new SqliteStorageRepository(testDbViaSymlinkedParent, customProdEnv);
+    } catch (err: any) {
+      caughtParentOpen = err.message.includes('matches production database') || err.message.includes('Refusing to use database path');
+    }
+    assert(caughtParentOpen, 'SqliteStorageRepository pre-open check blocks access via symlinked parent directory');
+    const currentBytesCase3 = fs.readFileSync(customProdFile);
+    assert(
+      Buffer.compare(currentBytesCase3, initialCustomBytes) === 0,
+      'Data Integrity: Custom production database bytes remain unchanged after rejected parent symlink access'
+    );
+
+    // Case 4: Existing production path behavior using DATA_DIR remains protected
+    const dataDirEnv: NodeJS.ProcessEnv = { DATA_DIR: realProdDir };
+    assert(
+      getProductionDatabasePath(dataDirEnv) === path.resolve(realProdDir, DEFAULT_PRODUCTION_DB_BASENAME),
+      'DATA_DIR precedence honored for production database path'
+    );
+    assert(
+      isTargetingProduction(path.join(realProdDir, DEFAULT_PRODUCTION_DB_BASENAME), dataDirEnv) === true,
+      'DATA_DIR/videorisk.db target is strictly protected'
+    );
+
+    // Case 5: Default production path data/videorisk.db remains protected
+    const defaultProdTarget = path.resolve(process.cwd(), 'data', DEFAULT_PRODUCTION_DB_BASENAME);
+    assert(
+      isTargetingProduction(defaultProdTarget, {}) === true,
+      'Default production target cwd/data/videorisk.db is always protected'
+    );
+
+    // Case 6: Relative and absolute paths handled consistently after canonicalization
+    const relativeCustomProd = path.relative(process.cwd(), customProdFile);
+    const relEnv: NodeJS.ProcessEnv = { DATABASE_PATH: relativeCustomProd };
+    assert(
+      isTargetingProduction(customProdFile, relEnv) === true,
+      'Absolute path targets relative custom production configuration'
+    );
+    assert(
+      isTargetingProduction(relativeCustomProd, customProdEnv) === true,
+      'Relative path targets absolute custom production configuration'
+    );
+    const redundantRelPath = path.join(realProdDir, '..', 'storage', 'live.sqlite');
+    assert(
+      isTargetingProduction(redundantRelPath, customProdEnv) === true,
+      'Normalized relative/redundant path targets custom production configuration'
+    );
+
+    // Case 7: Nonexistent database target is resolved safely when parent directory can be canonicalized
+    const nonExistentTarget = path.join(customProdTempDir, 'non_existent_test_db.sqlite');
+    assert(!fs.existsSync(nonExistentTarget), 'Target file does not exist yet');
+    const resolvedNonExistent = canonicalizeDatabaseTarget(nonExistentTarget);
+    assert(
+      resolvedNonExistent === nonExistentTarget,
+      'Nonexistent database target resolved safely via canonical parent directory'
+    );
+    assert(!fs.existsSync(nonExistentTarget), 'Verification: canonicalizeDatabaseTarget did NOT create nonexistent file');
+
+    // Case 8: Broken symlink handled safely and cannot bypass production target protection
+    const brokenSymlinkProd = path.join(customProdTempDir, 'broken_symlink_to_nonexistent_prod.sqlite');
+    const nonExistentProdTarget = path.join(realProdDir, 'non_existent_live.sqlite');
+    fs.symlinkSync(nonExistentProdTarget, brokenSymlinkProd);
+    const brokenProdEnv: NodeJS.ProcessEnv = { DATABASE_PATH: nonExistentProdTarget };
+
+    let caughtBrokenSymlink = false;
+    try {
+      validateTestDatabaseTarget(brokenSymlinkProd, brokenProdEnv);
+    } catch (err: any) {
+      caughtBrokenSymlink = err.message.includes('matches production database') || err.message.includes('Cannot safely canonicalize');
+    }
+    assert(caughtBrokenSymlink, 'Broken symlink pointing to production target is safely rejected');
+
+    // Broken symlink to nonexistent unresolvable directory fails closed
+    const brokenSymlinkUnresolvable = path.join(customProdTempDir, 'broken_symlink_unresolvable.sqlite');
+    fs.symlinkSync('/non_existent_unresolvable_dir_xyz/missing.db', brokenSymlinkUnresolvable);
+    let caughtUnresolvableBroken = false;
+    try {
+      validateTestDatabaseTarget(brokenSymlinkUnresolvable, {});
+    } catch (err: any) {
+      caughtUnresolvableBroken = err.message.includes('does not exist or is unresolvable');
+    }
+    assert(caughtUnresolvableBroken, 'Broken symlink to unresolvable parent directory fails closed safely');
+
+    // Case 9: Symlink cycles, excessive depth fail closed
+    const cycleA = path.join(customProdTempDir, 'cycle_a.db');
+    const cycleB = path.join(customProdTempDir, 'cycle_b.db');
+    fs.symlinkSync(cycleB, cycleA);
+    fs.symlinkSync(cycleA, cycleB);
+
+    let caughtCycle = false;
+    try {
+      validateTestDatabaseTarget(cycleA, {});
+    } catch (err: any) {
+      caughtCycle = err.message.includes('Detected symlink cycle or excessive link depth');
+    }
+    assert(caughtCycle, 'Symlink cycle fails closed safely with cycle detection error');
+
+    // Case 10: Any rejected configuration fails before SQLite opens the database
+    let rejectedPreOpenFailed = false;
+    try {
+      new SqliteStorageRepository(cycleA);
+    } catch (err: any) {
+      rejectedPreOpenFailed = err.message.includes('symlink cycle');
+    }
+    assert(rejectedPreOpenFailed, 'Rejected cycle configuration fails before SQLite opens the database');
+
+    // Case 11: Test runner's test-specific DATABASE_PATH override is not incorrectly treated as original production configuration
+    const testRunnerOverrideEnv: NodeJS.ProcessEnv = {
+      DATABASE_PATH: 'data/videorisk_test.db'
+    };
+    assert(
+      isTestDatabasePath('data/videorisk_test.db', testRunnerOverrideEnv) === true,
+      'data/videorisk_test.db is recognized as test database path'
+    );
+    assert(
+      getProductionDatabasePath(testRunnerOverrideEnv) === path.resolve(process.cwd(), 'data', 'videorisk.db'),
+      'Test runner DATABASE_PATH override is NOT classified as production database'
+    );
+    assert(
+      isTargetingProduction('data/videorisk_test.db', testRunnerOverrideEnv) === false,
+      'data/videorisk_test.db is NOT flagged as targeting production'
+    );
+
+    // Custom TEST_DATABASE_PATH override
+    const customTestRunnerEnv: NodeJS.ProcessEnv = {
+      TEST_DATABASE_PATH: '/tmp/test_runner_override.db',
+      DATABASE_PATH: '/tmp/test_runner_override.db'
+    };
+    assert(
+      isTestDatabasePath('/tmp/test_runner_override.db', customTestRunnerEnv) === true,
+      'Explicit TEST_DATABASE_PATH override is recognized as test database'
+    );
+    assert(
+      getProductionDatabasePath(customTestRunnerEnv) === path.resolve(process.cwd(), 'data', 'videorisk.db'),
+      'Explicit TEST_DATABASE_PATH is NOT treated as production database path'
+    );
+
+    // Case 12: Valid explicitly configured TEST_DATABASE_PATH continues to work
+    const validTestDbTarget = path.join(customProdTempDir, 'valid_isolated_test.db');
+    const validTestEnv: NodeJS.ProcessEnv = {
+      TEST_DATABASE_PATH: validTestDbTarget
+    };
+    const validResolution = enforceTestDatabaseIsolation(validTestEnv);
+    assert(
+      validResolution.resolvedPath === validTestDbTarget && validResolution.isCustom === true,
+      'Valid explicitly configured TEST_DATABASE_PATH is successfully validated and enforced'
+    );
+
+    // Final Data Integrity check: Production database bytes remained 100% identical throughout all tests
+    const finalBytes = fs.readFileSync(customProdFile);
+    assert(
+      Buffer.compare(finalBytes, initialCustomBytes) === 0,
+      'Comprehensive Data Integrity: Production database bytes remained 100% untouched throughout all isolation tests'
+    );
+  } finally {
+    fs.rmSync(customProdTempDir, { recursive: true, force: true });
   }
 
   // Test 2.2: Exact Rate-Limit Prefix Cleanup (Literal vs SQL LIKE Wildcards)
@@ -639,7 +885,8 @@ export async function runRateLimitingAndAbuseProtectionTests() {
     process.env.UPLOAD_RATE_WINDOW = '60';
     process.env.UPLOAD_IP_RATE_LIMIT = '2';
 
-    const uploadIp1 = `198.51.100.77`;
+    const uploadIpPrefix = `198.51.${Math.floor(Math.random() * 200) + 10}`;
+    const uploadIp1 = `${uploadIpPrefix}.77`;
 
     // Upload 1 & 2 succeed/reach pipeline
     const up1 = await sendMultipartUpload(uploader1Token, 'test_vid1.mp4', dummyMp4, uploadIp1);
@@ -683,7 +930,7 @@ export async function runRateLimitingAndAbuseProtectionTests() {
     // CRITICAL ATOMIC NON-CONSUMPTION PROOF 1:
     // User 2's upload was rejected by IP quota. User 2's OWN account quota must NOT have been consumed!
     // When User 2 uploads from a fresh, unblocked IP, the upload must be allowed through!
-    const cleanIpForUser2 = `198.51.100.88`;
+    const cleanIpForUser2 = `${uploadIpPrefix}.88`;
     const upUser2Clean = await sendMultipartUpload(uploader2Token, 'test_vid_user2.mp4', dummyMp4, cleanIpForUser2);
     assert(
       upUser2Clean.status === 200 || upUser2Clean.status === 400,
@@ -693,7 +940,7 @@ export async function runRateLimitingAndAbuseProtectionTests() {
     // CRITICAL ATOMIC NON-CONSUMPTION PROOF 2:
     // User 1's user quota is exhausted (2 of 2). User 1 attempts upload on a fresh IP (cleanIpForUser3).
     // It is rejected by user quota. The fresh IP's quota must NOT be consumed!
-    const freshSharedIp = `198.51.100.99`;
+    const freshSharedIp = `${uploadIpPrefix}.99`;
     const upUser1BlockedOnFreshIp = await sendMultipartUpload(uploader1Token, 'test_vid_u1_fresh.mp4', dummyMp4, freshSharedIp);
     assert(upUser1BlockedOnFreshIp.status === 429, 'Exhausted User 1 is blocked on fresh IP by user quota');
 
@@ -720,7 +967,7 @@ export async function runRateLimitingAndAbuseProtectionTests() {
       body: JSON.stringify({ email: concurrentUserEmail, password: 'uploaderPassword123' })
     });
     const concurrentUserToken = (await concurrentUserReg.json()).token;
-    const concurrentIp = `198.51.100.123`;
+    const concurrentIp = `${uploadIpPrefix}.123`;
 
     // Fire 6 simultaneous uploads under a limit of 2
     const simultaneousUploads = await Promise.all(
