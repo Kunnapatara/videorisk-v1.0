@@ -14,6 +14,24 @@ async function startServer() {
   const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
   const isProd = process.env.NODE_ENV === 'production';
 
+  // Reverse proxy configuration:
+  // By default, Express trust proxy is disabled (false) to prevent client IP spoofing via arbitrary X-Forwarded-For headers.
+  // In production deployments behind a trusted reverse proxy (e.g. Cloud Run, Nginx, AWS ALB),
+  // configure the TRUST_PROXY environment variable (e.g. '1', 'loopback', 'true').
+  const trustProxy = process.env.TRUST_PROXY;
+  if (trustProxy) {
+    const tp = trustProxy.trim();
+    if (tp === 'true') {
+      app.set('trust proxy', true);
+    } else if (tp === 'false') {
+      app.set('trust proxy', false);
+    } else if (!isNaN(Number(tp))) {
+      app.set('trust proxy', Number(tp));
+    } else {
+      app.set('trust proxy', tp);
+    }
+  }
+
   app.use(express.json({
     verify: (req: any, _res, buf) => {
       req.rawBody = buf;

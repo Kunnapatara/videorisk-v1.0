@@ -36,6 +36,8 @@ export async function runAuthAndOwnershipTests() {
   const baseUrl = `http://127.0.0.1:${port}/api`;
 
   try {
+    await storage.rateLimits.clearRateLimits?.();
+
     // ---------------------------------------------------------
     // 1. AUTHENTICATION & SESSION LIFECYCLE
     // ---------------------------------------------------------

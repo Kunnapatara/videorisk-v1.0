@@ -17,6 +17,11 @@ import {
   FencingError
 } from '../../types';
 
+export interface IRateLimitRepository {
+  checkRateLimit(key: string, action: string, limit: number, windowSeconds: number): Promise<boolean>;
+  clearRateLimits?(): Promise<void>;
+}
+
 export interface IPasswordResetRepository {
   createResetToken(userId: string, tokenHash: string, expiresAt: string): Promise<void>;
   getResetToken(tokenHash: string): Promise<PasswordResetRecord | null>;
@@ -120,7 +125,9 @@ export interface IStorageRepository {
   usage: IUsageRepository;
   billing: IBillingRepository;
   passwordReset: IPasswordResetRepository;
+  rateLimits: IRateLimitRepository;
   queue: IJobQueueRepository;
+  checkRateLimit(key: string, action: string, limit: number, windowSeconds: number): Promise<boolean>;
   getOperationalMetrics?: () => Promise<OperationalMetrics>;
   close?: () => Promise<void>;
   runTransaction<T>(operation: (state: any) => Promise<T> | T): Promise<T>;
@@ -903,18 +910,33 @@ export class InMemoryStorageRepository implements IStorageRepository {
     },
 
     checkRateLimit: async (key: string, action: string, limit: number, windowSeconds: number): Promise<boolean> => {
-      const now = Math.floor(Date.now() / 1000);
-      const windowStart = now - windowSeconds;
-      this.state.rateLimits = this.state.rateLimits.filter(e => e.timestamp >= windowStart);
-
-      const recent = this.state.rateLimits.filter(e => e.key === key && e.action === action);
-      if (recent.length >= limit) {
-        return false;
-      }
-
-      this.state.rateLimits.push({ key, action, timestamp: now });
-      return true;
+      return this.checkRateLimit(key, action, limit, windowSeconds);
     }
+  };
+
+  public rateLimits: IRateLimitRepository = {
+    checkRateLimit: async (key: string, action: string, limit: number, windowSeconds: number): Promise<boolean> => {
+      return this.checkRateLimit(key, action, limit, windowSeconds);
+    },
+    clearRateLimits: async (): Promise<void> => {
+      this.state.rateLimits = [];
+      this.save();
+    }
+  };
+
+  public checkRateLimit = async (key: string, action: string, limit: number, windowSeconds: number): Promise<boolean> => {
+    const now = Math.floor(Date.now() / 1000);
+    const windowStart = now - windowSeconds;
+    this.state.rateLimits = this.state.rateLimits.filter(e => e.timestamp >= windowStart);
+
+    const recent = this.state.rateLimits.filter(e => e.key === key && e.action === action);
+    if (recent.length >= limit) {
+      return false;
+    }
+
+    this.state.rateLimits.push({ key, action, timestamp: now });
+    this.save();
+    return true;
   };
 
   public queue: IJobQueueRepository = {

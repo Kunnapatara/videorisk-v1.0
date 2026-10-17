@@ -21,6 +21,7 @@ export async function runPasswordRecoveryTests() {
 
   // Set up ephemeral express app for API testing
   const app = express();
+  app.set('trust proxy', true);
   app.use(express.json());
   app.use(apiRouter);
 

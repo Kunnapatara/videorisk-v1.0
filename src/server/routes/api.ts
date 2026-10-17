@@ -243,6 +243,20 @@ export async function requireAuth(req: Request, res: Response): Promise<UserAcco
 }
 
 /**
+ * Safely extracts client IP address respecting Express's configured trust-proxy semantics.
+ * Does NOT blindly trust unvalidated X-Forwarded-For headers.
+ * Relies on req.ip (which Express securely populates only when trust proxy is configured),
+ * falling back to socket remote address.
+ */
+export function getClientIp(req: Request): string {
+  const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+  if (typeof ip === 'string' && ip.startsWith('::ffff:')) {
+    return ip.substring(7);
+  }
+  return ip;
+}
+
+/**
  * Express middleware requiring an authenticated user session.
  * Rejects unauthenticated requests with HTTP 401 before any downstream upload/processing runs.
  */
@@ -255,6 +269,35 @@ export const requireAuthMiddleware: RequestHandler = async (req, res, next) => {
     next();
   } catch (err: any) {
     res.status(500).json({ error: 'Authentication check failed.' });
+  }
+};
+
+/**
+ * Rate-limiting middleware for video file uploads.
+ * Runs AFTER requireAuthMiddleware (ensuring the user is authenticated)
+ * and BEFORE uploadVideoMiddleware (Multer), preventing unauthenticated or
+ * rate-limited requests from writing large video files to the server disk.
+ */
+export const uploadRateLimitMiddleware: RequestHandler = async (req, res, next) => {
+  try {
+    const user = (req as any).user;
+    const clientIp = getClientIp(req);
+    // Prefer authenticated user ID to protect legitimate users sharing NAT IPs, fallback to IP
+    const uploadKey = user?.id ? `user_${user.id}` : `ip_${clientIp}`;
+
+    const uploadLimit = process.env.UPLOAD_RATE_LIMIT ? parseInt(process.env.UPLOAD_RATE_LIMIT, 10) : 10;
+    const uploadWindow = process.env.UPLOAD_RATE_WINDOW ? parseInt(process.env.UPLOAD_RATE_WINDOW, 10) : 600; // 10 minutes
+
+    const allowed = await storage.rateLimits.checkRateLimit(uploadKey, 'upload_video', uploadLimit, uploadWindow);
+    if (!allowed) {
+      res.status(429).json({ 
+        error: 'Upload rate limit exceeded. Please wait before uploading another video.' 
+      });
+      return;
+    }
+    next();
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to evaluate upload rate limit.' });
   }
 };
 
@@ -307,6 +350,15 @@ apiRouter.get('/health', (req: Request, res: Response) => {
 // 2. Authentication & Account Management (Public)
 apiRouter.post('/auth/register', async (req: Request, res: Response) => {
   try {
+    const clientIp = getClientIp(req);
+    const registerLimit = process.env.AUTH_REGISTER_RATE_LIMIT ? parseInt(process.env.AUTH_REGISTER_RATE_LIMIT, 10) : 10;
+    const registerWindow = process.env.AUTH_REGISTER_RATE_WINDOW ? parseInt(process.env.AUTH_REGISTER_RATE_WINDOW, 10) : 900; // 15 minutes
+
+    const allowed = await storage.rateLimits.checkRateLimit(clientIp, 'auth_register', registerLimit, registerWindow);
+    if (!allowed) {
+      return res.status(429).json({ error: 'Too many registration attempts. Please wait before trying again.' });
+    }
+
     const { email, password } = req.body;
     if (!email || typeof email !== 'string' || !email.includes('@')) {
       return res.status(400).json({ error: 'A valid email address is required.' });
@@ -346,6 +398,15 @@ apiRouter.post('/auth/register', async (req: Request, res: Response) => {
 
 apiRouter.post('/auth/login', async (req: Request, res: Response) => {
   try {
+    const clientIp = getClientIp(req);
+    const loginLimit = process.env.AUTH_LOGIN_RATE_LIMIT ? parseInt(process.env.AUTH_LOGIN_RATE_LIMIT, 10) : 10;
+    const loginWindow = process.env.AUTH_LOGIN_RATE_WINDOW ? parseInt(process.env.AUTH_LOGIN_RATE_WINDOW, 10) : 900; // 15 minutes
+
+    const allowed = await storage.rateLimits.checkRateLimit(clientIp, 'auth_login', loginLimit, loginWindow);
+    if (!allowed) {
+      return res.status(429).json({ error: 'Too many login attempts. Please wait before trying again.' });
+    }
+
     const { email, password } = req.body;
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required.' });
@@ -401,8 +462,8 @@ apiRouter.post('/auth/forgot-password', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'A valid email address is required.' });
     }
 
-    const clientIp = (req.headers['x-forwarded-for'] as string) || req.ip || req.socket.remoteAddress || 'unknown';
-    const allowed = await storage.passwordReset.checkRateLimit(clientIp, 'forgot_password', 5, 900);
+    const clientIp = getClientIp(req);
+    const allowed = await storage.rateLimits.checkRateLimit(clientIp, 'forgot_password', 5, 900);
     if (!allowed) {
       return res.status(429).json({ error: 'Too many password reset requests. Please wait a few minutes before trying again.' });
     }
@@ -451,8 +512,8 @@ apiRouter.post('/auth/reset-password', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'New password must be at least 8 characters long.' });
     }
 
-    const clientIp = (req.headers['x-forwarded-for'] as string) || req.ip || req.socket.remoteAddress || 'unknown';
-    const allowed = await storage.passwordReset.checkRateLimit(clientIp, 'reset_password_attempt', 10, 900);
+    const clientIp = getClientIp(req);
+    const allowed = await storage.rateLimits.checkRateLimit(clientIp, 'reset_password_attempt', 10, 900);
     if (!allowed) {
       return res.status(429).json({ error: 'Too many reset attempts. Please wait before trying again.' });
     }
@@ -772,7 +833,12 @@ apiRouter.get('/billing/plans', async (req: Request, res: Response) => {
 });
 
 // 5. Upload & Pre-inspection (Protected)
-apiRouter.post('/uploads', requireAuthMiddleware, uploadVideoMiddleware, async (req: Request, res: Response) => {
+apiRouter.post(
+  '/uploads',
+  requireAuthMiddleware,
+  uploadRateLimitMiddleware,
+  uploadVideoMiddleware,
+  async (req: Request, res: Response) => {
   try {
     const user = await requireAuth(req, res);
     if (!user) {

@@ -29,6 +29,7 @@ import {
   IChannelProfileRepository,
   IPasswordResetRepository,
   IJobQueueRepository,
+  IRateLimitRepository,
   LeaseFencingToken,
   UploadRecord
 } from './index';
@@ -717,6 +718,21 @@ export class SqliteStorageRepository implements IStorageRepository {
     },
 
     checkRateLimit: async (key: string, action: string, limit: number, windowSeconds: number): Promise<boolean> => {
+      return this.checkRateLimit(key, action, limit, windowSeconds);
+    }
+  };
+
+  public rateLimits: IRateLimitRepository = {
+    checkRateLimit: async (key: string, action: string, limit: number, windowSeconds: number): Promise<boolean> => {
+      return this.checkRateLimit(key, action, limit, windowSeconds);
+    },
+    clearRateLimits: async (): Promise<void> => {
+      this.db.prepare('DELETE FROM rate_limits;').run();
+    }
+  };
+
+  public checkRateLimit = async (key: string, action: string, limit: number, windowSeconds: number): Promise<boolean> => {
+    return await this.runTransaction(async () => {
       const now = Math.floor(Date.now() / 1000);
       const windowStart = now - windowSeconds;
 
@@ -738,7 +754,7 @@ export class SqliteStorageRepository implements IStorageRepository {
         VALUES (?, ?, ?)
       `).run(key, action, now);
       return true; // Allowed
-    }
+    });
   };
 
   private validateLeaseFence(db: any, scanId: string, leaseToken?: LeaseFencingToken): void {

@@ -12,6 +12,8 @@ import { runPasswordRecoveryTests } from './password_recovery.test';
 import { runSecurityRetentionAndE2ETests } from './security_retention_and_e2e.test';
 import { runLeaseFencingAndHeartbeatTests } from './lease_fencing_and_heartbeat.test';
 import { runScanDeletionAndMediaCleanupTests } from './scan_deletion_and_media_cleanup.test';
+import { runRateLimitingAndAbuseProtectionTests } from './rate_limiting_and_abuse_protection.test';
+import { storage } from '../src/server/storage';
 
 async function main() {
   console.log('######################################################');
@@ -22,6 +24,9 @@ async function main() {
   const startTime = Date.now();
 
   try {
+    // Clear residual rate limit entries from previous test runs so localhost tests run clean
+    await storage.rateLimits.clearRateLimits?.();
+
     // Run Suite 1
     await runAuthAndOwnershipTests();
 
@@ -54,6 +59,9 @@ async function main() {
 
     // Run Suite 11: Scan Deletion & Billing Configuration
     await runScanDeletionAndMediaCleanupTests();
+
+    // Run Suite 12: Route-Level Rate Limiting & Abuse Protection
+    await runRateLimitingAndAbuseProtectionTests();
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log(`\n🎉 ALL AUTOMATED VERIFICATION SUITES COMPLETED SUCCESSFULLY in ${elapsed}s!`);
