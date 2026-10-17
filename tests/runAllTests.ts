@@ -7,6 +7,7 @@ import { enforceTestDatabaseIsolation, verifyStorageTestDatabase } from '../src/
 // Explicitly establish dedicated test database BEFORE importing storage or routes.
 // Guarantees automated tests cannot silently use or wipe production videorisk.db!
 // ----------------------------------------------------------------------------
+process.env.VIDEORISK_TEST_RUN = 'true';
 const testDbResolution = enforceTestDatabaseIsolation();
 
 async function main() {

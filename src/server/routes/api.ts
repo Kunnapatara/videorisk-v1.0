@@ -4,6 +4,7 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import crypto from 'crypto';
+import net from 'net';
 import { storage } from '../storage';
 import { jobOrchestrator } from '../pipeline/jobOrchestrator';
 import { mediaInspector } from '../pipeline/mediaInspector';
@@ -243,31 +244,63 @@ export async function requireAuth(req: Request, res: Response): Promise<UserAcco
 }
 
 /**
+ * Strictly validates and parses a positive integer from a string value:
+ * 1. Trims surrounding whitespace.
+ * 2. Entire value must match digits only without leading zeroes: /^[1-9]\d*$/
+ * 3. Rejects decimal values (e.g. "1.5"), trailing characters (e.g. "10abc"), zero ("0"),
+ *    negative values ("-1"), non-numeric strings, and Infinity.
+ * 4. Rejects values outside JavaScript's safe-integer range (Number.MAX_SAFE_INTEGER).
+ * Returns null if invalid.
+ */
+export function parseStrictPositiveInt(val: string | undefined | null): number | null {
+  if (val === undefined || val === null || typeof val !== 'string') {
+    return null;
+  }
+  const trimmed = val.trim();
+  if (!/^[1-9]\d*$/.test(trimmed)) {
+    return null;
+  }
+  // Check bounds using BigInt for values longer than 15 digits to avoid float precision coercion
+  if (trimmed.length > 15) {
+    try {
+      if (BigInt(trimmed) > BigInt(Number.MAX_SAFE_INTEGER)) {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+  }
+  const num = Number(trimmed);
+  if (!Number.isSafeInteger(num) || num <= 0) {
+    return null;
+  }
+  return num;
+}
+
+/**
  * Resolves a rate-limit integer setting with unambiguous precedence:
  * 1. Primary (current/specific) environment variable if set to a valid positive integer.
  * 2. Fallback (legacy/general) environment variable if set to a valid positive integer.
  * 3. Default positive integer value.
  *
  * Security Guarantee:
- * Invalid strings, empty strings, zero ('0'), negative numbers ('-5'), NaN, or Infinity
- * are strictly rejected and will never disable the rate limit.
+ * Invalid strings, empty strings, zero ('0'), negative numbers ('-1'), decimals ('1.5'),
+ * trailing letters ('10abc'), NaN, Infinity, or overflow values are strictly rejected
+ * and will never disable the rate limit. An invalid primary value never prevents a valid
+ * legacy fallback from being applied.
  */
 export function resolveRateLimitInt(
   primaryVal: string | undefined,
   fallbackVal: string | undefined,
   defaultValue: number
 ): number {
-  if (primaryVal !== undefined && primaryVal !== null && typeof primaryVal === 'string' && primaryVal.trim() !== '') {
-    const parsed = parseInt(primaryVal.trim(), 10);
-    if (!isNaN(parsed) && Number.isFinite(parsed) && parsed > 0) {
-      return parsed;
-    }
+  const primaryParsed = parseStrictPositiveInt(primaryVal);
+  if (primaryParsed !== null) {
+    return primaryParsed;
   }
-  if (fallbackVal !== undefined && fallbackVal !== null && typeof fallbackVal === 'string' && fallbackVal.trim() !== '') {
-    const parsed = parseInt(fallbackVal.trim(), 10);
-    if (!isNaN(parsed) && Number.isFinite(parsed) && parsed > 0) {
-      return parsed;
-    }
+  const fallbackParsed = parseStrictPositiveInt(fallbackVal);
+  if (fallbackParsed !== null) {
+    return fallbackParsed;
   }
   return defaultValue;
 }
@@ -295,6 +328,43 @@ export function getClientIp(req: Request): string {
 }
 
 /**
+ * Strictly validates an IP address (IPv4/IPv6) or CIDR block (IPv4/IPv6).
+ * Uses Node's built-in net.isIP to validate octets and address formatting.
+ * Strictly validates prefix lengths (0-32 for IPv4, 0-128 for IPv6).
+ */
+export function isValidIpOrCidr(entry: string): boolean {
+  if (!entry || typeof entry !== 'string') return false;
+  const trimmed = entry.trim();
+  if (trimmed === '') return false;
+
+  // CIDR: IP/prefix
+  if (trimmed.includes('/')) {
+    const parts = trimmed.split('/');
+    if (parts.length !== 2) return false;
+    const [ipPart, prefixPart] = parts;
+
+    const ipVer = net.isIP(ipPart);
+    if (ipVer === 0) return false;
+
+    // Prefix must be a non-negative integer without signs, decimals, or letters
+    if (!/^(0|[1-9]\d*)$/.test(prefixPart)) return false;
+    const prefix = Number(prefixPart);
+    if (!Number.isSafeInteger(prefix)) return false;
+
+    if (ipVer === 4) {
+      return prefix >= 0 && prefix <= 32;
+    }
+    if (ipVer === 6) {
+      return prefix >= 0 && prefix <= 128;
+    }
+    return false;
+  }
+
+  // Standalone IP
+  return net.isIP(trimmed) !== 0;
+}
+
+/**
  * Validates and configures reverse proxy trust settings for Express.
  *
  * Security Requirements & Assumptions:
@@ -302,22 +372,24 @@ export function getClientIp(req: Request): string {
  * - In production, unrestricted "true" should NOT be used unless all inbound traffic is strictly constrained
  *   to traverse the front-end reverse proxy (e.g. AWS ALB, Cloud Run, Nginx).
  * - Deployment Note: The application must NOT be directly reachable through an untrusted path when proxy trust is enabled.
- * - Accepts hop counts (e.g. 1), CIDR/IP lists, or standard keywords ("loopback").
+ * - Accepts hop counts (e.g. 1), CIDR/IP lists, or standard keywords ("loopback", "linklocal", "uniquelocal").
  * - Fails safely to false if an invalid or unparseable configuration is provided.
  */
 export function configureTrustProxy(app: express.Express, rawVal: string | undefined): void {
-  if (!rawVal || rawVal.trim() === '' || rawVal.trim().toLowerCase() === 'false') {
+  if (rawVal === undefined || rawVal === null || typeof rawVal !== 'string' || rawVal.trim() === '' || rawVal.trim().toLowerCase() === 'false') {
     app.set('trust proxy', false);
     return;
   }
 
   const trimmed = rawVal.trim();
 
-  // 1. Exact numeric hop count (e.g. "1" for a single front-end proxy layer)
-  const num = Number(trimmed);
-  if (!isNaN(num) && Number.isInteger(num) && num > 0) {
-    app.set('trust proxy', num);
-    return;
+  // 1. Exact numeric positive hop count (e.g. "1", "2")
+  if (/^[1-9]\d*$/.test(trimmed)) {
+    const num = Number(trimmed);
+    if (Number.isSafeInteger(num) && num > 0) {
+      app.set('trust proxy', num);
+      return;
+    }
   }
 
   // 2. Standard Express trust proxy keywords
@@ -327,27 +399,22 @@ export function configureTrustProxy(app: express.Express, rawVal: string | undef
     return;
   }
 
-  // 3. Comma-separated IP addresses or CIDR subnets
-  const parts = trimmed.split(',').map(p => p.trim());
-  const isIpOrCidrList = parts.every(item =>
-    item.length > 0 && (/^([0-9]{1,3}\.){3}[0-9]{1,3}(\/[0-9]{1,2})?$/.test(item) || item.includes(':'))
-  );
-  if (isIpOrCidrList) {
-    app.set('trust proxy', trimmed);
+  // 3. Boolean "true" (unrestricted trust proxy) - always logs explicit security warning
+  if (trimmed.toLowerCase() === 'true') {
+    console.warn(
+      '[SECURITY WARNING] TRUST_PROXY is set to unrestricted "true". ' +
+      'This trusts all X-Forwarded-For headers from any connecting client. ' +
+      'Ensure the application is NOT directly accessible without passing through your edge proxy/load balancer. ' +
+      'Prefer configuring an exact hop count (e.g. TRUST_PROXY=1) or trusted subnet CIDR range.'
+    );
+    app.set('trust proxy', true);
     return;
   }
 
-  // 4. Boolean "true" (unrestricted trust proxy) - only permitted with explicit warning
-  if (trimmed.toLowerCase() === 'true') {
-    if (process.env.NODE_ENV === 'production') {
-      console.warn(
-        '[SECURITY WARNING] TRUST_PROXY is set to unrestricted "true". ' +
-        'This trusts all X-Forwarded-For headers from any connecting client. ' +
-        'Ensure the application is NOT directly accessible without passing through your edge proxy/load balancer. ' +
-        'Prefer configuring an exact hop count (e.g. TRUST_PROXY=1) or trusted subnet CIDR range.'
-      );
-    }
-    app.set('trust proxy', true);
+  // 4. Comma-separated list of IP addresses or CIDR subnets
+  const parts = trimmed.split(',').map(p => p.trim());
+  if (parts.length > 0 && parts.every(part => isValidIpOrCidr(part))) {
+    app.set('trust proxy', parts.join(', '));
     return;
   }
 

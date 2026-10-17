@@ -36,6 +36,7 @@ import {
   LeaseFencingToken,
   UploadRecord
 } from './index';
+import { validateTestDatabaseTarget } from './testIsolation';
 
 export interface MigrationRecord {
   version: number;
@@ -58,6 +59,11 @@ export class SqliteStorageRepository implements IStorageRepository {
       this.dbPath = path.resolve(process.env.DATA_DIR, 'videorisk.db');
     } else {
       this.dbPath = path.resolve(process.cwd(), 'data', 'videorisk.db');
+    }
+
+    // Pre-open validation: Ensure no SQLite connection opens or writes to a production database during test runs
+    if (process.env.VIDEORISK_TEST_RUN === 'true' || process.env.TEST_DATABASE_PATH || process.env.NODE_ENV === 'test') {
+      validateTestDatabaseTarget(this.dbPath);
     }
 
     const dir = path.dirname(this.dbPath);

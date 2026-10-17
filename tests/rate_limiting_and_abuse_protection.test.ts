@@ -4,9 +4,26 @@ import fs from 'fs';
 import os from 'os';
 import crypto from 'crypto';
 import type { Server } from 'http';
-import { apiRouter, getClientIp, parsePositiveInt, resolveRateLimitInt, configureTrustProxy } from '../src/server/routes/api';
-import { storage, InMemoryStorageRepository } from '../src/server/storage';
-import { enforceTestDatabaseIsolation, verifyStorageTestDatabase, getProductionDatabasePath, getDefaultTestDatabasePath } from '../src/server/storage/testIsolation';
+import {
+  apiRouter,
+  getClientIp,
+  parsePositiveInt,
+  resolveRateLimitInt,
+  parseStrictPositiveInt,
+  configureTrustProxy,
+  isValidIpOrCidr
+} from '../src/server/routes/api';
+import { storage, InMemoryStorageRepository, SqliteStorageRepository } from '../src/server/storage';
+import {
+  enforceTestDatabaseIsolation,
+  verifyStorageTestDatabase,
+  getProductionDatabasePath,
+  getDefaultTestDatabasePath,
+  canonicalizeDatabaseTarget,
+  validateTestDatabaseTarget,
+  isTargetingProduction,
+  getProductionCanonicalTargets
+} from '../src/server/storage/testIsolation';
 
 function assert(condition: boolean, desc: string) {
   if (condition) {
@@ -91,7 +108,7 @@ export async function runRateLimitingAndAbuseProtectionTests() {
   try {
     enforceTestDatabaseIsolation(mockEnv4);
   } catch (err: any) {
-    caughtProdOverride = err.message.includes('Refusing to use production database path');
+    caughtProdOverride = err.message.includes('Refusing to use database path');
   }
   assert(caughtProdOverride, 'Refuses to use production database path as TEST_DATABASE_PATH');
 
@@ -114,6 +131,85 @@ export async function runRateLimitingAndAbuseProtectionTests() {
     path.resolve(activeStoragePath) !== prodPath && path.basename(activeStoragePath) !== 'videorisk.db',
     `Verified active test database (${activeStoragePath}) is isolated from production`
   );
+
+  // Symlink Regression Hardening Tests
+  const symlinkTempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vr-symlink-isolation-'));
+  try {
+    // 1. Test database path that is a symlink to production database
+    const dummyProdDir = path.join(symlinkTempDir, 'prod_dir');
+    fs.mkdirSync(dummyProdDir, { recursive: true });
+    const dummyProdDb = path.join(dummyProdDir, 'videorisk.db');
+    const initialProdContent = 'PRODUCTION_DATA_INTEGRITY_MARKER_' + Date.now();
+    fs.writeFileSync(dummyProdDb, initialProdContent, 'utf8');
+
+    const envWithCustomDataDir: NodeJS.ProcessEnv = { DATA_DIR: dummyProdDir };
+    const symlinkToProd = path.join(symlinkTempDir, 'symlink_to_prod.db');
+    fs.symlinkSync(dummyProdDb, symlinkToProd);
+
+    // Verify validateTestDatabaseTarget catches symlink and throws before connection opens
+    let caughtSymlinkToProd = false;
+    try {
+      validateTestDatabaseTarget(symlinkToProd, envWithCustomDataDir);
+    } catch (err: any) {
+      caughtSymlinkToProd = err.message.includes('matches production database');
+    }
+    assert(caughtSymlinkToProd, 'Validation detects and rejects test database path that is a symlink to production');
+
+    // Verify pre-open check in SqliteStorageRepository blocks connection before open
+    let caughtRepoOpen = false;
+    try {
+      new SqliteStorageRepository(symlinkToProd);
+    } catch (err: any) {
+      caughtRepoOpen = err.message.includes('matches production database') || err.message.includes('Refusing to use database path');
+    }
+    assert(caughtRepoOpen, 'SqliteStorageRepository pre-open check blocks initialization on symlink to production');
+
+    // Verify production database contents remained completely unchanged
+    const afterCheckContent = fs.readFileSync(dummyProdDb, 'utf8');
+    assert(afterCheckContent === initialProdContent, 'Production database contents remain completely intact after rejected symlink access');
+
+    // 2. Default test database replaced with a symlink to production
+    const symlinkAsDefaultTest = path.join(symlinkTempDir, 'videorisk_test.db');
+    fs.symlinkSync(dummyProdDb, symlinkAsDefaultTest);
+    let caughtDefaultSymlink = false;
+    try {
+      validateTestDatabaseTarget(symlinkAsDefaultTest, envWithCustomDataDir);
+    } catch (err: any) {
+      caughtDefaultSymlink = err.message.includes('matches production database');
+    }
+    assert(caughtDefaultSymlink, 'Rejection enforced when default test path is replaced with a symlink to production');
+
+    // 3. Production paths configured through DATA_DIR
+    let caughtDataDirProd = false;
+    try {
+      validateTestDatabaseTarget(dummyProdDb, envWithCustomDataDir);
+    } catch (err: any) {
+      caughtDataDirProd = err.message.includes('matches production database') || err.message.includes('production database name');
+    }
+    assert(caughtDataDirProd, 'Production paths configured through DATA_DIR are strictly protected');
+
+    // 4. Existing database files vs not-yet-created database files
+    const nonExistentDb = path.join(symlinkTempDir, 'not_yet_created.db');
+    const validatedNonExistent = validateTestDatabaseTarget(nonExistentDb, envWithCustomDataDir);
+    assert(validatedNonExistent === nonExistentDb, 'Not-yet-created database file in valid directory validates successfully');
+
+    const existingValidDb = path.join(symlinkTempDir, 'existing_valid.db');
+    fs.writeFileSync(existingValidDb, 'TEST_DATA');
+    const validatedExisting = validateTestDatabaseTarget(existingValidDb, envWithCustomDataDir);
+    assert(validatedExisting === existingValidDb, 'Existing valid test database file validates successfully');
+
+    // 5. Unsafe or unresolvable parent directory
+    const unresolvableDb = path.join(symlinkTempDir, 'non_existent_subdir_xyz', 'test.db');
+    let caughtUnresolvable = false;
+    try {
+      validateTestDatabaseTarget(unresolvableDb, envWithCustomDataDir);
+    } catch (err: any) {
+      caughtUnresolvable = err.message.includes('does not exist or is unresolvable');
+    }
+    assert(caughtUnresolvable, 'Unsafe or unresolvable parent directories fail closed safely');
+  } finally {
+    fs.rmSync(symlinkTempDir, { recursive: true, force: true });
+  }
 
   // Test 2.2: Exact Rate-Limit Prefix Cleanup (Literal vs SQL LIKE Wildcards)
   const exactKey = `test_exact_${Date.now()}`;
@@ -183,27 +279,45 @@ export async function runRateLimitingAndAbuseProtectionTests() {
   // ---------------------------------------------------------
   console.log('\n[3. Environment Variable Precedence & Safety]');
 
-  // Test parsePositiveInt
+  // Test parseStrictPositiveInt and parsePositiveInt
+  assert(parseStrictPositiveInt('10') === 10, '"10" -> accepted as 10');
+  assert(parseStrictPositiveInt(' 10 ') === 10, '" 10 " -> accepted as 10 after trimming');
+  assert(parseStrictPositiveInt('1.5') === null, '"1.5" -> rejected (decimal)');
+  assert(parseStrictPositiveInt('10abc') === null, '"10abc" -> rejected (trailing characters)');
+  assert(parseStrictPositiveInt('0') === null, '"0" -> rejected (zero is not positive)');
+  assert(parseStrictPositiveInt('-1') === null, '"-1" -> rejected (negative)');
+  assert(parseStrictPositiveInt('Infinity') === null, '"Infinity" -> rejected');
+  assert(parseStrictPositiveInt('') === null, 'Empty string -> rejected');
+  assert(parseStrictPositiveInt('   ') === null, 'Whitespace-only string -> rejected');
+  assert(parseStrictPositiveInt('9007199254740992') === null, 'Value larger than MAX_SAFE_INTEGER -> rejected');
+  assert(parseStrictPositiveInt('999999999999999999999999') === null, 'Huge numeric string -> rejected');
+  assert(parseStrictPositiveInt(undefined) === null, 'undefined -> rejected (returns null)');
+
+  // parsePositiveInt fallback to default
   assert(parsePositiveInt('15', 10) === 15, 'Valid string parsed as positive integer');
   assert(parsePositiveInt(undefined, 10) === 10, 'Undefined falls back to safe default');
   assert(parsePositiveInt('invalid', 10) === 10, 'NaN string falls back to safe default');
   assert(parsePositiveInt('-5', 10) === 10, 'Negative integer falls back to safe default');
-  assert(parsePositiveInt('0', 10) === 10, 'Zero integer falls back to safe default (cannot disable limits)');
+  assert(parsePositiveInt('0', 10) === 10, 'Zero integer falls back to safe default');
+  assert(parsePositiveInt('1.5', 10) === 10, 'Decimal string falls back to safe default');
+  assert(parsePositiveInt('10abc', 10) === 10, 'Partially numeric string falls back to safe default');
 
   // Test resolveRateLimitInt unambiguous precedence:
-  // 1. Primary (current/specific) takes precedence over legacy when valid
-  assert(resolveRateLimitInt('25', '10', 5) === 25, 'Primary takes precedence over legacy when both valid');
-  // 2. Legacy is used when primary is undefined
-  assert(resolveRateLimitInt(undefined, '18', 5) === 18, 'Legacy used when primary is undefined');
-  // 3. Legacy is used when primary is invalid string
-  assert(resolveRateLimitInt('not_a_number', '18', 5) === 18, 'Legacy used when primary is invalid');
-  // 4. Legacy is used when primary is 0 or negative
-  assert(resolveRateLimitInt('0', '18', 5) === 18, 'Legacy used when primary is 0');
-  assert(resolveRateLimitInt('-10', '18', 5) === 18, 'Legacy used when primary is negative');
-  // 5. Default is used when both are invalid/0/negative/undefined (cannot disable limit)
-  assert(resolveRateLimitInt('0', '0', 20) === 20, 'Safe default enforced when both are zero');
-  assert(resolveRateLimitInt('-5', 'invalid', 20) === 20, 'Safe default enforced when both invalid');
-  assert(resolveRateLimitInt(undefined, undefined, 20) === 20, 'Safe default enforced when both undefined');
+  // 1. Valid primary plus valid legacy fallback -> primary value used
+  assert(resolveRateLimitInt('20', '10', 5) === 20, 'Valid primary plus valid legacy fallback -> primary value used');
+  // 2. Invalid primary plus valid legacy fallback -> legacy value used
+  assert(resolveRateLimitInt('1.5', '10', 5) === 10, 'Invalid primary ("1.5") plus valid legacy fallback -> legacy value used');
+  assert(resolveRateLimitInt('0', '10', 5) === 10, 'Invalid primary ("0") plus valid legacy fallback -> legacy value used');
+  assert(resolveRateLimitInt('-1', '10', 5) === 10, 'Invalid primary ("-1") plus valid legacy fallback -> legacy value used');
+  assert(resolveRateLimitInt('10abc', '10', 5) === 10, 'Invalid primary ("10abc") plus valid legacy fallback -> legacy value used');
+  assert(resolveRateLimitInt('Infinity', '10', 5) === 10, 'Invalid primary ("Infinity") plus valid legacy fallback -> legacy value used');
+  assert(resolveRateLimitInt('', '10', 5) === 10, 'Empty primary plus valid legacy fallback -> legacy value used');
+  assert(resolveRateLimitInt(undefined, '10', 5) === 10, 'Undefined primary plus valid legacy fallback -> legacy value used');
+  // 3. Invalid primary and invalid legacy fallback -> existing secure default used
+  assert(resolveRateLimitInt('1.5', '10abc', 20) === 20, 'Invalid primary and invalid legacy fallback -> secure default used');
+  assert(resolveRateLimitInt('0', '0', 20) === 20, 'Zero primary and zero legacy fallback -> secure default used');
+  assert(resolveRateLimitInt('-5', 'invalid', 20) === 20, 'Negative primary and invalid legacy fallback -> secure default used');
+  assert(resolveRateLimitInt(undefined, undefined, 20) === 20, 'Undefined primary and undefined legacy fallback -> secure default used');
   assert(resolveRateLimitInt('  30  ', undefined, 20) === 30, 'Trimmed positive integer parsed correctly');
 
   // ---------------------------------------------------------
@@ -211,22 +325,78 @@ export async function runRateLimitingAndAbuseProtectionTests() {
   // ---------------------------------------------------------
   console.log('\n[4. Express App Setup & Trusted Proxy Validation]');
 
-  // Test configureTrustProxy utility
-  const proxyTestApp1 = express();
-  configureTrustProxy(proxyTestApp1, undefined);
-  assert(proxyTestApp1.get('trust proxy') === false, 'Default TRUST_PROXY is false');
+  // Positive hop counts
+  const proxyAppHop1 = express();
+  configureTrustProxy(proxyAppHop1, '1');
+  assert(proxyAppHop1.get('trust proxy') === 1, 'Positive hop count "1" configures 1 hop');
 
-  const proxyTestApp2 = express();
-  configureTrustProxy(proxyTestApp2, '1');
-  assert(proxyTestApp2.get('trust proxy') === 1, 'TRUST_PROXY=1 configures 1 hop');
+  const proxyAppHop2 = express();
+  configureTrustProxy(proxyAppHop2, ' 2 ');
+  assert(proxyAppHop2.get('trust proxy') === 2, 'Trimmed positive hop count " 2 " configures 2 hops');
 
-  const proxyTestApp3 = express();
-  configureTrustProxy(proxyTestApp3, 'malformed-value-xyz');
-  assert(proxyTestApp3.get('trust proxy') === false, 'Malformed TRUST_PROXY fails safe to false');
+  // Supported proxy keywords
+  const proxyAppLoopback = express();
+  configureTrustProxy(proxyAppLoopback, 'loopback');
+  assert(proxyAppLoopback.get('trust proxy') === 'loopback', 'Keyword "loopback" is accepted');
 
-  const proxyTestApp4 = express();
-  configureTrustProxy(proxyTestApp4, '10.0.0.0/8, 172.16.0.0/12');
-  assert(proxyTestApp4.get('trust proxy') === '10.0.0.0/8, 172.16.0.0/12', 'TRUST_PROXY accepts CIDR subnet list');
+  const proxyAppLinklocal = express();
+  configureTrustProxy(proxyAppLinklocal, 'linklocal');
+  assert(proxyAppLinklocal.get('trust proxy') === 'linklocal', 'Keyword "linklocal" is accepted');
+
+  const proxyAppUniquelocal = express();
+  configureTrustProxy(proxyAppUniquelocal, 'uniquelocal');
+  assert(proxyAppUniquelocal.get('trust proxy') === 'uniquelocal', 'Keyword "uniquelocal" is accepted');
+
+  // Valid IPv4, IPv6, and CIDRs
+  const proxyAppIp = express();
+  configureTrustProxy(proxyAppIp, '192.168.1.1, 10.0.0.0/8, ::1, 2001:db8::/32');
+  assert(
+    proxyAppIp.get('trust proxy') === '192.168.1.1, 10.0.0.0/8, ::1, 2001:db8::/32',
+    'Valid IPv4, IPv6, and CIDR list is accepted'
+  );
+
+  // Malformed and rejected examples -> must fail closed to false
+  const proxyTestCases: Array<{ label: string; val: any }> = [
+    { label: 'Malformed IPv4 (999.999.999.999)', val: '999.999.999.999' },
+    { label: 'Malformed CIDR prefix (10.0.0.1/99)', val: '10.0.0.1/99' },
+    { label: 'Malformed IPv6 string (fe80:::1)', val: 'fe80:::1' },
+    { label: 'Invalid IPv4 prefix length (10.0.0.1/-1)', val: '10.0.0.1/-1' },
+    { label: 'Invalid IPv4 prefix length (10.0.0.1/33)', val: '10.0.0.1/33' },
+    { label: 'Invalid IPv6 prefix length (2001:db8::/129)', val: '2001:db8::/129' },
+    { label: 'Zero hop count ("0")', val: '0' },
+    { label: 'Negative hop count ("-1")', val: '-1' },
+    { label: 'Decimal hop count ("1.5")', val: '1.5' },
+    { label: 'Malformed hop count ("10abc")', val: '10abc' },
+    { label: 'Empty configuration ("")', val: '' },
+    { label: 'Whitespace configuration ("   ")', val: '   ' },
+    { label: 'Undefined configuration', val: undefined },
+    { label: 'Arbitrary string ("malformed-value-xyz")', val: 'malformed-value-xyz' },
+    { label: 'Explicit "false"', val: 'false' }
+  ];
+
+  for (const tc of proxyTestCases) {
+    const testApp = express();
+    configureTrustProxy(testApp, tc.val);
+    assert(testApp.get('trust proxy') === false, `${tc.label} fails closed to false`);
+  }
+
+  // Explicit unrestricted "true" - verify warning and configuration
+  const proxyAppTrue = express();
+  const warningState = { captured: false };
+  const origWarn = console.warn;
+  console.warn = (...args: any[]) => {
+    if (args.some(a => String(a).includes('TRUST_PROXY is set to unrestricted "true"'))) {
+      warningState.captured = true;
+    }
+    origWarn(...args);
+  };
+  try {
+    configureTrustProxy(proxyAppTrue, 'true');
+    assert(proxyAppTrue.get('trust proxy') === true, 'Explicit "true" sets trust proxy to true');
+    assert(warningState.captured === true, 'Explicit "true" logs security warning');
+  } finally {
+    console.warn = origWarn;
+  }
 
   const app = express();
   app.set('trust proxy', true); // Trust proxy enabled in test harness to evaluate simulated client IPs
