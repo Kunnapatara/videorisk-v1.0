@@ -24,9 +24,24 @@ export interface RateLimitStatus {
   limit: number;
 }
 
+export interface RateLimitSpec {
+  key: string;
+  action: string;
+  limit: number;
+  windowSeconds: number;
+}
+
+export interface MultiRateLimitStatus {
+  allowed: boolean;
+  retryAfter: number;
+  rejectedSpec?: RateLimitSpec;
+  results: Array<{ key: string; action: string; allowed: boolean; retryAfter: number; count: number; limit: number }>;
+}
+
 export interface IRateLimitRepository {
   checkRateLimit(key: string, action: string, limit: number, windowSeconds: number): Promise<boolean>;
   consumeRateLimit(key: string, action: string, limit: number, windowSeconds: number): Promise<RateLimitStatus>;
+  consumeRateLimits(specs: RateLimitSpec[]): Promise<MultiRateLimitStatus>;
   clearRateLimits?(filter?: { keyPrefix?: string; key?: string }): Promise<void>;
   clearTestRateLimits?(prefix?: string): Promise<void>;
 }
@@ -138,6 +153,7 @@ export interface IStorageRepository {
   queue: IJobQueueRepository;
   checkRateLimit(key: string, action: string, limit: number, windowSeconds: number): Promise<boolean>;
   consumeRateLimit(key: string, action: string, limit: number, windowSeconds: number): Promise<RateLimitStatus>;
+  consumeRateLimits(specs: RateLimitSpec[]): Promise<MultiRateLimitStatus>;
   getOperationalMetrics?: () => Promise<OperationalMetrics>;
   close?: () => Promise<void>;
   runTransaction<T>(operation: (state: any) => Promise<T> | T): Promise<T>;
@@ -931,10 +947,20 @@ export class InMemoryStorageRepository implements IStorageRepository {
     consumeRateLimit: async (key: string, action: string, limit: number, windowSeconds: number): Promise<RateLimitStatus> => {
       return this.consumeRateLimit(key, action, limit, windowSeconds);
     },
+    consumeRateLimits: async (specs: RateLimitSpec[]): Promise<MultiRateLimitStatus> => {
+      return this.consumeRateLimits(specs);
+    },
     clearRateLimits: async (filter?: { keyPrefix?: string; key?: string }): Promise<void> => {
+      if (process.env.NODE_ENV === 'production' && !filter?.keyPrefix && !filter?.key) {
+        throw new Error('Refusing to clear all rate limits in production environment without a target key or prefix filter.');
+      }
+
       if (filter?.key) {
         this.state.rateLimits = this.state.rateLimits.filter(r => r.key !== filter.key);
       } else if (filter?.keyPrefix) {
+        if (filter.keyPrefix.length === 0) {
+          throw new Error('A non-empty literal prefix is required when keyPrefix filter is specified.');
+        }
         this.state.rateLimits = this.state.rateLimits.filter(r => !r.key.startsWith(filter.keyPrefix!));
       } else if (process.env.NODE_ENV !== 'production') {
         // In non-prod default cleanup, only remove test-scoped entries
@@ -951,34 +977,79 @@ export class InMemoryStorageRepository implements IStorageRepository {
       this.save();
     },
     clearTestRateLimits: async (prefix: string = 'test_'): Promise<void> => {
+      if (process.env.NODE_ENV === 'production') {
+        throw new Error('Refusing to run clearTestRateLimits in production environment.');
+      }
+      if (!prefix || prefix.length === 0) {
+        throw new Error('A non-empty literal prefix is required for clearTestRateLimits.');
+      }
       this.state.rateLimits = this.state.rateLimits.filter(r => !r.key.startsWith(prefix));
       this.save();
     }
   };
 
-  public consumeRateLimit = async (key: string, action: string, limit: number, windowSeconds: number): Promise<RateLimitStatus> => {
+  public consumeRateLimits = async (specs: RateLimitSpec[]): Promise<MultiRateLimitStatus> => {
     const now = Math.floor(Date.now() / 1000);
-    const windowStart = now - windowSeconds;
-    this.state.rateLimits = this.state.rateLimits.filter(e => e.timestamp >= windowStart);
+    const maxWindow = specs.length > 0 ? Math.max(...specs.map(s => s.windowSeconds)) : 900;
+    this.state.rateLimits = this.state.rateLimits.filter(e => e.timestamp >= now - maxWindow);
 
-    const matching = this.state.rateLimits.filter(e => e.key === key && e.action === action);
-    if (matching.length >= limit) {
-      const oldest = Math.min(...matching.map(m => m.timestamp));
-      const retryAfter = Math.max(1, Math.ceil((oldest + windowSeconds) - now));
+    let anyBlocked = false;
+    let maxRetryAfter = 0;
+    let firstRejectedSpec: RateLimitSpec | undefined;
+    const evaluations: any[] = [];
+
+    // Phase 1: Evaluate all specs without committing
+    for (const spec of specs) {
+      const windowStart = now - spec.windowSeconds;
+      const matching = this.state.rateLimits.filter(
+        e => e.key === spec.key && e.action === spec.action && e.timestamp >= windowStart
+      );
+      if (matching.length >= spec.limit) {
+        anyBlocked = true;
+        const oldest = Math.min(...matching.map(m => m.timestamp));
+        const retryAfter = Math.max(1, Math.ceil((oldest + spec.windowSeconds) - now));
+        if (retryAfter > maxRetryAfter) maxRetryAfter = retryAfter;
+        if (!firstRejectedSpec) firstRejectedSpec = spec;
+        evaluations.push({ key: spec.key, action: spec.action, allowed: false, retryAfter, count: matching.length, limit: spec.limit });
+      } else {
+        evaluations.push({ key: spec.key, action: spec.action, allowed: true, retryAfter: 0, count: matching.length, limit: spec.limit });
+      }
+    }
+
+    // Phase 2: If ANY quota exceeded, do NOT consume any quota!
+    if (anyBlocked) {
       return {
         allowed: false,
-        retryAfter,
-        count: matching.length,
-        limit
+        retryAfter: maxRetryAfter,
+        rejectedSpec: firstRejectedSpec,
+        results: evaluations
       };
     }
 
-    this.state.rateLimits.push({ key, action, timestamp: now });
+    // Phase 3: Only when ALL quotas passed, atomically consume all dimensions
+    for (const spec of specs) {
+      this.state.rateLimits.push({ key: spec.key, action: spec.action, timestamp: now });
+    }
     this.save();
+
+    for (const ev of evaluations) {
+      ev.count += 1;
+    }
+
     return {
       allowed: true,
       retryAfter: 0,
-      count: matching.length + 1,
+      results: evaluations
+    };
+  };
+
+  public consumeRateLimit = async (key: string, action: string, limit: number, windowSeconds: number): Promise<RateLimitStatus> => {
+    const multi = await this.consumeRateLimits([{ key, action, limit, windowSeconds }]);
+    const first = multi.results[0];
+    return {
+      allowed: multi.allowed,
+      retryAfter: multi.retryAfter,
+      count: first ? first.count : 0,
       limit
     };
   };

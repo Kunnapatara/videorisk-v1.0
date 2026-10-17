@@ -31,6 +31,8 @@ import {
   IJobQueueRepository,
   IRateLimitRepository,
   RateLimitStatus,
+  RateLimitSpec,
+  MultiRateLimitStatus,
   LeaseFencingToken,
   UploadRecord
 } from './index';
@@ -730,6 +732,9 @@ export class SqliteStorageRepository implements IStorageRepository {
     consumeRateLimit: async (key: string, action: string, limit: number, windowSeconds: number): Promise<RateLimitStatus> => {
       return this.consumeRateLimit(key, action, limit, windowSeconds);
     },
+    consumeRateLimits: async (specs: RateLimitSpec[]): Promise<MultiRateLimitStatus> => {
+      return this.consumeRateLimits(specs);
+    },
     clearRateLimits: async (filter?: { keyPrefix?: string; key?: string }): Promise<void> => {
       if (process.env.NODE_ENV === 'production' && !filter?.keyPrefix && !filter?.key) {
         throw new Error('Refusing to clear all rate limits in production environment without a target key or prefix filter.');
@@ -738,67 +743,112 @@ export class SqliteStorageRepository implements IStorageRepository {
       if (filter?.key) {
         this.db.prepare('DELETE FROM rate_limits WHERE key = ?;').run(filter.key);
       } else if (filter?.keyPrefix) {
-        this.db.prepare('DELETE FROM rate_limits WHERE key LIKE ?;').run(`${filter.keyPrefix}%`);
+        if (filter.keyPrefix.length === 0) {
+          throw new Error('A non-empty literal prefix is required when keyPrefix filter is specified.');
+        }
+        // Exact literal prefix comparison using substr() to prevent SQL LIKE wildcard interpretation of '_' or '%'
+        this.db.prepare('DELETE FROM rate_limits WHERE substr(key, 1, ?) = ?;').run(filter.keyPrefix.length, filter.keyPrefix);
       } else if (process.env.NODE_ENV !== 'production') {
         // Only delete test-scoped keys by default in non-production, preserving unrelated records
         this.db.prepare(`
           DELETE FROM rate_limits 
-          WHERE key LIKE 'test_%' 
-             OR key LIKE 'concurrent_%'
-             OR key LIKE 'uploader_%'
-             OR key LIKE '198.51.100.%'
-             OR key LIKE '203.0.113.%'
-             OR key LIKE '192.0.2.%'
+          WHERE substr(key, 1, 5) = 'test_'
+             OR substr(key, 1, 11) = 'concurrent_'
+             OR substr(key, 1, 9) = 'uploader_'
+             OR substr(key, 1, 12) = '198.51.100.'
+             OR substr(key, 1, 12) = '203.0.113.'
+             OR substr(key, 1, 8) = '192.0.2.'
              OR key = '127.0.0.1';
         `).run();
       }
     },
     clearTestRateLimits: async (prefix: string = 'test_'): Promise<void> => {
-      this.db.prepare('DELETE FROM rate_limits WHERE key LIKE ?;').run(`${prefix}%`);
+      if (process.env.NODE_ENV === 'production') {
+        throw new Error('Refusing to run clearTestRateLimits in production environment.');
+      }
+      if (!prefix || prefix.length === 0) {
+        throw new Error('A non-empty literal prefix is required for clearTestRateLimits.');
+      }
+      this.db.prepare('DELETE FROM rate_limits WHERE substr(key, 1, ?) = ?;').run(prefix.length, prefix);
     }
   };
 
-  public consumeRateLimit = async (key: string, action: string, limit: number, windowSeconds: number): Promise<RateLimitStatus> => {
+  public consumeRateLimits = async (specs: RateLimitSpec[]): Promise<MultiRateLimitStatus> => {
     return await this.runTransaction(async () => {
       const now = Math.floor(Date.now() / 1000);
-      const windowStart = now - windowSeconds;
+      const maxWindow = specs.length > 0 ? Math.max(...specs.map(s => s.windowSeconds)) : 900;
 
       // Clean old expired entries
-      this.db.prepare('DELETE FROM rate_limits WHERE timestamp < ?').run(windowStart);
+      this.db.prepare('DELETE FROM rate_limits WHERE timestamp < ?').run(now - maxWindow);
 
-      const row = this.db.prepare(`
-        SELECT COUNT(*) as count, MIN(timestamp) as oldest 
-        FROM rate_limits 
-        WHERE key = ? AND action = ? AND timestamp >= ?
-      `).get(key, action, windowStart) as any;
+      let anyBlocked = false;
+      let maxRetryAfter = 0;
+      let firstRejectedSpec: RateLimitSpec | undefined;
+      const evaluations: Array<{ key: string; action: string; allowed: boolean; retryAfter: number; count: number; limit: number; spec: RateLimitSpec }> = [];
 
-      const count = row?.count || 0;
-      const oldest = row?.oldest;
+      // Phase 1: Evaluate all specs without committing
+      for (const spec of specs) {
+        const windowStart = now - spec.windowSeconds;
+        const row = this.db.prepare(`
+          SELECT COUNT(*) as count, MIN(timestamp) as oldest 
+          FROM rate_limits 
+          WHERE key = ? AND action = ? AND timestamp >= ?
+        `).get(spec.key, spec.action, windowStart) as any;
 
-      if (count >= limit) {
-        const retryAfter = oldest
-          ? Math.max(1, Math.ceil((oldest + windowSeconds) - now))
-          : Math.max(1, windowSeconds);
+        const count = row?.count || 0;
+        const oldest = row?.oldest;
+
+        if (count >= spec.limit) {
+          anyBlocked = true;
+          const retryAfter = oldest
+            ? Math.max(1, Math.ceil((oldest + spec.windowSeconds) - now))
+            : Math.max(1, spec.windowSeconds);
+          if (retryAfter > maxRetryAfter) maxRetryAfter = retryAfter;
+          if (!firstRejectedSpec) firstRejectedSpec = spec;
+          evaluations.push({ key: spec.key, action: spec.action, allowed: false, retryAfter, count, limit: spec.limit, spec });
+        } else {
+          evaluations.push({ key: spec.key, action: spec.action, allowed: true, retryAfter: 0, count, limit: spec.limit, spec });
+        }
+      }
+
+      // Phase 2: If ANY quota exceeded, do NOT consume any quota!
+      if (anyBlocked) {
         return {
           allowed: false,
-          retryAfter,
-          count,
-          limit
+          retryAfter: maxRetryAfter,
+          rejectedSpec: firstRejectedSpec,
+          results: evaluations
         };
       }
 
-      this.db.prepare(`
+      // Phase 3: Only when ALL quotas passed, atomically insert records for all specs
+      const insertStmt = this.db.prepare(`
         INSERT INTO rate_limits (key, action, timestamp)
         VALUES (?, ?, ?)
-      `).run(key, action, now);
+      `);
+
+      for (const ev of evaluations) {
+        insertStmt.run(ev.key, ev.action, now);
+        ev.count += 1;
+      }
 
       return {
         allowed: true,
         retryAfter: 0,
-        count: count + 1,
-        limit
+        results: evaluations
       };
     });
+  };
+
+  public consumeRateLimit = async (key: string, action: string, limit: number, windowSeconds: number): Promise<RateLimitStatus> => {
+    const multi = await this.consumeRateLimits([{ key, action, limit, windowSeconds }]);
+    const first = multi.results[0];
+    return {
+      allowed: multi.allowed,
+      retryAfter: multi.retryAfter,
+      count: first ? first.count : 0,
+      limit
+    };
   };
 
   public checkRateLimit = async (key: string, action: string, limit: number, windowSeconds: number): Promise<boolean> => {

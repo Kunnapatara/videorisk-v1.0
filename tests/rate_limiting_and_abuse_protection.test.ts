@@ -4,8 +4,9 @@ import fs from 'fs';
 import os from 'os';
 import crypto from 'crypto';
 import type { Server } from 'http';
-import { apiRouter, getClientIp, parsePositiveInt, configureTrustProxy } from '../src/server/routes/api';
-import { storage } from '../src/server/storage';
+import { apiRouter, getClientIp, parsePositiveInt, resolveRateLimitInt, configureTrustProxy } from '../src/server/routes/api';
+import { storage, InMemoryStorageRepository } from '../src/server/storage';
+import { enforceTestDatabaseIsolation, verifyStorageTestDatabase, getProductionDatabasePath, getDefaultTestDatabasePath } from '../src/server/storage/testIsolation';
 
 function assert(condition: boolean, desc: string) {
   if (condition) {
@@ -56,22 +57,113 @@ export async function runRateLimitingAndAbuseProtectionTests() {
   assert(pwResetAllowed === true, 'storage.passwordReset.checkRateLimit() backward compatibility preserved');
 
   // ---------------------------------------------------------
-  // 2. Test Data Isolation & Targeted Cleanup Protection
+  // 2. Test Database Isolation & Exact Prefix Cleanup
   // ---------------------------------------------------------
-  console.log('\n[2. Test Data Isolation & Targeted Cleanup Protection]');
+  console.log('\n[2. Test Database Isolation & Exact Prefix Cleanup]');
 
-  // Insert a mock production rate-limit record that should NEVER be wiped by tests
+  // Test 2.1: Enforce Test Database Isolation Regression Proofs
+  const mockEnv1: NodeJS.ProcessEnv = {};
+  const res1 = enforceTestDatabaseIsolation(mockEnv1);
+  assert(
+    res1.resolvedPath === getDefaultTestDatabasePath() && mockEnv1.DATABASE_PATH === getDefaultTestDatabasePath(),
+    'Unset DATABASE_PATH safely establishes default isolated test database'
+  );
+
+  const mockEnv2: NodeJS.ProcessEnv = { DATABASE_PATH: 'data/videorisk.db' };
+  let caughtConflictingDb = false;
+  try {
+    enforceTestDatabaseIsolation(mockEnv2);
+  } catch (err: any) {
+    caughtConflictingDb = err.message.includes('Conflicting DATABASE_PATH detected');
+  }
+  assert(caughtConflictingDb, 'Conflicting external DATABASE_PATH fails safely with clear error');
+
+  const customTestDb = path.resolve(os.tmpdir(), `custom_test_${Date.now()}.db`);
+  const mockEnv3: NodeJS.ProcessEnv = { TEST_DATABASE_PATH: customTestDb };
+  const res3 = enforceTestDatabaseIsolation(mockEnv3);
+  assert(
+    res3.resolvedPath === customTestDb && mockEnv3.DATABASE_PATH === customTestDb,
+    'Supported explicit TEST_DATABASE_PATH override is honored'
+  );
+
+  const mockEnv4: NodeJS.ProcessEnv = { TEST_DATABASE_PATH: 'data/videorisk.db' };
+  let caughtProdOverride = false;
+  try {
+    enforceTestDatabaseIsolation(mockEnv4);
+  } catch (err: any) {
+    caughtProdOverride = err.message.includes('Refusing to use production database path');
+  }
+  assert(caughtProdOverride, 'Refuses to use production database path as TEST_DATABASE_PATH');
+
+  const mockEnv5: NodeJS.ProcessEnv = {
+    TEST_DATABASE_PATH: customTestDb,
+    DATABASE_PATH: '/different/path.db'
+  };
+  let caughtConflictWithTest = false;
+  try {
+    enforceTestDatabaseIsolation(mockEnv5);
+  } catch (err: any) {
+    caughtConflictWithTest = err.message.includes('conflicts with explicit TEST_DATABASE_PATH');
+  }
+  assert(caughtConflictWithTest, 'Conflicting DATABASE_PATH with explicit TEST_DATABASE_PATH throws error');
+
+  // Verify storage database path is NOT production
+  const activeStoragePath = (storage as any).dbPath || '';
+  const prodPath = getProductionDatabasePath();
+  assert(
+    path.resolve(activeStoragePath) !== prodPath && path.basename(activeStoragePath) !== 'videorisk.db',
+    `Verified active test database (${activeStoragePath}) is isolated from production`
+  );
+
+  // Test 2.2: Exact Rate-Limit Prefix Cleanup (Literal vs SQL LIKE Wildcards)
+  const exactKey = `test_exact_${Date.now()}`;
+  const likeKey1 = `testX_customer_${Date.now()}`; // Underscore wildcard trap
+  const likeKey2 = `test%special_${Date.now()}`;    // Percent wildcard trap
   const prodRecordKey = `prod_customer_${Date.now()}`;
-  await storage.rateLimits.checkRateLimit(prodRecordKey, 'customer_action', 10, 3600);
+  const unrelatedIpKey = `198.51.100.${Math.floor(Math.random() * 200) + 10}`;
 
-  // Run test-scoped cleanup
+  await storage.rateLimits.checkRateLimit(exactKey, 'test_action', 10, 3600);
+  await storage.rateLimits.checkRateLimit(likeKey1, 'test_action', 10, 3600);
+  await storage.rateLimits.checkRateLimit(likeKey2, 'test_action', 10, 3600);
+  await storage.rateLimits.checkRateLimit(prodRecordKey, 'customer_action', 10, 3600);
+  await storage.rateLimits.checkRateLimit(unrelatedIpKey, 'ip_action', 10, 3600);
+
+  // Run targeted prefix cleanup with literal prefix 'test_'
   await storage.rateLimits.clearRateLimits?.({ keyPrefix: 'test_' });
 
-  // Verify the unrelated production record is still intact
+  const exactCheck = await storage.rateLimits.consumeRateLimit(exactKey, 'test_action', 10, 3600);
+  const like1Check = await storage.rateLimits.consumeRateLimit(likeKey1, 'test_action', 10, 3600);
   const prodCheck = await storage.rateLimits.consumeRateLimit(prodRecordKey, 'customer_action', 10, 3600);
-  assert(prodCheck.count === 2, 'Unrelated/production rate-limit record was NOT erased by test cleanup');
+  const unrelatedCheck = await storage.rateLimits.consumeRateLimit(unrelatedIpKey, 'ip_action', 10, 3600);
 
-  // Verify production safety gate: unconstrained clear in production environment throws error
+  assert(exactCheck.count === 1, "Literal match 'test_exact' was deleted by cleanup (count reset)");
+  assert(like1Check.count === 2, "Wildcard lookalike 'testX_customer' was NOT deleted by 'test_' prefix");
+  assert(prodCheck.count === 2, 'Unrelated production record was NOT deleted by test cleanup');
+  assert(unrelatedCheck.count === 2, 'Unrelated IP rate-limit record was NOT deleted by test cleanup');
+
+  // Verify clearTestRateLimits literal prefix behavior on SQLite
+  await storage.rateLimits.clearTestRateLimits?.('test%');
+  const like2Check = await storage.rateLimits.consumeRateLimit(likeKey2, 'test_action', 10, 3600);
+  assert(like2Check.count === 1, "clearTestRateLimits with literal 'test%' deleted only literal percent match");
+
+  // Verify exact prefix cleanup on InMemoryStorageRepository consistency
+  const inMemory = new InMemoryStorageRepository();
+  const memExactKey = `test_mem_${Date.now()}`;
+  const memLikeKey = `testX_mem_${Date.now()}`;
+  const memProdKey = `prod_mem_${Date.now()}`;
+  await inMemory.rateLimits.checkRateLimit(memExactKey, 'action', 5, 60);
+  await inMemory.rateLimits.checkRateLimit(memLikeKey, 'action', 5, 60);
+  await inMemory.rateLimits.checkRateLimit(memProdKey, 'action', 5, 60);
+  await inMemory.rateLimits.clearRateLimits?.({ keyPrefix: 'test_' });
+
+  const mem1Check = await inMemory.rateLimits.consumeRateLimit(memExactKey, 'action', 5, 60);
+  const mem2Check = await inMemory.rateLimits.consumeRateLimit(memLikeKey, 'action', 5, 60);
+  const mem3Check = await inMemory.rateLimits.consumeRateLimit(memProdKey, 'action', 5, 60);
+  assert(mem1Check.count === 1, 'InMemoryStorage: Literal prefix match was cleanly removed');
+  assert(mem2Check.count === 2, 'InMemoryStorage: Wildcard lookalike was NOT removed');
+  assert(mem3Check.count === 2, 'InMemoryStorage: Unrelated record was preserved');
+
+  // Verify production safety gate: unconstrained clear in production throws error
   const origNodeEnv = process.env.NODE_ENV;
   process.env.NODE_ENV = 'production';
   try {
@@ -87,15 +179,32 @@ export async function runRateLimitingAndAbuseProtectionTests() {
   }
 
   // ---------------------------------------------------------
-  // 3. Environment Variable Parsing Safety
+  // 3. Environment Variable Parsing Safety & Precedence
   // ---------------------------------------------------------
-  console.log('\n[3. Environment Variable Parsing Safety]');
+  console.log('\n[3. Environment Variable Precedence & Safety]');
 
+  // Test parsePositiveInt
   assert(parsePositiveInt('15', 10) === 15, 'Valid string parsed as positive integer');
   assert(parsePositiveInt(undefined, 10) === 10, 'Undefined falls back to safe default');
   assert(parsePositiveInt('invalid', 10) === 10, 'NaN string falls back to safe default');
   assert(parsePositiveInt('-5', 10) === 10, 'Negative integer falls back to safe default');
   assert(parsePositiveInt('0', 10) === 10, 'Zero integer falls back to safe default (cannot disable limits)');
+
+  // Test resolveRateLimitInt unambiguous precedence:
+  // 1. Primary (current/specific) takes precedence over legacy when valid
+  assert(resolveRateLimitInt('25', '10', 5) === 25, 'Primary takes precedence over legacy when both valid');
+  // 2. Legacy is used when primary is undefined
+  assert(resolveRateLimitInt(undefined, '18', 5) === 18, 'Legacy used when primary is undefined');
+  // 3. Legacy is used when primary is invalid string
+  assert(resolveRateLimitInt('not_a_number', '18', 5) === 18, 'Legacy used when primary is invalid');
+  // 4. Legacy is used when primary is 0 or negative
+  assert(resolveRateLimitInt('0', '18', 5) === 18, 'Legacy used when primary is 0');
+  assert(resolveRateLimitInt('-10', '18', 5) === 18, 'Legacy used when primary is negative');
+  // 5. Default is used when both are invalid/0/negative/undefined (cannot disable limit)
+  assert(resolveRateLimitInt('0', '0', 20) === 20, 'Safe default enforced when both are zero');
+  assert(resolveRateLimitInt('-5', 'invalid', 20) === 20, 'Safe default enforced when both invalid');
+  assert(resolveRateLimitInt(undefined, undefined, 20) === 20, 'Safe default enforced when both undefined');
+  assert(resolveRateLimitInt('  30  ', undefined, 20) === 30, 'Trimmed positive integer parsed correctly');
 
   // ---------------------------------------------------------
   // 4. Express App Setup with Trust Proxy Configuration
@@ -114,6 +223,10 @@ export async function runRateLimitingAndAbuseProtectionTests() {
   const proxyTestApp3 = express();
   configureTrustProxy(proxyTestApp3, 'malformed-value-xyz');
   assert(proxyTestApp3.get('trust proxy') === false, 'Malformed TRUST_PROXY fails safe to false');
+
+  const proxyTestApp4 = express();
+  configureTrustProxy(proxyTestApp4, '10.0.0.0/8, 172.16.0.0/12');
+  assert(proxyTestApp4.get('trust proxy') === '10.0.0.0/8, 172.16.0.0/12', 'TRUST_PROXY accepts CIDR subnet list');
 
   const app = express();
   app.set('trust proxy', true); // Trust proxy enabled in test harness to evaluate simulated client IPs
@@ -134,6 +247,7 @@ export async function runRateLimitingAndAbuseProtectionTests() {
 
     const originalLoginLimit = process.env.AUTH_LOGIN_RATE_LIMIT;
     const originalLoginWindow = process.env.AUTH_LOGIN_RATE_WINDOW;
+    const originalLoginIpLimit = process.env.AUTH_LOGIN_IP_RATE_LIMIT;
     process.env.AUTH_LOGIN_RATE_LIMIT = '3';
     process.env.AUTH_LOGIN_RATE_WINDOW = '60';
 
@@ -175,6 +289,8 @@ export async function runRateLimitingAndAbuseProtectionTests() {
     else delete process.env.AUTH_LOGIN_RATE_LIMIT;
     if (originalLoginWindow !== undefined) process.env.AUTH_LOGIN_RATE_WINDOW = originalLoginWindow;
     else delete process.env.AUTH_LOGIN_RATE_WINDOW;
+    if (originalLoginIpLimit !== undefined) process.env.AUTH_LOGIN_IP_RATE_LIMIT = originalLoginIpLimit;
+    else delete process.env.AUTH_LOGIN_IP_RATE_LIMIT;
 
     // ---------------------------------------------------------
     // 6. Login Rate Limiting (Account Identifier Distributed Protection)
@@ -293,24 +409,15 @@ export async function runRateLimitingAndAbuseProtectionTests() {
     else delete process.env.AUTH_REGISTER_RATE_WINDOW;
 
     // ---------------------------------------------------------
-    // 9. Video Upload Rate Limiting (User Quota & Separate IP Quota)
+    // 9. Video Upload Rate Limiting (Dual Quotas & Atomic Non-Consumption)
     // ---------------------------------------------------------
-    console.log('\n[9. Video Upload Rate Limiting (User & IP Quotas)]');
+    console.log('\n[9. Video Upload Rate Limiting (Dual Quotas & Atomic Non-Consumption)]');
 
     // Test 9.1: Unauthenticated request receives 401 before upload rate limiting runs
     const unauthRes = await fetch(`${baseUrl}/uploads`, {
       method: 'POST'
     });
     assert(unauthRes.status === 401, 'Unauthenticated POST /uploads returns 401 Unauthorized (requireAuthMiddleware runs first)');
-
-    // Register User 1
-    const uploader1Email = `uploader1_${Date.now()}@videorisk.com`;
-    const uploader1Reg = await fetch(`${baseUrl}/auth/register`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: uploader1Email, password: 'uploaderPassword123' })
-    });
-    const uploader1Token = (await uploader1Reg.json()).token;
 
     // Helper to count files in uploads directory
     const uploadsDir = path.resolve(process.cwd(), 'uploads');
@@ -343,20 +450,33 @@ export async function runRateLimitingAndAbuseProtectionTests() {
 
     const dummyMp4 = Buffer.from('fake mp4 video content for testing upload pipeline');
 
-    // Test User Upload Quota
+    // Register User 1
+    const uploader1Email = `uploader1_${Date.now()}@videorisk.com`;
+    const uploader1Reg = await fetch(`${baseUrl}/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: uploader1Email, password: 'uploaderPassword123' })
+    });
+    const uploader1Token = (await uploader1Reg.json()).token;
+
+    // Test User & IP Upload Quotas
     const originalUploadLimit = process.env.UPLOAD_RATE_LIMIT;
     const originalUploadWindow = process.env.UPLOAD_RATE_WINDOW;
+    const originalUploadUserLimit = process.env.UPLOAD_USER_RATE_LIMIT;
+    const originalUploadIpLimit = process.env.UPLOAD_IP_RATE_LIMIT;
+
     process.env.UPLOAD_RATE_LIMIT = '2';
     process.env.UPLOAD_RATE_WINDOW = '60';
+    process.env.UPLOAD_IP_RATE_LIMIT = '2';
 
     const uploadIp1 = `198.51.100.77`;
 
     // Upload 1 & 2 succeed/reach pipeline
     const up1 = await sendMultipartUpload(uploader1Token, 'test_vid1.mp4', dummyMp4, uploadIp1);
-    assert(up1.status === 200 || up1.status === 400, `User upload 1 processed (HTTP ${up1.status})`);
+    assert(up1.status === 200 || up1.status === 400, `User 1 upload 1 processed (HTTP ${up1.status})`);
 
     const up2 = await sendMultipartUpload(uploader1Token, 'test_vid2.mp4', dummyMp4, uploadIp1);
-    assert(up2.status === 200 || up2.status === 400, `User upload 2 processed (HTTP ${up2.status})`);
+    assert(up2.status === 200 || up2.status === 400, `User 1 upload 2 processed (HTTP ${up2.status})`);
 
     const filesBeforeBlockedUpload = getUploadsFileCount();
 
@@ -375,11 +495,7 @@ export async function runRateLimitingAndAbuseProtectionTests() {
       `Multer did NOT write file to disk on 429 (file count unchanged: ${filesBeforeBlockedUpload})`
     );
 
-    // Test Separate IP Upload Quota (prevents multi-account sybil attacks from same IP)
-    const originalUploadIpLimit = process.env.UPLOAD_IP_RATE_LIMIT;
-    process.env.UPLOAD_IP_RATE_LIMIT = '2';
-
-    // Register User 2 on the same IP
+    // Register User 2
     const uploader2Email = `uploader2_${Date.now()}@videorisk.com`;
     const uploader2Reg = await fetch(`${baseUrl}/auth/register`, {
       method: 'POST',
@@ -388,28 +504,84 @@ export async function runRateLimitingAndAbuseProtectionTests() {
     });
     const uploader2Token = (await uploader2Reg.json()).token;
 
-    // User 2 tries to upload from uploadIp1 (which already consumed 2 slots from User 1)
-    const upUser2 = await sendMultipartUpload(uploader2Token, 'test_vid_sybil.mp4', dummyMp4, uploadIp1);
-    assert(upUser2.status === 429, 'Separate IP upload quota blocks 2nd account from same exhausted IP (HTTP 429)');
-    const upUser2Body = await upUser2.json();
-    assert(upUser2Body.error.includes('Upload rate limit exceeded'), 'IP upload rate limit message verified');
+    // User 2 tries to upload from uploadIp1 (which already consumed 2 slots from User 1) -> blocked by IP quota
+    const upUser2Blocked = await sendMultipartUpload(uploader2Token, 'test_vid_sybil.mp4', dummyMp4, uploadIp1);
+    assert(upUser2Blocked.status === 429, 'Separate IP upload quota blocks 2nd account from same exhausted IP (HTTP 429)');
+    const upUser2Body = await upUser2Blocked.json();
+    assert(upUser2Body.error.includes('Upload rate limit exceeded for your network'), 'Network IP upload rate limit message returned');
+
+    // CRITICAL ATOMIC NON-CONSUMPTION PROOF 1:
+    // User 2's upload was rejected by IP quota. User 2's OWN account quota must NOT have been consumed!
+    // When User 2 uploads from a fresh, unblocked IP, the upload must be allowed through!
+    const cleanIpForUser2 = `198.51.100.88`;
+    const upUser2Clean = await sendMultipartUpload(uploader2Token, 'test_vid_user2.mp4', dummyMp4, cleanIpForUser2);
+    assert(
+      upUser2Clean.status === 200 || upUser2Clean.status === 400,
+      `User 2 upload succeeds on clean IP: User quota was NOT consumed when previously rejected by IP quota (HTTP ${upUser2Clean.status})`
+    );
+
+    // CRITICAL ATOMIC NON-CONSUMPTION PROOF 2:
+    // User 1's user quota is exhausted (2 of 2). User 1 attempts upload on a fresh IP (cleanIpForUser3).
+    // It is rejected by user quota. The fresh IP's quota must NOT be consumed!
+    const freshSharedIp = `198.51.100.99`;
+    const upUser1BlockedOnFreshIp = await sendMultipartUpload(uploader1Token, 'test_vid_u1_fresh.mp4', dummyMp4, freshSharedIp);
+    assert(upUser1BlockedOnFreshIp.status === 429, 'Exhausted User 1 is blocked on fresh IP by user quota');
+
+    // Register User 3 and upload from that same fresh IP:
+    const uploader3Email = `uploader3_${Date.now()}@videorisk.com`;
+    const uploader3Reg = await fetch(`${baseUrl}/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: uploader3Email, password: 'uploaderPassword123' })
+    });
+    const uploader3Token = (await uploader3Reg.json()).token;
+
+    const upUser3OnFreshIp = await sendMultipartUpload(uploader3Token, 'test_vid_u3.mp4', dummyMp4, freshSharedIp);
+    assert(
+      upUser3OnFreshIp.status === 200 || upUser3OnFreshIp.status === 400,
+      `User 3 upload succeeds on shared IP: IP quota was NOT consumed when User 1 was rejected by user quota (HTTP ${upUser3OnFreshIp.status})`
+    );
+
+    // Concurrent upload quota integrity test
+    const concurrentUserEmail = `uploader_concurrent_${Date.now()}@videorisk.com`;
+    const concurrentUserReg = await fetch(`${baseUrl}/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: concurrentUserEmail, password: 'uploaderPassword123' })
+    });
+    const concurrentUserToken = (await concurrentUserReg.json()).token;
+    const concurrentIp = `198.51.100.123`;
+
+    // Fire 6 simultaneous uploads under a limit of 2
+    const simultaneousUploads = await Promise.all(
+      Array.from({ length: 6 }, (_, idx) =>
+        sendMultipartUpload(concurrentUserToken, `vid_${idx}.mp4`, dummyMp4, concurrentIp)
+      )
+    );
+    const concurrentAllowed = simultaneousUploads.filter(r => r.status === 200 || r.status === 400).length;
+    const concurrentBlocked = simultaneousUploads.filter(r => r.status === 429).length;
+
+    assert(concurrentAllowed === 2, `Concurrent uploads strictly capped at quota limit (allowed: ${concurrentAllowed}, expected: 2)`);
+    assert(concurrentBlocked === 4, `Excess concurrent uploads safely rejected with 429 (rejected: ${concurrentBlocked})`);
 
     // Restore upload env vars
     if (originalUploadLimit !== undefined) process.env.UPLOAD_RATE_LIMIT = originalUploadLimit;
     else delete process.env.UPLOAD_RATE_LIMIT;
     if (originalUploadWindow !== undefined) process.env.UPLOAD_RATE_WINDOW = originalUploadWindow;
     else delete process.env.UPLOAD_RATE_WINDOW;
+    if (originalUploadUserLimit !== undefined) process.env.UPLOAD_USER_RATE_LIMIT = originalUploadUserLimit;
+    else delete process.env.UPLOAD_USER_RATE_LIMIT;
     if (originalUploadIpLimit !== undefined) process.env.UPLOAD_IP_RATE_LIMIT = originalUploadIpLimit;
     else delete process.env.UPLOAD_IP_RATE_LIMIT;
 
     // ---------------------------------------------------------
-    // 10. Untrusted X-Forwarded-For Protection (Proxy Security)
+    // 10. Untrusted Proxy Protection & Client IP Semantics
     // ---------------------------------------------------------
     console.log('\n[10. Untrusted Proxy Protection & Client IP Semantics]');
 
-    // Create an un-proxied app with trust proxy: false
+    // Test 10.1: App with trust proxy: false (default deployment)
     const untrustedApp = express();
-    untrustedApp.set('trust proxy', false);
+    configureTrustProxy(untrustedApp, undefined); // Default -> false
     untrustedApp.use('/test-ip', (req, res) => {
       res.json({ ip: getClientIp(req) });
     });
@@ -419,17 +591,65 @@ export async function runRateLimitingAndAbuseProtectionTests() {
     const untrustedPort = (untrustedServer.address() as any).port;
 
     try {
-      // Send spoofed X-Forwarded-For
+      // Send spoofed X-Forwarded-For to untrusted app
       const spoofedRes = await fetch(`http://127.0.0.1:${untrustedPort}/test-ip`, {
         headers: { 'x-forwarded-for': '203.0.113.199' }
       });
       const spoofedData = await spoofedRes.json();
       assert(
         spoofedData.ip !== '203.0.113.199',
-        `Arbitrary X-Forwarded-For is NOT trusted when trust proxy is disabled (got ${spoofedData.ip}, not spoofed IP)`
+        `Arbitrary X-Forwarded-For is strictly IGNORED when trust proxy is disabled (got ${spoofedData.ip}, not spoofed IP)`
       );
     } finally {
       untrustedServer.close();
+    }
+
+    // Test 10.2: App with explicit single hop trust proxy (e.g. TRUST_PROXY=1)
+    const hopProxyApp = express();
+    configureTrustProxy(hopProxyApp, '1');
+    hopProxyApp.use('/test-ip', (req, res) => {
+      res.json({ ip: getClientIp(req) });
+    });
+    const hopServer: Server = await new Promise(resolve => {
+      const s = hopProxyApp.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    const hopPort = (hopServer.address() as any).port;
+
+    try {
+      const hopRes = await fetch(`http://127.0.0.1:${hopPort}/test-ip`, {
+        headers: { 'x-forwarded-for': '203.0.113.199' }
+      });
+      const hopData = await hopRes.json();
+      assert(
+        hopData.ip === '203.0.113.199',
+        `Hop count TRUST_PROXY=1 correctly evaluates client IP from trusted reverse proxy hop (got ${hopData.ip})`
+      );
+    } finally {
+      hopServer.close();
+    }
+
+    // Test 10.3: App with explicit loopback / trusted IP proxy
+    const loopbackApp = express();
+    configureTrustProxy(loopbackApp, 'loopback');
+    loopbackApp.use('/test-ip', (req, res) => {
+      res.json({ ip: getClientIp(req) });
+    });
+    const loopbackServer: Server = await new Promise(resolve => {
+      const s = loopbackApp.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    const loopbackPort = (loopbackServer.address() as any).port;
+
+    try {
+      const lbRes = await fetch(`http://127.0.0.1:${loopbackPort}/test-ip`, {
+        headers: { 'x-forwarded-for': '198.51.100.55' }
+      });
+      const lbData = await lbRes.json();
+      assert(
+        lbData.ip === '198.51.100.55',
+        `Trusted 'loopback' proxy configuration resolves forwarded client IP through local proxy (got ${lbData.ip})`
+      );
+    } finally {
+      loopbackServer.close();
     }
 
     console.log('\n======================================================');

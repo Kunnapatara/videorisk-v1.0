@@ -243,16 +243,41 @@ export async function requireAuth(req: Request, res: Response): Promise<UserAcco
 }
 
 /**
+ * Resolves a rate-limit integer setting with unambiguous precedence:
+ * 1. Primary (current/specific) environment variable if set to a valid positive integer.
+ * 2. Fallback (legacy/general) environment variable if set to a valid positive integer.
+ * 3. Default positive integer value.
+ *
+ * Security Guarantee:
+ * Invalid strings, empty strings, zero ('0'), negative numbers ('-5'), NaN, or Infinity
+ * are strictly rejected and will never disable the rate limit.
+ */
+export function resolveRateLimitInt(
+  primaryVal: string | undefined,
+  fallbackVal: string | undefined,
+  defaultValue: number
+): number {
+  if (primaryVal !== undefined && primaryVal !== null && typeof primaryVal === 'string' && primaryVal.trim() !== '') {
+    const parsed = parseInt(primaryVal.trim(), 10);
+    if (!isNaN(parsed) && Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  if (fallbackVal !== undefined && fallbackVal !== null && typeof fallbackVal === 'string' && fallbackVal.trim() !== '') {
+    const parsed = parseInt(fallbackVal.trim(), 10);
+    if (!isNaN(parsed) && Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return defaultValue;
+}
+
+/**
  * Safely parses positive integers from environment configuration with fallback to secure default.
  * Guarantees that invalid, empty, negative, or zero inputs cannot silently disable rate limits.
  */
 export function parsePositiveInt(val: string | undefined, defaultValue: number): number {
-  if (!val || typeof val !== 'string') return defaultValue;
-  const parsed = parseInt(val.trim(), 10);
-  if (isNaN(parsed) || parsed < 1 || !Number.isFinite(parsed)) {
-    return defaultValue;
-  }
-  return parsed;
+  return resolveRateLimitInt(val, undefined, defaultValue);
 }
 
 /**
@@ -367,32 +392,31 @@ export const uploadRateLimitMiddleware: RequestHandler = async (req, res, next) 
 
     const clientIp = getClientIp(req);
 
-    // 1. Authenticated user quota limit
-    const userLimit = parsePositiveInt(process.env.UPLOAD_RATE_LIMIT || process.env.UPLOAD_USER_RATE_LIMIT, 10);
-    const userWindow = parsePositiveInt(process.env.UPLOAD_RATE_WINDOW || process.env.UPLOAD_USER_RATE_WINDOW, 600); // 10 minutes
+    // 1. Authenticated user quota limit (UPLOAD_USER_RATE_LIMIT takes precedence over legacy UPLOAD_RATE_LIMIT)
+    const userLimit = resolveRateLimitInt(process.env.UPLOAD_USER_RATE_LIMIT, process.env.UPLOAD_RATE_LIMIT, 10);
+    const userWindow = resolveRateLimitInt(process.env.UPLOAD_USER_RATE_WINDOW, process.env.UPLOAD_RATE_WINDOW, 600); // 10 minutes
     const userKey = `user_${user.id}`;
 
-    const userStatus = await storage.rateLimits.consumeRateLimit(userKey, 'upload_video', userLimit, userWindow);
-    if (!userStatus.allowed) {
-      res.setHeader('Retry-After', String(userStatus.retryAfter));
-      res.status(429).json({ 
-        error: 'Upload rate limit exceeded for your account. Please wait before uploading another video.',
-        retryAfter: userStatus.retryAfter
-      });
-      return;
-    }
-
     // 2. Separate IP quota limit (prevents multi-account abuse from the same IP)
-    const ipLimit = parsePositiveInt(process.env.UPLOAD_IP_RATE_LIMIT, 20);
-    const ipWindow = parsePositiveInt(process.env.UPLOAD_IP_RATE_WINDOW, 600); // 10 minutes
+    const ipLimit = resolveRateLimitInt(process.env.UPLOAD_IP_RATE_LIMIT, undefined, 20);
+    const ipWindow = resolveRateLimitInt(process.env.UPLOAD_IP_RATE_WINDOW, undefined, 600); // 10 minutes
     const ipKey = `ip_${clientIp}`;
 
-    const ipStatus = await storage.rateLimits.consumeRateLimit(ipKey, 'upload_video_ip', ipLimit, ipWindow);
-    if (!ipStatus.allowed) {
-      res.setHeader('Retry-After', String(ipStatus.retryAfter));
+    // 3. Atomically check and consume both quotas together:
+    // If either quota is exhausted, NEITHER quota is consumed.
+    const multiStatus = await storage.rateLimits.consumeRateLimits([
+      { key: userKey, action: 'upload_video', limit: userLimit, windowSeconds: userWindow },
+      { key: ipKey, action: 'upload_video_ip', limit: ipLimit, windowSeconds: ipWindow }
+    ]);
+
+    if (!multiStatus.allowed) {
+      res.setHeader('Retry-After', String(multiStatus.retryAfter));
+      const isIpBlocked = multiStatus.rejectedSpec?.action === 'upload_video_ip';
       res.status(429).json({ 
-        error: 'Upload rate limit exceeded for your network. Please wait before uploading another video.',
-        retryAfter: ipStatus.retryAfter
+        error: isIpBlocked
+          ? 'Upload rate limit exceeded for your network. Please wait before uploading another video.'
+          : 'Upload rate limit exceeded for your account. Please wait before uploading another video.',
+        retryAfter: multiStatus.retryAfter
       });
       return;
     }
@@ -454,8 +478,8 @@ apiRouter.get('/health', (req: Request, res: Response) => {
 apiRouter.post('/auth/register', async (req: Request, res: Response) => {
   try {
     const clientIp = getClientIp(req);
-    const registerLimit = parsePositiveInt(process.env.AUTH_REGISTER_RATE_LIMIT, 30);
-    const registerWindow = parsePositiveInt(process.env.AUTH_REGISTER_RATE_WINDOW, 900); // 15 minutes
+    const registerLimit = resolveRateLimitInt(process.env.AUTH_REGISTER_RATE_LIMIT, undefined, 30);
+    const registerWindow = resolveRateLimitInt(process.env.AUTH_REGISTER_RATE_WINDOW, undefined, 900); // 15 minutes
 
     const regStatus = await storage.rateLimits.consumeRateLimit(clientIp, 'auth_register', registerLimit, registerWindow);
     if (!regStatus.allowed) {
@@ -511,33 +535,33 @@ apiRouter.post('/auth/login', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Email and password are required.' });
     }
 
-    // 1. IP-based brute-force limit
+    // 1. IP-based brute-force limit (AUTH_LOGIN_IP_RATE_LIMIT takes precedence over legacy AUTH_LOGIN_RATE_LIMIT)
     const clientIp = getClientIp(req);
-    const loginIpLimit = parsePositiveInt(process.env.AUTH_LOGIN_RATE_LIMIT || process.env.AUTH_LOGIN_IP_RATE_LIMIT, 20);
-    const loginIpWindow = parsePositiveInt(process.env.AUTH_LOGIN_RATE_WINDOW || process.env.AUTH_LOGIN_IP_RATE_WINDOW, 900); // 15 minutes
-
-    const ipStatus = await storage.rateLimits.consumeRateLimit(clientIp, 'auth_login', loginIpLimit, loginIpWindow);
-    if (!ipStatus.allowed) {
-      res.setHeader('Retry-After', String(ipStatus.retryAfter));
-      return res.status(429).json({ 
-        error: 'Too many login attempts from this network. Please wait before trying again.',
-        retryAfter: ipStatus.retryAfter
-      });
-    }
+    const loginIpLimit = resolveRateLimitInt(process.env.AUTH_LOGIN_IP_RATE_LIMIT, process.env.AUTH_LOGIN_RATE_LIMIT, 20);
+    const loginIpWindow = resolveRateLimitInt(process.env.AUTH_LOGIN_IP_RATE_WINDOW, process.env.AUTH_LOGIN_RATE_WINDOW, 900); // 15 minutes
 
     // 2. Account identifier limit (normalized, length-limited, and SHA-256 hashed to avoid storing raw emails)
     const normalizedEmail = email.toLowerCase().trim().slice(0, 255);
     const accountHash = crypto.createHash('sha256').update(normalizedEmail).digest('hex').slice(0, 32);
     const accountKey = `acct_${accountHash}`;
-    const acctLimit = parsePositiveInt(process.env.AUTH_LOGIN_ACCOUNT_RATE_LIMIT, 5);
-    const acctWindow = parsePositiveInt(process.env.AUTH_LOGIN_ACCOUNT_RATE_WINDOW, 900); // 15 minutes
+    const acctLimit = resolveRateLimitInt(process.env.AUTH_LOGIN_ACCOUNT_RATE_LIMIT, undefined, 5);
+    const acctWindow = resolveRateLimitInt(process.env.AUTH_LOGIN_ACCOUNT_RATE_WINDOW, undefined, 900); // 15 minutes
 
-    const acctStatus = await storage.rateLimits.consumeRateLimit(accountKey, 'auth_login_account', acctLimit, acctWindow);
-    if (!acctStatus.allowed) {
-      res.setHeader('Retry-After', String(acctStatus.retryAfter));
+    // 3. Atomically check and consume both login rate limits:
+    // If either limit is exceeded, neither quota is consumed and expensive scrypt hashing is avoided.
+    const loginStatus = await storage.rateLimits.consumeRateLimits([
+      { key: clientIp, action: 'auth_login', limit: loginIpLimit, windowSeconds: loginIpWindow },
+      { key: accountKey, action: 'auth_login_account', limit: acctLimit, windowSeconds: acctWindow }
+    ]);
+
+    if (!loginStatus.allowed) {
+      res.setHeader('Retry-After', String(loginStatus.retryAfter));
+      const isAcctBlocked = loginStatus.rejectedSpec?.action === 'auth_login_account';
       return res.status(429).json({ 
-        error: 'Too many login attempts for this account. Please wait before trying again.',
-        retryAfter: acctStatus.retryAfter
+        error: isAcctBlocked
+          ? 'Too many login attempts for this account. Please wait before trying again.'
+          : 'Too many login attempts from this network. Please wait before trying again.',
+        retryAfter: loginStatus.retryAfter
       });
     }
 

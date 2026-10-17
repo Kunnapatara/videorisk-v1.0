@@ -1,27 +1,30 @@
 import path from 'path';
 import fs from 'fs';
+import { enforceTestDatabaseIsolation, verifyStorageTestDatabase } from '../src/server/storage/testIsolation';
 
 // ----------------------------------------------------------------------------
 // TEST RUNNER DATABASE ISOLATION:
-// Set isolated test database environment BEFORE importing any storage or routes.
-// This guarantees that automated tests never mutate or wipe production videorisk.db!
+// Explicitly establish dedicated test database BEFORE importing storage or routes.
+// Guarantees automated tests cannot silently use or wipe production videorisk.db!
 // ----------------------------------------------------------------------------
-if (!process.env.DATABASE_PATH) {
-  process.env.DATABASE_PATH = path.resolve(process.cwd(), 'data', 'videorisk_test.db');
-}
+const testDbResolution = enforceTestDatabaseIsolation();
 
 async function main() {
   console.log('######################################################');
   console.log('# VIDEORISK.COM — MASTER VERIFICATION TEST SUITE     #');
   console.log('# Security, Isolation, Context & Capability Proofs   #');
   console.log('######################################################');
-  console.log(`[Database Isolation] Active Test Database: ${process.env.DATABASE_PATH}\n`);
+  console.log(`[Database Isolation] Active Test Database: ${testDbResolution.resolvedPath} (${testDbResolution.source})\n`);
 
   const startTime = Date.now();
 
   try {
     // Dynamically import test suites and storage AFTER DATABASE_PATH is locked to test db
     const { storage } = await import('../src/server/storage');
+
+    // Verify the resolved database path before any test performs storage mutations
+    verifyStorageTestDatabase((storage as any).dbPath, testDbResolution.resolvedPath);
+
     const { runAuthAndOwnershipTests } = await import('./auth_and_ownership.test');
     const { runProductCapabilitiesTests } = await import('./product_capabilities.test');
     const { runPersistenceAndBillingHardeningTests } = await import('./persistence_and_billing_hardening.test');
