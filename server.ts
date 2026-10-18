@@ -2,7 +2,7 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
-import { apiRouter, configureTrustProxy } from './src/server/routes/api';
+import { apiRouter, configureTrustProxy, secureUploadsHandler } from './src/server/routes/api';
 
 dotenv.config();
 
@@ -35,8 +35,8 @@ async function startServer() {
   // Mount API router
   app.use('/api', apiRouter);
 
-  // Serve static assets from public / uploads (thumbnails, proxies)
-  app.use('/uploads', express.static(path.resolve(process.cwd(), 'uploads')));
+  // Secure authorized delivery of uploaded media, proxies, and thumbnails
+  app.use('/uploads', secureUploadsHandler);
 
   // In production, serve built client from dist/
   if (isProd) {

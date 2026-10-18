@@ -216,6 +216,10 @@ export async function getAuthenticatedUser(req: Request): Promise<UserAccount | 
     token = String(req.headers['x-session-token']).trim();
   } else if ((req as any).cookies?.vr_session) {
     token = String((req as any).cookies.vr_session).trim();
+  } else if (req.query?.token && typeof req.query.token === 'string') {
+    token = req.query.token.trim();
+  } else if (req.query?.sessionToken && typeof req.query.sessionToken === 'string') {
+    token = req.query.sessionToken.trim();
   }
 
   if (!token) {
@@ -242,6 +246,278 @@ export async function requireAuth(req: Request, res: Response): Promise<UserAcco
   (req as any).user = user;
   return user;
 }
+
+/**
+ * Resolves the user account ID who owns a stored media file or scan artifact.
+ * Inspects:
+ * 1. Uploads repository by canonical file path and fileId (basename).
+ * 2. Scans repository by videoPath, thumbnailPath, proxyPath, and proxy naming pattern.
+ * 3. Frames directory by scan ID association.
+ * Returns null if the file cannot be authenticated to a specific user.
+ */
+export async function getMediaOwner(candidatePath: string): Promise<{ userId: string } | null> {
+  const normPath = path.resolve(candidatePath);
+  const baseName = path.basename(normPath);
+
+  // 1. Direct match in uploads repository by full path or fileId
+  const uploadByPath = await storage.uploads.getUploadByPath(normPath);
+  if (uploadByPath) {
+    return { userId: uploadByPath.userId };
+  }
+
+  const uploadByFileId = await storage.uploads.getUpload(baseName);
+  if (uploadByFileId) {
+    return { userId: uploadByFileId.userId };
+  }
+
+  // 2. Direct match in scans repository
+  const allScans = await storage.scans.getAllScans();
+  for (const scan of allScans) {
+    if (scan.videoPath && (path.resolve(scan.videoPath) === normPath || path.basename(scan.videoPath) === baseName)) {
+      return { userId: scan.userId };
+    }
+    if (scan.thumbnailPath && (path.resolve(scan.thumbnailPath) === normPath || path.basename(scan.thumbnailPath) === baseName)) {
+      return { userId: scan.userId };
+    }
+    if (scan.proxyPath && (path.resolve(scan.proxyPath) === normPath || path.basename(scan.proxyPath) === baseName)) {
+      return { userId: scan.userId };
+    }
+
+    // Proxy derivative matching: proxies/proxy_${baseNameNoExt}.mp4
+    if (baseName.startsWith('proxy_')) {
+      const proxyStem = baseName.replace(/^proxy_/, '').replace(/\.mp4$/i, '');
+      if (scan.videoPath) {
+        const videoStem = path.basename(scan.videoPath, path.extname(scan.videoPath));
+        if (videoStem === proxyStem) {
+          return { userId: scan.userId };
+        }
+      }
+      if (scan.videoFilename) {
+        const fileStem = path.basename(scan.videoFilename, path.extname(scan.videoFilename));
+        if (fileStem === proxyStem) {
+          return { userId: scan.userId };
+        }
+      }
+    }
+
+    // Frame snapshots: uploads/frames/${scanId}_.../...
+    if (normPath.includes(path.sep + 'frames' + path.sep)) {
+      if (normPath.includes(scan.id)) {
+        return { userId: scan.userId };
+      }
+    }
+  }
+
+  // 3. Check proxy derivative against upload records
+  if (baseName.startsWith('proxy_')) {
+    const proxyStem = baseName.replace(/^proxy_/, '').replace(/\.mp4$/i, '');
+    for (const ext of ['.mp4', '.mov', '.webm', '.mkv', '.avi']) {
+      const uploadByStem = await storage.uploads.getUpload(proxyStem + ext);
+      if (uploadByStem) {
+        return { userId: uploadByStem.userId };
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Secure file delivery handler for uploads directory.
+ * Enforces:
+ * 1. Directory traversal prevention (validateSafeStoragePath, URI decoding, null bytes check).
+ * 2. Strict authentication & session verification (via Bearer, x-session-token, cookie, or query param).
+ * 3. Strict object-level authorization (IDOR protection: verifies that requesting user owns the media or associated scan).
+ * 4. RFC 7233 byte-range streaming for audio/video players.
+ * 5. Secure response headers (X-Content-Type-Options: nosniff, private cache control, Content-Type, Accept-Ranges).
+ * 6. Directory listing prevention.
+ */
+export const secureUploadsHandler: RequestHandler = async (req: Request, res: Response, next) => {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    return next();
+  }
+
+  try {
+    let rawPath = '';
+    if ((req.params as any)?.filePath) {
+      rawPath = (req.params as any).filePath;
+    } else if ((req.params as any)?.[0]) {
+      rawPath = (req.params as any)[0];
+    } else if (req.path) {
+      rawPath = req.path.replace(/^\/+/, '');
+    }
+
+    if (!rawPath) {
+      return res.status(400).json({ error: 'File path is required.' });
+    }
+
+    let decodedPath: string;
+    try {
+      decodedPath = decodeURIComponent(rawPath);
+    } catch {
+      return res.status(400).json({ error: 'Malformed path encoding.' });
+    }
+
+    if (decodedPath.includes('\0')) {
+      return res.status(400).json({ error: 'Null bytes are not permitted in file path.' });
+    }
+
+    // Resolve target path within upload directory
+    const targetFullPath = path.resolve(uploadDir, decodedPath);
+
+    // Validate path safety against traversal, symlink jumping, and directory escapes
+    const validation = validateSafeStoragePath(targetFullPath);
+    if (!validation.isSafe) {
+      return res.status(403).json({ error: 'Access denied: Invalid or unsafe path.' });
+    }
+
+    const resolved = validation.resolvedPath;
+
+    // Check file existence
+    if (!fs.existsSync(resolved)) {
+      return res.status(404).json({ error: 'File not found.' });
+    }
+
+    const stat = fs.statSync(resolved);
+    if (stat.isDirectory()) {
+      return res.status(403).json({ error: 'Directory listing is not permitted.' });
+    }
+
+    // Identify owner from storage records (uploads or scans)
+    const owner = await getMediaOwner(resolved);
+
+    // Public demo / sample asset detection:
+    // Only permit unauthenticated access if explicitly marked public AND untracked in private user records
+    const baseName = path.basename(resolved);
+    const isPublicSample = !owner && (
+      baseName.startsWith('public_') ||
+      baseName.startsWith('sample_public_') ||
+      decodedPath.startsWith('public/') ||
+      decodedPath.startsWith('samples/')
+    );
+
+    if (!isPublicSample) {
+      const authenticatedUser = await getAuthenticatedUser(req);
+      if (!authenticatedUser) {
+        return res.status(401).json({ error: 'Unauthorized: A valid active session is required to access private media.' });
+      }
+
+      // If an owner was identified, verify that the authenticated user owns this asset
+      if (owner && owner.userId !== authenticatedUser.id) {
+        return res.status(403).json({ error: 'Access denied: You do not own this media asset.' });
+      }
+
+      // If the file is not tracked in storage and not an intentional public sample, fail closed
+      if (!owner) {
+        return res.status(403).json({ error: 'Access denied: Media asset is not associated with an authorized scan.' });
+      }
+    }
+
+    // Determine MIME type
+    const ext = path.extname(resolved).toLowerCase();
+    const mimeMap: Record<string, string> = {
+      '.mp4': 'video/mp4',
+      '.mov': 'video/quicktime',
+      '.webm': 'video/webm',
+      '.mkv': 'video/x-matroska',
+      '.avi': 'video/x-msvideo',
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.png': 'image/png',
+      '.webp': 'image/webp',
+      '.gif': 'image/gif',
+      '.svg': 'image/svg+xml',
+      '.json': 'application/json',
+      '.pdf': 'application/pdf',
+      '.txt': 'text/plain'
+    };
+    const contentType = mimeMap[ext] || 'application/octet-stream';
+
+    // Set secure response headers
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'private, no-cache, no-store, must-revalidate');
+    res.setHeader('Accept-Ranges', 'bytes');
+
+    if (req.method === 'HEAD') {
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Content-Length', stat.size);
+      return res.status(200).end();
+    }
+
+    const fileSize = stat.size;
+    const range = req.headers.range;
+
+    if (range) {
+      const match = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
+      if (!match) {
+        res.setHeader('Content-Range', `bytes */${fileSize}`);
+        return res.status(416).json({ error: 'Range Not Satisfiable' });
+      }
+
+      const rawStart = match[1];
+      const rawEnd = match[2];
+
+      let start = 0;
+      let end = fileSize - 1;
+
+      if (rawStart === '' && rawEnd !== '') {
+        // Suffix range: bytes=-500
+        const suffix = parseInt(rawEnd, 10);
+        if (isNaN(suffix) || suffix <= 0) {
+          res.setHeader('Content-Range', `bytes */${fileSize}`);
+          return res.status(416).json({ error: 'Range Not Satisfiable' });
+        }
+        start = Math.max(0, fileSize - suffix);
+        end = fileSize - 1;
+      } else if (rawStart !== '') {
+        start = parseInt(rawStart, 10);
+        if (rawEnd !== '') {
+          end = parseInt(rawEnd, 10);
+        }
+      } else {
+        res.setHeader('Content-Range', `bytes */${fileSize}`);
+        return res.status(416).json({ error: 'Range Not Satisfiable' });
+      }
+
+      if (isNaN(start) || isNaN(end) || start < 0 || start > end || start >= fileSize) {
+        res.setHeader('Content-Range', `bytes */${fileSize}`);
+        return res.status(416).json({ error: 'Range Not Satisfiable' });
+      }
+
+      if (end >= fileSize) {
+        end = fileSize - 1;
+      }
+
+      const chunkSize = (end - start) + 1;
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
+      res.setHeader('Content-Length', chunkSize);
+      res.setHeader('Content-Type', contentType);
+
+      const stream = fs.createReadStream(resolved, { start, end });
+      stream.on('error', (err) => {
+        console.error('[Upload Streaming Error]', err?.message || err);
+        if (!res.headersSent) res.status(500).end();
+      });
+      stream.pipe(res);
+    } else {
+      res.status(200);
+      res.setHeader('Content-Length', fileSize);
+      res.setHeader('Content-Type', contentType);
+
+      const stream = fs.createReadStream(resolved);
+      stream.on('error', (err) => {
+        console.error('[Upload Streaming Error]', err?.message || err);
+        if (!res.headersSent) res.status(500).end();
+      });
+      stream.pipe(res);
+    }
+  } catch (err: any) {
+    console.error('[Upload Serve Error]', err?.message || err);
+    res.status(500).json({ error: 'Failed to retrieve media file.' });
+  }
+};
+
 
 /**
  * Strictly validates and parses a positive integer from a string value:
@@ -1858,6 +2134,10 @@ apiRouter.delete('/uploads/:fileId', async (req: Request, res: Response) => {
     res.status(500).json({ error: 'Failed to delete upload.' });
   }
 });
+
+// 16b. Secure Delivery of Uploaded Media & Artifacts (Protected against unauth, IDOR, traversal)
+apiRouter.get('/uploads/:filePath(*)', secureUploadsHandler);
+apiRouter.get('/uploads', secureUploadsHandler);
 
 // 17. Operational Metrics & Cost Telemetry (Workstream 12)
 apiRouter.get('/operational/metrics', async (req: Request, res: Response) => {
