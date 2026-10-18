@@ -622,12 +622,14 @@ export async function runAuthAndOwnershipTests() {
     fs.writeFileSync(frameLongPath, 'FRAME_SNAPSHOT_FOR_SCAN_LONG');
 
     let subProxySamplePath: string | null = null;
+    let nestedRootDir: string | null = null;
     let nestedSamplePath: string | null = null;
     let frameSamplePath: string | null = null;
     let framesSampleDir: string | null = null;
     let symlinkOutPath: string | null = null;
     let symlinkToSubPath: string | null = null;
     let symlinkInSubPath: string | null = null;
+    let externalTempTarget: string | null = null;
 
     try {
       // -------------------------------------------------------
@@ -726,15 +728,17 @@ export async function runAuthAndOwnershipTests() {
       assert(userBSubProxyRes.status === 403, 'User B access to unowned file in proxies/ is rejected (403 Forbidden)');
 
       // Test A.10: Same-named file in multi-level nested subdirectory does NOT receive public status
-      const nestedDir = path.resolve(uploadDir, 'nested', 'deep', 'sub');
+      const nestedRootName = `test_nested_${testTime}`;
+      nestedRootDir = path.resolve(uploadDir, nestedRootName);
+      const nestedDir = path.resolve(nestedRootDir, 'deep', 'sub');
       fs.mkdirSync(nestedDir, { recursive: true });
       nestedSamplePath = path.resolve(nestedDir, publicSampleFileId);
       fs.writeFileSync(nestedSamplePath, 'NESTED_DEEP_SECRET_SAMPLE_CONTENT');
 
-      assert(isTrustedPublicMedia(nestedSamplePath, `nested/deep/sub/${publicSampleFileId}`) === false, 'isTrustedPublicMedia returns false for nested subdirectory');
+      assert(isTrustedPublicMedia(nestedSamplePath, `${nestedRootName}/deep/sub/${publicSampleFileId}`) === false, 'isTrustedPublicMedia returns false for nested subdirectory');
       assert(isTrustedPublicMedia(nestedSamplePath) === false, 'isTrustedPublicMedia returns false for nested path even without relativePath');
 
-      const anonNestedRes = await fetch(`${uploadsBaseUrl}/nested/deep/sub/${publicSampleFileId}`);
+      const anonNestedRes = await fetch(`${uploadsBaseUrl}/${nestedRootName}/deep/sub/${publicSampleFileId}`);
       assert(anonNestedRes.status === 401, 'Anonymous access to allowlisted-name file in nested subdirectory is rejected (401 Unauthorized)');
 
       // Test A.11: Same-named file in frames subdirectory does NOT receive public status
@@ -755,33 +759,39 @@ export async function runAuthAndOwnershipTests() {
       assert(isTrustedPublicMedia('', '') === false, 'isTrustedPublicMedia fails closed on empty path');
       assert(isTrustedPublicMedia(null as any) === false, 'isTrustedPublicMedia fails closed on null path');
 
-      // Test A.13: Symlink security verification (if symlink supported by environment)
-      let symlinksTested = false;
+      // Test A.13: Symlink security verification
+      externalTempTarget = path.resolve(os.tmpdir(), `test_symlink_ext_target_${testTime}.txt`);
+      fs.writeFileSync(externalTempTarget, 'EXTERNAL_TEMP_SECRET_CONTENT');
+
       symlinkOutPath = path.resolve(uploadDir, `symlink_out_${testTime}.mp4`);
       symlinkToSubPath = path.resolve(uploadDir, `symlink_to_sub_${testTime}.mp4`);
       symlinkInSubPath = path.resolve(proxiesDir, `symlink_in_sub_${testTime}.mp4`);
+
+      let symlinkCreationError: any = null;
       try {
-        fs.symlinkSync(path.resolve(process.cwd(), 'package.json'), symlinkOutPath);
+        fs.symlinkSync(externalTempTarget, symlinkOutPath);
         fs.symlinkSync(subProxySamplePath, symlinkToSubPath);
         fs.symlinkSync(publicSamplePath, symlinkInSubPath);
-        symlinksTested = true;
-      } catch {
-        console.log('    ℹ Symlink creation unsupported in current environment, skipping OS-level symlink tests.');
+      } catch (err: any) {
+        symlinkCreationError = err;
       }
 
-      if (symlinksTested) {
-        assert(isTrustedPublicMedia(symlinkOutPath, path.basename(symlinkOutPath)) === false, 'Symlink escaping storage is rejected by isTrustedPublicMedia');
-        const symlinkOutRes = await fetch(`${uploadsBaseUrl}/${path.basename(symlinkOutPath)}`);
-        assert(symlinkOutRes.status === 403 || symlinkOutRes.status === 400, 'Symlink pointing outside uploadDir is rejected (403/400)');
-
-        assert(isTrustedPublicMedia(symlinkToSubPath, path.basename(symlinkToSubPath)) === false, 'Symlink pointing into subdirectory is rejected by isTrustedPublicMedia');
-        const symlinkToSubRes = await fetch(`${uploadsBaseUrl}/${path.basename(symlinkToSubPath)}`);
-        assert(symlinkToSubRes.status === 401, 'Anonymous access to symlink pointing into subdirectory is rejected (401 Unauthorized)');
-
-        assert(isTrustedPublicMedia(symlinkInSubPath, `proxies/${path.basename(symlinkInSubPath)}`) === false, 'Symlink located in subdirectory is rejected by isTrustedPublicMedia');
-        const symlinkInSubRes = await fetch(`${uploadsBaseUrl}/proxies/${path.basename(symlinkInSubPath)}`);
-        assert(symlinkInSubRes.status === 401, 'Anonymous access to symlink inside subdirectory is rejected (401 Unauthorized)');
+      if (symlinkCreationError) {
+        console.warn(`  ⚠️ BLOCKED: Symlink operations are not supported by the environment: ${symlinkCreationError?.code || symlinkCreationError?.message}`);
+        throw new Error(`BLOCKED: Symlink operations not supported by environment: ${symlinkCreationError?.message}`);
       }
+
+      assert(isTrustedPublicMedia(symlinkOutPath, path.basename(symlinkOutPath)) === false, 'Symlink escaping storage is rejected by isTrustedPublicMedia');
+      const symlinkOutRes = await fetch(`${uploadsBaseUrl}/${path.basename(symlinkOutPath)}`);
+      assert(symlinkOutRes.status === 403 || symlinkOutRes.status === 400, 'Symlink pointing outside uploadDir is rejected (403/400)');
+
+      assert(isTrustedPublicMedia(symlinkToSubPath, path.basename(symlinkToSubPath)) === false, 'Symlink pointing into subdirectory is rejected by isTrustedPublicMedia');
+      const symlinkToSubRes = await fetch(`${uploadsBaseUrl}/${path.basename(symlinkToSubPath)}`);
+      assert(symlinkToSubRes.status === 401, 'Anonymous access to symlink pointing into subdirectory is rejected (401 Unauthorized)');
+
+      assert(isTrustedPublicMedia(symlinkInSubPath, `proxies/${path.basename(symlinkInSubPath)}`) === false, 'Symlink located in subdirectory is rejected by isTrustedPublicMedia');
+      const symlinkInSubRes = await fetch(`${uploadsBaseUrl}/proxies/${path.basename(symlinkInSubPath)}`);
+      assert(symlinkInSubRes.status === 401, 'Anonymous access to symlink inside subdirectory is rejected (401 Unauthorized)');
 
       // -------------------------------------------------------
       // ISSUE B: PROHIBITION OF SESSION TOKENS IN URL & MEDIA TOKENS
@@ -957,18 +967,24 @@ export async function runAuthAndOwnershipTests() {
         frameSamplePath,
         symlinkOutPath,
         symlinkToSubPath,
-        symlinkInSubPath
+        symlinkInSubPath,
+        externalTempTarget
       ].filter((p): p is string => Boolean(p));
       for (const p of allTestFiles) {
-        if (fs.existsSync(p)) {
-          try { fs.unlinkSync(p); } catch { /* ignore */ }
-        }
+        try {
+          const stat = fs.lstatSync(p, { throwIfNoEntry: false });
+          if (stat) {
+            fs.unlinkSync(p);
+          }
+        } catch { /* ignore */ }
       }
       try { fs.rmSync(framesLongDir, { recursive: true, force: true }); } catch { /* ignore */ }
       try { fs.rmSync(dirA, { recursive: true, force: true }); } catch { /* ignore */ }
       try { fs.rmSync(dirB, { recursive: true, force: true }); } catch { /* ignore */ }
-      try { fs.rmSync(path.resolve(uploadDir, 'nested'), { recursive: true, force: true }); } catch { /* ignore */ }
-      if (framesSampleDir) {
+      if (nestedRootDir && fs.existsSync(nestedRootDir)) {
+        try { fs.rmSync(nestedRootDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+      if (framesSampleDir && fs.existsSync(framesSampleDir)) {
         try { fs.rmSync(framesSampleDir, { recursive: true, force: true }); } catch { /* ignore */ }
       }
     }
