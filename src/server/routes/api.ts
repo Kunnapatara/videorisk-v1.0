@@ -206,6 +206,13 @@ export function sanitizeUser(user: UserAccount) {
  * Returns null if token is missing, invalid, or expired.
  * Never silently converts an anonymous request into a shared default user.
  */
+/**
+ * Extracts and authenticates user identity from request session tokens.
+ * Strictly supports Authorization Bearer token, x-session-token header, and cookie.
+ * NEVER accepts session tokens from URL query strings (e.g. ?token= or ?sessionToken=)
+ * to prevent token exposure in browser history, logs, and Referer headers.
+ * Returns null if token is missing, invalid, or expired.
+ */
 export async function getAuthenticatedUser(req: Request): Promise<UserAccount | null> {
   let token: string | undefined;
 
@@ -216,10 +223,6 @@ export async function getAuthenticatedUser(req: Request): Promise<UserAccount | 
     token = String(req.headers['x-session-token']).trim();
   } else if ((req as any).cookies?.vr_session) {
     token = String((req as any).cookies.vr_session).trim();
-  } else if (req.query?.token && typeof req.query.token === 'string') {
-    token = req.query.token.trim();
-  } else if (req.query?.sessionToken && typeof req.query.sessionToken === 'string') {
-    token = req.query.sessionToken.trim();
   }
 
   if (!token) {
@@ -247,78 +250,294 @@ export async function requireAuth(req: Request, res: Response): Promise<UserAcco
   return user;
 }
 
+// ==============================================================================
+// ISSUE B: SCOPED, SHORT-LIVED MEDIA ACCESS TOKENS (No Session Tokens in URL)
+// ==============================================================================
+
+/**
+ * Server-authoritative secret for signing short-lived, resource-scoped media access tokens.
+ * Kept isolated from primary session tokens and client credentials.
+ */
+const MEDIA_TOKEN_SECRET = process.env.MEDIA_TOKEN_SECRET || crypto.randomBytes(32).toString('hex');
+
+export interface MediaAccessTokenPayload {
+  userId: string;
+  resourceId: string; // canonical relative path or fileId, e.g. "videorisk_123.mp4"
+  expiresAt: number;  // timestamp in milliseconds
+  nonce: string;
+}
+
+/**
+ * Creates a cryptographically signed, short-lived media access token scoped strictly to a single resource.
+ * Max duration: 300 seconds. Default duration: 120 seconds.
+ */
+export function createMediaAccessToken(userId: string, resourceId: string, durationSeconds: number = 120): string {
+  if (!userId || typeof userId !== 'string') {
+    throw new Error('Valid userId is required to create media access token.');
+  }
+  if (!resourceId || typeof resourceId !== 'string') {
+    throw new Error('Valid resourceId is required to create media access token.');
+  }
+
+  const safeDuration = Math.min(300, Math.max(1, durationSeconds));
+  const normalizedResource = resourceId.replace(/^\/+/, '').trim();
+  const payload: MediaAccessTokenPayload = {
+    userId: userId.trim(),
+    resourceId: normalizedResource,
+    expiresAt: Date.now() + (safeDuration * 1000),
+    nonce: crypto.randomBytes(16).toString('hex')
+  };
+
+  const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  const signature = crypto.createHmac('sha256', MEDIA_TOKEN_SECRET).update(payloadB64).digest('base64url');
+  return `${payloadB64}.${signature}`;
+}
+
+/**
+ * Validates a media access token against the requested resource path and verifies:
+ * 1. Correct cryptographic HMAC-SHA256 signature (constant-time comparison).
+ * 2. Token has not expired.
+ * 3. Token resourceId strictly matches the requested resource.
+ * Returns the authenticated userId or null if invalid, expired, tampered, or out of scope.
+ */
+export function verifyMediaAccessToken(tokenStr: string | undefined | null, requestedRelativePath: string): { userId: string } | null {
+  if (!tokenStr || typeof tokenStr !== 'string') {
+    return null;
+  }
+
+  const trimmed = tokenStr.trim();
+  const parts = trimmed.split('.');
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    return null;
+  }
+
+  const [payloadB64, providedSig] = parts;
+
+  // Verify HMAC signature in constant time
+  const expectedSig = crypto.createHmac('sha256', MEDIA_TOKEN_SECRET).update(payloadB64).digest('base64url');
+  const providedBuf = Buffer.from(providedSig);
+  const expectedBuf = Buffer.from(expectedSig);
+
+  if (providedBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(providedBuf, expectedBuf)) {
+    return null;
+  }
+
+  // Parse and validate payload
+  try {
+    const rawJson = Buffer.from(payloadB64, 'base64url').toString('utf8');
+    const payload: MediaAccessTokenPayload = JSON.parse(rawJson);
+
+    if (!payload.userId || !payload.resourceId || !payload.expiresAt) {
+      return null;
+    }
+
+    // Expiration check
+    if (Date.now() > payload.expiresAt) {
+      return null;
+    }
+
+    // Strict Scope check:
+    const normTokenResource = path.normalize(payload.resourceId).replace(/^\/+/, '');
+    const normRequested = path.normalize(requestedRelativePath).replace(/^\/+/, '');
+
+    const tokenBase = path.basename(normTokenResource);
+    const reqBase = path.basename(normRequested);
+
+    // Exact relative path match, or exact basename match for files inside root upload dir
+    const isExactMatch = normTokenResource === normRequested;
+    const isBasenameMatch = tokenBase === reqBase && (!normTokenResource.includes(path.sep) || normTokenResource === normRequested);
+
+    // Proxy derivative matching: if token was granted for the parent video "video.mp4", allow its derived proxy "proxies/proxy_video.mp4"
+    let isDerivedProxyMatch = false;
+    if (normRequested.startsWith('proxies' + path.sep)) {
+      const proxyStem = reqBase.replace(/^proxy_/, '').replace(/\.mp4$/i, '');
+      const tokenStem = path.basename(normTokenResource, path.extname(normTokenResource));
+      if (proxyStem === tokenStem) {
+        isDerivedProxyMatch = true;
+      }
+    }
+
+    if (!isExactMatch && !isBasenameMatch && !isDerivedProxyMatch) {
+      return null; // Scope mismatch!
+    }
+
+    return { userId: payload.userId };
+  } catch {
+    return null;
+  }
+}
+
+// ==============================================================================
+// ISSUE A: TRUSTED PUBLIC MEDIA AUTHORIZATION (Explicit Allowlist Only)
+// ==============================================================================
+
+/**
+ * Explicit allowlist of approved public demo/sample media assets.
+ * Only exact filenames matching this allowlist and lacking any user ownership records
+ * can be accessed unauthenticated.
+ * Generic prefixes (e.g. "public_", "sample_public_") or path patterns are never trusted.
+ */
+export const TRUSTED_PUBLIC_MEDIA_ALLOWLIST = new Set<string>([
+  'sample_public_demo.mp4',
+  'sample_public_test.mp4',
+  'public_demo_sample.mp4'
+]);
+
+export function registerTrustedPublicMedia(filename: string): void {
+  const baseName = path.basename(filename.trim());
+  if (baseName) {
+    TRUSTED_PUBLIC_MEDIA_ALLOWLIST.add(baseName);
+  }
+}
+
+export function unregisterTrustedPublicMedia(filename: string): void {
+  const baseName = path.basename(filename.trim());
+  if (baseName) {
+    TRUSTED_PUBLIC_MEDIA_ALLOWLIST.delete(baseName);
+  }
+}
+
+export function isTrustedPublicMedia(resolvedPath: string, _relativePath: string): boolean {
+  const baseName = path.basename(resolvedPath);
+  return TRUSTED_PUBLIC_MEDIA_ALLOWLIST.has(baseName);
+}
+
+// ==============================================================================
+// ISSUE C: STRICT OWNERSHIP RESOLUTION (Trusted Relationships, No Guessing)
+// ==============================================================================
+
 /**
  * Resolves the user account ID who owns a stored media file or scan artifact.
- * Inspects:
- * 1. Uploads repository by canonical file path and fileId (basename).
- * 2. Scans repository by videoPath, thumbnailPath, proxyPath, and proxy naming pattern.
- * 3. Frames directory by scan ID association.
- * Returns null if the file cannot be authenticated to a specific user.
+ * Strictly enforces:
+ * 1. Exact canonical path matching against storage records (uploads and scans).
+ * 2. Elimination of substring matching (e.g. no normPath.includes(scan.id)).
+ * 3. Prevention of basename collision across different directories.
+ * 4. Prevention of proxy stem collisions across multiple user accounts.
+ * 5. Detection of conflicting records -> fails closed (returns null).
+ * 6. Orphaned files without trusted relationships -> fails closed (returns null).
  */
 export async function getMediaOwner(candidatePath: string): Promise<{ userId: string } | null> {
-  const normPath = path.resolve(candidatePath);
-  const baseName = path.basename(normPath);
+  let normPath: string;
+  try {
+    normPath = fs.existsSync(candidatePath) ? fs.realpathSync(candidatePath) : path.resolve(candidatePath);
+  } catch {
+    normPath = path.resolve(candidatePath);
+  }
 
-  // 1. Direct match in uploads repository by full path or fileId
+  const baseName = path.basename(normPath);
+  const uploadDirResolved = path.resolve(uploadDir);
+
+  // 1. Direct match in uploads repository by exact canonical filePath
   const uploadByPath = await storage.uploads.getUploadByPath(normPath);
   if (uploadByPath) {
-    return { userId: uploadByPath.userId };
+    // Verify that the upload record's resolved path actually matches normPath
+    if (path.resolve(uploadByPath.filePath) === normPath) {
+      return { userId: uploadByPath.userId };
+    }
   }
 
-  const uploadByFileId = await storage.uploads.getUpload(baseName);
-  if (uploadByFileId) {
-    return { userId: uploadByFileId.userId };
+  // Check upload by fileId (primary key), but ONLY if the file is directly inside uploadDir
+  // and its recorded filePath matches normPath (preventing cross-directory basename collisions)
+  if (path.dirname(normPath) === uploadDirResolved) {
+    const uploadByFileId = await storage.uploads.getUpload(baseName);
+    if (uploadByFileId) {
+      let recordResolved: string;
+      try {
+        recordResolved = fs.existsSync(uploadByFileId.filePath) 
+          ? fs.realpathSync(uploadByFileId.filePath) 
+          : path.resolve(uploadByFileId.filePath);
+      } catch {
+        recordResolved = path.resolve(uploadByFileId.filePath);
+      }
+      if (recordResolved === normPath) {
+        return { userId: uploadByFileId.userId };
+      }
+    }
   }
 
-  // 2. Direct match in scans repository
+  // 2. Direct exact match in scans repository
   const allScans = await storage.scans.getAllScans();
-  for (const scan of allScans) {
-    if (scan.videoPath && (path.resolve(scan.videoPath) === normPath || path.basename(scan.videoPath) === baseName)) {
-      return { userId: scan.userId };
-    }
-    if (scan.thumbnailPath && (path.resolve(scan.thumbnailPath) === normPath || path.basename(scan.thumbnailPath) === baseName)) {
-      return { userId: scan.userId };
-    }
-    if (scan.proxyPath && (path.resolve(scan.proxyPath) === normPath || path.basename(scan.proxyPath) === baseName)) {
-      return { userId: scan.userId };
-    }
+  const directMatchingScans = allScans.filter(scan => {
+    const vMatch = scan.videoPath && path.resolve(scan.videoPath) === normPath;
+    const tMatch = scan.thumbnailPath && path.resolve(scan.thumbnailPath) === normPath;
+    const pMatch = scan.proxyPath && path.resolve(scan.proxyPath) === normPath;
+    return vMatch || tMatch || pMatch;
+  });
 
-    // Proxy derivative matching: proxies/proxy_${baseNameNoExt}.mp4
-    if (baseName.startsWith('proxy_')) {
-      const proxyStem = baseName.replace(/^proxy_/, '').replace(/\.mp4$/i, '');
+  if (directMatchingScans.length > 0) {
+    const scanOwners = new Set(directMatchingScans.map(s => s.userId));
+    if (scanOwners.size === 1) {
+      return { userId: directMatchingScans[0].userId };
+    }
+    // Ambiguous conflict: Multiple distinct users own matching records -> fail closed!
+    return null;
+  }
+
+  // 3. Proxy derivative matching: uploads/proxies/proxy_${sourceStem}.mp4
+  const proxiesDir = path.resolve(uploadDirResolved, 'proxies');
+  if (path.dirname(normPath) === proxiesDir && baseName.startsWith('proxy_') && baseName.endsWith('.mp4')) {
+    const proxyStem = baseName.replace(/^proxy_/, '').replace(/\.mp4$/i, '');
+    
+    // Find all scans whose source video filename stem matches proxyStem exactly
+    const matchingProxyScans = allScans.filter(scan => {
       if (scan.videoPath) {
-        const videoStem = path.basename(scan.videoPath, path.extname(scan.videoPath));
-        if (videoStem === proxyStem) {
-          return { userId: scan.userId };
-        }
+        const vStem = path.basename(scan.videoPath, path.extname(scan.videoPath));
+        if (vStem === proxyStem) return true;
       }
       if (scan.videoFilename) {
-        const fileStem = path.basename(scan.videoFilename, path.extname(scan.videoFilename));
-        if (fileStem === proxyStem) {
-          return { userId: scan.userId };
-        }
+        const fStem = path.basename(scan.videoFilename, path.extname(scan.videoFilename));
+        if (fStem === proxyStem) return true;
       }
+      return false;
+    });
+
+    // Also check upload records whose source file stem matches proxyStem exactly
+    const candidateOwners = new Set<string>();
+    for (const scan of matchingProxyScans) {
+      candidateOwners.add(scan.userId);
     }
 
-    // Frame snapshots: uploads/frames/${scanId}_.../...
-    if (normPath.includes(path.sep + 'frames' + path.sep)) {
-      if (normPath.includes(scan.id)) {
-        return { userId: scan.userId };
-      }
-    }
-  }
-
-  // 3. Check proxy derivative against upload records
-  if (baseName.startsWith('proxy_')) {
-    const proxyStem = baseName.replace(/^proxy_/, '').replace(/\.mp4$/i, '');
     for (const ext of ['.mp4', '.mov', '.webm', '.mkv', '.avi']) {
-      const uploadByStem = await storage.uploads.getUpload(proxyStem + ext);
-      if (uploadByStem) {
-        return { userId: uploadByStem.userId };
+      const up = await storage.uploads.getUpload(proxyStem + ext);
+      if (up) {
+        candidateOwners.add(up.userId);
       }
     }
+
+    if (candidateOwners.size === 1) {
+      const [singleOwner] = Array.from(candidateOwners);
+      return { userId: singleOwner };
+    }
+    // If 0 matches (orphaned proxy) or >1 matches (cross-user collision): FAIL CLOSED!
+    return null;
   }
 
+  // 4. Frame snapshots: uploads/frames/${jobSubdir}/frame_xxx.jpg
+  const framesDir = path.resolve(uploadDirResolved, 'frames');
+  if (normPath.startsWith(framesDir + path.sep)) {
+    const relFromFrames = path.relative(framesDir, normPath);
+    const jobSubdir = relFromFrames.split(path.sep)[0];
+
+    // Strictly match jobSubdir without substring ambiguity (never use includes)
+    const matchingFrameScans = allScans.filter(scan => {
+      if (jobSubdir === scan.id) return true;
+      if (jobSubdir.startsWith(scan.id + '_')) {
+        const suffix = jobSubdir.substring(scan.id.length + 1);
+        // Suffix must be numeric or standard timestamp/random segment
+        return /^[0-9]+(_[a-z0-9]+)?$/i.test(suffix);
+      }
+      return false;
+    });
+
+    const frameOwners = new Set(matchingFrameScans.map(s => s.userId));
+    if (frameOwners.size === 1) {
+      return { userId: matchingFrameScans[0].userId };
+    }
+    // If 0 matches or multiple conflicting scans: FAIL CLOSED!
+    return null;
+  }
+
+  // No trusted relationship found -> FAIL CLOSED!
   return null;
 }
 
@@ -326,7 +545,8 @@ export async function getMediaOwner(candidatePath: string): Promise<{ userId: st
  * Secure file delivery handler for uploads directory.
  * Enforces:
  * 1. Directory traversal prevention (validateSafeStoragePath, URI decoding, null bytes check).
- * 2. Strict authentication & session verification (via Bearer, x-session-token, cookie, or query param).
+ * 2. Strict authentication & session verification (Bearer, x-session-token, cookie, or scoped media_token).
+ *    NEVER accepts session tokens in URL query strings.
  * 3. Strict object-level authorization (IDOR protection: verifies that requesting user owns the media or associated scan).
  * 4. RFC 7233 byte-range streaming for audio/video players.
  * 5. Secure response headers (X-Content-Type-Options: nosniff, private cache control, Content-Type, Accept-Ranges).
@@ -386,28 +606,44 @@ export const secureUploadsHandler: RequestHandler = async (req: Request, res: Re
     // Identify owner from storage records (uploads or scans)
     const owner = await getMediaOwner(resolved);
 
-    // Public demo / sample asset detection:
-    // Only permit unauthenticated access if explicitly marked public AND untracked in private user records
-    const baseName = path.basename(resolved);
-    const isPublicSample = !owner && (
-      baseName.startsWith('public_') ||
-      baseName.startsWith('sample_public_') ||
-      decodedPath.startsWith('public/') ||
-      decodedPath.startsWith('samples/')
-    );
+    // Trusted Public Sample detection (Issue A):
+    // Only permit unauthenticated access if file is in explicit TRUSTED_PUBLIC_MEDIA_ALLOWLIST
+    // AND has NO user ownership record in storage
+    const isPublicApproved = !owner && isTrustedPublicMedia(resolved, decodedPath);
 
-    if (!isPublicSample) {
-      const authenticatedUser = await getAuthenticatedUser(req);
-      if (!authenticatedUser) {
-        return res.status(401).json({ error: 'Unauthorized: A valid active session is required to access private media.' });
+    if (!isPublicApproved) {
+      // Authenticate requesting user:
+      // 1. Primary session authentication via Authorization Bearer, x-session-token header, or vr_session cookie
+      let authenticatedUserId: string | null = null;
+      const sessionUser = await getAuthenticatedUser(req);
+      if (sessionUser) {
+        authenticatedUserId = sessionUser.id;
+      }
+
+      // 2. Resource-scoped, short-lived Media Access Token (Issue B):
+      // Only accepted if passed via ?media_token= or ?mediaToken=
+      // Note: Primary session tokens in ?token= or ?sessionToken= are strictly ignored and NOT accepted!
+      if (!authenticatedUserId) {
+        const queryMediaToken = (req.query?.media_token || req.query?.mediaToken);
+        if (typeof queryMediaToken === 'string' && queryMediaToken.trim()) {
+          const verified = verifyMediaAccessToken(queryMediaToken.trim(), decodedPath);
+          if (verified) {
+            authenticatedUserId = verified.userId;
+          }
+        }
+      }
+
+      // If unauthenticated by both session and valid media token: reject 401
+      if (!authenticatedUserId) {
+        return res.status(401).json({ error: 'Unauthorized: A valid active session or media access token is required.' });
       }
 
       // If an owner was identified, verify that the authenticated user owns this asset
-      if (owner && owner.userId !== authenticatedUser.id) {
+      if (owner && owner.userId !== authenticatedUserId) {
         return res.status(403).json({ error: 'Access denied: You do not own this media asset.' });
       }
 
-      // If the file is not tracked in storage and not an intentional public sample, fail closed
+      // If the file is not tracked in storage and not an intentional public sample: fail closed (Issue C)
       if (!owner) {
         return res.status(403).json({ error: 'Access denied: Media asset is not associated with an authorized scan.' });
       }
@@ -461,7 +697,6 @@ export const secureUploadsHandler: RequestHandler = async (req: Request, res: Re
       let end = fileSize - 1;
 
       if (rawStart === '' && rawEnd !== '') {
-        // Suffix range: bytes=-500
         const suffix = parseInt(rawEnd, 10);
         if (isNaN(suffix) || suffix <= 0) {
           res.setHeader('Content-Range', `bytes */${fileSize}`);
@@ -517,7 +752,6 @@ export const secureUploadsHandler: RequestHandler = async (req: Request, res: Re
     res.status(500).json({ error: 'Failed to retrieve media file.' });
   }
 };
-
 
 /**
  * Strictly validates and parses a positive integer from a string value:
@@ -2138,6 +2372,54 @@ apiRouter.delete('/uploads/:fileId', async (req: Request, res: Response) => {
 // 16b. Secure Delivery of Uploaded Media & Artifacts (Protected against unauth, IDOR, traversal)
 apiRouter.get('/uploads/:filePath(*)', secureUploadsHandler);
 apiRouter.get('/uploads', secureUploadsHandler);
+
+// 16c. Issue Scoped, Short-Lived Media Access Token
+apiRouter.post('/media/token', requireAuthMiddleware, async (req: Request, res: Response) => {
+  try {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+
+    const { fileId, durationSeconds = 120 } = req.body;
+    if (!fileId || typeof fileId !== 'string') {
+      return res.status(400).json({ error: 'fileId is required.' });
+    }
+
+    const cleanFileId = path.normalize(fileId).replace(/^\/+/, '');
+    const targetPath = path.resolve(uploadDir, cleanFileId);
+
+    // Validate path safety against traversal
+    const validation = validateSafeStoragePath(targetPath);
+    if (!validation.isSafe) {
+      return res.status(403).json({ error: 'Invalid file path.' });
+    }
+
+    // Verify ownership
+    const owner = await getMediaOwner(validation.resolvedPath);
+    if (!owner) {
+      return res.status(404).json({ error: 'Media asset not found or unowned.' });
+    }
+    if (owner.userId !== user.id) {
+      return res.status(403).json({ error: 'Access denied: You do not own this media asset.' });
+    }
+
+    const parsedDuration = typeof durationSeconds === 'number' && durationSeconds > 0 
+      ? Math.min(300, Math.max(1, durationSeconds)) 
+      : 120;
+
+    const mediaToken = createMediaAccessToken(user.id, cleanFileId, parsedDuration);
+    const expiresAt = new Date(Date.now() + (parsedDuration * 1000)).toISOString();
+
+    res.json({
+      mediaToken,
+      fileId: cleanFileId,
+      expiresAt,
+      expiresInSeconds: parsedDuration,
+      mediaUrl: `/uploads/${cleanFileId}?media_token=${mediaToken}`
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to generate media token.' });
+  }
+});
 
 // 17. Operational Metrics & Cost Telemetry (Workstream 12)
 apiRouter.get('/operational/metrics', async (req: Request, res: Response) => {

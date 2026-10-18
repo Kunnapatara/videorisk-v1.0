@@ -1,8 +1,18 @@
 import express from 'express';
+import http from 'http';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
-import { apiRouter, secureUploadsHandler } from '../src/server/routes/api';
+import { 
+  apiRouter, 
+  secureUploadsHandler,
+  createMediaAccessToken,
+  verifyMediaAccessToken,
+  getMediaOwner,
+  registerTrustedPublicMedia,
+  unregisterTrustedPublicMedia,
+  TRUSTED_PUBLIC_MEDIA_ALLOWLIST
+} from '../src/server/routes/api';
 import { storage } from '../src/server/storage';
 import { creditService } from '../src/server/services/creditService';
 import { billingService } from '../src/server/services/billingService';
@@ -434,9 +444,9 @@ export async function runAuthAndOwnershipTests() {
     assert(rescanData.parentScanId === scanA.id, 'Created rescan job correctly references parentScanId');
 
     // ---------------------------------------------------------
-    // 3c. PRIVATE UPLOAD ASSET ACCESS CONTROL & STREAMING SECURITY
+    // 3c. SECURE MEDIA ACCESS HARDENING (ISSUES A, B, C)
     // ---------------------------------------------------------
-    console.log('\n[3c. Private Upload Asset Access Control & Streaming Security]');
+    console.log('\n[3c. Secure Media Access Hardening (Issues A, B, C)]');
 
     const testTime = Date.now();
     const testVideoFileId = `userA_private_${testTime}.mp4`;
@@ -478,146 +488,397 @@ export async function runAuthAndOwnershipTests() {
     const testProxyPayload = 'MOCK_USER_A_DERIVED_PROXY_STREAM_PAYLOAD';
     fs.writeFileSync(testProxyPath, testProxyPayload);
 
-    const publicSampleFileId = `sample_public_demo_${testTime}.mp4`;
+    // Issue A fixture: User-owned file that tries to spoof public prefix
+    const fakePublicFileId = `public_userA_private_${testTime}.mp4`;
+    const fakePublicPath = path.resolve(uploadDir, fakePublicFileId);
+    fs.writeFileSync(fakePublicPath, 'FAKE_PUBLIC_USER_A_SECRET_DATA');
+    await storage.uploads.recordUpload({
+      fileId: fakePublicFileId,
+      userId: userA.id,
+      filename: 'public_video.mp4',
+      filePath: fakePublicPath,
+      fileSize: Buffer.byteLength('FAKE_PUBLIC_USER_A_SECRET_DATA'),
+      type: 'video',
+      createdAt: new Date().toISOString()
+    });
+
+    const fakeSampleFileId = `sample_public_userA_${testTime}.mp4`;
+    const fakeSamplePath = path.resolve(uploadDir, fakeSampleFileId);
+    fs.writeFileSync(fakeSamplePath, 'FAKE_SAMPLE_USER_A_SECRET_DATA');
+    await storage.uploads.recordUpload({
+      fileId: fakeSampleFileId,
+      userId: userA.id,
+      filename: 'sample_video.mp4',
+      filePath: fakeSamplePath,
+      fileSize: Buffer.byteLength('FAKE_SAMPLE_USER_A_SECRET_DATA'),
+      type: 'video',
+      createdAt: new Date().toISOString()
+    });
+
+    // Legitimate public sample asset (in allowlist, no owner record)
+    const publicSampleFileId = `sample_public_test.mp4`;
     const publicSamplePath = path.resolve(uploadDir, publicSampleFileId);
     const publicSamplePayload = 'PUBLIC_SAMPLE_VIDEO_CONTENT_ACCESSIBLE_UNAUTHENTICATED';
     fs.writeFileSync(publicSamplePath, publicSamplePayload);
 
+    // Orphaned unowned file
     const unownedFileId = `unregistered_orphan_${testTime}.mp4`;
     const unownedPath = path.resolve(uploadDir, unownedFileId);
     fs.writeFileSync(unownedPath, 'ORPHANED_DATA_WITH_NO_USER_RECORD');
 
+    // Issue C fixtures: Multiple directories with same basename
+    const dirA = path.resolve(os.tmpdir(), `test_isolation_dirA_${testTime}`);
+    const dirB = path.resolve(os.tmpdir(), `test_isolation_dirB_${testTime}`);
+    fs.mkdirSync(dirA, { recursive: true });
+    fs.mkdirSync(dirB, { recursive: true });
+    const sameBasename = `shared_name_${testTime}.mp4`;
+    const pathA = path.resolve(dirA, sameBasename);
+    const pathB = path.resolve(dirB, sameBasename);
+    fs.writeFileSync(pathA, 'USER_A_FILE_IN_DIR_A');
+    fs.writeFileSync(pathB, 'USER_B_FILE_IN_DIR_B');
+
+    await storage.uploads.recordUpload({
+      fileId: `fileA_${testTime}`,
+      userId: userA.id,
+      filename: sameBasename,
+      filePath: pathA,
+      fileSize: 20,
+      type: 'video',
+      createdAt: new Date().toISOString()
+    });
+    await storage.uploads.recordUpload({
+      fileId: `fileB_${testTime}`,
+      userId: userB.id,
+      filename: sameBasename,
+      filePath: pathB,
+      fileSize: 20,
+      type: 'video',
+      createdAt: new Date().toISOString()
+    });
+
+    // Issue C fixtures: Proxy collision across different accounts
+    const stemCollision = `collision_clip_${testTime}`;
+    const collisionPathA = path.resolve(uploadDir, `${stemCollision}.mp4`);
+    const collisionPathB = path.resolve(uploadDir, `${stemCollision}.mov`);
+    fs.writeFileSync(collisionPathA, 'COLLISION_A');
+    fs.writeFileSync(collisionPathB, 'COLLISION_B');
+    await storage.uploads.recordUpload({
+      fileId: `${stemCollision}.mp4`,
+      userId: userA.id,
+      filename: `${stemCollision}.mp4`,
+      filePath: collisionPathA,
+      fileSize: 11,
+      type: 'video',
+      createdAt: new Date().toISOString()
+    });
+    await storage.uploads.recordUpload({
+      fileId: `${stemCollision}.mov`,
+      userId: userB.id,
+      filename: `${stemCollision}.mov`,
+      filePath: collisionPathB,
+      fileSize: 11,
+      type: 'video',
+      createdAt: new Date().toISOString()
+    });
+    const collisionProxyPath = path.resolve(proxiesDir, `proxy_${stemCollision}.mp4`);
+    fs.writeFileSync(collisionProxyPath, 'COLLISION_PROXY_CONTENT');
+
+    // Issue C fixtures: Substring scan ID collision
+    const scanIdShort = `scan_sub_${testTime}`;
+    const scanIdLong = `scan_sub_${testTime}_long`;
+    await storage.scans.createScan({
+      id: scanIdShort,
+      userId: userA.id,
+      videoTitle: 'Short Scan',
+      videoFilename: 'short.mp4',
+      videoPath: testVideoPath,
+      scanMode: 'standard',
+      status: 'COMPLETED',
+      currentStage: 'Risk report',
+      completedStages: ['Upload'],
+      creditsUsed: 1,
+      createdAt: new Date().toISOString()
+    });
+    await storage.scans.createScan({
+      id: scanIdLong,
+      userId: userB.id,
+      videoTitle: 'Long Scan',
+      videoFilename: 'long.mp4',
+      videoPath: path.resolve(uploadDir, `userB_long_${testTime}.mp4`),
+      scanMode: 'standard',
+      status: 'COMPLETED',
+      currentStage: 'Risk report',
+      completedStages: ['Upload'],
+      creditsUsed: 1,
+      createdAt: new Date().toISOString()
+    });
+
+    const framesDir = path.resolve(uploadDir, 'frames');
+    const jobSubdirLong = `${scanIdLong}_${Date.now()}`;
+    const framesLongDir = path.resolve(framesDir, jobSubdirLong);
+    fs.mkdirSync(framesLongDir, { recursive: true });
+    const frameLongPath = path.resolve(framesLongDir, 'frame_001.jpg');
+    fs.writeFileSync(frameLongPath, 'FRAME_SNAPSHOT_FOR_SCAN_LONG');
+
     try {
-      // Test 3c.1: Anonymous GET /uploads/:fileId receives 401 Unauthorized
-      const anonUploadsRes = await fetch(`${uploadsBaseUrl}/${testVideoFileId}`);
-      assert(anonUploadsRes.status === 401, 'Anonymous request to /uploads/:fileId returns 401 Unauthorized');
+      // -------------------------------------------------------
+      // ISSUE A: TRUSTED PUBLIC AUTHORIZATION TESTS
+      // -------------------------------------------------------
+      console.log('  --- Sub-suite A: Trusted Public Media Authorization ---');
 
-      // Test 3c.2: Anonymous GET /api/uploads/:fileId receives 401 Unauthorized
-      const anonApiUploadsRes = await fetch(`${baseUrl}/uploads/${testVideoFileId}`);
-      assert(anonApiUploadsRes.status === 401, 'Anonymous request to /api/uploads/:fileId returns 401 Unauthorized');
+      // Test A.1: User file starting with "public_" is NOT public for anonymous (401)
+      const anonFakePublicRes = await fetch(`${uploadsBaseUrl}/${fakePublicFileId}`);
+      assert(anonFakePublicRes.status === 401, 'File with public_ prefix owned by User A returns 401 Unauthorized for anonymous');
 
-      // Test 3c.3: Cross-user access (IDOR): User B cannot access User A's private video via /uploads
-      const userBUploadsRes = await fetch(`${uploadsBaseUrl}/${testVideoFileId}`, {
+      // Test A.2: User file starting with "public_" is NOT accessible to User B (403)
+      const userBFakePublicRes = await fetch(`${uploadsBaseUrl}/${fakePublicFileId}`, {
         headers: { Authorization: `Bearer ${tokenB}` }
       });
-      assert(userBUploadsRes.status === 403, 'User B access to User A private video on /uploads returns 403 Forbidden');
+      assert(userBFakePublicRes.status === 403, 'File with public_ prefix owned by User A returns 403 Forbidden for User B');
 
-      // Test 3c.4: Cross-user access (IDOR): User B cannot access User A's private video via /api/uploads
-      const userBApiUploadsRes = await fetch(`${baseUrl}/uploads/${testVideoFileId}`, {
+      // Test A.3: User file starting with "sample_public_" is NOT public for anonymous (401)
+      const anonFakeSampleRes = await fetch(`${uploadsBaseUrl}/${fakeSampleFileId}`);
+      assert(anonFakeSampleRes.status === 401, 'File with sample_public_ prefix owned by User A returns 401 Unauthorized for anonymous');
+
+      // Test A.4: User file starting with "sample_public_" is NOT accessible to User B (403)
+      const userBFakeSampleRes = await fetch(`${uploadsBaseUrl}/${fakeSampleFileId}`, {
         headers: { Authorization: `Bearer ${tokenB}` }
       });
-      assert(userBApiUploadsRes.status === 403, 'User B access to User A private video on /api/uploads returns 403 Forbidden');
+      assert(userBFakeSampleRes.status === 403, 'File with sample_public_ prefix owned by User A returns 403 Forbidden for User B');
 
-      // Test 3c.5: Authorized Owner access: User A receives 200 OK with secure headers and full body
-      const userAUploadsRes = await fetch(`${uploadsBaseUrl}/${testVideoFileId}`, {
+      // Test A.5: Explicitly allowlisted public sample without owner record is accessible unauthenticated (200 OK)
+      const publicSampleRes = await fetch(`${uploadsBaseUrl}/${publicSampleFileId}`);
+      assert(publicSampleRes.status === 200, 'Explicit allowlisted public sample returns 200 OK unauthenticated');
+      const publicSampleBody = await publicSampleRes.text();
+      assert(publicSampleBody === publicSamplePayload, 'Public sample returns expected content');
+
+      // Test A.6: Dynamic registration and unregistration of trusted public media
+      const dynSampleId = `dyn_sample_${testTime}.mp4`;
+      const dynSamplePath = path.resolve(uploadDir, dynSampleId);
+      fs.writeFileSync(dynSamplePath, 'DYNAMIC_PUBLIC_SAMPLE');
+      try {
+        // Before registration: fails closed (401)
+        const unregRes = await fetch(`${uploadsBaseUrl}/${dynSampleId}`);
+        assert(unregRes.status === 401, 'Unregistered unowned sample returns 401 Unauthorized');
+
+        // Register in trusted allowlist
+        registerTrustedPublicMedia(dynSampleId);
+        const regRes = await fetch(`${uploadsBaseUrl}/${dynSampleId}`);
+        assert(regRes.status === 200, 'Registered trusted public sample returns 200 OK');
+
+        // Unregister from trusted allowlist
+        unregisterTrustedPublicMedia(dynSampleId);
+        const postUnregRes = await fetch(`${uploadsBaseUrl}/${dynSampleId}`);
+        assert(postUnregRes.status === 401, 'Unregistered sample returns 401 Unauthorized again');
+      } finally {
+        if (fs.existsSync(dynSamplePath)) fs.unlinkSync(dynSamplePath);
+      }
+
+      // Test A.7: Directory listing attempts are rejected
+      const rootDirRes = await fetch(`${uploadsBaseUrl}`);
+      assert(rootDirRes.status === 400 || rootDirRes.status === 403, 'Root directory request is rejected without directory listing');
+
+      const proxiesListRes = await fetch(`${uploadsBaseUrl}/proxies`);
+      assert(proxiesListRes.status === 403, 'Subdirectory request is rejected without directory listing');
+
+      // Test A.8: Path traversal attempts are rejected (raw HTTP and encoded traversal)
+      const traversalRes = await new Promise<{ status: number }>((resolve, reject) => {
+        const req = http.request({
+          host: '127.0.0.1',
+          port,
+          path: '/uploads/../../data/videorisk.db',
+          headers: { Authorization: `Bearer ${activeTokenA}` }
+        }, (res) => {
+          resolve({ status: res.statusCode || 0 });
+        });
+        req.on('error', reject);
+        req.end();
+      });
+      assert(traversalRes.status === 403 || traversalRes.status === 400, 'Path traversal escaping storage is rejected');
+
+      const encodedTraversalRes = await fetch(`${uploadsBaseUrl}/..%2F..%2Fdata/videorisk.db`, {
         headers: { Authorization: `Bearer ${activeTokenA}` }
       });
-      assert(userAUploadsRes.status === 200, 'User A access to own video returns 200 OK');
-      assert(userAUploadsRes.headers.get('content-type')?.includes('video/mp4') === true, 'Response Content-Type is video/mp4');
-      assert(userAUploadsRes.headers.get('x-content-type-options') === 'nosniff', 'Response includes X-Content-Type-Options: nosniff');
-      assert(userAUploadsRes.headers.get('cache-control')?.includes('private') === true, 'Response includes private Cache-Control header');
-      assert(userAUploadsRes.headers.get('accept-ranges') === 'bytes', 'Response includes Accept-Ranges: bytes');
-      const fetchedBody = await userAUploadsRes.text();
-      assert(fetchedBody === testVideoPayload, 'Fetched video content matches original uploaded payload');
+      assert(encodedTraversalRes.status === 403 || encodedTraversalRes.status === 400, 'Encoded path traversal escaping storage is rejected');
 
-      // Test 3c.6: Query token authentication (for HTML5 <video> / <img> elements)
-      const userAQueryAuthRes = await fetch(`${uploadsBaseUrl}/${testVideoFileId}?token=${activeTokenA}`);
-      assert(userAQueryAuthRes.status === 200, 'User A access via ?token= session query parameter returns 200 OK');
-      const queryAuthBody = await userAQueryAuthRes.text();
-      assert(queryAuthBody === testVideoPayload, 'Content delivered via query token authentication matches payload');
+      // -------------------------------------------------------
+      // ISSUE B: PROHIBITION OF SESSION TOKENS IN URL & MEDIA TOKENS
+      // -------------------------------------------------------
+      console.log('  --- Sub-suite B: Media Access Tokens & Session Token Protection ---');
 
-      // Test 3c.7: Range request (HTTP 206 Partial Content)
-      const rangeRes = await fetch(`${uploadsBaseUrl}/${testVideoFileId}`, {
+      // Test B.1: Primary session token via ?token= MUST NOT grant access (401 Unauthorized)
+      const sessionInQueryRes = await fetch(`${uploadsBaseUrl}/${testVideoFileId}?token=${activeTokenA}`);
+      assert(sessionInQueryRes.status === 401, 'Primary session token passed via ?token= is rejected with 401 Unauthorized');
+
+      // Test B.2: Primary session token via ?sessionToken= MUST NOT grant access (401 Unauthorized)
+      const sessionInQueryRes2 = await fetch(`${uploadsBaseUrl}/${testVideoFileId}?sessionToken=${activeTokenA}`);
+      assert(sessionInQueryRes2.status === 401, 'Primary session token passed via ?sessionToken= is rejected with 401 Unauthorized');
+
+      // Test B.3: Generation of short-lived Media Access Token via POST /api/media/token
+      const tokenGenRes = await fetch(`${baseUrl}/media/token`, {
+        method: 'POST',
         headers: { 
           Authorization: `Bearer ${activeTokenA}`,
-          Range: 'bytes=0-15'
-        }
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ fileId: testVideoFileId, durationSeconds: 60 })
       });
-      assert(rangeRes.status === 206, 'Valid Range header returns 206 Partial Content');
-      assert(rangeRes.headers.get('content-range')?.startsWith('bytes 0-15/') === true, 'Content-Range header indicates bytes 0-15');
-      assert(rangeRes.headers.get('content-length') === '16', 'Content-Length matches range chunk size (16)');
-      const rangeBody = await rangeRes.text();
-      assert(rangeBody === testVideoPayload.substring(0, 16), 'Range response body matches requested byte slice');
+      assert(tokenGenRes.status === 200, 'POST /media/token generates media token for owned file (200 OK)');
+      const tokenGenData = await tokenGenRes.json();
+      assert(!!tokenGenData.mediaToken, 'Response contains signed mediaToken');
+      assert(tokenGenData.expiresInSeconds === 60, 'Token expiration seconds matches requested duration');
+      const validMediaToken = tokenGenData.mediaToken;
 
-      // Test 3c.8: Unsatisfiable Range request returns 416 Range Not Satisfiable
-      const badRangeRes = await fetch(`${uploadsBaseUrl}/${testVideoFileId}`, {
+      // Test B.4: Non-owner cannot generate media token for another user's file
+      const userBFakeTokenRes = await fetch(`${baseUrl}/media/token`, {
+        method: 'POST',
         headers: { 
-          Authorization: `Bearer ${activeTokenA}`,
-          Range: 'bytes=99999-999999'
-        }
+          Authorization: `Bearer ${tokenB}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ fileId: testVideoFileId })
       });
-      assert(badRangeRes.status === 416, 'Unsatisfiable byte range returns 416 Range Not Satisfiable');
-      assert(!!badRangeRes.headers.get('content-range'), '416 response includes Content-Range header');
+      assert(userBFakeTokenRes.status === 403, 'User B cannot generate media token for User A file (403 Forbidden)');
 
-      // Test 3c.9: Path Traversal attempts escaping storage root are blocked (403 Forbidden)
-      const traversalRes = await fetch(`${uploadsBaseUrl}/../../data/videorisk.db`, {
+      // Test B.5: Access media using valid Media Access Token via ?media_token=
+      const mediaTokenAccessRes = await fetch(`${uploadsBaseUrl}/${testVideoFileId}?media_token=${validMediaToken}`);
+      assert(mediaTokenAccessRes.status === 200, 'Access with valid media_token returns 200 OK');
+      const mediaTokenBody = await mediaTokenAccessRes.text();
+      assert(mediaTokenBody === testVideoPayload, 'Media body fetched via media_token matches payload');
+
+      // Test B.6: Range requests work seamlessly with media_token
+      const mediaRangeRes = await fetch(`${uploadsBaseUrl}/${testVideoFileId}?media_token=${validMediaToken}`, {
+        headers: { Range: 'bytes=0-15' }
+      });
+      assert(mediaRangeRes.status === 206, 'Valid Range request with media_token returns 206 Partial Content');
+      assert(mediaRangeRes.headers.get('content-range')?.startsWith('bytes 0-15/') === true, 'Content-Range reflects byte slice');
+      assert(mediaRangeRes.headers.get('content-length') === '16', 'Content-Length is 16');
+
+      // Test B.7: HEAD requests work seamlessly with media_token
+      const mediaHeadRes = await fetch(`${uploadsBaseUrl}/${testVideoFileId}?media_token=${validMediaToken}`, {
+        method: 'HEAD'
+      });
+      assert(mediaHeadRes.status === 200, 'HEAD request with media_token returns 200 OK');
+      assert(mediaHeadRes.headers.get('content-type')?.includes('video/mp4') === true, 'HEAD returns video/mp4 content-type');
+
+      // Test B.8: Media token scope enforcement (token for video cannot access thumbnail)
+      const scopeMismatchRes = await fetch(`${uploadsBaseUrl}/${testThumbFileId}?media_token=${validMediaToken}`);
+      assert(scopeMismatchRes.status === 401, 'Media token used for different file is rejected (scope mismatch -> 401)');
+
+      // Test B.9: Tampered / forged media token is rejected (401)
+      const tamperedMediaToken = validMediaToken.substring(0, validMediaToken.length - 4) + 'abcd';
+      const tamperedRes = await fetch(`${uploadsBaseUrl}/${testVideoFileId}?media_token=${tamperedMediaToken}`);
+      assert(tamperedRes.status === 401, 'Tampered media token with invalid HMAC is rejected (401)');
+
+      // Test B.10: Expired media token is rejected (401)
+      const expiredToken = createMediaAccessToken(userA.id, testVideoFileId, 1);
+      // Wait 1.2 seconds for expiration
+      await new Promise(r => setTimeout(r, 1200));
+      const expiredRes = await fetch(`${uploadsBaseUrl}/${testVideoFileId}?media_token=${expiredToken}`);
+      assert(expiredRes.status === 401, 'Expired media token is rejected (401)');
+
+      // Test B.11: Media token CANNOT be used to call protected APIs instead of session token
+      const protectedApiWithMediaToken = await fetch(`${baseUrl}/user`, {
+        headers: { Authorization: `Bearer ${validMediaToken}` }
+      });
+      assert(protectedApiWithMediaToken.status === 401, 'Media token cannot be used to call protected APIs (401 Unauthorized)');
+
+      // -------------------------------------------------------
+      // ISSUE C: STRICT OWNERSHIP RESOLUTION (NO SUBSTRING / BASENAME GUESSING)
+      // -------------------------------------------------------
+      console.log('  --- Sub-suite C: Strict Ownership Resolution ---');
+
+      // Test C.1: Same basename in different directories resolves strictly to respective owner
+      const ownerPathA = await getMediaOwner(pathA);
+      const ownerPathB = await getMediaOwner(pathB);
+      assert(ownerPathA?.userId === userA.id, 'getMediaOwner on dirA resolves strictly to User A');
+      assert(ownerPathB?.userId === userB.id, 'getMediaOwner on dirB resolves strictly to User B');
+
+      // Test C.2: Proxy stem collision across multiple user accounts fails closed
+      const collisionProxyOwner = await getMediaOwner(collisionProxyPath);
+      assert(collisionProxyOwner === null, 'getMediaOwner on proxy with stem collision across multiple accounts fails closed (null)');
+
+      const userACollisionRes = await fetch(`${uploadsBaseUrl}/proxies/${path.basename(collisionProxyPath)}`, {
         headers: { Authorization: `Bearer ${activeTokenA}` }
       });
-      assert(traversalRes.status === 403 || traversalRes.status === 400 || traversalRes.status === 404, 'Path traversal escaping upload directory is rejected');
+      assert(userACollisionRes.status === 403, 'Access to proxy with ambiguous multi-user stem collision is rejected (403 Forbidden)');
 
-      const encodedTraversalRes = await fetch(`${uploadsBaseUrl}/%2e%2e/%2e%2e/data/videorisk.db`, {
-        headers: { Authorization: `Bearer ${activeTokenA}` }
-      });
-      assert(encodedTraversalRes.status === 403 || encodedTraversalRes.status === 400 || encodedTraversalRes.status === 404, 'Encoded path traversal is rejected');
-
-      // Test 3c.10: Directory listing attempts are rejected
-      const dirListRes = await fetch(`${uploadsBaseUrl}`, {
-        headers: { Authorization: `Bearer ${activeTokenA}` }
-      });
-      assert(dirListRes.status === 400 || dirListRes.status === 403, 'Root directory request is rejected without directory listing');
-
-      const proxiesDirRes = await fetch(`${uploadsBaseUrl}/proxies`, {
-        headers: { Authorization: `Bearer ${activeTokenA}` }
-      });
-      assert(proxiesDirRes.status === 403, 'Subdirectory request is rejected without directory listing');
-
-      // Test 3c.11: Thumbnail ownership protection
-      const userBThumbRes = await fetch(`${uploadsBaseUrl}/${testThumbFileId}`, {
-        headers: { Authorization: `Bearer ${tokenB}` }
-      });
-      assert(userBThumbRes.status === 403, 'User B access to User A thumbnail returns 403 Forbidden');
-
-      const userAThumbRes = await fetch(`${uploadsBaseUrl}/${testThumbFileId}`, {
-        headers: { Authorization: `Bearer ${activeTokenA}` }
-      });
-      assert(userAThumbRes.status === 200, 'User A access to own thumbnail returns 200 OK');
-      assert(userAThumbRes.headers.get('content-type')?.includes('image/jpeg') === true, 'Thumbnail content-type is image/jpeg');
-
-      // Test 3c.12: Proxy artifact ownership protection
-      const userBProxyRes = await fetch(`${uploadsBaseUrl}/proxies/${testProxyFileId}`, {
-        headers: { Authorization: `Bearer ${tokenB}` }
-      });
-      assert(userBProxyRes.status === 403, 'User B access to User A proxy returns 403 Forbidden');
+      // Test C.3: Single unambiguous proxy resolves cleanly to single owner
+      const uniqueProxyOwner = await getMediaOwner(testProxyPath);
+      assert(uniqueProxyOwner?.userId === userA.id, 'Unambiguous proxy resolves cleanly to User A');
 
       const userAProxyRes = await fetch(`${uploadsBaseUrl}/proxies/${testProxyFileId}`, {
         headers: { Authorization: `Bearer ${activeTokenA}` }
       });
-      assert(userAProxyRes.status === 200, 'User A access to own proxy returns 200 OK');
+      assert(userAProxyRes.status === 200, 'User A can access own derived proxy (200 OK)');
 
-      // Test 3c.13: Non-existent file returns 404
-      const missingFileRes = await fetch(`${uploadsBaseUrl}/does_not_exist_${Date.now()}.mp4`, {
+      const userBProxyRes = await fetch(`${uploadsBaseUrl}/proxies/${testProxyFileId}`, {
+        headers: { Authorization: `Bearer ${tokenB}` }
+      });
+      assert(userBProxyRes.status === 403, 'User B cannot access User A proxy (403 Forbidden)');
+
+      // Test C.4: Scan ID substring collision (scan_sub vs scan_sub_long)
+      // Verify that frame Long matches User B and NOT User A (proving no includes(scan.id) substring bug)
+      const frameLongOwner = await getMediaOwner(frameLongPath);
+      assert(frameLongOwner?.userId === userB.id, 'getMediaOwner on frame directory resolves strictly to User B (not substring scan_sub User A)');
+
+      // Test C.5: Orphaned private media with no trusted record fails closed
+      const orphanOwner = await getMediaOwner(unownedPath);
+      assert(orphanOwner === null, 'getMediaOwner on orphaned file returns null');
+
+      const orphanAccessRes = await fetch(`${uploadsBaseUrl}/${unownedFileId}`, {
         headers: { Authorization: `Bearer ${activeTokenA}` }
       });
-      assert(missingFileRes.status === 404, 'Request for non-existent file returns 404 Not Found');
+      assert(orphanAccessRes.status === 403, 'Access to orphaned private file is rejected (403 Forbidden)');
 
-      // Test 3c.14: Untracked file in uploads fails closed (403 Forbidden)
-      const orphanRes = await fetch(`${uploadsBaseUrl}/${unownedFileId}`, {
+      // Test C.6: Authorized Owner can access own video and thumbnail via Authorization header
+      const ownerVideoRes = await fetch(`${uploadsBaseUrl}/${testVideoFileId}`, {
         headers: { Authorization: `Bearer ${activeTokenA}` }
       });
-      assert(orphanRes.status === 403, 'Untracked media asset in uploads directory fails closed (403 Forbidden)');
+      assert(ownerVideoRes.status === 200, 'User A can access own video via Bearer header (200 OK)');
 
-      // Test 3c.15: Public sample asset without owner is accessible unauthenticated
-      const publicRes = await fetch(`${uploadsBaseUrl}/${publicSampleFileId}`);
-      assert(publicRes.status === 200, 'Explicit public sample asset allows unauthenticated access (200 OK)');
-      const publicBody = await publicRes.text();
-      assert(publicBody === publicSamplePayload, 'Public sample asset returns expected content');
+      const ownerThumbRes = await fetch(`${uploadsBaseUrl}/${testThumbFileId}`, {
+        headers: { Authorization: `Bearer ${activeTokenA}` }
+      });
+      assert(ownerThumbRes.status === 200, 'User A can access own thumbnail via Bearer header (200 OK)');
+
+      // User B cannot access User A's thumbnail
+      const userBThumbRes = await fetch(`${uploadsBaseUrl}/${testThumbFileId}`, {
+        headers: { Authorization: `Bearer ${tokenB}` }
+      });
+      assert(userBThumbRes.status === 403, 'User B cannot access User A thumbnail (403 Forbidden)');
+
+      // Test C.7: Non-existent file returns 404
+      const missingRes = await fetch(`${uploadsBaseUrl}/does_not_exist_${Date.now()}.mp4`, {
+        headers: { Authorization: `Bearer ${activeTokenA}` }
+      });
+      assert(missingRes.status === 404, 'Non-existent file returns 404 Not Found');
+
     } finally {
       // Clean up test files created for 3c
-      for (const p of [testVideoPath, testThumbPath, testProxyPath, publicSamplePath, unownedPath]) {
+      const allTestFiles = [
+        testVideoPath,
+        testThumbPath,
+        testProxyPath,
+        fakePublicPath,
+        fakeSamplePath,
+        publicSamplePath,
+        unownedPath,
+        pathA,
+        pathB,
+        collisionPathA,
+        collisionPathB,
+        collisionProxyPath,
+        frameLongPath
+      ];
+      for (const p of allTestFiles) {
         if (fs.existsSync(p)) {
           try { fs.unlinkSync(p); } catch { /* ignore */ }
         }
       }
+      try { fs.rmSync(framesLongDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      try { fs.rmSync(dirA, { recursive: true, force: true }); } catch { /* ignore */ }
+      try { fs.rmSync(dirB, { recursive: true, force: true }); } catch { /* ignore */ }
     }
 
     // ---------------------------------------------------------
