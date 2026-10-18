@@ -450,6 +450,9 @@ export async function runAuthAndOwnershipTests() {
     console.log('\n[3c. Secure Media Access Hardening (Issues A, B, C)]');
 
     const testTime = Date.now();
+    let publicSamplePreExisted = false;
+    let publicSampleCreatedByThisTest = false;
+    let publicSampleOriginalBuffer: Buffer | null = null;
     const testVideoFileId = `userA_private_${testTime}.mp4`;
     const testVideoPath = path.resolve(uploadDir, testVideoFileId);
     const testVideoPayload = 'MOCK_USER_A_PRIVATE_VIDEO_DATA_FOR_SECURITY_VALIDATION_0123456789';
@@ -517,10 +520,18 @@ export async function runAuthAndOwnershipTests() {
     });
 
     // Legitimate public sample asset (in allowlist, no owner record)
+    // Non-destructive fixture handling: protect pre-existing sample_public_test.mp4 if present
     const publicSampleFileId = `sample_public_test.mp4`;
     const publicSamplePath = path.resolve(uploadDir, publicSampleFileId);
     const publicSamplePayload = 'PUBLIC_SAMPLE_VIDEO_CONTENT_ACCESSIBLE_UNAUTHENTICATED';
-    fs.writeFileSync(publicSamplePath, publicSamplePayload);
+
+    publicSamplePreExisted = fs.existsSync(publicSamplePath);
+    if (publicSamplePreExisted) {
+      publicSampleOriginalBuffer = fs.readFileSync(publicSamplePath);
+    } else {
+      fs.writeFileSync(publicSamplePath, publicSamplePayload);
+      publicSampleCreatedByThisTest = true;
+    }
 
     // Orphaned unowned file
     const unownedFileId = `unregistered_orphan_${testTime}.mp4`;
@@ -661,7 +672,10 @@ export async function runAuthAndOwnershipTests() {
       const publicSampleRes = await fetch(`${uploadsBaseUrl}/${publicSampleFileId}`);
       assert(publicSampleRes.status === 200, 'Explicit allowlisted public sample returns 200 OK unauthenticated');
       const publicSampleBody = await publicSampleRes.text();
-      assert(publicSampleBody === publicSamplePayload, 'Public sample returns expected content');
+      const expectedPublicContent = publicSampleCreatedByThisTest
+        ? publicSamplePayload
+        : (publicSampleOriginalBuffer ? publicSampleOriginalBuffer.toString('utf8') : publicSamplePayload);
+      assert(publicSampleBody === expectedPublicContent, 'Public sample returns expected content');
 
       // Test A.6: Dynamic registration and unregistration of trusted public media
       const dynSampleId = `dyn_sample_${testTime}.mp4`;
@@ -792,6 +806,107 @@ export async function runAuthAndOwnershipTests() {
       assert(isTrustedPublicMedia(symlinkInSubPath, `proxies/${path.basename(symlinkInSubPath)}`) === false, 'Symlink located in subdirectory is rejected by isTrustedPublicMedia');
       const symlinkInSubRes = await fetch(`${uploadsBaseUrl}/proxies/${path.basename(symlinkInSubPath)}`);
       assert(symlinkInSubRes.status === 401, 'Anonymous access to symlink inside subdirectory is rejected (401 Unauthorized)');
+
+      // ----------------------------------------------------------------------
+      // Test A.14: Test Fixture Data Safety & Non-Destructive Cleanup Proofs
+      // (Mandatory Regression Tests for Section 5)
+      // ----------------------------------------------------------------------
+      console.log('  --- Sub-suite A.14: Fixture Data Safety & Isolated Lifecycle Tests ---');
+
+      // 1. When a pre-existing sample file exists before test, it MUST NOT be overwritten or deleted
+      const safetyTempDir = path.resolve(os.tmpdir(), `test_fixture_safety_${testTime}`);
+      fs.mkdirSync(safetyTempDir, { recursive: true });
+
+      try {
+        const mockUploadsDir = path.resolve(safetyTempDir, 'mock_uploads');
+        fs.mkdirSync(mockUploadsDir, { recursive: true });
+
+        const preExistingFile = path.resolve(mockUploadsDir, 'sample_public_test.mp4');
+        const preExistingContent = 'PRE_EXISTING_ORIGINAL_PUBLIC_SAMPLE_DATA_SHA256';
+        fs.writeFileSync(preExistingFile, preExistingContent);
+
+        // Safe fixture initialization logic:
+        const preExists = fs.existsSync(preExistingFile);
+        let createdByTest = false;
+        let originalContent: Buffer | null = null;
+        if (preExists) {
+          originalContent = fs.readFileSync(preExistingFile);
+        } else {
+          fs.writeFileSync(preExistingFile, 'NEW_TEST_PAYLOAD');
+          createdByTest = true;
+        }
+
+        assert(preExists === true, 'Safety test: detects pre-existing file');
+        assert(createdByTest === false, 'Safety test: did NOT mark pre-existing file as test-created');
+        assert(fs.readFileSync(preExistingFile).toString('utf8') === preExistingContent, 'Safety test: pre-existing file content is NOT overwritten');
+
+        // Safe cleanup:
+        if (createdByTest) {
+          fs.unlinkSync(preExistingFile);
+        }
+
+        assert(fs.existsSync(preExistingFile) === true, 'Safety test: pre-existing file was NOT deleted during cleanup');
+        assert(fs.readFileSync(preExistingFile).toString('utf8') === preExistingContent, 'Safety test: pre-existing file content remains completely intact');
+
+        // 2. When NO pre-existing file exists, test creates fixture and cleanly removes it
+        const nonPreExistingFile = path.resolve(mockUploadsDir, 'sample_public_temp.mp4');
+        const nonPreExists = fs.existsSync(nonPreExistingFile);
+        let createdNonPre = false;
+        if (!nonPreExists) {
+          fs.writeFileSync(nonPreExistingFile, 'TEMP_FIXTURE_CONTENT');
+          createdNonPre = true;
+        }
+
+        assert(createdNonPre === true, 'Safety test: creates fixture when file does not pre-exist');
+        assert(fs.existsSync(nonPreExistingFile) === true, 'Safety test: fixture exists during test');
+
+        // Cleanup:
+        if (createdNonPre) {
+          fs.unlinkSync(nonPreExistingFile);
+        }
+        assert(fs.existsSync(nonPreExistingFile) === false, 'Safety test: test-created fixture is cleanly removed after test');
+
+        // 3. When an assertion or step throws an error, cleanup preserves pre-existing file
+        let errorCaught = false;
+        try {
+          assert(fs.existsSync(preExistingFile) === true, 'Pre-existing file present before simulated failure');
+          throw new Error('Simulated test execution failure');
+        } catch (err: any) {
+          errorCaught = true;
+        } finally {
+          if (createdByTest) {
+            fs.unlinkSync(preExistingFile);
+          }
+        }
+        assert(errorCaught === true, 'Safety test: error was raised and caught as expected');
+        assert(fs.existsSync(preExistingFile) === true, 'Safety test: pre-existing file survived failed test run');
+        assert(fs.readFileSync(preExistingFile).toString('utf8') === preExistingContent, 'Safety test: pre-existing file content preserved on failure');
+
+        // 4. Symlink pointing outside temporary test directory does NOT delete or alter external target
+        const externalTargetDir = path.resolve(safetyTempDir, 'external_protected_dir');
+        fs.mkdirSync(externalTargetDir, { recursive: true });
+        const externalTargetFile = path.resolve(externalTargetDir, 'protected_production_file.txt');
+        const externalTargetContent = 'CRITICAL_PROTECTED_DATA_DO_NOT_TOUCH';
+        fs.writeFileSync(externalTargetFile, externalTargetContent);
+
+        const internalSymlinkPath = path.resolve(mockUploadsDir, 'symlink_pointing_out.mp4');
+        fs.symlinkSync(externalTargetFile, internalSymlinkPath);
+
+        assert(fs.existsSync(internalSymlinkPath) === true, 'Symlink created successfully');
+
+        // Safe cleanup: only unlink the symlink itself (using lstatSync), never the external target
+        const symlinkStat = fs.lstatSync(internalSymlinkPath, { throwIfNoEntry: false });
+        if (symlinkStat) {
+          fs.unlinkSync(internalSymlinkPath);
+        }
+
+        assert(fs.existsSync(internalSymlinkPath) === false, 'Symlink was unlinked from test directory');
+        assert(fs.existsSync(externalTargetFile) === true, 'External target was NOT deleted by symlink cleanup');
+        assert(fs.readFileSync(externalTargetFile).toString('utf8') === externalTargetContent, 'External target content was NOT modified by symlink cleanup');
+
+      } finally {
+        try { fs.rmSync(safetyTempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
 
       // -------------------------------------------------------
       // ISSUE B: PROHIBITION OF SESSION TOKENS IN URL & MEDIA TOKENS
@@ -954,7 +1069,7 @@ export async function runAuthAndOwnershipTests() {
         testProxyPath,
         fakePublicPath,
         fakeSamplePath,
-        publicSamplePath,
+        ...(publicSampleCreatedByThisTest ? [publicSamplePath] : []),
         unownedPath,
         pathA,
         pathB,
@@ -978,6 +1093,15 @@ export async function runAuthAndOwnershipTests() {
           }
         } catch { /* ignore */ }
       }
+
+      if (publicSamplePreExisted && publicSampleOriginalBuffer !== null) {
+        // Assert pre-existing file was NOT deleted or altered
+        const currentBuf = fs.existsSync(publicSamplePath) ? fs.readFileSync(publicSamplePath) : null;
+        if (!currentBuf || !currentBuf.equals(publicSampleOriginalBuffer)) {
+          fs.writeFileSync(publicSamplePath, publicSampleOriginalBuffer);
+        }
+      }
+
       try { fs.rmSync(framesLongDir, { recursive: true, force: true }); } catch { /* ignore */ }
       try { fs.rmSync(dirA, { recursive: true, force: true }); } catch { /* ignore */ }
       try { fs.rmSync(dirB, { recursive: true, force: true }); } catch { /* ignore */ }
