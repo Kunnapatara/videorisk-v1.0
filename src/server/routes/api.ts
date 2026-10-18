@@ -397,9 +397,72 @@ export function unregisterTrustedPublicMedia(filename: string): void {
   }
 }
 
-export function isTrustedPublicMedia(resolvedPath: string, _relativePath: string): boolean {
-  const baseName = path.basename(resolvedPath);
-  return TRUSTED_PUBLIC_MEDIA_ALLOWLIST.has(baseName);
+/**
+ * Evaluates whether a media file is an explicitly approved public asset.
+ * Hardened to enforce:
+ * 1. Strict location binding: Only files located directly in the root of uploadDir are eligible.
+ *    Files in any subdirectory (e.g. proxies/, frames/, nested subdirectories) are NEVER public.
+ * 2. Strict relative path verification: No subdirectories, slashes, or traversal in requested relative path.
+ * 3. Canonical path verification: Resolves symlinks to ensure target does not escape the public root or point into subdirectories.
+ * 4. Explicit allowlist matching: File basename must match TRUSTED_PUBLIC_MEDIA_ALLOWLIST.
+ * 5. Fails closed (returns false) on any ambiguity, invalid path, or non-matching location.
+ */
+export function isTrustedPublicMedia(resolvedPath: string, relativePath?: string): boolean {
+  if (!resolvedPath || typeof resolvedPath !== 'string') {
+    return false;
+  }
+
+  try {
+    const uploadDirResolved = path.resolve(uploadDir);
+    const targetResolved = path.resolve(resolvedPath);
+
+    // 1. If relativePath is supplied, ensure it represents a direct child at the root (no subdirectories)
+    if (relativePath !== undefined && relativePath !== null) {
+      if (typeof relativePath !== 'string') return false;
+      const cleanRel = relativePath.trim().replace(/^[/\\]+/, '');
+      if (!cleanRel || cleanRel.includes('/') || cleanRel.includes('\\')) {
+        return false;
+      }
+      const normRel = path.normalize(cleanRel);
+      if (normRel.startsWith('..') || path.isAbsolute(normRel) || path.dirname(normRel) !== '.') {
+        return false;
+      }
+    }
+
+    // 2. Target must be directly inside uploadDir (parent directory must be exactly uploadDirResolved)
+    if (path.dirname(targetResolved) !== uploadDirResolved) {
+      return false;
+    }
+
+    // 3. Canonical symlink check: verify realpath is directly in real uploadDir
+    if (fs.existsSync(targetResolved)) {
+      try {
+        const realUploadDir = fs.realpathSync(uploadDirResolved);
+        const realTarget = fs.realpathSync(targetResolved);
+        if (path.dirname(realTarget) !== realUploadDir) {
+          return false;
+        }
+        // Ensure canonical basename matches resolved basename (no symlink alias trickery)
+        if (path.basename(realTarget) !== path.basename(targetResolved)) {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+    }
+
+    // 4. Relative path from uploadDir must be exactly the filename without any directory component
+    const relFromRoot = path.relative(uploadDirResolved, targetResolved);
+    if (!relFromRoot || relFromRoot.startsWith('..') || path.isAbsolute(relFromRoot) || relFromRoot.includes(path.sep)) {
+      return false;
+    }
+
+    // 5. Must match an approved filename in the explicit allowlist
+    const baseName = path.basename(targetResolved);
+    return TRUSTED_PUBLIC_MEDIA_ALLOWLIST.has(baseName);
+  } catch {
+    return false;
+  }
 }
 
 // ==============================================================================

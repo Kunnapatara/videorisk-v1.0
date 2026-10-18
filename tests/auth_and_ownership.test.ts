@@ -11,6 +11,7 @@ import {
   getMediaOwner,
   registerTrustedPublicMedia,
   unregisterTrustedPublicMedia,
+  isTrustedPublicMedia,
   TRUSTED_PUBLIC_MEDIA_ALLOWLIST
 } from '../src/server/routes/api';
 import { storage } from '../src/server/storage';
@@ -620,6 +621,14 @@ export async function runAuthAndOwnershipTests() {
     const frameLongPath = path.resolve(framesLongDir, 'frame_001.jpg');
     fs.writeFileSync(frameLongPath, 'FRAME_SNAPSHOT_FOR_SCAN_LONG');
 
+    let subProxySamplePath: string | null = null;
+    let nestedSamplePath: string | null = null;
+    let frameSamplePath: string | null = null;
+    let framesSampleDir: string | null = null;
+    let symlinkOutPath: string | null = null;
+    let symlinkToSubPath: string | null = null;
+    let symlinkInSubPath: string | null = null;
+
     try {
       // -------------------------------------------------------
       // ISSUE A: TRUSTED PUBLIC AUTHORIZATION TESTS
@@ -700,6 +709,79 @@ export async function runAuthAndOwnershipTests() {
         headers: { Authorization: `Bearer ${activeTokenA}` }
       });
       assert(encodedTraversalRes.status === 403 || encodedTraversalRes.status === 400, 'Encoded path traversal escaping storage is rejected');
+
+      // Test A.9: Same-named file in single subdirectory does NOT receive public status
+      subProxySamplePath = path.resolve(proxiesDir, publicSampleFileId);
+      fs.writeFileSync(subProxySamplePath, 'SUBDIRECTORY_SECRET_SAMPLE_CONTENT');
+
+      assert(isTrustedPublicMedia(subProxySamplePath, `proxies/${publicSampleFileId}`) === false, 'isTrustedPublicMedia returns false for file in proxies subdirectory');
+      assert(isTrustedPublicMedia(subProxySamplePath) === false, 'isTrustedPublicMedia returns false for resolved path in subdirectory even without relativePath');
+
+      const anonSubProxyRes = await fetch(`${uploadsBaseUrl}/proxies/${publicSampleFileId}`);
+      assert(anonSubProxyRes.status === 401, 'Anonymous access to allowlisted-name file in proxies/ is rejected (401 Unauthorized)');
+
+      const userBSubProxyRes = await fetch(`${uploadsBaseUrl}/proxies/${publicSampleFileId}`, {
+        headers: { Authorization: `Bearer ${tokenB}` }
+      });
+      assert(userBSubProxyRes.status === 403, 'User B access to unowned file in proxies/ is rejected (403 Forbidden)');
+
+      // Test A.10: Same-named file in multi-level nested subdirectory does NOT receive public status
+      const nestedDir = path.resolve(uploadDir, 'nested', 'deep', 'sub');
+      fs.mkdirSync(nestedDir, { recursive: true });
+      nestedSamplePath = path.resolve(nestedDir, publicSampleFileId);
+      fs.writeFileSync(nestedSamplePath, 'NESTED_DEEP_SECRET_SAMPLE_CONTENT');
+
+      assert(isTrustedPublicMedia(nestedSamplePath, `nested/deep/sub/${publicSampleFileId}`) === false, 'isTrustedPublicMedia returns false for nested subdirectory');
+      assert(isTrustedPublicMedia(nestedSamplePath) === false, 'isTrustedPublicMedia returns false for nested path even without relativePath');
+
+      const anonNestedRes = await fetch(`${uploadsBaseUrl}/nested/deep/sub/${publicSampleFileId}`);
+      assert(anonNestedRes.status === 401, 'Anonymous access to allowlisted-name file in nested subdirectory is rejected (401 Unauthorized)');
+
+      // Test A.11: Same-named file in frames subdirectory does NOT receive public status
+      framesSampleDir = path.resolve(framesDir, `sample_test_job_${testTime}`);
+      fs.mkdirSync(framesSampleDir, { recursive: true });
+      frameSamplePath = path.resolve(framesSampleDir, 'sample_public_demo.mp4');
+      fs.writeFileSync(frameSamplePath, 'FRAME_SNAPSHOT_PUBLIC_NAME_SPOOF');
+
+      assert(isTrustedPublicMedia(frameSamplePath, `frames/sample_test_job_${testTime}/sample_public_demo.mp4`) === false, 'isTrustedPublicMedia returns false for frames subdirectory');
+
+      const anonFrameRes = await fetch(`${uploadsBaseUrl}/frames/sample_test_job_${testTime}/sample_public_demo.mp4`);
+      assert(anonFrameRes.status === 401, 'Anonymous access to sample_public_demo.mp4 in frames/ is rejected (401 Unauthorized)');
+
+      // Test A.12: Direct helper verification against path traversal escaping uploadDir
+      assert(isTrustedPublicMedia(path.resolve(uploadDir, '../data/sample_public_test.mp4'), '../data/sample_public_test.mp4') === false, 'isTrustedPublicMedia rejects path escaping to parent directory');
+      assert(isTrustedPublicMedia(path.resolve(uploadDir, '../../etc/passwd'), '../../etc/passwd') === false, 'isTrustedPublicMedia rejects deep traversal path');
+      assert(isTrustedPublicMedia(path.resolve(uploadDir, 'proxies/../sample_public_test.mp4'), 'proxies/../sample_public_test.mp4') === false, 'isTrustedPublicMedia rejects relativePath containing traversal components');
+      assert(isTrustedPublicMedia('', '') === false, 'isTrustedPublicMedia fails closed on empty path');
+      assert(isTrustedPublicMedia(null as any) === false, 'isTrustedPublicMedia fails closed on null path');
+
+      // Test A.13: Symlink security verification (if symlink supported by environment)
+      let symlinksTested = false;
+      symlinkOutPath = path.resolve(uploadDir, `symlink_out_${testTime}.mp4`);
+      symlinkToSubPath = path.resolve(uploadDir, `symlink_to_sub_${testTime}.mp4`);
+      symlinkInSubPath = path.resolve(proxiesDir, `symlink_in_sub_${testTime}.mp4`);
+      try {
+        fs.symlinkSync(path.resolve(process.cwd(), 'package.json'), symlinkOutPath);
+        fs.symlinkSync(subProxySamplePath, symlinkToSubPath);
+        fs.symlinkSync(publicSamplePath, symlinkInSubPath);
+        symlinksTested = true;
+      } catch {
+        console.log('    ℹ Symlink creation unsupported in current environment, skipping OS-level symlink tests.');
+      }
+
+      if (symlinksTested) {
+        assert(isTrustedPublicMedia(symlinkOutPath, path.basename(symlinkOutPath)) === false, 'Symlink escaping storage is rejected by isTrustedPublicMedia');
+        const symlinkOutRes = await fetch(`${uploadsBaseUrl}/${path.basename(symlinkOutPath)}`);
+        assert(symlinkOutRes.status === 403 || symlinkOutRes.status === 400, 'Symlink pointing outside uploadDir is rejected (403/400)');
+
+        assert(isTrustedPublicMedia(symlinkToSubPath, path.basename(symlinkToSubPath)) === false, 'Symlink pointing into subdirectory is rejected by isTrustedPublicMedia');
+        const symlinkToSubRes = await fetch(`${uploadsBaseUrl}/${path.basename(symlinkToSubPath)}`);
+        assert(symlinkToSubRes.status === 401, 'Anonymous access to symlink pointing into subdirectory is rejected (401 Unauthorized)');
+
+        assert(isTrustedPublicMedia(symlinkInSubPath, `proxies/${path.basename(symlinkInSubPath)}`) === false, 'Symlink located in subdirectory is rejected by isTrustedPublicMedia');
+        const symlinkInSubRes = await fetch(`${uploadsBaseUrl}/proxies/${path.basename(symlinkInSubPath)}`);
+        assert(symlinkInSubRes.status === 401, 'Anonymous access to symlink inside subdirectory is rejected (401 Unauthorized)');
+      }
 
       // -------------------------------------------------------
       // ISSUE B: PROHIBITION OF SESSION TOKENS IN URL & MEDIA TOKENS
@@ -869,8 +951,14 @@ export async function runAuthAndOwnershipTests() {
         collisionPathA,
         collisionPathB,
         collisionProxyPath,
-        frameLongPath
-      ];
+        frameLongPath,
+        subProxySamplePath,
+        nestedSamplePath,
+        frameSamplePath,
+        symlinkOutPath,
+        symlinkToSubPath,
+        symlinkInSubPath
+      ].filter((p): p is string => Boolean(p));
       for (const p of allTestFiles) {
         if (fs.existsSync(p)) {
           try { fs.unlinkSync(p); } catch { /* ignore */ }
@@ -879,6 +967,10 @@ export async function runAuthAndOwnershipTests() {
       try { fs.rmSync(framesLongDir, { recursive: true, force: true }); } catch { /* ignore */ }
       try { fs.rmSync(dirA, { recursive: true, force: true }); } catch { /* ignore */ }
       try { fs.rmSync(dirB, { recursive: true, force: true }); } catch { /* ignore */ }
+      try { fs.rmSync(path.resolve(uploadDir, 'nested'), { recursive: true, force: true }); } catch { /* ignore */ }
+      if (framesSampleDir) {
+        try { fs.rmSync(framesSampleDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
     }
 
     // ---------------------------------------------------------
