@@ -287,8 +287,8 @@ export function sanitizeMediaTokenDuration(durationSeconds: any): number {
  * Max duration: 300 seconds. Default duration: 120 seconds. Minimum duration: 10 seconds.
  */
 export function createMediaAccessToken(
-  userId: string, 
-  resourceId: string, 
+  userId: string,
+  resourceId: string,
   durationSeconds: number = 120,
   options?: { nowMs?: number }
 ): string {
@@ -323,7 +323,7 @@ export function createMediaAccessToken(
  * Returns the authenticated userId or null if invalid, expired, tampered, or out of scope.
  */
 export function verifyMediaAccessToken(
-  tokenStr: string | undefined | null, 
+  tokenStr: string | undefined | null,
   requestedRelativePath: string,
   options?: { nowMs?: number }
 ): { userId: string } | null {
@@ -359,7 +359,7 @@ export function verifyMediaAccessToken(
 
     // Expiration check: production uses Date.now(); unit tests can inject nowMs if specified
     const currentTime = (typeof options?.nowMs === 'number' && Number.isFinite(options.nowMs)) ? options.nowMs : Date.now();
-    if (currentTime > payload.expiresAt) {
+    if (currentTime >= payload.expiresAt) {
       return null;
     }
 

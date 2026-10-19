@@ -33,7 +33,8 @@ export class TestFixtureManager {
   public registeredPublicMedia = new Set<string>();
 
   createFile(filePath: string, data: string | Buffer): string {
-    if (fs.existsSync(filePath)) {
+    const stat = fs.lstatSync(filePath, { throwIfNoEntry: false });
+    if (stat) {
       throw new Error(`Safety violation: Refusing to overwrite pre-existing file: ${filePath}`);
     }
     fs.writeFileSync(filePath, data, { flag: 'wx' });
@@ -42,8 +43,9 @@ export class TestFixtureManager {
   }
 
   createSymlink(target: string, linkPath: string): string {
-    if (fs.existsSync(linkPath)) {
-      throw new Error(`Safety violation: Refusing to overwrite pre-existing symlink: ${linkPath}`);
+    const stat = fs.lstatSync(linkPath, { throwIfNoEntry: false });
+    if (stat) {
+      throw new Error(`Safety violation: Refusing to overwrite pre-existing entry: ${linkPath}`);
     }
     fs.symlinkSync(target, linkPath);
     this.createdFiles.add(linkPath);
@@ -51,11 +53,37 @@ export class TestFixtureManager {
   }
 
   createDir(dirPath: string): string {
-    if (!fs.existsSync(dirPath)) {
-      fs.mkdirSync(dirPath, { recursive: true });
-      this.createdDirs.add(dirPath);
+    const normalized = path.resolve(dirPath);
+    // Find all ancestor directories that do not currently exist
+    const dirsToCreate: string[] = [];
+    let cur = normalized;
+    while (cur && cur !== path.dirname(cur)) {
+      try {
+        const stat = fs.lstatSync(cur, { throwIfNoEntry: false });
+        if (stat) {
+          break;
+        }
+      } catch {
+        break;
+      }
+      dirsToCreate.unshift(cur);
+      cur = path.dirname(cur);
     }
-    return dirPath;
+
+    for (const d of dirsToCreate) {
+      try {
+        const stat = fs.lstatSync(d, { throwIfNoEntry: false });
+        if (!stat) {
+          fs.mkdirSync(d);
+          this.createdDirs.add(d);
+        }
+      } catch (err: any) {
+        if (err.code !== 'EEXIST') {
+          throw err;
+        }
+      }
+    }
+    return normalized;
   }
 
   registerPublic(filename: string): void {
@@ -90,11 +118,20 @@ export class TestFixtureManager {
     this.createdFiles.clear();
 
     // 3. Remove only test-owned directories in reverse order of creation
+    // CRITICAL: NEVER use recursive deletion! Non-recursive rmdirSync ensures
+    // that if any unexpected or foreign files exist inside, deletion will safely fail (ENOTEMPTY),
+    // guaranteeing unowned data is never destroyed. Never follows symlinks.
     const dirs = Array.from(this.createdDirs).reverse();
     for (const dirPath of dirs) {
       try {
-        if (fs.existsSync(dirPath)) {
-          fs.rmSync(dirPath, { recursive: true, force: true });
+        const stat = fs.lstatSync(dirPath, { throwIfNoEntry: false });
+        if (!stat) {
+          continue;
+        }
+        if (stat.isSymbolicLink()) {
+          fs.unlinkSync(dirPath);
+        } else if (stat.isDirectory()) {
+          fs.rmdirSync(dirPath);
         }
       } catch { /* ignore */ }
     }
@@ -989,6 +1026,50 @@ export async function runAuthAndOwnershipTests() {
         assert(fs.existsSync(partialFile) === false, 'Safety test: partial file was cleaned up on failure');
         assert(!TRUSTED_PUBLIC_MEDIA_ALLOWLIST.has(partialMedia), 'Safety test: partial public media was unregistered on failure');
 
+        // 7. Pre-existing directory safety: createDir does not claim pre-existing directory, and cleanup never deletes it
+        const preExistingDir = path.resolve(mockUploadsDir, 'pre_existing_unowned_dir');
+        fs.mkdirSync(preExistingDir, { recursive: true });
+        const dirMgr = new TestFixtureManager();
+        dirMgr.createDir(preExistingDir);
+        assert(!dirMgr.createdDirs.has(preExistingDir), 'Safety test: pre-existing directory is NOT claimed by fixture manager');
+        dirMgr.cleanup();
+        assert(fs.existsSync(preExistingDir) === true, 'Safety test: pre-existing directory was NOT deleted by cleanup');
+
+        // 8. Non-recursive directory safety: Untracked foreign files inside test directory prevent deletion and are preserved
+        const mixedDir = path.resolve(mockUploadsDir, `mixed_dir_${Date.now()}`);
+        const mixedMgr = new TestFixtureManager();
+        mixedMgr.createDir(mixedDir);
+        assert(mixedMgr.createdDirs.has(mixedDir) === true, 'Safety test: newly created directory is tracked');
+
+        const trackedFile = path.resolve(mixedDir, 'tracked.mp4');
+        mixedMgr.createFile(trackedFile, 'TRACKED_TEST_DATA');
+        const foreignFile = path.resolve(mixedDir, 'foreign_user_data.mp4');
+        const foreignContent = 'IMPORTANT_USER_DATA_THAT_MUST_NEVER_BE_DELETED';
+        fs.writeFileSync(foreignFile, foreignContent);
+
+        mixedMgr.cleanup();
+        assert(fs.existsSync(trackedFile) === false, 'Safety test: tracked file inside directory is cleanly removed');
+        assert(fs.existsSync(foreignFile) === true, 'Safety test: foreign file inside directory was NOT deleted by cleanup');
+        assert(fs.readFileSync(foreignFile, 'utf8') === foreignContent, 'Safety test: foreign content remains 100% intact');
+        assert(fs.existsSync(mixedDir) === true, 'Safety test: directory containing foreign file was safely preserved (non-recursive)');
+
+        // Clean up manual foreign file and mixedDir created for test 8
+        try { fs.unlinkSync(foreignFile); } catch { /* ignore */ }
+        try { fs.rmdirSync(mixedDir); } catch { /* ignore */ }
+
+        // 9. Symlink directory safety: cleanup on symlink to directory unlinks symlink without recursing into target
+        const externalSymlinkTargetDir = path.resolve(safetyTempDir, 'external_symlink_dir');
+        fs.mkdirSync(externalSymlinkTargetDir, { recursive: true });
+        const externalSymlinkFile = path.resolve(externalSymlinkTargetDir, 'external_file.txt');
+        fs.writeFileSync(externalSymlinkFile, 'EXTERNAL_FILE_SHOULD_SURVIVE');
+
+        const symlinkDirMgr = new TestFixtureManager();
+        const dirSymlinkPath = path.resolve(mockUploadsDir, 'symlink_to_external_dir');
+        symlinkDirMgr.createSymlink(externalSymlinkTargetDir, dirSymlinkPath);
+        assert(fs.existsSync(dirSymlinkPath) === true, 'Safety test: directory symlink created');
+        symlinkDirMgr.cleanup();
+        assert(fs.existsSync(dirSymlinkPath) === false, 'Safety test: directory symlink was unlinked');
+        assert(fs.existsSync(externalSymlinkFile) === true, 'Safety test: file inside external target directory remains intact');
       } finally {
         try { fs.rmSync(safetyTempDir, { recursive: true, force: true }); } catch { /* ignore */ }
       }
@@ -1127,23 +1208,45 @@ export async function runAuthAndOwnershipTests() {
       assert(sanitizeMediaTokenDuration(null) === 120, 'Unit: sanitizeMediaTokenDuration(null) === 120');
       assert(sanitizeMediaTokenDuration(undefined) === 120, 'Unit: sanitizeMediaTokenDuration(undefined) === 120');
 
-      // Helper to verify payload expiration duration from generated token
-      function getDecodedDuration(tokenStr: string, originNow: number): number {
+      // Helper to decode token payload
+      function getDecodedPayload(tokenStr: string): any {
         const payloadJson = Buffer.from(tokenStr.split('.')[0], 'base64url').toString('utf8');
-        const payload = JSON.parse(payloadJson);
+        return JSON.parse(payloadJson);
+      }
+      function getDecodedDuration(tokenStr: string, originNow: number): number {
+        const payload = getDecodedPayload(tokenStr);
         return Math.round((payload.expiresAt - originNow) / 1000);
       }
       const testNow = Date.now();
       assert(getDecodedDuration(createMediaAccessToken(userA.id, testVideoFileId, 2, { nowMs: testNow }), testNow) === 10, 'Unit payload: 2s clamped to 10s');
+      assert(getDecodedPayload(createMediaAccessToken(userA.id, testVideoFileId, 2, { nowMs: testNow })).expiresAt === testNow + 10000, 'Payload exact expiresAt for 2s is testNow + 10000ms');
+
       assert(getDecodedDuration(createMediaAccessToken(userA.id, testVideoFileId, 10, { nowMs: testNow }), testNow) === 10, 'Unit payload: 10s exact min');
+      assert(getDecodedPayload(createMediaAccessToken(userA.id, testVideoFileId, 10, { nowMs: testNow })).expiresAt === testNow + 10000, 'Payload exact expiresAt for 10s is testNow + 10000ms');
+
       assert(getDecodedDuration(createMediaAccessToken(userA.id, testVideoFileId, 45, { nowMs: testNow }), testNow) === 45, 'Unit payload: 45s normal');
+      assert(getDecodedPayload(createMediaAccessToken(userA.id, testVideoFileId, 45, { nowMs: testNow })).expiresAt === testNow + 45000, 'Payload exact expiresAt for 45s is testNow + 45000ms');
+
       assert(getDecodedDuration(createMediaAccessToken(userA.id, testVideoFileId, 45.7, { nowMs: testNow }), testNow) === 45, 'Unit payload: 45.7s floored to 45s');
+      assert(getDecodedPayload(createMediaAccessToken(userA.id, testVideoFileId, 45.7, { nowMs: testNow })).expiresAt === testNow + 45000, 'Payload exact expiresAt for 45.7s is floored to testNow + 45000ms');
+
       assert(getDecodedDuration(createMediaAccessToken(userA.id, testVideoFileId, 300, { nowMs: testNow }), testNow) === 300, 'Unit payload: 300s exact max');
+      assert(getDecodedPayload(createMediaAccessToken(userA.id, testVideoFileId, 300, { nowMs: testNow })).expiresAt === testNow + 300000, 'Payload exact expiresAt for 300s is testNow + 300000ms');
+
       assert(getDecodedDuration(createMediaAccessToken(userA.id, testVideoFileId, 1000, { nowMs: testNow }), testNow) === 300, 'Unit payload: 1000s clamped to 300s');
+      assert(getDecodedPayload(createMediaAccessToken(userA.id, testVideoFileId, 1000, { nowMs: testNow })).expiresAt === testNow + 300000, 'Payload exact expiresAt for 1000s is clamped to testNow + 300000ms');
+
       assert(getDecodedDuration(createMediaAccessToken(userA.id, testVideoFileId, NaN, { nowMs: testNow }), testNow) === 120, 'Unit payload: NaN defaults to 120s');
+      assert(getDecodedPayload(createMediaAccessToken(userA.id, testVideoFileId, NaN, { nowMs: testNow })).expiresAt === testNow + 120000, 'Payload exact expiresAt for NaN is testNow + 120000ms');
+
       assert(getDecodedDuration(createMediaAccessToken(userA.id, testVideoFileId, Infinity, { nowMs: testNow }), testNow) === 120, 'Unit payload: Infinity defaults to 120s');
+      assert(getDecodedPayload(createMediaAccessToken(userA.id, testVideoFileId, Infinity, { nowMs: testNow })).expiresAt === testNow + 120000, 'Payload exact expiresAt for Infinity is testNow + 120000ms');
+
       assert(getDecodedDuration(createMediaAccessToken(userA.id, testVideoFileId, -Infinity, { nowMs: testNow }), testNow) === 120, 'Unit payload: -Infinity defaults to 120s');
+      assert(getDecodedPayload(createMediaAccessToken(userA.id, testVideoFileId, -Infinity, { nowMs: testNow })).expiresAt === testNow + 120000, 'Payload exact expiresAt for -Infinity is testNow + 120000ms');
+
       assert(getDecodedDuration(createMediaAccessToken(userA.id, testVideoFileId, -10, { nowMs: testNow }), testNow) === 10, 'Unit payload: -10s clamped to 10s');
+      assert(getDecodedPayload(createMediaAccessToken(userA.id, testVideoFileId, -10, { nowMs: testNow })).expiresAt === testNow + 10000, 'Payload exact expiresAt for -10s is testNow + 10000ms');
 
       // Test B.4: Non-owner cannot generate media token for another user's file
       const userBFakeTokenRes = await fetch(`${baseUrl}/media/token`, {
@@ -1187,24 +1290,37 @@ export async function runAuthAndOwnershipTests() {
       assert(tamperedRes.status === 401, 'Tampered media token with invalid HMAC is rejected (401)');
 
       // Test B.10: Expired media token is rejected (401) without mutating global Date.now
-      // 1. Generate token created 15 seconds in the past with 10s duration (expired 5s ago)
+      // 1. HTTP verification: Generate token created 15 seconds in the past with 10s duration (expired 5s ago)
       const expiredPastToken = createMediaAccessToken(userA.id, testVideoFileId, 10, { nowMs: Date.now() - 15000 });
       const expiredRes = await fetch(`${uploadsBaseUrl}/${testVideoFileId}?media_token=${expiredPastToken}`);
       assert(expiredRes.status === 401, 'Expired media token is rejected with 401 Unauthorized via HTTP');
 
-      // 2. Active, unexpired media token with minimum duration (10s) succeeds immediately
+      // 2. Active, unexpired media token with minimum duration (10s) succeeds immediately via HTTP
       const active10sToken = createMediaAccessToken(userA.id, testVideoFileId, 10);
       const activeRes = await fetch(`${uploadsBaseUrl}/${testVideoFileId}?media_token=${active10sToken}`);
       assert(activeRes.status === 200, 'Active unexpired media token (10s TTL) returns 200 OK via HTTP');
 
-      // 3. Direct unit verification of verifyMediaAccessToken with injectable clock (unexpired vs expired)
+      // 3. Exact boundary verification of verifyMediaAccessToken with injectable clock:
+      // Contract: Token expires at exact expiresAt timestamp (currentTime >= payload.expiresAt fails)
       const clockBase = Date.now();
       const unitToken = createMediaAccessToken(userA.id, testVideoFileId, 10, { nowMs: clockBase });
-      const verifyActive = verifyMediaAccessToken(unitToken, testVideoFileId, { nowMs: clockBase + 5000 });
-      assert(verifyActive?.userId === userA.id, 'verifyMediaAccessToken accepts token before expiration timestamp');
+      const expectedExpiresAt = clockBase + 10000;
 
-      const verifyExpired = verifyMediaAccessToken(unitToken, testVideoFileId, { nowMs: clockBase + 11000 });
-      assert(verifyExpired === null, 'verifyMediaAccessToken returns null for token after expiration timestamp');
+      // Boundary Case A (Before expiresAt): currentTime = expiresAt - 1ms -> MUST accept
+      const verifyBefore = verifyMediaAccessToken(unitToken, testVideoFileId, { nowMs: expectedExpiresAt - 1 });
+      assert(verifyBefore?.userId === userA.id, 'verifyMediaAccessToken accepts token 1ms before expiresAt boundary');
+
+      // Boundary Case B (Exactly at expiresAt): currentTime = expiresAt -> MUST reject
+      const verifyExact = verifyMediaAccessToken(unitToken, testVideoFileId, { nowMs: expectedExpiresAt });
+      assert(verifyExact === null, 'verifyMediaAccessToken rejects token exactly at expiresAt boundary (>=)');
+
+      // Boundary Case C (After expiresAt): currentTime = expiresAt + 1ms -> MUST reject
+      const verifyAfter = verifyMediaAccessToken(unitToken, testVideoFileId, { nowMs: expectedExpiresAt + 1 });
+      assert(verifyAfter === null, 'verifyMediaAccessToken rejects token 1ms after expiresAt boundary');
+
+      // Boundary Case D (Well after expiresAt): currentTime = expiresAt + 5000ms -> MUST reject
+      const verifyWellExpired = verifyMediaAccessToken(unitToken, testVideoFileId, { nowMs: expectedExpiresAt + 5000 });
+      assert(verifyWellExpired === null, 'verifyMediaAccessToken returns null for token well after expiration timestamp');
 
       // Test B.11: Media token CANNOT be used to call protected APIs instead of session token
       const protectedApiWithMediaToken = await fetch(`${baseUrl}/user`, {
@@ -1346,4 +1462,16 @@ export async function runAuthAndOwnershipTests() {
   } finally {
     server.close();
   }
+}
+
+if (process.argv[1] && process.argv[1].includes('auth_and_ownership.test')) {
+  process.env.VIDEORISK_TEST_RUN = 'true';
+  runAuthAndOwnershipTests()
+    .then(() => {
+      process.exit(0);
+    })
+    .catch((err) => {
+      console.error(err);
+      process.exit(1);
+    });
 }
