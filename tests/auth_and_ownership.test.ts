@@ -450,9 +450,6 @@ export async function runAuthAndOwnershipTests() {
     console.log('\n[3c. Secure Media Access Hardening (Issues A, B, C)]');
 
     const testTime = Date.now();
-    let publicSamplePreExisted = false;
-    let publicSampleCreatedByThisTest = false;
-    let publicSampleOriginalBuffer: Buffer | null = null;
     const testVideoFileId = `userA_private_${testTime}.mp4`;
     const testVideoPath = path.resolve(uploadDir, testVideoFileId);
     const testVideoPayload = 'MOCK_USER_A_PRIVATE_VIDEO_DATA_FOR_SECURITY_VALIDATION_0123456789';
@@ -520,18 +517,13 @@ export async function runAuthAndOwnershipTests() {
     });
 
     // Legitimate public sample asset (in allowlist, no owner record)
-    // Non-destructive fixture handling: protect pre-existing sample_public_test.mp4 if present
-    const publicSampleFileId = `sample_public_test.mp4`;
+    // Non-destructive fixture handling: use a uniquely-named test-owned fixture registered dynamically,
+    // ensuring we NEVER touch, overwrite, or delete any pre-existing or user files in uploads/
+    const publicSampleFileId = `sample_public_test_${testTime}.mp4`;
     const publicSamplePath = path.resolve(uploadDir, publicSampleFileId);
     const publicSamplePayload = 'PUBLIC_SAMPLE_VIDEO_CONTENT_ACCESSIBLE_UNAUTHENTICATED';
-
-    publicSamplePreExisted = fs.existsSync(publicSamplePath);
-    if (publicSamplePreExisted) {
-      publicSampleOriginalBuffer = fs.readFileSync(publicSamplePath);
-    } else {
-      fs.writeFileSync(publicSamplePath, publicSamplePayload);
-      publicSampleCreatedByThisTest = true;
-    }
+    fs.writeFileSync(publicSamplePath, publicSamplePayload);
+    registerTrustedPublicMedia(publicSampleFileId);
 
     // Orphaned unowned file
     const unownedFileId = `unregistered_orphan_${testTime}.mp4`;
@@ -672,10 +664,12 @@ export async function runAuthAndOwnershipTests() {
       const publicSampleRes = await fetch(`${uploadsBaseUrl}/${publicSampleFileId}`);
       assert(publicSampleRes.status === 200, 'Explicit allowlisted public sample returns 200 OK unauthenticated');
       const publicSampleBody = await publicSampleRes.text();
-      const expectedPublicContent = publicSampleCreatedByThisTest
-        ? publicSamplePayload
-        : (publicSampleOriginalBuffer ? publicSampleOriginalBuffer.toString('utf8') : publicSamplePayload);
-      assert(publicSampleBody === expectedPublicContent, 'Public sample returns expected content');
+      assert(publicSampleBody === publicSamplePayload, 'Public sample returns expected content');
+
+      // Verify that default production allowlist entries are present in TRUSTED_PUBLIC_MEDIA_ALLOWLIST
+      assert(TRUSTED_PUBLIC_MEDIA_ALLOWLIST.has('sample_public_demo.mp4'), 'Allowlist contains sample_public_demo.mp4');
+      assert(TRUSTED_PUBLIC_MEDIA_ALLOWLIST.has('sample_public_test.mp4'), 'Allowlist contains sample_public_test.mp4');
+      assert(TRUSTED_PUBLIC_MEDIA_ALLOWLIST.has('public_demo_sample.mp4'), 'Allowlist contains public_demo_sample.mp4');
 
       // Test A.6: Dynamic registration and unregistration of trusted public media
       const dynSampleId = `dyn_sample_${testTime}.mp4`;
@@ -707,24 +701,29 @@ export async function runAuthAndOwnershipTests() {
       assert(proxiesListRes.status === 403, 'Subdirectory request is rejected without directory listing');
 
       // Test A.8: Path traversal attempts are rejected (raw HTTP and encoded traversal)
-      const traversalRes = await new Promise<{ status: number }>((resolve, reject) => {
+      const traversalRes = await new Promise<{ status: number; body: string }>((resolve, reject) => {
         const req = http.request({
           host: '127.0.0.1',
           port,
           path: '/uploads/../../data/videorisk.db',
           headers: { Authorization: `Bearer ${activeTokenA}` }
         }, (res) => {
-          resolve({ status: res.statusCode || 0 });
+          let data = '';
+          res.on('data', chunk => { data += chunk; });
+          res.on('end', () => resolve({ status: res.statusCode || 0, body: data }));
         });
         req.on('error', reject);
         req.end();
       });
       assert(traversalRes.status === 403 || traversalRes.status === 400, 'Path traversal escaping storage is rejected');
+      assert(!traversalRes.body.includes('SQLite format 3'), 'Database content was NOT leaked in traversal response');
 
       const encodedTraversalRes = await fetch(`${uploadsBaseUrl}/..%2F..%2Fdata/videorisk.db`, {
         headers: { Authorization: `Bearer ${activeTokenA}` }
       });
       assert(encodedTraversalRes.status === 403 || encodedTraversalRes.status === 400, 'Encoded path traversal escaping storage is rejected');
+      const encodedBody = await encodedTraversalRes.text();
+      assert(!encodedBody.includes('SQLite format 3'), 'Database content was NOT leaked in encoded traversal response');
 
       // Test A.9: Same-named file in single subdirectory does NOT receive public status
       subProxySamplePath = path.resolve(proxiesDir, publicSampleFileId);
@@ -936,6 +935,56 @@ export async function runAuthAndOwnershipTests() {
       assert(tokenGenData.expiresInSeconds === 60, 'Token expiration seconds matches requested duration');
       const validMediaToken = tokenGenData.mediaToken;
 
+      // Test B.3b: Parameter validation & clamping for durationSeconds contract [10, 300]
+      // Case 1: Below minimum (durationSeconds: 2) -> clamped to 10
+      const belowMinRes = await fetch(`${baseUrl}/media/token`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${activeTokenA}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fileId: testVideoFileId, durationSeconds: 2 })
+      });
+      const belowMinData = await belowMinRes.json();
+      assert(belowMinData.expiresInSeconds === 10, 'Duration below minimum (2s) is clamped to 10s');
+
+      // Case 2: Above maximum (durationSeconds: 1000) -> clamped to 300
+      const aboveMaxRes = await fetch(`${baseUrl}/media/token`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${activeTokenA}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fileId: testVideoFileId, durationSeconds: 1000 })
+      });
+      const aboveMaxData = await aboveMaxRes.json();
+      assert(aboveMaxData.expiresInSeconds === 300, 'Duration above maximum (1000s) is clamped to 300s');
+
+      // Case 3: Non-numeric value (durationSeconds: "invalid") -> safe default 120
+      const nonNumRes = await fetch(`${baseUrl}/media/token`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${activeTokenA}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fileId: testVideoFileId, durationSeconds: 'invalid' })
+      });
+      const nonNumData = await nonNumRes.json();
+      assert(nonNumData.expiresInSeconds === 120, 'Non-numeric duration falls back to safe default 120s');
+
+      // Case 4: Decimal value (durationSeconds: 45.7) -> integer floored to 45
+      const decimalRes = await fetch(`${baseUrl}/media/token`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${activeTokenA}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fileId: testVideoFileId, durationSeconds: 45.7 })
+      });
+      const decimalData = await decimalRes.json();
+      assert(decimalData.expiresInSeconds === 45, 'Decimal duration (45.7s) is floored to integer 45s');
+
+      // Case 5: Omitted value (durationSeconds not sent) -> safe default 120
+      const omittedRes = await fetch(`${baseUrl}/media/token`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${activeTokenA}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fileId: testVideoFileId })
+      });
+      const omittedData = await omittedRes.json();
+      assert(omittedData.expiresInSeconds === 120, 'Omitted duration falls back to safe default 120s');
+
+      // Case 6: Direct unit contract checks on createMediaAccessToken
+      assert(createMediaAccessToken(userA.id, testVideoFileId, NaN).length > 0, 'createMediaAccessToken handles NaN safely');
+      assert(createMediaAccessToken(userA.id, testVideoFileId, -10).length > 0, 'createMediaAccessToken handles negative values safely');
+
       // Test B.4: Non-owner cannot generate media token for another user's file
       const userBFakeTokenRes = await fetch(`${baseUrl}/media/token`, {
         method: 'POST',
@@ -977,12 +1026,17 @@ export async function runAuthAndOwnershipTests() {
       const tamperedRes = await fetch(`${uploadsBaseUrl}/${testVideoFileId}?media_token=${tamperedMediaToken}`);
       assert(tamperedRes.status === 401, 'Tampered media token with invalid HMAC is rejected (401)');
 
-      // Test B.10: Expired media token is rejected (401)
-      const expiredToken = createMediaAccessToken(userA.id, testVideoFileId, 1);
-      // Wait 1.2 seconds for expiration
-      await new Promise(r => setTimeout(r, 1200));
-      const expiredRes = await fetch(`${uploadsBaseUrl}/${testVideoFileId}?media_token=${expiredToken}`);
-      assert(expiredRes.status === 401, 'Expired media token is rejected (401)');
+      // Test B.10: Expired media token is rejected (401) using production contract [10, 300] and clock advance
+      const tokenToTimeout = createMediaAccessToken(userA.id, testVideoFileId, 10);
+      const originalNow = Date.now;
+      try {
+        // Advance clock by 11 seconds past the 10-second contract minimum
+        Date.now = () => originalNow() + 11000;
+        const expiredRes = await fetch(`${uploadsBaseUrl}/${testVideoFileId}?media_token=${tokenToTimeout}`);
+        assert(expiredRes.status === 401, 'Expired media token is rejected (401)');
+      } finally {
+        Date.now = originalNow;
+      }
 
       // Test B.11: Media token CANNOT be used to call protected APIs instead of session token
       const protectedApiWithMediaToken = await fetch(`${baseUrl}/user`, {
@@ -1062,6 +1116,9 @@ export async function runAuthAndOwnershipTests() {
       assert(missingRes.status === 404, 'Non-existent file returns 404 Not Found');
 
     } finally {
+      // Unregister dynamically registered test fixture from allowlist
+      unregisterTrustedPublicMedia(publicSampleFileId);
+
       // Clean up test files created for 3c
       const allTestFiles = [
         testVideoPath,
@@ -1069,7 +1126,7 @@ export async function runAuthAndOwnershipTests() {
         testProxyPath,
         fakePublicPath,
         fakeSamplePath,
-        ...(publicSampleCreatedByThisTest ? [publicSamplePath] : []),
+        publicSamplePath,
         unownedPath,
         pathA,
         pathB,
@@ -1092,14 +1149,6 @@ export async function runAuthAndOwnershipTests() {
             fs.unlinkSync(p);
           }
         } catch { /* ignore */ }
-      }
-
-      if (publicSamplePreExisted && publicSampleOriginalBuffer !== null) {
-        // Assert pre-existing file was NOT deleted or altered
-        const currentBuf = fs.existsSync(publicSamplePath) ? fs.readFileSync(publicSamplePath) : null;
-        if (!currentBuf || !currentBuf.equals(publicSampleOriginalBuffer)) {
-          fs.writeFileSync(publicSamplePath, publicSampleOriginalBuffer);
-        }
       }
 
       try { fs.rmSync(framesLongDir, { recursive: true, force: true }); } catch { /* ignore */ }

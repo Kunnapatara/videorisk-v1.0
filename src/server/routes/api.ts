@@ -279,7 +279,11 @@ export function createMediaAccessToken(userId: string, resourceId: string, durat
     throw new Error('Valid resourceId is required to create media access token.');
   }
 
-  const safeDuration = Math.min(300, Math.max(1, durationSeconds));
+  // Enforce production contract: duration must be clamped strictly within [10, 300] seconds, default 120
+  let safeDuration = 120;
+  if (typeof durationSeconds === 'number' && Number.isFinite(durationSeconds) && !Number.isNaN(durationSeconds)) {
+    safeDuration = Math.min(300, Math.max(10, Math.floor(durationSeconds)));
+  }
   const normalizedResource = resourceId.replace(/^\/+/, '').trim();
   const payload: MediaAccessTokenPayload = {
     userId: userId.trim(),
@@ -2465,9 +2469,10 @@ apiRouter.post('/media/token', requireAuthMiddleware, async (req: Request, res: 
       return res.status(403).json({ error: 'Access denied: You do not own this media asset.' });
     }
 
-    const parsedDuration = typeof durationSeconds === 'number' && durationSeconds > 0 
-      ? Math.min(300, Math.max(1, durationSeconds)) 
-      : 120;
+    let parsedDuration = 120;
+    if (typeof durationSeconds === 'number' && Number.isFinite(durationSeconds) && !Number.isNaN(durationSeconds)) {
+      parsedDuration = Math.min(300, Math.max(10, Math.floor(durationSeconds)));
+    }
 
     const mediaToken = createMediaAccessToken(user.id, cleanFileId, parsedDuration);
     const expiresAt = new Date(Date.now() + (parsedDuration * 1000)).toISOString();
