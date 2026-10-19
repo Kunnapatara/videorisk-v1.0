@@ -8,6 +8,7 @@ import {
   secureUploadsHandler,
   createMediaAccessToken,
   verifyMediaAccessToken,
+  sanitizeMediaTokenDuration,
   getMediaOwner,
   registerTrustedPublicMedia,
   unregisterTrustedPublicMedia,
@@ -17,6 +18,89 @@ import {
 import { storage } from '../src/server/storage';
 import { creditService } from '../src/server/services/creditService';
 import { billingService } from '../src/server/services/billingService';
+
+/**
+ * Isolated, non-destructive test fixture manager:
+ * - Writes files with flag: 'wx' (exclusive creation) to strictly prevent overwriting existing files
+ * - Unlinks only files and symlinks that this manager created, using lstatSync without following symlinks
+ * - Unregisters dynamic public media allowlist entries automatically
+ * - Removes only test-created directories
+ * - Provides 100% idempotent and exception-safe cleanup
+ */
+export class TestFixtureManager {
+  public createdFiles = new Set<string>();
+  public createdDirs = new Set<string>();
+  public registeredPublicMedia = new Set<string>();
+
+  createFile(filePath: string, data: string | Buffer): string {
+    if (fs.existsSync(filePath)) {
+      throw new Error(`Safety violation: Refusing to overwrite pre-existing file: ${filePath}`);
+    }
+    fs.writeFileSync(filePath, data, { flag: 'wx' });
+    this.createdFiles.add(filePath);
+    return filePath;
+  }
+
+  createSymlink(target: string, linkPath: string): string {
+    if (fs.existsSync(linkPath)) {
+      throw new Error(`Safety violation: Refusing to overwrite pre-existing symlink: ${linkPath}`);
+    }
+    fs.symlinkSync(target, linkPath);
+    this.createdFiles.add(linkPath);
+    return linkPath;
+  }
+
+  createDir(dirPath: string): string {
+    if (!fs.existsSync(dirPath)) {
+      fs.mkdirSync(dirPath, { recursive: true });
+      this.createdDirs.add(dirPath);
+    }
+    return dirPath;
+  }
+
+  registerPublic(filename: string): void {
+    registerTrustedPublicMedia(filename);
+    this.registeredPublicMedia.add(path.basename(filename));
+  }
+
+  unregisterPublic(filename: string): void {
+    const base = path.basename(filename);
+    unregisterTrustedPublicMedia(base);
+    this.registeredPublicMedia.delete(base);
+  }
+
+  cleanup(): void {
+    // 1. Unregister all dynamic public media allowlist entries
+    for (const base of Array.from(this.registeredPublicMedia)) {
+      try {
+        unregisterTrustedPublicMedia(base);
+      } catch { /* ignore */ }
+    }
+    this.registeredPublicMedia.clear();
+
+    // 2. Safely unlink only tracked files and symlinks without following symlink targets
+    for (const filePath of Array.from(this.createdFiles)) {
+      try {
+        const stat = fs.lstatSync(filePath, { throwIfNoEntry: false });
+        if (stat) {
+          fs.unlinkSync(filePath);
+        }
+      } catch { /* ignore */ }
+    }
+    this.createdFiles.clear();
+
+    // 3. Remove only test-owned directories in reverse order of creation
+    const dirs = Array.from(this.createdDirs).reverse();
+    for (const dirPath of dirs) {
+      try {
+        if (fs.existsSync(dirPath)) {
+          fs.rmSync(dirPath, { recursive: true, force: true });
+        }
+      } catch { /* ignore */ }
+    }
+    this.createdDirs.clear();
+  }
+}
 
 export async function runAuthAndOwnershipTests() {
   console.log('\n======================================================');
@@ -449,11 +533,12 @@ export async function runAuthAndOwnershipTests() {
     // ---------------------------------------------------------
     console.log('\n[3c. Secure Media Access Hardening (Issues A, B, C)]');
 
+    const fixtureMgr = new TestFixtureManager();
     const testTime = Date.now();
     const testVideoFileId = `userA_private_${testTime}.mp4`;
     const testVideoPath = path.resolve(uploadDir, testVideoFileId);
     const testVideoPayload = 'MOCK_USER_A_PRIVATE_VIDEO_DATA_FOR_SECURITY_VALIDATION_0123456789';
-    fs.writeFileSync(testVideoPath, testVideoPayload);
+    fixtureMgr.createFile(testVideoPath, testVideoPayload);
 
     await storage.uploads.recordUpload({
       fileId: testVideoFileId,
@@ -468,7 +553,7 @@ export async function runAuthAndOwnershipTests() {
     const testThumbFileId = `thumb_userA_${testTime}.jpg`;
     const testThumbPath = path.resolve(uploadDir, testThumbFileId);
     const testThumbPayload = 'FAKE_USER_A_THUMBNAIL_BYTES_FOR_IMAGE_SECURITY';
-    fs.writeFileSync(testThumbPath, testThumbPayload);
+    fixtureMgr.createFile(testThumbPath, testThumbPayload);
 
     await storage.uploads.recordUpload({
       fileId: testThumbFileId,
@@ -482,17 +567,17 @@ export async function runAuthAndOwnershipTests() {
 
     const proxiesDir = path.resolve(uploadDir, 'proxies');
     if (!fs.existsSync(proxiesDir)) {
-      fs.mkdirSync(proxiesDir, { recursive: true });
+      fixtureMgr.createDir(proxiesDir);
     }
     const testProxyFileId = `proxy_userA_private_${testTime}.mp4`;
     const testProxyPath = path.resolve(proxiesDir, testProxyFileId);
     const testProxyPayload = 'MOCK_USER_A_DERIVED_PROXY_STREAM_PAYLOAD';
-    fs.writeFileSync(testProxyPath, testProxyPayload);
+    fixtureMgr.createFile(testProxyPath, testProxyPayload);
 
     // Issue A fixture: User-owned file that tries to spoof public prefix
     const fakePublicFileId = `public_userA_private_${testTime}.mp4`;
     const fakePublicPath = path.resolve(uploadDir, fakePublicFileId);
-    fs.writeFileSync(fakePublicPath, 'FAKE_PUBLIC_USER_A_SECRET_DATA');
+    fixtureMgr.createFile(fakePublicPath, 'FAKE_PUBLIC_USER_A_SECRET_DATA');
     await storage.uploads.recordUpload({
       fileId: fakePublicFileId,
       userId: userA.id,
@@ -505,7 +590,7 @@ export async function runAuthAndOwnershipTests() {
 
     const fakeSampleFileId = `sample_public_userA_${testTime}.mp4`;
     const fakeSamplePath = path.resolve(uploadDir, fakeSampleFileId);
-    fs.writeFileSync(fakeSamplePath, 'FAKE_SAMPLE_USER_A_SECRET_DATA');
+    fixtureMgr.createFile(fakeSamplePath, 'FAKE_SAMPLE_USER_A_SECRET_DATA');
     await storage.uploads.recordUpload({
       fileId: fakeSampleFileId,
       userId: userA.id,
@@ -522,24 +607,24 @@ export async function runAuthAndOwnershipTests() {
     const publicSampleFileId = `sample_public_test_${testTime}.mp4`;
     const publicSamplePath = path.resolve(uploadDir, publicSampleFileId);
     const publicSamplePayload = 'PUBLIC_SAMPLE_VIDEO_CONTENT_ACCESSIBLE_UNAUTHENTICATED';
-    fs.writeFileSync(publicSamplePath, publicSamplePayload);
-    registerTrustedPublicMedia(publicSampleFileId);
+    fixtureMgr.createFile(publicSamplePath, publicSamplePayload);
+    fixtureMgr.registerPublic(publicSampleFileId);
 
     // Orphaned unowned file
     const unownedFileId = `unregistered_orphan_${testTime}.mp4`;
     const unownedPath = path.resolve(uploadDir, unownedFileId);
-    fs.writeFileSync(unownedPath, 'ORPHANED_DATA_WITH_NO_USER_RECORD');
+    fixtureMgr.createFile(unownedPath, 'ORPHANED_DATA_WITH_NO_USER_RECORD');
 
     // Issue C fixtures: Multiple directories with same basename
     const dirA = path.resolve(os.tmpdir(), `test_isolation_dirA_${testTime}`);
     const dirB = path.resolve(os.tmpdir(), `test_isolation_dirB_${testTime}`);
-    fs.mkdirSync(dirA, { recursive: true });
-    fs.mkdirSync(dirB, { recursive: true });
+    fixtureMgr.createDir(dirA);
+    fixtureMgr.createDir(dirB);
     const sameBasename = `shared_name_${testTime}.mp4`;
     const pathA = path.resolve(dirA, sameBasename);
     const pathB = path.resolve(dirB, sameBasename);
-    fs.writeFileSync(pathA, 'USER_A_FILE_IN_DIR_A');
-    fs.writeFileSync(pathB, 'USER_B_FILE_IN_DIR_B');
+    fixtureMgr.createFile(pathA, 'USER_A_FILE_IN_DIR_A');
+    fixtureMgr.createFile(pathB, 'USER_B_FILE_IN_DIR_B');
 
     await storage.uploads.recordUpload({
       fileId: `fileA_${testTime}`,
@@ -564,8 +649,8 @@ export async function runAuthAndOwnershipTests() {
     const stemCollision = `collision_clip_${testTime}`;
     const collisionPathA = path.resolve(uploadDir, `${stemCollision}.mp4`);
     const collisionPathB = path.resolve(uploadDir, `${stemCollision}.mov`);
-    fs.writeFileSync(collisionPathA, 'COLLISION_A');
-    fs.writeFileSync(collisionPathB, 'COLLISION_B');
+    fixtureMgr.createFile(collisionPathA, 'COLLISION_A');
+    fixtureMgr.createFile(collisionPathB, 'COLLISION_B');
     await storage.uploads.recordUpload({
       fileId: `${stemCollision}.mp4`,
       userId: userA.id,
@@ -585,7 +670,7 @@ export async function runAuthAndOwnershipTests() {
       createdAt: new Date().toISOString()
     });
     const collisionProxyPath = path.resolve(proxiesDir, `proxy_${stemCollision}.mp4`);
-    fs.writeFileSync(collisionProxyPath, 'COLLISION_PROXY_CONTENT');
+    fixtureMgr.createFile(collisionProxyPath, 'COLLISION_PROXY_CONTENT');
 
     // Issue C fixtures: Substring scan ID collision
     const scanIdShort = `scan_sub_${testTime}`;
@@ -620,9 +705,9 @@ export async function runAuthAndOwnershipTests() {
     const framesDir = path.resolve(uploadDir, 'frames');
     const jobSubdirLong = `${scanIdLong}_${Date.now()}`;
     const framesLongDir = path.resolve(framesDir, jobSubdirLong);
-    fs.mkdirSync(framesLongDir, { recursive: true });
+    fixtureMgr.createDir(framesLongDir);
     const frameLongPath = path.resolve(framesLongDir, 'frame_001.jpg');
-    fs.writeFileSync(frameLongPath, 'FRAME_SNAPSHOT_FOR_SCAN_LONG');
+    fixtureMgr.createFile(frameLongPath, 'FRAME_SNAPSHOT_FOR_SCAN_LONG');
 
     let subProxySamplePath: string | null = null;
     let nestedRootDir: string | null = null;
@@ -727,7 +812,7 @@ export async function runAuthAndOwnershipTests() {
 
       // Test A.9: Same-named file in single subdirectory does NOT receive public status
       subProxySamplePath = path.resolve(proxiesDir, publicSampleFileId);
-      fs.writeFileSync(subProxySamplePath, 'SUBDIRECTORY_SECRET_SAMPLE_CONTENT');
+      fixtureMgr.createFile(subProxySamplePath, 'SUBDIRECTORY_SECRET_SAMPLE_CONTENT');
 
       assert(isTrustedPublicMedia(subProxySamplePath, `proxies/${publicSampleFileId}`) === false, 'isTrustedPublicMedia returns false for file in proxies subdirectory');
       assert(isTrustedPublicMedia(subProxySamplePath) === false, 'isTrustedPublicMedia returns false for resolved path in subdirectory even without relativePath');
@@ -743,10 +828,11 @@ export async function runAuthAndOwnershipTests() {
       // Test A.10: Same-named file in multi-level nested subdirectory does NOT receive public status
       const nestedRootName = `test_nested_${testTime}`;
       nestedRootDir = path.resolve(uploadDir, nestedRootName);
+      fixtureMgr.createDir(nestedRootDir);
       const nestedDir = path.resolve(nestedRootDir, 'deep', 'sub');
-      fs.mkdirSync(nestedDir, { recursive: true });
+      fixtureMgr.createDir(nestedDir);
       nestedSamplePath = path.resolve(nestedDir, publicSampleFileId);
-      fs.writeFileSync(nestedSamplePath, 'NESTED_DEEP_SECRET_SAMPLE_CONTENT');
+      fixtureMgr.createFile(nestedSamplePath, 'NESTED_DEEP_SECRET_SAMPLE_CONTENT');
 
       assert(isTrustedPublicMedia(nestedSamplePath, `${nestedRootName}/deep/sub/${publicSampleFileId}`) === false, 'isTrustedPublicMedia returns false for nested subdirectory');
       assert(isTrustedPublicMedia(nestedSamplePath) === false, 'isTrustedPublicMedia returns false for nested path even without relativePath');
@@ -756,9 +842,9 @@ export async function runAuthAndOwnershipTests() {
 
       // Test A.11: Same-named file in frames subdirectory does NOT receive public status
       framesSampleDir = path.resolve(framesDir, `sample_test_job_${testTime}`);
-      fs.mkdirSync(framesSampleDir, { recursive: true });
+      fixtureMgr.createDir(framesSampleDir);
       frameSamplePath = path.resolve(framesSampleDir, 'sample_public_demo.mp4');
-      fs.writeFileSync(frameSamplePath, 'FRAME_SNAPSHOT_PUBLIC_NAME_SPOOF');
+      fixtureMgr.createFile(frameSamplePath, 'FRAME_SNAPSHOT_PUBLIC_NAME_SPOOF');
 
       assert(isTrustedPublicMedia(frameSamplePath, `frames/sample_test_job_${testTime}/sample_public_demo.mp4`) === false, 'isTrustedPublicMedia returns false for frames subdirectory');
 
@@ -774,7 +860,7 @@ export async function runAuthAndOwnershipTests() {
 
       // Test A.13: Symlink security verification
       externalTempTarget = path.resolve(os.tmpdir(), `test_symlink_ext_target_${testTime}.txt`);
-      fs.writeFileSync(externalTempTarget, 'EXTERNAL_TEMP_SECRET_CONTENT');
+      fixtureMgr.createFile(externalTempTarget, 'EXTERNAL_TEMP_SECRET_CONTENT');
 
       symlinkOutPath = path.resolve(uploadDir, `symlink_out_${testTime}.mp4`);
       symlinkToSubPath = path.resolve(uploadDir, `symlink_to_sub_${testTime}.mp4`);
@@ -782,9 +868,9 @@ export async function runAuthAndOwnershipTests() {
 
       let symlinkCreationError: any = null;
       try {
-        fs.symlinkSync(externalTempTarget, symlinkOutPath);
-        fs.symlinkSync(subProxySamplePath, symlinkToSubPath);
-        fs.symlinkSync(publicSamplePath, symlinkInSubPath);
+        fixtureMgr.createSymlink(externalTempTarget, symlinkOutPath);
+        fixtureMgr.createSymlink(subProxySamplePath, symlinkToSubPath);
+        fixtureMgr.createSymlink(publicSamplePath, symlinkInSubPath);
       } catch (err: any) {
         symlinkCreationError = err;
       }
@@ -812,7 +898,7 @@ export async function runAuthAndOwnershipTests() {
       // ----------------------------------------------------------------------
       console.log('  --- Sub-suite A.14: Fixture Data Safety & Isolated Lifecycle Tests ---');
 
-      // 1. When a pre-existing sample file exists before test, it MUST NOT be overwritten or deleted
+      // 1. Collision safety via flag: 'wx': Attempting to create an existing file fails and preserves original
       const safetyTempDir = path.resolve(os.tmpdir(), `test_fixture_safety_${testTime}`);
       fs.mkdirSync(safetyTempDir, { recursive: true });
 
@@ -824,62 +910,37 @@ export async function runAuthAndOwnershipTests() {
         const preExistingContent = 'PRE_EXISTING_ORIGINAL_PUBLIC_SAMPLE_DATA_SHA256';
         fs.writeFileSync(preExistingFile, preExistingContent);
 
-        // Safe fixture initialization logic:
-        const preExists = fs.existsSync(preExistingFile);
-        let createdByTest = false;
-        let originalContent: Buffer | null = null;
-        if (preExists) {
-          originalContent = fs.readFileSync(preExistingFile);
-        } else {
-          fs.writeFileSync(preExistingFile, 'NEW_TEST_PAYLOAD');
-          createdByTest = true;
+        const isolatedMgr = new TestFixtureManager();
+        let collisionBlocked = false;
+        try {
+          isolatedMgr.createFile(preExistingFile, 'MALICIOUS_OVERWRITE_PAYLOAD');
+        } catch {
+          collisionBlocked = true;
         }
+        assert(collisionBlocked === true, 'Safety test: collision detection blocks overwriting existing file');
+        assert(fs.readFileSync(preExistingFile, 'utf8') === preExistingContent, 'Safety test: pre-existing content remains 100% intact');
+        assert(!isolatedMgr.createdFiles.has(preExistingFile), 'Safety test: pre-existing file was NOT claimed by fixture manager');
 
-        assert(preExists === true, 'Safety test: detects pre-existing file');
-        assert(createdByTest === false, 'Safety test: did NOT mark pre-existing file as test-created');
-        assert(fs.readFileSync(preExistingFile).toString('utf8') === preExistingContent, 'Safety test: pre-existing file content is NOT overwritten');
-
-        // Safe cleanup:
-        if (createdByTest) {
-          fs.unlinkSync(preExistingFile);
-        }
-
-        assert(fs.existsSync(preExistingFile) === true, 'Safety test: pre-existing file was NOT deleted during cleanup');
-        assert(fs.readFileSync(preExistingFile).toString('utf8') === preExistingContent, 'Safety test: pre-existing file content remains completely intact');
-
-        // 2. When NO pre-existing file exists, test creates fixture and cleanly removes it
+        // 2. Non-pre-existing file creates and removes cleanly
         const nonPreExistingFile = path.resolve(mockUploadsDir, 'sample_public_temp.mp4');
-        const nonPreExists = fs.existsSync(nonPreExistingFile);
-        let createdNonPre = false;
-        if (!nonPreExists) {
-          fs.writeFileSync(nonPreExistingFile, 'TEMP_FIXTURE_CONTENT');
-          createdNonPre = true;
-        }
-
-        assert(createdNonPre === true, 'Safety test: creates fixture when file does not pre-exist');
-        assert(fs.existsSync(nonPreExistingFile) === true, 'Safety test: fixture exists during test');
+        isolatedMgr.createFile(nonPreExistingFile, 'TEMP_FIXTURE_CONTENT');
+        assert(fs.existsSync(nonPreExistingFile) === true, 'Safety test: creates fixture when file does not pre-exist');
 
         // Cleanup:
-        if (createdNonPre) {
-          fs.unlinkSync(nonPreExistingFile);
-        }
+        isolatedMgr.cleanup();
         assert(fs.existsSync(nonPreExistingFile) === false, 'Safety test: test-created fixture is cleanly removed after test');
+        assert(fs.existsSync(preExistingFile) === true, 'Safety test: pre-existing file is NOT deleted during cleanup');
+        assert(fs.readFileSync(preExistingFile, 'utf8') === preExistingContent, 'Safety test: pre-existing content preserved through cleanup');
 
-        // 3. When an assertion or step throws an error, cleanup preserves pre-existing file
-        let errorCaught = false;
+        // 3. Idempotent cleanup: Calling cleanup multiple times succeeds with zero errors
+        let doubleCleanupSafe = true;
         try {
-          assert(fs.existsSync(preExistingFile) === true, 'Pre-existing file present before simulated failure');
-          throw new Error('Simulated test execution failure');
-        } catch (err: any) {
-          errorCaught = true;
-        } finally {
-          if (createdByTest) {
-            fs.unlinkSync(preExistingFile);
-          }
+          isolatedMgr.cleanup();
+          isolatedMgr.cleanup();
+        } catch {
+          doubleCleanupSafe = false;
         }
-        assert(errorCaught === true, 'Safety test: error was raised and caught as expected');
-        assert(fs.existsSync(preExistingFile) === true, 'Safety test: pre-existing file survived failed test run');
-        assert(fs.readFileSync(preExistingFile).toString('utf8') === preExistingContent, 'Safety test: pre-existing file content preserved on failure');
+        assert(doubleCleanupSafe === true, 'Safety test: cleanup is completely idempotent');
 
         // 4. Symlink pointing outside temporary test directory does NOT delete or alter external target
         const externalTargetDir = path.resolve(safetyTempDir, 'external_protected_dir');
@@ -888,20 +949,45 @@ export async function runAuthAndOwnershipTests() {
         const externalTargetContent = 'CRITICAL_PROTECTED_DATA_DO_NOT_TOUCH';
         fs.writeFileSync(externalTargetFile, externalTargetContent);
 
+        const symlinkMgr = new TestFixtureManager();
         const internalSymlinkPath = path.resolve(mockUploadsDir, 'symlink_pointing_out.mp4');
-        fs.symlinkSync(externalTargetFile, internalSymlinkPath);
+        symlinkMgr.createSymlink(externalTargetFile, internalSymlinkPath);
 
-        assert(fs.existsSync(internalSymlinkPath) === true, 'Symlink created successfully');
+        assert(fs.existsSync(internalSymlinkPath) === true, 'Safety test: symlink created successfully');
+        symlinkMgr.cleanup();
 
-        // Safe cleanup: only unlink the symlink itself (using lstatSync), never the external target
-        const symlinkStat = fs.lstatSync(internalSymlinkPath, { throwIfNoEntry: false });
-        if (symlinkStat) {
-          fs.unlinkSync(internalSymlinkPath);
+        assert(fs.existsSync(internalSymlinkPath) === false, 'Safety test: symlink was unlinked from test directory');
+        assert(fs.existsSync(externalTargetFile) === true, 'Safety test: external target was NOT deleted by symlink cleanup');
+        assert(fs.readFileSync(externalTargetFile, 'utf8') === externalTargetContent, 'Safety test: external target content was NOT modified by symlink cleanup');
+
+        // 5. Allowlist state restoration: Registration is completely reverted after cleanup
+        const allowlistMgr = new TestFixtureManager();
+        const testDynMedia = `test_dyn_allow_${Date.now()}.mp4`;
+        assert(!TRUSTED_PUBLIC_MEDIA_ALLOWLIST.has(testDynMedia), 'Safety test: allowlist initially does not contain test media');
+        allowlistMgr.registerPublic(testDynMedia);
+        assert(TRUSTED_PUBLIC_MEDIA_ALLOWLIST.has(testDynMedia), 'Safety test: allowlist contains test media after registration');
+        allowlistMgr.cleanup();
+        assert(!TRUSTED_PUBLIC_MEDIA_ALLOWLIST.has(testDynMedia), 'Safety test: allowlist restored to original state after cleanup');
+
+        // 6. Setup failure handling: Cleanup unwinds only resources created before failure
+        const failureMgr = new TestFixtureManager();
+        const partialFile = path.resolve(mockUploadsDir, `partial_${Date.now()}.mp4`);
+        const partialMedia = `partial_media_${Date.now()}.mp4`;
+        let failureCaught = false;
+        try {
+          failureMgr.createFile(partialFile, 'PARTIAL_DATA');
+          failureMgr.registerPublic(partialMedia);
+          assert(fs.existsSync(partialFile) === true, 'Safety test: partial file exists before error');
+          assert(TRUSTED_PUBLIC_MEDIA_ALLOWLIST.has(partialMedia) === true, 'Safety test: partial registration exists before error');
+          throw new Error('Simulated setup failure halfway through');
+        } catch {
+          failureCaught = true;
+        } finally {
+          failureMgr.cleanup();
         }
-
-        assert(fs.existsSync(internalSymlinkPath) === false, 'Symlink was unlinked from test directory');
-        assert(fs.existsSync(externalTargetFile) === true, 'External target was NOT deleted by symlink cleanup');
-        assert(fs.readFileSync(externalTargetFile).toString('utf8') === externalTargetContent, 'External target content was NOT modified by symlink cleanup');
+        assert(failureCaught === true, 'Safety test: simulated setup failure was caught');
+        assert(fs.existsSync(partialFile) === false, 'Safety test: partial file was cleaned up on failure');
+        assert(!TRUSTED_PUBLIC_MEDIA_ALLOWLIST.has(partialMedia), 'Safety test: partial public media was unregistered on failure');
 
       } finally {
         try { fs.rmSync(safetyTempDir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -943,25 +1029,25 @@ export async function runAuthAndOwnershipTests() {
         body: JSON.stringify({ fileId: testVideoFileId, durationSeconds: 2 })
       });
       const belowMinData = await belowMinRes.json();
-      assert(belowMinData.expiresInSeconds === 10, 'Duration below minimum (2s) is clamped to 10s');
+      assert(belowMinData.expiresInSeconds === 10, 'HTTP: Duration below minimum (2s) is clamped to 10s');
 
-      // Case 2: Above maximum (durationSeconds: 1000) -> clamped to 300
-      const aboveMaxRes = await fetch(`${baseUrl}/media/token`, {
+      // Case 2: Exact minimum (durationSeconds: 10) -> exactly 10
+      const exactMinRes = await fetch(`${baseUrl}/media/token`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${activeTokenA}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fileId: testVideoFileId, durationSeconds: 1000 })
+        body: JSON.stringify({ fileId: testVideoFileId, durationSeconds: 10 })
       });
-      const aboveMaxData = await aboveMaxRes.json();
-      assert(aboveMaxData.expiresInSeconds === 300, 'Duration above maximum (1000s) is clamped to 300s');
+      const exactMinData = await exactMinRes.json();
+      assert(exactMinData.expiresInSeconds === 10, 'HTTP: Exact minimum (10s) returns 10s');
 
-      // Case 3: Non-numeric value (durationSeconds: "invalid") -> safe default 120
-      const nonNumRes = await fetch(`${baseUrl}/media/token`, {
+      // Case 3: Normal value (durationSeconds: 45) -> exactly 45
+      const normalRes = await fetch(`${baseUrl}/media/token`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${activeTokenA}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fileId: testVideoFileId, durationSeconds: 'invalid' })
+        body: JSON.stringify({ fileId: testVideoFileId, durationSeconds: 45 })
       });
-      const nonNumData = await nonNumRes.json();
-      assert(nonNumData.expiresInSeconds === 120, 'Non-numeric duration falls back to safe default 120s');
+      const normalData = await normalRes.json();
+      assert(normalData.expiresInSeconds === 45, 'HTTP: Normal duration (45s) returns 45s');
 
       // Case 4: Decimal value (durationSeconds: 45.7) -> integer floored to 45
       const decimalRes = await fetch(`${baseUrl}/media/token`, {
@@ -970,20 +1056,94 @@ export async function runAuthAndOwnershipTests() {
         body: JSON.stringify({ fileId: testVideoFileId, durationSeconds: 45.7 })
       });
       const decimalData = await decimalRes.json();
-      assert(decimalData.expiresInSeconds === 45, 'Decimal duration (45.7s) is floored to integer 45s');
+      assert(decimalData.expiresInSeconds === 45, 'HTTP: Decimal duration (45.7s) is floored to integer 45s');
 
-      // Case 5: Omitted value (durationSeconds not sent) -> safe default 120
+      // Case 5: Exact maximum (durationSeconds: 300) -> exactly 300
+      const exactMaxRes = await fetch(`${baseUrl}/media/token`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${activeTokenA}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fileId: testVideoFileId, durationSeconds: 300 })
+      });
+      const exactMaxData = await exactMaxRes.json();
+      assert(exactMaxData.expiresInSeconds === 300, 'HTTP: Exact maximum (300s) returns 300s');
+
+      // Case 6: Above maximum (durationSeconds: 1000) -> clamped to 300
+      const aboveMaxRes = await fetch(`${baseUrl}/media/token`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${activeTokenA}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fileId: testVideoFileId, durationSeconds: 1000 })
+      });
+      const aboveMaxData = await aboveMaxRes.json();
+      assert(aboveMaxData.expiresInSeconds === 300, 'HTTP: Duration above maximum (1000s) is clamped to 300s');
+
+      // Case 7: Negative number (durationSeconds: -50) -> clamped to 10
+      const negRes = await fetch(`${baseUrl}/media/token`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${activeTokenA}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fileId: testVideoFileId, durationSeconds: -50 })
+      });
+      const negData = await negRes.json();
+      assert(negData.expiresInSeconds === 10, 'HTTP: Negative duration (-50s) is clamped to minimum 10s');
+
+      // Case 8: Non-numeric string (durationSeconds: "invalid") -> safe default 120
+      const nonNumRes = await fetch(`${baseUrl}/media/token`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${activeTokenA}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fileId: testVideoFileId, durationSeconds: 'invalid' })
+      });
+      const nonNumData = await nonNumRes.json();
+      assert(nonNumData.expiresInSeconds === 120, 'HTTP: Non-numeric duration falls back to safe default 120s');
+
+      // Case 9: Null value (durationSeconds: null) -> safe default 120
+      const nullRes = await fetch(`${baseUrl}/media/token`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${activeTokenA}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fileId: testVideoFileId, durationSeconds: null })
+      });
+      const nullData = await nullRes.json();
+      assert(nullData.expiresInSeconds === 120, 'HTTP: Null duration falls back to safe default 120s');
+
+      // Case 10: Omitted value (durationSeconds not sent) -> safe default 120
       const omittedRes = await fetch(`${baseUrl}/media/token`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${activeTokenA}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ fileId: testVideoFileId })
       });
       const omittedData = await omittedRes.json();
-      assert(omittedData.expiresInSeconds === 120, 'Omitted duration falls back to safe default 120s');
+      assert(omittedData.expiresInSeconds === 120, 'HTTP: Omitted duration falls back to safe default 120s');
 
-      // Case 6: Direct unit contract checks on createMediaAccessToken
-      assert(createMediaAccessToken(userA.id, testVideoFileId, NaN).length > 0, 'createMediaAccessToken handles NaN safely');
-      assert(createMediaAccessToken(userA.id, testVideoFileId, -10).length > 0, 'createMediaAccessToken handles negative values safely');
+      // Direct unit contract checks on sanitizeMediaTokenDuration
+      assert(sanitizeMediaTokenDuration(2) === 10, 'Unit: sanitizeMediaTokenDuration(2) === 10');
+      assert(sanitizeMediaTokenDuration(10) === 10, 'Unit: sanitizeMediaTokenDuration(10) === 10');
+      assert(sanitizeMediaTokenDuration(45) === 45, 'Unit: sanitizeMediaTokenDuration(45) === 45');
+      assert(sanitizeMediaTokenDuration(45.7) === 45, 'Unit: sanitizeMediaTokenDuration(45.7) === 45');
+      assert(sanitizeMediaTokenDuration(300) === 300, 'Unit: sanitizeMediaTokenDuration(300) === 300');
+      assert(sanitizeMediaTokenDuration(1000) === 300, 'Unit: sanitizeMediaTokenDuration(1000) === 300');
+      assert(sanitizeMediaTokenDuration(-50) === 10, 'Unit: sanitizeMediaTokenDuration(-50) === 10');
+      assert(sanitizeMediaTokenDuration(NaN) === 120, 'Unit: sanitizeMediaTokenDuration(NaN) === 120');
+      assert(sanitizeMediaTokenDuration(Infinity) === 120, 'Unit: sanitizeMediaTokenDuration(Infinity) === 120');
+      assert(sanitizeMediaTokenDuration(-Infinity) === 120, 'Unit: sanitizeMediaTokenDuration(-Infinity) === 120');
+      assert(sanitizeMediaTokenDuration('not-a-number') === 120, 'Unit: sanitizeMediaTokenDuration("not-a-number") === 120');
+      assert(sanitizeMediaTokenDuration(null) === 120, 'Unit: sanitizeMediaTokenDuration(null) === 120');
+      assert(sanitizeMediaTokenDuration(undefined) === 120, 'Unit: sanitizeMediaTokenDuration(undefined) === 120');
+
+      // Helper to verify payload expiration duration from generated token
+      function getDecodedDuration(tokenStr: string, originNow: number): number {
+        const payloadJson = Buffer.from(tokenStr.split('.')[0], 'base64url').toString('utf8');
+        const payload = JSON.parse(payloadJson);
+        return Math.round((payload.expiresAt - originNow) / 1000);
+      }
+      const testNow = Date.now();
+      assert(getDecodedDuration(createMediaAccessToken(userA.id, testVideoFileId, 2, { nowMs: testNow }), testNow) === 10, 'Unit payload: 2s clamped to 10s');
+      assert(getDecodedDuration(createMediaAccessToken(userA.id, testVideoFileId, 10, { nowMs: testNow }), testNow) === 10, 'Unit payload: 10s exact min');
+      assert(getDecodedDuration(createMediaAccessToken(userA.id, testVideoFileId, 45, { nowMs: testNow }), testNow) === 45, 'Unit payload: 45s normal');
+      assert(getDecodedDuration(createMediaAccessToken(userA.id, testVideoFileId, 45.7, { nowMs: testNow }), testNow) === 45, 'Unit payload: 45.7s floored to 45s');
+      assert(getDecodedDuration(createMediaAccessToken(userA.id, testVideoFileId, 300, { nowMs: testNow }), testNow) === 300, 'Unit payload: 300s exact max');
+      assert(getDecodedDuration(createMediaAccessToken(userA.id, testVideoFileId, 1000, { nowMs: testNow }), testNow) === 300, 'Unit payload: 1000s clamped to 300s');
+      assert(getDecodedDuration(createMediaAccessToken(userA.id, testVideoFileId, NaN, { nowMs: testNow }), testNow) === 120, 'Unit payload: NaN defaults to 120s');
+      assert(getDecodedDuration(createMediaAccessToken(userA.id, testVideoFileId, Infinity, { nowMs: testNow }), testNow) === 120, 'Unit payload: Infinity defaults to 120s');
+      assert(getDecodedDuration(createMediaAccessToken(userA.id, testVideoFileId, -Infinity, { nowMs: testNow }), testNow) === 120, 'Unit payload: -Infinity defaults to 120s');
+      assert(getDecodedDuration(createMediaAccessToken(userA.id, testVideoFileId, -10, { nowMs: testNow }), testNow) === 10, 'Unit payload: -10s clamped to 10s');
 
       // Test B.4: Non-owner cannot generate media token for another user's file
       const userBFakeTokenRes = await fetch(`${baseUrl}/media/token`, {
@@ -1026,17 +1186,25 @@ export async function runAuthAndOwnershipTests() {
       const tamperedRes = await fetch(`${uploadsBaseUrl}/${testVideoFileId}?media_token=${tamperedMediaToken}`);
       assert(tamperedRes.status === 401, 'Tampered media token with invalid HMAC is rejected (401)');
 
-      // Test B.10: Expired media token is rejected (401) using production contract [10, 300] and clock advance
-      const tokenToTimeout = createMediaAccessToken(userA.id, testVideoFileId, 10);
-      const originalNow = Date.now;
-      try {
-        // Advance clock by 11 seconds past the 10-second contract minimum
-        Date.now = () => originalNow() + 11000;
-        const expiredRes = await fetch(`${uploadsBaseUrl}/${testVideoFileId}?media_token=${tokenToTimeout}`);
-        assert(expiredRes.status === 401, 'Expired media token is rejected (401)');
-      } finally {
-        Date.now = originalNow;
-      }
+      // Test B.10: Expired media token is rejected (401) without mutating global Date.now
+      // 1. Generate token created 15 seconds in the past with 10s duration (expired 5s ago)
+      const expiredPastToken = createMediaAccessToken(userA.id, testVideoFileId, 10, { nowMs: Date.now() - 15000 });
+      const expiredRes = await fetch(`${uploadsBaseUrl}/${testVideoFileId}?media_token=${expiredPastToken}`);
+      assert(expiredRes.status === 401, 'Expired media token is rejected with 401 Unauthorized via HTTP');
+
+      // 2. Active, unexpired media token with minimum duration (10s) succeeds immediately
+      const active10sToken = createMediaAccessToken(userA.id, testVideoFileId, 10);
+      const activeRes = await fetch(`${uploadsBaseUrl}/${testVideoFileId}?media_token=${active10sToken}`);
+      assert(activeRes.status === 200, 'Active unexpired media token (10s TTL) returns 200 OK via HTTP');
+
+      // 3. Direct unit verification of verifyMediaAccessToken with injectable clock (unexpired vs expired)
+      const clockBase = Date.now();
+      const unitToken = createMediaAccessToken(userA.id, testVideoFileId, 10, { nowMs: clockBase });
+      const verifyActive = verifyMediaAccessToken(unitToken, testVideoFileId, { nowMs: clockBase + 5000 });
+      assert(verifyActive?.userId === userA.id, 'verifyMediaAccessToken accepts token before expiration timestamp');
+
+      const verifyExpired = verifyMediaAccessToken(unitToken, testVideoFileId, { nowMs: clockBase + 11000 });
+      assert(verifyExpired === null, 'verifyMediaAccessToken returns null for token after expiration timestamp');
 
       // Test B.11: Media token CANNOT be used to call protected APIs instead of session token
       const protectedApiWithMediaToken = await fetch(`${baseUrl}/user`, {
@@ -1116,50 +1284,8 @@ export async function runAuthAndOwnershipTests() {
       assert(missingRes.status === 404, 'Non-existent file returns 404 Not Found');
 
     } finally {
-      // Unregister dynamically registered test fixture from allowlist
-      unregisterTrustedPublicMedia(publicSampleFileId);
-
-      // Clean up test files created for 3c
-      const allTestFiles = [
-        testVideoPath,
-        testThumbPath,
-        testProxyPath,
-        fakePublicPath,
-        fakeSamplePath,
-        publicSamplePath,
-        unownedPath,
-        pathA,
-        pathB,
-        collisionPathA,
-        collisionPathB,
-        collisionProxyPath,
-        frameLongPath,
-        subProxySamplePath,
-        nestedSamplePath,
-        frameSamplePath,
-        symlinkOutPath,
-        symlinkToSubPath,
-        symlinkInSubPath,
-        externalTempTarget
-      ].filter((p): p is string => Boolean(p));
-      for (const p of allTestFiles) {
-        try {
-          const stat = fs.lstatSync(p, { throwIfNoEntry: false });
-          if (stat) {
-            fs.unlinkSync(p);
-          }
-        } catch { /* ignore */ }
-      }
-
-      try { fs.rmSync(framesLongDir, { recursive: true, force: true }); } catch { /* ignore */ }
-      try { fs.rmSync(dirA, { recursive: true, force: true }); } catch { /* ignore */ }
-      try { fs.rmSync(dirB, { recursive: true, force: true }); } catch { /* ignore */ }
-      if (nestedRootDir && fs.existsSync(nestedRootDir)) {
-        try { fs.rmSync(nestedRootDir, { recursive: true, force: true }); } catch { /* ignore */ }
-      }
-      if (framesSampleDir && fs.existsSync(framesSampleDir)) {
-        try { fs.rmSync(framesSampleDir, { recursive: true, force: true }); } catch { /* ignore */ }
-      }
+      // Clean up all 3c test files, symlinks, directories, and dynamic allowlist registrations cleanly & idempotently
+      fixtureMgr.cleanup();
     }
 
     // ---------------------------------------------------------

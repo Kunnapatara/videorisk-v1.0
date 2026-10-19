@@ -268,10 +268,30 @@ export interface MediaAccessTokenPayload {
 }
 
 /**
- * Creates a cryptographically signed, short-lived media access token scoped strictly to a single resource.
- * Max duration: 300 seconds. Default duration: 120 seconds.
+ * Sanitizes and enforces the server-authoritative media access token duration contract:
+ * - Minimum: 10 seconds
+ * - Maximum: 300 seconds
+ * - Default: 120 seconds
+ * - Decimals: Floored to integer
+ * - Non-finite, NaN, Infinity, -Infinity, non-numeric: Default 120
  */
-export function createMediaAccessToken(userId: string, resourceId: string, durationSeconds: number = 120): string {
+export function sanitizeMediaTokenDuration(durationSeconds: any): number {
+  if (typeof durationSeconds === 'number' && Number.isFinite(durationSeconds) && !Number.isNaN(durationSeconds)) {
+    return Math.min(300, Math.max(10, Math.floor(durationSeconds)));
+  }
+  return 120;
+}
+
+/**
+ * Creates a cryptographically signed, short-lived media access token scoped strictly to a single resource.
+ * Max duration: 300 seconds. Default duration: 120 seconds. Minimum duration: 10 seconds.
+ */
+export function createMediaAccessToken(
+  userId: string, 
+  resourceId: string, 
+  durationSeconds: number = 120,
+  options?: { nowMs?: number }
+): string {
   if (!userId || typeof userId !== 'string') {
     throw new Error('Valid userId is required to create media access token.');
   }
@@ -280,15 +300,13 @@ export function createMediaAccessToken(userId: string, resourceId: string, durat
   }
 
   // Enforce production contract: duration must be clamped strictly within [10, 300] seconds, default 120
-  let safeDuration = 120;
-  if (typeof durationSeconds === 'number' && Number.isFinite(durationSeconds) && !Number.isNaN(durationSeconds)) {
-    safeDuration = Math.min(300, Math.max(10, Math.floor(durationSeconds)));
-  }
+  const safeDuration = sanitizeMediaTokenDuration(durationSeconds);
+  const baseTime = (typeof options?.nowMs === 'number' && Number.isFinite(options.nowMs)) ? options.nowMs : Date.now();
   const normalizedResource = resourceId.replace(/^\/+/, '').trim();
   const payload: MediaAccessTokenPayload = {
     userId: userId.trim(),
     resourceId: normalizedResource,
-    expiresAt: Date.now() + (safeDuration * 1000),
+    expiresAt: baseTime + (safeDuration * 1000),
     nonce: crypto.randomBytes(16).toString('hex')
   };
 
@@ -304,7 +322,11 @@ export function createMediaAccessToken(userId: string, resourceId: string, durat
  * 3. Token resourceId strictly matches the requested resource.
  * Returns the authenticated userId or null if invalid, expired, tampered, or out of scope.
  */
-export function verifyMediaAccessToken(tokenStr: string | undefined | null, requestedRelativePath: string): { userId: string } | null {
+export function verifyMediaAccessToken(
+  tokenStr: string | undefined | null, 
+  requestedRelativePath: string,
+  options?: { nowMs?: number }
+): { userId: string } | null {
   if (!tokenStr || typeof tokenStr !== 'string') {
     return null;
   }
@@ -335,8 +357,9 @@ export function verifyMediaAccessToken(tokenStr: string | undefined | null, requ
       return null;
     }
 
-    // Expiration check
-    if (Date.now() > payload.expiresAt) {
+    // Expiration check: production uses Date.now(); unit tests can inject nowMs if specified
+    const currentTime = (typeof options?.nowMs === 'number' && Number.isFinite(options.nowMs)) ? options.nowMs : Date.now();
+    if (currentTime > payload.expiresAt) {
       return null;
     }
 
@@ -2469,10 +2492,7 @@ apiRouter.post('/media/token', requireAuthMiddleware, async (req: Request, res: 
       return res.status(403).json({ error: 'Access denied: You do not own this media asset.' });
     }
 
-    let parsedDuration = 120;
-    if (typeof durationSeconds === 'number' && Number.isFinite(durationSeconds) && !Number.isNaN(durationSeconds)) {
-      parsedDuration = Math.min(300, Math.max(10, Math.floor(durationSeconds)));
-    }
+    const parsedDuration = sanitizeMediaTokenDuration(durationSeconds);
 
     const mediaToken = createMediaAccessToken(user.id, cleanFileId, parsedDuration);
     const expiresAt = new Date(Date.now() + (parsedDuration * 1000)).toISOString();
