@@ -2,7 +2,7 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
-import { apiRouter, configureTrustProxy, secureUploadsHandler } from './src/server/routes/api';
+import { apiRouter, configureTrustProxy, secureUploadsHandler, validateAndGetMediaTokenSecret } from './src/server/routes/api';
 
 dotenv.config();
 
@@ -13,6 +13,9 @@ async function startServer() {
   const app = express();
   const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
   const isProd = process.env.NODE_ENV === 'production';
+
+  // Validate critical security environment variables before accepting any traffic
+  validateAndGetMediaTokenSecret(process.env);
 
   // Configure and validate reverse proxy trust settings at startup
   configureTrustProxy(app, process.env.TRUST_PROXY);

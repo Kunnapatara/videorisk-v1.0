@@ -274,6 +274,7 @@ export interface ReScanComparison {
   resolvedIssues: string[];
   remainingIssues: string[];
   newIssues?: string[];
+  notVerifiedIssues?: string[];
   improvements: string[];
   comparisonSummary: string;
   originalRatios: {
@@ -284,6 +285,13 @@ export interface ReScanComparison {
     originalContribution?: number | null;
     reusedContent: number;
   };
+}
+
+export interface ComparisonOptions {
+  isRevisedFailed?: boolean;
+  revisedScanRecord?: { status?: string; error?: string };
+  originalScanRecord?: { status?: string; error?: string };
+  skippedDomains?: EvidenceDomain[];
 }
 
 export interface UserAccount {

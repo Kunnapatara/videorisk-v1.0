@@ -196,6 +196,24 @@ export function validateBillingConfiguration(
     });
   }
 
+  // 6. Media Access Token Secret Validation
+  const mediaTokenSecret = env.MEDIA_TOKEN_SECRET?.trim() || '';
+  if (!mediaTokenSecret) {
+    if (mode === 'production') {
+      issues.push({
+        type: 'WARNING',
+        variable: 'MEDIA_TOKEN_SECRET',
+        message: 'MEDIA_TOKEN_SECRET is not set. Production server startup will fail fast unless MEDIA_TOKEN_SECRET is provided.',
+      });
+    } else {
+      issues.push({
+        type: 'INFO',
+        variable: 'MEDIA_TOKEN_SECRET',
+        message: 'MEDIA_TOKEN_SECRET not set. Development server will operate with per-process random fallback secret.',
+      });
+    }
+  }
+
   const errorsCount = issues.filter((i) => i.type === 'ERROR').length;
   const warningsCount = issues.filter((i) => i.type === 'WARNING').length;
 

@@ -1,0 +1,3334 @@
+From 99165f196e75a58e851104515cc185a9046e29c0 Mon Sep 17 00:00:00 2001
+From: Kunnapatara <kunnapatara@yahoo.com>
+Date: Tue, 20 Oct 2026 07:21:30 +0000
+Subject: [PATCH] fix: implement re-scan verification, media token secret, and
+ CI workflow
+
+- Re-scan comparison semantics: support notVerifiedIssues and newIssues, evidence-backed domain resolution checks
+- Media token secret: enforce pre-shared non-empty secret in production with server startup guard and testability hook
+- CI & Dependencies: add GitHub Actions CI workflow and generate package-lock.json with aligned esbuild peer dependency
+---
+ .github/workflows/ci.yml                      |   38 +
+ package-lock.json                             | 2760 +++++++++++++++++
+ package.json                                  |    2 +-
+ scripts/validate-env.ts                       |   18 +
+ server.ts                                     |    5 +-
+ src/components/ComparisonView.tsx             |   64 +-
+ src/server/intelligence/policyIntelligence.ts |  185 +-
+ src/server/routes/api.ts                      |   45 +-
+ src/types/index.ts                            |    8 +
+ 9 files changed, 3085 insertions(+), 40 deletions(-)
+ create mode 100644 .github/workflows/ci.yml
+ create mode 100644 package-lock.json
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+index 0000000..5f847d8
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1,38 @@
++name: CI
++
++on:
++  push:
++    branches: [main]
++  pull_request:
++    branches: [main]
++
++concurrency:
++  group: ${{ github.workflow }}-${{ github.ref }}
++  cancel-in-progress: true
++
++jobs:
++  verify:
++    name: Lint, Test & Build
++    runs-on: ubuntu-latest
++
++    steps:
++      - name: Checkout repository
++        uses: actions/checkout@v4
++
++      - name: Setup Node.js
++        uses: actions/setup-node@v4
++        with:
++          node-version: 22
++          cache: 'npm'
++
++      - name: Install dependencies
++        run: npm ci
++
++      - name: Run linter and typecheck
++        run: npm run lint
++
++      - name: Run automated verification tests
++        run: npm test
++
++      - name: Run production build
++        run: npm run build
+diff --git a/package-lock.json b/package-lock.json
+new file mode 100644
+index 0000000..287f0f7
+--- /dev/null
++++ b/package-lock.json
+@@ -0,0 +1,2760 @@
++{
++  "name": "react-example",
++  "version": "0.0.0",
++  "lockfileVersion": 3,
++  "requires": true,
++  "packages": {
++    "": {
++      "name": "react-example",
++      "version": "0.0.0",
++      "dependencies": {
++        "@google/genai": "^2.4.0",
++        "@tailwindcss/vite": "^4.3.3",
++        "@vitejs/plugin-react": "^6.1.1",
++        "dotenv": "^17.2.3",
++        "express": "^4.21.2",
++        "lucide-react": "^0.546.0",
++        "motion": "^12.23.24",
++        "multer": "^2.4.0",
++        "react": "^19.0.1",
++        "react-dom": "^19.0.1",
++        "stripe": "^23.0.0",
++        "vite": "^8.3.0"
++      },
++      "devDependencies": {
++        "@types/express": "^4.17.21",
++        "@types/multer": "^2.3.0",
++        "@types/node": "^22.14.0",
++        "@types/react": "^19.3.0",
++        "@types/react-dom": "^19.3.0",
++        "autoprefixer": "^10.4.21",
++        "esbuild": "^0.28.0",
++        "tailwindcss": "^4.3.3",
++        "tsx": "^4.21.0",
++        "typescript": "^7.0.2"
++      }
++    },
++    "node_modules/@esbuild/aix-ppc64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/aix-ppc64/-/aix-ppc64-0.28.2.tgz",
++      "integrity": "sha512-XExcO+dvLKvVtNTibSTBej1NCAbaGhWn9Ww1ZPx80qsahhPFe/8jgWP0IchNe0F3HwkU7n8ejhH8bjonqht8mQ==",
++      "cpu": [
++        "ppc64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "aix"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/android-arm": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/android-arm/-/android-arm-0.28.2.tgz",
++      "integrity": "sha512-kXXoiPVVGQcnIYGOeaovwOURpniDBpSq4A03qkQ+BMQqtGG6HYap3xne9C1O1yo4TR3qxlCX5IqqmX6fFo2Lqg==",
++      "cpu": [
++        "arm"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "android"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/android-arm64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/android-arm64/-/android-arm64-0.28.2.tgz",
++      "integrity": "sha512-5YfKeeI8qWfBZIX+u2xZC3Zlb3Os/gLS2sbEKM+I4ZOcsWmHS2WLysCcQZDAFRslDUU5Oiq44gf6PYN1vGwG5A==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "android"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/android-x64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/android-x64/-/android-x64-0.28.2.tgz",
++      "integrity": "sha512-O387ite7SzUyCcy3JQX4P4bLtEA7bLLkx+esve5JHnyYfNTxcVpXZo9jhdB0lTKN44gztELTdU7nS8Nr16Fs1Q==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "android"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/darwin-arm64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/darwin-arm64/-/darwin-arm64-0.28.2.tgz",
++      "integrity": "sha512-n4KqkOQrraxHJcgjM1RvwbigfQKIKJVpM7xp+KsxiyUSrRdIXnt73VhrPAx0fV44hgfmIVKjxMN9J1t5jySVkw==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/darwin-x64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/darwin-x64/-/darwin-x64-0.28.2.tgz",
++      "integrity": "sha512-uq6suIWYP37qzGddBKPw5QEQPi6HiLGsO7UmkpfyaYNQ3D+rN6w6WfwH+nuqcGXWvawGwxOEroO4YGnFh95azw==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/freebsd-arm64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/freebsd-arm64/-/freebsd-arm64-0.28.2.tgz",
++      "integrity": "sha512-n+I0BTSRIoy+d6RPKnEVwql5UwBJolytvY4mAOIEJorKlqgPII8ix6slVVrfZ5Tnj7glIZvloylbB/EJPMWEXw==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "freebsd"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/freebsd-x64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/freebsd-x64/-/freebsd-x64-0.28.2.tgz",
++      "integrity": "sha512-78XJTJkvPs0kz2w61301PJjXl4g7q3JqiYMZ/M/yVI73EHBrCRTgkhu9oqG7vPqq+a/yadEW8aD+agKlk5xrmg==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "freebsd"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/linux-arm": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-arm/-/linux-arm-0.28.2.tgz",
++      "integrity": "sha512-XlDnu2q5yoqems+xay6wSAcg9DDD7K9RLKZEBOMZm3ckNpJBvOX20tSfby8KfrrhINDyv9V2YVZKY/SpoGJI8w==",
++      "cpu": [
++        "arm"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/linux-arm64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-arm64/-/linux-arm64-0.28.2.tgz",
++      "integrity": "sha512-pW4AC0P3it8c7do9MVM4p51FzHzdM/TZrerurgRcHJ2WTa1VQ1CIq18xncfpBJw4ojkiZZrKW2yIBWBP92j6Ug==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/linux-ia32": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-ia32/-/linux-ia32-0.28.2.tgz",
++      "integrity": "sha512-CYbnj78HsIeA+DhgUKgFCfvNsTHFhMMrinUrMZpDXJXKN8T3XViTZ/+wtHeVxEWY8ewSzTFN+nRmSwO2tZaLUQ==",
++      "cpu": [
++        "ia32"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/linux-loong64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-loong64/-/linux-loong64-0.28.2.tgz",
++      "integrity": "sha512-buwkd8nsph4R+ajRvw0qM5Hja/TXQow3ptzWO2EbG/cqcIkHloRrdlBtQlshyYGTNFvfkfJ5tpPLVkY4DtsPfQ==",
++      "cpu": [
++        "loong64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/linux-mips64el": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-mips64el/-/linux-mips64el-0.28.2.tgz",
++      "integrity": "sha512-ZVykbDyk7519VwiNb9Lcj9m8XM6v5V9uKPvrEMkkEedVewf+0itkhahp4HDpgERXhwLRpWFypsGbG/J8s0QjJA==",
++      "cpu": [
++        "mips64el"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/linux-ppc64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-ppc64/-/linux-ppc64-0.28.2.tgz",
++      "integrity": "sha512-CAXl+Dtd9UUuJd8pKKdwh6MLm3MUMiqMPmhZ3tTSXPqfyQ3vDl6R5hZdZ/kYojK4ofXtdfSv1tFq8XzWx3heNQ==",
++      "cpu": [
++        "ppc64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/linux-riscv64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-riscv64/-/linux-riscv64-0.28.2.tgz",
++      "integrity": "sha512-GeXCej4IQtU1B+QlDV8W/RRvbzI3O/Stss+/bCXv4lZls5WGRtu2a+3JkA3i4qIUlMXpcHebWpF8AkJhATowuA==",
++      "cpu": [
++        "riscv64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/linux-s390x": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-s390x/-/linux-s390x-0.28.2.tgz",
++      "integrity": "sha512-3H1weTYZPxt/WOhByszQZybS9w5lKzUn1FDMsgEChbHWQwHYQQRfBxgCcZvPhjHfKyJjIievvMmEUawJrdY9Dg==",
++      "cpu": [
++        "s390x"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/linux-x64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/linux-x64/-/linux-x64-0.28.2.tgz",
++      "integrity": "sha512-4xTZr1FUmSoQW4XIWmit3tzQrUTZM+N3P0XV8xROKYF50XfI7xeO90+1bZvNwxIufQ9hDQVRJH5YhgPVF8A/HQ==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/netbsd-arm64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/netbsd-arm64/-/netbsd-arm64-0.28.2.tgz",
++      "integrity": "sha512-sSATRjPeDBg3pdgHoQfoYBob11Kk1FGa9lui5RIHZCoCkJa9QKlvl3/vKz2usCmYYjs7ymJR/2Nnsqe+Hjt5nw==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "netbsd"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/netbsd-x64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/netbsd-x64/-/netbsd-x64-0.28.2.tgz",
++      "integrity": "sha512-lqnzCV+mM0gIADaKihiCg6ifgfU2L3h5E33rNQBN1Y4MaVGnzryzmvvf7UHxprpQdE8hpqLolJ9Rl+SkIRDpyw==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "netbsd"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/openbsd-arm64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/openbsd-arm64/-/openbsd-arm64-0.28.2.tgz",
++      "integrity": "sha512-AL2qJILH7lNjrDmCQDvdxMfAUIv8KMNZOvrwAQ8i8//ntL9FflhOyMJ8OZSMBb8/AWXe3/5v5S20y3zCoZWKoQ==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "openbsd"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/openbsd-x64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/openbsd-x64/-/openbsd-x64-0.28.2.tgz",
++      "integrity": "sha512-QtiuPytchRyC4rwUKhexJdQKvDuZ6hWloi3igqPQNUJCS1/v9EiO3UTOXR6A3FoMo4fnAKbWJdqaIwhOzh8qEw==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "openbsd"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/openharmony-arm64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/openharmony-arm64/-/openharmony-arm64-0.28.2.tgz",
++      "integrity": "sha512-WkhYDmpTjLvGlScA1rwjRUmhl4k8oXR3cIbtqWmELgU/dFeHHlEllxDvdWcNJV9rbzCexB5vz8gtNewWLgCT7Q==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "openharmony"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/sunos-x64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/sunos-x64/-/sunos-x64-0.28.2.tgz",
++      "integrity": "sha512-GPMSkTOtMnv2U2F8gxe4Io6qmVs+YKyp832Etqqxr0hFngmXQ3rzwytelm3GIn7T4VviRUlf3sOgBOiTdvaf7g==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "sunos"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/win32-arm64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/win32-arm64/-/win32-arm64-0.28.2.tgz",
++      "integrity": "sha512-PIhhEkE9uPBleRBrQEJpUn7MBnibZzbGzYWPmY3x+YoVg/95zbjB4CxPPOQ8l5tYYM4mMaCthF8/1DIfBQQyWQ==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/win32-ia32": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/win32-ia32/-/win32-ia32-0.28.2.tgz",
++      "integrity": "sha512-YmJbfTlvU7Sdn9BB+4PRES4oB6pxgS37MAONj+hBr/cpXS1aBPKXxNnDbu+QCWPj0o9dgyxeq79g6c5P8KeuYA==",
++      "cpu": [
++        "ia32"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@esbuild/win32-x64": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/@esbuild/win32-x64/-/win32-x64-0.28.2.tgz",
++      "integrity": "sha512-5ebpxr3nWMzrL/rnUI755Jkuee0bHL/Gq0WTF9lvcpv73wAp5eu8MfBUgWK9bhWvZjj7yX8etf/8tI8Ney695g==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/@google/genai": {
++      "version": "2.30.0",
++      "hasInstallScript": true,
++      "license": "Apache-2.0",
++      "dependencies": {
++        "google-auth-library": "^10.3.0",
++        "p-retry": "^4.6.2",
++        "protobufjs": "^7.5.4",
++        "ws": "^8.18.0"
++      },
++      "engines": {
++        "node": ">=20.0.0"
++      },
++      "peerDependencies": {
++        "@modelcontextprotocol/sdk": "^1.25.2"
++      },
++      "peerDependenciesMeta": {
++        "@modelcontextprotocol/sdk": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/@jridgewell/gen-mapping": {
++      "version": "0.3.13",
++      "license": "MIT",
++      "dependencies": {
++        "@jridgewell/sourcemap-codec": "^1.5.0",
++        "@jridgewell/trace-mapping": "^0.3.24"
++      }
++    },
++    "node_modules/@jridgewell/remapping": {
++      "version": "2.3.5",
++      "license": "MIT",
++      "dependencies": {
++        "@jridgewell/gen-mapping": "^0.3.5",
++        "@jridgewell/trace-mapping": "^0.3.24"
++      }
++    },
++    "node_modules/@jridgewell/resolve-uri": {
++      "version": "3.1.2",
++      "license": "MIT",
++      "engines": {
++        "node": ">=6.0.0"
++      }
++    },
++    "node_modules/@jridgewell/sourcemap-codec": {
++      "version": "1.6.0",
++      "license": "MIT"
++    },
++    "node_modules/@jridgewell/trace-mapping": {
++      "version": "0.3.31",
++      "license": "MIT",
++      "dependencies": {
++        "@jridgewell/resolve-uri": "^3.1.0",
++        "@jridgewell/sourcemap-codec": "^1.4.14"
++      }
++    },
++    "node_modules/@oxc-project/types": {
++      "version": "0.154.0",
++      "license": "MIT",
++      "funding": {
++        "url": "https://github.com/sponsors/oxc-project"
++      }
++    },
++    "node_modules/@protobufjs/aspromise": {
++      "version": "1.1.2",
++      "license": "BSD-3-Clause"
++    },
++    "node_modules/@protobufjs/base64": {
++      "version": "1.1.2",
++      "license": "BSD-3-Clause"
++    },
++    "node_modules/@protobufjs/codegen": {
++      "version": "2.0.5",
++      "license": "BSD-3-Clause"
++    },
++    "node_modules/@protobufjs/eventemitter": {
++      "version": "1.1.1",
++      "license": "BSD-3-Clause"
++    },
++    "node_modules/@protobufjs/fetch": {
++      "version": "1.1.1",
++      "license": "BSD-3-Clause",
++      "dependencies": {
++        "@protobufjs/aspromise": "^1.1.1"
++      }
++    },
++    "node_modules/@protobufjs/float": {
++      "version": "1.0.2",
++      "license": "BSD-3-Clause"
++    },
++    "node_modules/@protobufjs/path": {
++      "version": "1.1.2",
++      "license": "BSD-3-Clause"
++    },
++    "node_modules/@protobufjs/pool": {
++      "version": "1.1.0",
++      "license": "BSD-3-Clause"
++    },
++    "node_modules/@protobufjs/utf8": {
++      "version": "1.1.2",
++      "license": "BSD-3-Clause"
++    },
++    "node_modules/@rolldown/binding-linux-x64-gnu": {
++      "version": "1.2.14",
++      "cpu": [
++        "x64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
++    },
++    "node_modules/@rolldown/binding-linux-x64-musl": {
++      "version": "1.2.14",
++      "cpu": [
++        "x64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
++    },
++    "node_modules/@rolldown/pluginutils": {
++      "version": "1.0.1",
++      "license": "MIT"
++    },
++    "node_modules/@tailwindcss/node": {
++      "version": "4.3.3",
++      "license": "MIT",
++      "dependencies": {
++        "@jridgewell/remapping": "^2.3.5",
++        "enhanced-resolve": "^5.24.1",
++        "jiti": "^2.7.0",
++        "lightningcss": "1.32.0",
++        "magic-string": "^0.30.21",
++        "source-map-js": "^1.2.1",
++        "tailwindcss": "4.3.3"
++      }
++    },
++    "node_modules/@tailwindcss/node/node_modules/lightningcss": {
++      "version": "1.32.0",
++      "license": "MPL-2.0",
++      "dependencies": {
++        "detect-libc": "^2.0.3"
++      },
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      },
++      "optionalDependencies": {
++        "lightningcss-android-arm64": "1.32.0",
++        "lightningcss-darwin-arm64": "1.32.0",
++        "lightningcss-darwin-x64": "1.32.0",
++        "lightningcss-freebsd-x64": "1.32.0",
++        "lightningcss-linux-arm-gnueabihf": "1.32.0",
++        "lightningcss-linux-arm64-gnu": "1.32.0",
++        "lightningcss-linux-arm64-musl": "1.32.0",
++        "lightningcss-linux-x64-gnu": "1.32.0",
++        "lightningcss-linux-x64-musl": "1.32.0",
++        "lightningcss-win32-arm64-msvc": "1.32.0",
++        "lightningcss-win32-x64-msvc": "1.32.0"
++      }
++    },
++    "node_modules/@tailwindcss/node/node_modules/lightningcss/node_modules/lightningcss-linux-x64-gnu": {
++      "version": "1.32.0",
++      "cpu": [
++        "x64"
++      ],
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/@tailwindcss/node/node_modules/lightningcss/node_modules/lightningcss-linux-x64-musl": {
++      "version": "1.32.0",
++      "cpu": [
++        "x64"
++      ],
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/@tailwindcss/oxide": {
++      "version": "4.3.3",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 20"
++      },
++      "optionalDependencies": {
++        "@tailwindcss/oxide-android-arm64": "4.3.3",
++        "@tailwindcss/oxide-darwin-arm64": "4.3.3",
++        "@tailwindcss/oxide-darwin-x64": "4.3.3",
++        "@tailwindcss/oxide-freebsd-x64": "4.3.3",
++        "@tailwindcss/oxide-linux-arm-gnueabihf": "4.3.3",
++        "@tailwindcss/oxide-linux-arm64-gnu": "4.3.3",
++        "@tailwindcss/oxide-linux-arm64-musl": "4.3.3",
++        "@tailwindcss/oxide-linux-x64-gnu": "4.3.3",
++        "@tailwindcss/oxide-linux-x64-musl": "4.3.3",
++        "@tailwindcss/oxide-wasm32-wasi": "4.3.3",
++        "@tailwindcss/oxide-win32-arm64-msvc": "4.3.3",
++        "@tailwindcss/oxide-win32-x64-msvc": "4.3.3"
++      }
++    },
++    "node_modules/@tailwindcss/oxide-linux-x64-gnu": {
++      "version": "4.3.3",
++      "cpu": [
++        "x64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 20"
++      }
++    },
++    "node_modules/@tailwindcss/oxide-linux-x64-musl": {
++      "version": "4.3.3",
++      "cpu": [
++        "x64"
++      ],
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 20"
++      }
++    },
++    "node_modules/@tailwindcss/vite": {
++      "version": "4.3.3",
++      "license": "MIT",
++      "dependencies": {
++        "@tailwindcss/node": "4.3.3",
++        "@tailwindcss/oxide": "4.3.3",
++        "tailwindcss": "4.3.3"
++      },
++      "peerDependencies": {
++        "vite": "^5.2.0 || ^6 || ^7 || ^8"
++      }
++    },
++    "node_modules/@types/body-parser": {
++      "version": "1.19.6",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@types/connect": "*",
++        "@types/node": "*"
++      }
++    },
++    "node_modules/@types/body-parser/node_modules/@types/node": {
++      "version": "26.6.5",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "undici-types": "~8.9.0"
++      }
++    },
++    "node_modules/@types/body-parser/node_modules/@types/node/node_modules/undici-types": {
++      "version": "8.9.0",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/@types/connect": {
++      "version": "3.4.38",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@types/node": "*"
++      }
++    },
++    "node_modules/@types/connect/node_modules/@types/node": {
++      "version": "26.6.5",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "undici-types": "~8.9.0"
++      }
++    },
++    "node_modules/@types/connect/node_modules/@types/node/node_modules/undici-types": {
++      "version": "8.9.0",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/@types/express": {
++      "version": "4.17.25",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@types/body-parser": "*",
++        "@types/express-serve-static-core": "^4.17.33",
++        "@types/qs": "*",
++        "@types/serve-static": "^1"
++      }
++    },
++    "node_modules/@types/express-serve-static-core": {
++      "version": "4.19.9",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@types/node": "*",
++        "@types/qs": "*",
++        "@types/range-parser": "*",
++        "@types/send": "*"
++      }
++    },
++    "node_modules/@types/express-serve-static-core/node_modules/@types/node": {
++      "version": "26.6.5",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "undici-types": "~8.9.0"
++      }
++    },
++    "node_modules/@types/express-serve-static-core/node_modules/@types/node/node_modules/undici-types": {
++      "version": "8.9.0",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/@types/http-errors": {
++      "version": "2.0.5",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/@types/mime": {
++      "version": "1.3.5",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/@types/multer": {
++      "version": "2.3.0",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@types/express": "*"
++      }
++    },
++    "node_modules/@types/multer/node_modules/@types/express": {
++      "version": "5.0.6",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@types/body-parser": "*",
++        "@types/express-serve-static-core": "^5.0.0",
++        "@types/serve-static": "^2"
++      }
++    },
++    "node_modules/@types/multer/node_modules/@types/express/node_modules/@types/express-serve-static-core": {
++      "version": "5.1.3",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@types/node": "*",
++        "@types/qs": "*",
++        "@types/range-parser": "*",
++        "@types/send": "*"
++      }
++    },
++    "node_modules/@types/multer/node_modules/@types/express/node_modules/@types/express-serve-static-core/node_modules/@types/node": {
++      "version": "26.6.5",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "undici-types": "~8.9.0"
++      }
++    },
++    "node_modules/@types/multer/node_modules/@types/express/node_modules/@types/express-serve-static-core/node_modules/@types/node/node_modules/undici-types": {
++      "version": "8.9.0",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/@types/multer/node_modules/@types/express/node_modules/@types/serve-static": {
++      "version": "2.2.0",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@types/http-errors": "*",
++        "@types/node": "*"
++      }
++    },
++    "node_modules/@types/multer/node_modules/@types/express/node_modules/@types/serve-static/node_modules/@types/node": {
++      "version": "26.6.5",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "undici-types": "~8.9.0"
++      }
++    },
++    "node_modules/@types/multer/node_modules/@types/express/node_modules/@types/serve-static/node_modules/@types/node/node_modules/undici-types": {
++      "version": "8.9.0",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/@types/node": {
++      "version": "22.20.5",
++      "devOptional": true,
++      "license": "MIT",
++      "dependencies": {
++        "undici-types": "~6.21.0"
++      }
++    },
++    "node_modules/@types/qs": {
++      "version": "6.15.1",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/@types/range-parser": {
++      "version": "1.2.7",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/@types/react": {
++      "version": "19.3.0",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "csstype": "^3.2.2"
++      }
++    },
++    "node_modules/@types/react-dom": {
++      "version": "19.3.0",
++      "dev": true,
++      "license": "MIT",
++      "peerDependencies": {
++        "@types/react": "^19.3.0"
++      }
++    },
++    "node_modules/@types/retry": {
++      "version": "0.12.0",
++      "license": "MIT"
++    },
++    "node_modules/@types/send": {
++      "version": "1.2.1",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@types/node": "*"
++      }
++    },
++    "node_modules/@types/send/node_modules/@types/node": {
++      "version": "26.6.5",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "undici-types": "~8.9.0"
++      }
++    },
++    "node_modules/@types/send/node_modules/@types/node/node_modules/undici-types": {
++      "version": "8.9.0",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/@types/serve-static": {
++      "version": "1.15.10",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@types/http-errors": "*",
++        "@types/node": "*",
++        "@types/send": "<1"
++      }
++    },
++    "node_modules/@types/serve-static/node_modules/@types/node": {
++      "version": "26.6.5",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "undici-types": "~8.9.0"
++      }
++    },
++    "node_modules/@types/serve-static/node_modules/@types/node/node_modules/undici-types": {
++      "version": "8.9.0",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/@types/serve-static/node_modules/@types/send": {
++      "version": "0.17.6",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@types/mime": "^1",
++        "@types/node": "*"
++      }
++    },
++    "node_modules/@typescript/typescript-linux-x64": {
++      "version": "7.0.2",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "Apache-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">=16.20.0"
++      }
++    },
++    "node_modules/@vitejs/plugin-react": {
++      "version": "6.1.2",
++      "license": "MIT",
++      "dependencies": {
++        "@rolldown/pluginutils": "^1.0.1"
++      },
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      },
++      "peerDependencies": {
++        "@rolldown/plugin-babel": "^0.1.7 || ^0.2.0",
++        "babel-plugin-react-compiler": "^1.0.0",
++        "oxc-transform-react": "^0.152.0",
++        "vite": "^8.0.0"
++      },
++      "peerDependenciesMeta": {
++        "@rolldown/plugin-babel": {
++          "optional": true
++        },
++        "babel-plugin-react-compiler": {
++          "optional": true
++        },
++        "oxc-transform-react": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/accepts": {
++      "version": "1.3.8",
++      "license": "MIT",
++      "dependencies": {
++        "mime-types": "~2.1.34",
++        "negotiator": "0.6.3"
++      },
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/agent-base": {
++      "version": "7.1.4",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 14"
++      }
++    },
++    "node_modules/append-field": {
++      "version": "1.0.0",
++      "license": "MIT"
++    },
++    "node_modules/array-flatten": {
++      "version": "1.1.1",
++      "license": "MIT"
++    },
++    "node_modules/autoprefixer": {
++      "version": "10.6.1",
++      "dev": true,
++      "funding": [
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/postcss/"
++        },
++        {
++          "type": "tidelift",
++          "url": "https://tidelift.com/funding/github/npm/autoprefixer"
++        },
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "browserslist": "^4.28.9",
++        "caniuse-lite": "^1.0.30001810",
++        "fraction.js": "^5.3.4",
++        "picocolors": "^1.1.1",
++        "postcss-value-parser": "^4.2.0"
++      },
++      "bin": {
++        "autoprefixer": "bin/autoprefixer"
++      },
++      "engines": {
++        "node": "^10 || ^12 || >=14"
++      },
++      "peerDependencies": {
++        "postcss": "^8.1.0"
++      }
++    },
++    "node_modules/base64-js": {
++      "version": "1.5.1",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/feross"
++        },
++        {
++          "type": "patreon",
++          "url": "https://www.patreon.com/feross"
++        },
++        {
++          "type": "consulting",
++          "url": "https://feross.org/support"
++        }
++      ],
++      "license": "MIT"
++    },
++    "node_modules/baseline-browser-mapping": {
++      "version": "2.11.30",
++      "dev": true,
++      "license": "Apache-2.0",
++      "bin": {
++        "baseline-browser-mapping": "dist/cli.cjs"
++      },
++      "engines": {
++        "node": ">=6.0.0"
++      }
++    },
++    "node_modules/bignumber.js": {
++      "version": "9.3.1",
++      "license": "MIT",
++      "engines": {
++        "node": "*"
++      }
++    },
++    "node_modules/body-parser": {
++      "version": "1.20.8",
++      "license": "MIT",
++      "dependencies": {
++        "bytes": "~3.1.2",
++        "content-type": "~1.0.5",
++        "debug": "2.6.9",
++        "depd": "2.0.0",
++        "destroy": "~1.2.0",
++        "http-errors": "~2.0.1",
++        "iconv-lite": "~0.4.24",
++        "on-finished": "~2.4.1",
++        "qs": "~6.16.0",
++        "raw-body": "~2.5.3",
++        "type-is": "~1.6.18",
++        "unpipe": "~1.0.0"
++      },
++      "engines": {
++        "node": ">= 0.8",
++        "npm": "1.2.8000 || >= 1.4.16"
++      }
++    },
++    "node_modules/browserslist": {
++      "version": "4.29.4",
++      "dev": true,
++      "funding": [
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/browserslist"
++        },
++        {
++          "type": "tidelift",
++          "url": "https://tidelift.com/funding/github/npm/browserslist"
++        },
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "baseline-browser-mapping": "^2.11.29",
++        "caniuse-lite": "^1.0.30001816",
++        "electron-to-chromium": "^1.5.459",
++        "node-releases": "^2.0.59",
++        "update-browserslist-db": "^1.3.4"
++      },
++      "bin": {
++        "browserslist": "cli.js"
++      },
++      "engines": {
++        "node": "^6 || ^7 || ^8 || ^9 || ^10 || ^11 || ^12 || >=13.7"
++      }
++    },
++    "node_modules/buffer-equal-constant-time": {
++      "version": "1.0.1",
++      "license": "BSD-3-Clause"
++    },
++    "node_modules/busboy": {
++      "version": "1.6.0",
++      "dependencies": {
++        "streamsearch": "^1.1.0"
++      },
++      "engines": {
++        "node": ">=10.16.0"
++      }
++    },
++    "node_modules/bytes": {
++      "version": "3.1.2",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.8"
++      }
++    },
++    "node_modules/call-bind-apply-helpers": {
++      "version": "1.0.2",
++      "license": "MIT",
++      "dependencies": {
++        "es-errors": "^1.3.0",
++        "function-bind": "^1.1.2"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      }
++    },
++    "node_modules/call-bound": {
++      "version": "1.0.4",
++      "license": "MIT",
++      "dependencies": {
++        "call-bind-apply-helpers": "^1.0.2",
++        "get-intrinsic": "^1.3.0"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/caniuse-lite": {
++      "version": "1.0.30001817",
++      "dev": true,
++      "funding": [
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/browserslist"
++        },
++        {
++          "type": "tidelift",
++          "url": "https://tidelift.com/funding/github/npm/caniuse-lite"
++        },
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "CC-BY-4.0"
++    },
++    "node_modules/content-disposition": {
++      "version": "0.5.4",
++      "license": "MIT",
++      "dependencies": {
++        "safe-buffer": "5.2.1"
++      },
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/content-type": {
++      "version": "1.0.5",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/cookie": {
++      "version": "0.7.2",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/cookie-signature": {
++      "version": "1.0.7",
++      "license": "MIT"
++    },
++    "node_modules/csstype": {
++      "version": "3.2.3",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/data-uri-to-buffer": {
++      "version": "4.0.1",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 12"
++      }
++    },
++    "node_modules/debug": {
++      "version": "2.6.9",
++      "license": "MIT",
++      "dependencies": {
++        "ms": "2.0.0"
++      }
++    },
++    "node_modules/depd": {
++      "version": "2.0.0",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.8"
++      }
++    },
++    "node_modules/destroy": {
++      "version": "1.2.0",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.8",
++        "npm": "1.2.8000 || >= 1.4.16"
++      }
++    },
++    "node_modules/detect-libc": {
++      "version": "2.1.2",
++      "license": "Apache-2.0",
++      "engines": {
++        "node": ">=8"
++      }
++    },
++    "node_modules/dotenv": {
++      "version": "17.4.2",
++      "license": "BSD-2-Clause",
++      "engines": {
++        "node": ">=12"
++      },
++      "funding": {
++        "url": "https://dotenvx.com"
++      }
++    },
++    "node_modules/dunder-proto": {
++      "version": "1.0.1",
++      "license": "MIT",
++      "dependencies": {
++        "call-bind-apply-helpers": "^1.0.1",
++        "es-errors": "^1.3.0",
++        "gopd": "^1.2.0"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      }
++    },
++    "node_modules/ecdsa-sig-formatter": {
++      "version": "1.0.11",
++      "license": "Apache-2.0",
++      "dependencies": {
++        "safe-buffer": "^5.0.1"
++      }
++    },
++    "node_modules/ee-first": {
++      "version": "1.1.1",
++      "license": "MIT"
++    },
++    "node_modules/electron-to-chromium": {
++      "version": "1.5.460",
++      "dev": true,
++      "license": "ISC"
++    },
++    "node_modules/encodeurl": {
++      "version": "2.0.0",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.8"
++      }
++    },
++    "node_modules/enhanced-resolve": {
++      "version": "5.26.0",
++      "license": "MIT",
++      "dependencies": {
++        "graceful-fs": "^4.2.4",
++        "tapable": "^2.3.3"
++      },
++      "engines": {
++        "node": ">=10.13.0"
++      }
++    },
++    "node_modules/es-define-property": {
++      "version": "1.0.1",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.4"
++      }
++    },
++    "node_modules/es-errors": {
++      "version": "1.3.0",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.4"
++      }
++    },
++    "node_modules/es-object-atoms": {
++      "version": "1.1.2",
++      "license": "MIT",
++      "dependencies": {
++        "es-errors": "^1.3.0"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      }
++    },
++    "node_modules/esbuild": {
++      "version": "0.28.2",
++      "resolved": "https://registry.npmjs.org/esbuild/-/esbuild-0.28.2.tgz",
++      "integrity": "sha512-HKVLS8dvII+xoKW9kmqxbRKrnWEXfJJr/FZhhJmiqIB0e053QNYFqOBouTMO/k5sID4MvCiUCvv8b9M4h32wIA==",
++      "devOptional": true,
++      "hasInstallScript": true,
++      "license": "MIT",
++      "bin": {
++        "esbuild": "bin/esbuild"
++      },
++      "engines": {
++        "node": ">=18"
++      },
++      "optionalDependencies": {
++        "@esbuild/aix-ppc64": "0.28.2",
++        "@esbuild/android-arm": "0.28.2",
++        "@esbuild/android-arm64": "0.28.2",
++        "@esbuild/android-x64": "0.28.2",
++        "@esbuild/darwin-arm64": "0.28.2",
++        "@esbuild/darwin-x64": "0.28.2",
++        "@esbuild/freebsd-arm64": "0.28.2",
++        "@esbuild/freebsd-x64": "0.28.2",
++        "@esbuild/linux-arm": "0.28.2",
++        "@esbuild/linux-arm64": "0.28.2",
++        "@esbuild/linux-ia32": "0.28.2",
++        "@esbuild/linux-loong64": "0.28.2",
++        "@esbuild/linux-mips64el": "0.28.2",
++        "@esbuild/linux-ppc64": "0.28.2",
++        "@esbuild/linux-riscv64": "0.28.2",
++        "@esbuild/linux-s390x": "0.28.2",
++        "@esbuild/linux-x64": "0.28.2",
++        "@esbuild/netbsd-arm64": "0.28.2",
++        "@esbuild/netbsd-x64": "0.28.2",
++        "@esbuild/openbsd-arm64": "0.28.2",
++        "@esbuild/openbsd-x64": "0.28.2",
++        "@esbuild/openharmony-arm64": "0.28.2",
++        "@esbuild/sunos-x64": "0.28.2",
++        "@esbuild/win32-arm64": "0.28.2",
++        "@esbuild/win32-ia32": "0.28.2",
++        "@esbuild/win32-x64": "0.28.2"
++      }
++    },
++    "node_modules/escalade": {
++      "version": "3.2.0",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=6"
++      }
++    },
++    "node_modules/escape-html": {
++      "version": "1.0.3",
++      "license": "MIT"
++    },
++    "node_modules/etag": {
++      "version": "1.8.1",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/express": {
++      "version": "4.22.3",
++      "license": "MIT",
++      "dependencies": {
++        "accepts": "~1.3.8",
++        "array-flatten": "1.1.1",
++        "body-parser": "~1.20.5",
++        "content-disposition": "~0.5.4",
++        "content-type": "~1.0.4",
++        "cookie": "~0.7.1",
++        "cookie-signature": "~1.0.6",
++        "debug": "2.6.9",
++        "depd": "2.0.0",
++        "encodeurl": "~2.0.0",
++        "escape-html": "~1.0.3",
++        "etag": "~1.8.1",
++        "finalhandler": "~1.3.1",
++        "fresh": "~0.5.2",
++        "http-errors": "~2.0.0",
++        "merge-descriptors": "1.0.3",
++        "methods": "~1.1.2",
++        "on-finished": "~2.4.1",
++        "parseurl": "~1.3.3",
++        "path-to-regexp": "~0.1.13",
++        "proxy-addr": "~2.0.7",
++        "qs": "~6.16.0",
++        "range-parser": "~1.2.1",
++        "safe-buffer": "5.2.1",
++        "send": "~0.19.0",
++        "serve-static": "~1.16.2",
++        "setprototypeof": "1.2.0",
++        "statuses": "~2.0.1",
++        "type-is": "~1.6.18",
++        "utils-merge": "1.0.1",
++        "vary": "~1.1.2"
++      },
++      "engines": {
++        "node": ">= 0.10.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/express"
++      }
++    },
++    "node_modules/extend": {
++      "version": "3.0.2",
++      "license": "MIT"
++    },
++    "node_modules/fdir": {
++      "version": "6.5.0",
++      "license": "MIT",
++      "engines": {
++        "node": ">=12.0.0"
++      },
++      "peerDependencies": {
++        "picomatch": "^3 || ^4"
++      },
++      "peerDependenciesMeta": {
++        "picomatch": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/fetch-blob": {
++      "version": "3.2.0",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/jimmywarting"
++        },
++        {
++          "type": "paypal",
++          "url": "https://paypal.me/jimmywarting"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "node-domexception": "^1.0.0",
++        "web-streams-polyfill": "^3.0.3"
++      },
++      "engines": {
++        "node": "^12.20 || >= 14.13"
++      }
++    },
++    "node_modules/finalhandler": {
++      "version": "1.3.2",
++      "license": "MIT",
++      "dependencies": {
++        "debug": "2.6.9",
++        "encodeurl": "~2.0.0",
++        "escape-html": "~1.0.3",
++        "on-finished": "~2.4.1",
++        "parseurl": "~1.3.3",
++        "statuses": "~2.0.2",
++        "unpipe": "~1.0.0"
++      },
++      "engines": {
++        "node": ">= 0.8"
++      }
++    },
++    "node_modules/formdata-polyfill": {
++      "version": "4.0.10",
++      "license": "MIT",
++      "dependencies": {
++        "fetch-blob": "^3.1.2"
++      },
++      "engines": {
++        "node": ">=12.20.0"
++      }
++    },
++    "node_modules/forwarded": {
++      "version": "0.2.0",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/fraction.js": {
++      "version": "5.3.4",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": "*"
++      },
++      "funding": {
++        "type": "github",
++        "url": "https://github.com/sponsors/rawify"
++      }
++    },
++    "node_modules/framer-motion": {
++      "version": "12.43.0",
++      "license": "MIT",
++      "dependencies": {
++        "motion-dom": "^12.43.0",
++        "motion-utils": "^12.39.0",
++        "tslib": "^2.4.0"
++      },
++      "peerDependencies": {
++        "@emotion/is-prop-valid": "*",
++        "react": "^18.0.0 || ^19.0.0",
++        "react-dom": "^18.0.0 || ^19.0.0"
++      },
++      "peerDependenciesMeta": {
++        "@emotion/is-prop-valid": {
++          "optional": true
++        },
++        "react": {
++          "optional": true
++        },
++        "react-dom": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/fresh": {
++      "version": "0.5.2",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/fsevents": {
++      "version": "2.3.3",
++      "resolved": "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz",
++      "integrity": "sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==",
++      "hasInstallScript": true,
++      "license": "MIT",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "engines": {
++        "node": "^8.16.0 || ^10.6.0 || >=11.0.0"
++      }
++    },
++    "node_modules/function-bind": {
++      "version": "1.1.2",
++      "license": "MIT",
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/gaxios": {
++      "version": "7.3.1",
++      "license": "Apache-2.0",
++      "dependencies": {
++        "extend": "^3.0.2",
++        "https-proxy-agent": "^7.0.1",
++        "node-fetch": "^3.3.2"
++      },
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/gcp-metadata": {
++      "version": "8.1.2",
++      "license": "Apache-2.0",
++      "dependencies": {
++        "gaxios": "^7.0.0",
++        "google-logging-utils": "^1.0.0",
++        "json-bigint": "^1.0.0"
++      },
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/get-intrinsic": {
++      "version": "1.3.0",
++      "license": "MIT",
++      "dependencies": {
++        "call-bind-apply-helpers": "^1.0.2",
++        "es-define-property": "^1.0.1",
++        "es-errors": "^1.3.0",
++        "es-object-atoms": "^1.1.1",
++        "function-bind": "^1.1.2",
++        "get-proto": "^1.0.1",
++        "gopd": "^1.2.0",
++        "has-symbols": "^1.1.0",
++        "hasown": "^2.0.2",
++        "math-intrinsics": "^1.1.0"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/get-proto": {
++      "version": "1.0.1",
++      "license": "MIT",
++      "dependencies": {
++        "dunder-proto": "^1.0.1",
++        "es-object-atoms": "^1.0.0"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      }
++    },
++    "node_modules/google-auth-library": {
++      "version": "10.9.1",
++      "license": "Apache-2.0",
++      "dependencies": {
++        "base64-js": "^1.3.0",
++        "ecdsa-sig-formatter": "^1.0.11",
++        "gaxios": "^7.1.4",
++        "gcp-metadata": "8.1.2",
++        "google-logging-utils": "1.1.3",
++        "jws": "^4.0.0"
++      },
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/google-logging-utils": {
++      "version": "1.1.3",
++      "license": "Apache-2.0",
++      "engines": {
++        "node": ">=14"
++      }
++    },
++    "node_modules/gopd": {
++      "version": "1.2.0",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/graceful-fs": {
++      "version": "4.2.11",
++      "license": "ISC"
++    },
++    "node_modules/has-symbols": {
++      "version": "1.1.0",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/hasown": {
++      "version": "2.0.4",
++      "license": "MIT",
++      "dependencies": {
++        "function-bind": "^1.1.2"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      }
++    },
++    "node_modules/http-errors": {
++      "version": "2.0.1",
++      "license": "MIT",
++      "dependencies": {
++        "depd": "~2.0.0",
++        "inherits": "~2.0.4",
++        "setprototypeof": "~1.2.0",
++        "statuses": "~2.0.2",
++        "toidentifier": "~1.0.1"
++      },
++      "engines": {
++        "node": ">= 0.8"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/express"
++      }
++    },
++    "node_modules/https-proxy-agent": {
++      "version": "7.0.6",
++      "license": "MIT",
++      "dependencies": {
++        "agent-base": "^7.1.2",
++        "debug": "4"
++      },
++      "engines": {
++        "node": ">= 14"
++      }
++    },
++    "node_modules/https-proxy-agent/node_modules/debug": {
++      "version": "4.4.3",
++      "license": "MIT",
++      "dependencies": {
++        "ms": "^2.1.3"
++      },
++      "engines": {
++        "node": ">=6.0"
++      },
++      "peerDependenciesMeta": {
++        "supports-color": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/https-proxy-agent/node_modules/debug/node_modules/ms": {
++      "version": "2.1.3",
++      "license": "MIT"
++    },
++    "node_modules/iconv-lite": {
++      "version": "0.4.24",
++      "license": "MIT",
++      "dependencies": {
++        "safer-buffer": ">= 2.1.2 < 3"
++      },
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
++    "node_modules/inherits": {
++      "version": "2.0.4",
++      "license": "ISC"
++    },
++    "node_modules/ipaddr.js": {
++      "version": "1.9.1",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.10"
++      }
++    },
++    "node_modules/jiti": {
++      "version": "2.7.0",
++      "license": "MIT",
++      "bin": {
++        "jiti": "lib/jiti-cli.mjs"
++      }
++    },
++    "node_modules/json-bigint": {
++      "version": "1.0.0",
++      "license": "MIT",
++      "dependencies": {
++        "bignumber.js": "^9.0.0"
++      }
++    },
++    "node_modules/jwa": {
++      "version": "2.0.1",
++      "license": "MIT",
++      "dependencies": {
++        "buffer-equal-constant-time": "^1.0.1",
++        "ecdsa-sig-formatter": "1.0.11",
++        "safe-buffer": "^5.0.1"
++      }
++    },
++    "node_modules/jws": {
++      "version": "4.0.1",
++      "license": "MIT",
++      "dependencies": {
++        "jwa": "^2.0.1",
++        "safe-buffer": "^5.0.1"
++      }
++    },
++    "node_modules/lightningcss": {
++      "version": "1.33.0",
++      "license": "MPL-2.0",
++      "dependencies": {
++        "detect-libc": "^2.0.3"
++      },
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      },
++      "optionalDependencies": {
++        "lightningcss-android-arm64": "1.33.0",
++        "lightningcss-darwin-arm64": "1.33.0",
++        "lightningcss-darwin-x64": "1.33.0",
++        "lightningcss-freebsd-x64": "1.33.0",
++        "lightningcss-linux-arm-gnueabihf": "1.33.0",
++        "lightningcss-linux-arm64-gnu": "1.33.0",
++        "lightningcss-linux-arm64-musl": "1.33.0",
++        "lightningcss-linux-x64-gnu": "1.33.0",
++        "lightningcss-linux-x64-musl": "1.33.0",
++        "lightningcss-win32-arm64-msvc": "1.33.0",
++        "lightningcss-win32-x64-msvc": "1.33.0"
++      }
++    },
++    "node_modules/lightningcss-linux-x64-gnu": {
++      "version": "1.33.0",
++      "cpu": [
++        "x64"
++      ],
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/lightningcss-linux-x64-musl": {
++      "version": "1.33.0",
++      "cpu": [
++        "x64"
++      ],
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/long": {
++      "version": "5.3.2",
++      "license": "Apache-2.0"
++    },
++    "node_modules/lucide-react": {
++      "version": "0.546.0",
++      "license": "ISC",
++      "peerDependencies": {
++        "react": "^16.5.1 || ^17.0.0 || ^18.0.0 || ^19.0.0"
++      }
++    },
++    "node_modules/magic-string": {
++      "version": "0.30.21",
++      "license": "MIT",
++      "dependencies": {
++        "@jridgewell/sourcemap-codec": "^1.5.5"
++      }
++    },
++    "node_modules/math-intrinsics": {
++      "version": "1.1.0",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.4"
++      }
++    },
++    "node_modules/media-typer": {
++      "version": "0.3.0",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/merge-descriptors": {
++      "version": "1.0.3",
++      "license": "MIT",
++      "funding": {
++        "url": "https://github.com/sponsors/sindresorhus"
++      }
++    },
++    "node_modules/methods": {
++      "version": "1.1.2",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/mime": {
++      "version": "1.6.0",
++      "license": "MIT",
++      "bin": {
++        "mime": "cli.js"
++      },
++      "engines": {
++        "node": ">=4"
++      }
++    },
++    "node_modules/mime-db": {
++      "version": "1.52.0",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/mime-types": {
++      "version": "2.1.35",
++      "license": "MIT",
++      "dependencies": {
++        "mime-db": "1.52.0"
++      },
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/motion": {
++      "version": "12.43.0",
++      "license": "MIT",
++      "dependencies": {
++        "framer-motion": "^12.43.0",
++        "tslib": "^2.4.0"
++      },
++      "peerDependencies": {
++        "@emotion/is-prop-valid": "*",
++        "react": "^18.0.0 || ^19.0.0",
++        "react-dom": "^18.0.0 || ^19.0.0"
++      },
++      "peerDependenciesMeta": {
++        "@emotion/is-prop-valid": {
++          "optional": true
++        },
++        "react": {
++          "optional": true
++        },
++        "react-dom": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/motion-dom": {
++      "version": "12.43.0",
++      "license": "MIT",
++      "dependencies": {
++        "motion-utils": "^12.39.0"
++      }
++    },
++    "node_modules/motion-utils": {
++      "version": "12.39.0",
++      "license": "MIT"
++    },
++    "node_modules/ms": {
++      "version": "2.0.0",
++      "license": "MIT"
++    },
++    "node_modules/multer": {
++      "version": "2.4.0",
++      "license": "MIT",
++      "dependencies": {
++        "append-field": "^1.0.0",
++        "busboy": "^1.6.0",
++        "type-is": "^1.6.18"
++      },
++      "engines": {
++        "node": ">= 10.16.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/express"
++      }
++    },
++    "node_modules/nanoid": {
++      "version": "3.3.20",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "MIT",
++      "bin": {
++        "nanoid": "bin/nanoid.cjs"
++      },
++      "engines": {
++        "node": "^10 || ^12 || ^13.7 || ^14 || >=15.0.1"
++      }
++    },
++    "node_modules/negotiator": {
++      "version": "0.6.3",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/node-domexception": {
++      "version": "1.0.0",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/jimmywarting"
++        },
++        {
++          "type": "github",
++          "url": "https://paypal.me/jimmywarting"
++        }
++      ],
++      "license": "MIT",
++      "engines": {
++        "node": ">=10.5.0"
++      }
++    },
++    "node_modules/node-fetch": {
++      "version": "3.3.2",
++      "license": "MIT",
++      "dependencies": {
++        "data-uri-to-buffer": "^4.0.0",
++        "fetch-blob": "^3.1.4",
++        "formdata-polyfill": "^4.0.10"
++      },
++      "engines": {
++        "node": "^12.20.0 || ^14.13.1 || >=16.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/node-fetch"
++      }
++    },
++    "node_modules/node-releases": {
++      "version": "2.0.59",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/object-inspect": {
++      "version": "1.13.4",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/on-finished": {
++      "version": "2.4.1",
++      "license": "MIT",
++      "dependencies": {
++        "ee-first": "1.1.1"
++      },
++      "engines": {
++        "node": ">= 0.8"
++      }
++    },
++    "node_modules/p-retry": {
++      "version": "4.6.2",
++      "license": "MIT",
++      "dependencies": {
++        "@types/retry": "0.12.0",
++        "retry": "^0.13.1"
++      },
++      "engines": {
++        "node": ">=8"
++      }
++    },
++    "node_modules/parseurl": {
++      "version": "1.3.3",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.8"
++      }
++    },
++    "node_modules/path-to-regexp": {
++      "version": "0.1.13",
++      "license": "MIT"
++    },
++    "node_modules/picocolors": {
++      "version": "1.1.1",
++      "license": "ISC"
++    },
++    "node_modules/picomatch": {
++      "version": "4.0.7",
++      "license": "MIT",
++      "engines": {
++        "node": ">=12"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/jonschlinkert"
++      }
++    },
++    "node_modules/postcss": {
++      "version": "8.5.31",
++      "funding": [
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/postcss/"
++        },
++        {
++          "type": "tidelift",
++          "url": "https://tidelift.com/funding/github/npm/postcss"
++        },
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "nanoid": "^3.3.20",
++        "picocolors": "^1.1.1",
++        "source-map-js": "^1.2.2"
++      },
++      "engines": {
++        "node": "^10 || ^12 || >=14"
++      }
++    },
++    "node_modules/postcss-value-parser": {
++      "version": "4.2.0",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/protobufjs": {
++      "version": "7.6.6",
++      "hasInstallScript": true,
++      "license": "BSD-3-Clause",
++      "dependencies": {
++        "@protobufjs/aspromise": "^1.1.2",
++        "@protobufjs/base64": "^1.1.2",
++        "@protobufjs/codegen": "^2.0.5",
++        "@protobufjs/eventemitter": "^1.1.1",
++        "@protobufjs/fetch": "^1.1.1",
++        "@protobufjs/float": "^1.0.2",
++        "@protobufjs/path": "^1.1.2",
++        "@protobufjs/pool": "^1.1.0",
++        "@protobufjs/utf8": "^1.1.1",
++        "@types/node": ">=13.7.0",
++        "long": "^5.3.2"
++      },
++      "engines": {
++        "node": ">=12.0.0"
++      }
++    },
++    "node_modules/protobufjs/node_modules/@types/node": {
++      "version": "26.6.5",
++      "license": "MIT",
++      "dependencies": {
++        "undici-types": "~8.9.0"
++      }
++    },
++    "node_modules/protobufjs/node_modules/@types/node/node_modules/undici-types": {
++      "version": "8.9.0",
++      "license": "MIT"
++    },
++    "node_modules/proxy-addr": {
++      "version": "2.0.8",
++      "license": "MIT",
++      "dependencies": {
++        "forwarded": "0.2.0",
++        "ipaddr.js": "1.9.1"
++      },
++      "engines": {
++        "node": ">= 0.10"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/express"
++      }
++    },
++    "node_modules/qs": {
++      "version": "6.16.1",
++      "license": "BSD-3-Clause",
++      "dependencies": {
++        "es-define-property": "^1.0.1",
++        "side-channel": "^1.1.1"
++      },
++      "engines": {
++        "node": ">=0.6"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/range-parser": {
++      "version": "1.2.1",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/raw-body": {
++      "version": "2.5.3",
++      "license": "MIT",
++      "dependencies": {
++        "bytes": "~3.1.2",
++        "http-errors": "~2.0.1",
++        "iconv-lite": "~0.4.24",
++        "unpipe": "~1.0.0"
++      },
++      "engines": {
++        "node": ">= 0.8"
++      }
++    },
++    "node_modules/react": {
++      "version": "19.3.1",
++      "license": "MIT",
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
++    "node_modules/react-dom": {
++      "version": "19.3.1",
++      "license": "MIT",
++      "dependencies": {
++        "scheduler": "^0.28.0"
++      },
++      "peerDependencies": {
++        "react": "^19.3.1"
++      }
++    },
++    "node_modules/retry": {
++      "version": "0.13.1",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 4"
++      }
++    },
++    "node_modules/rolldown": {
++      "version": "1.2.14",
++      "license": "MIT",
++      "dependencies": {
++        "@oxc-project/types": "=0.154.0",
++        "@rolldown/pluginutils": "^1.0.0"
++      },
++      "bin": {
++        "rolldown": "bin/cli.mjs"
++      },
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      },
++      "optionalDependencies": {
++        "@rolldown/binding-android-arm-eabi": "1.2.14",
++        "@rolldown/binding-android-arm64": "1.2.14",
++        "@rolldown/binding-darwin-arm64": "1.2.14",
++        "@rolldown/binding-darwin-x64": "1.2.14",
++        "@rolldown/binding-freebsd-x64": "1.2.14",
++        "@rolldown/binding-linux-arm-gnueabihf": "1.2.14",
++        "@rolldown/binding-linux-arm64-gnu": "1.2.14",
++        "@rolldown/binding-linux-arm64-musl": "1.2.14",
++        "@rolldown/binding-linux-ppc64-gnu": "1.2.14",
++        "@rolldown/binding-linux-s390x-gnu": "1.2.14",
++        "@rolldown/binding-linux-x64-gnu": "1.2.14",
++        "@rolldown/binding-linux-x64-musl": "1.2.14",
++        "@rolldown/binding-openharmony-arm64": "1.2.14",
++        "@rolldown/binding-win32-arm64-msvc": "1.2.14",
++        "@rolldown/binding-win32-x64-msvc": "1.2.14"
++      }
++    },
++    "node_modules/safe-buffer": {
++      "version": "5.2.1",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/feross"
++        },
++        {
++          "type": "patreon",
++          "url": "https://www.patreon.com/feross"
++        },
++        {
++          "type": "consulting",
++          "url": "https://feross.org/support"
++        }
++      ],
++      "license": "MIT"
++    },
++    "node_modules/safer-buffer": {
++      "version": "2.1.2",
++      "license": "MIT"
++    },
++    "node_modules/scheduler": {
++      "version": "0.28.0",
++      "license": "MIT"
++    },
++    "node_modules/send": {
++      "version": "0.19.2",
++      "license": "MIT",
++      "dependencies": {
++        "debug": "2.6.9",
++        "depd": "2.0.0",
++        "destroy": "1.2.0",
++        "encodeurl": "~2.0.0",
++        "escape-html": "~1.0.3",
++        "etag": "~1.8.1",
++        "fresh": "~0.5.2",
++        "http-errors": "~2.0.1",
++        "mime": "1.6.0",
++        "ms": "2.1.3",
++        "on-finished": "~2.4.1",
++        "range-parser": "~1.2.1",
++        "statuses": "~2.0.2"
++      },
++      "engines": {
++        "node": ">= 0.8.0"
++      }
++    },
++    "node_modules/send/node_modules/ms": {
++      "version": "2.1.3",
++      "license": "MIT"
++    },
++    "node_modules/serve-static": {
++      "version": "1.16.3",
++      "license": "MIT",
++      "dependencies": {
++        "encodeurl": "~2.0.0",
++        "escape-html": "~1.0.3",
++        "parseurl": "~1.3.3",
++        "send": "~0.19.1"
++      },
++      "engines": {
++        "node": ">= 0.8.0"
++      }
++    },
++    "node_modules/setprototypeof": {
++      "version": "1.2.0",
++      "license": "ISC"
++    },
++    "node_modules/side-channel": {
++      "version": "1.1.1",
++      "license": "MIT",
++      "dependencies": {
++        "es-errors": "^1.3.0",
++        "object-inspect": "^1.13.4",
++        "side-channel-list": "^1.0.1",
++        "side-channel-map": "^1.0.1",
++        "side-channel-weakmap": "^1.0.2"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/side-channel-list": {
++      "version": "1.0.1",
++      "license": "MIT",
++      "dependencies": {
++        "es-errors": "^1.3.0",
++        "object-inspect": "^1.13.4"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/side-channel-map": {
++      "version": "1.0.1",
++      "license": "MIT",
++      "dependencies": {
++        "call-bound": "^1.0.2",
++        "es-errors": "^1.3.0",
++        "get-intrinsic": "^1.2.5",
++        "object-inspect": "^1.13.3"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/side-channel-weakmap": {
++      "version": "1.0.2",
++      "license": "MIT",
++      "dependencies": {
++        "call-bound": "^1.0.2",
++        "es-errors": "^1.3.0",
++        "get-intrinsic": "^1.2.5",
++        "object-inspect": "^1.13.3",
++        "side-channel-map": "^1.0.1"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/source-map-js": {
++      "version": "1.2.2",
++      "license": "BSD-3-Clause",
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
++    "node_modules/statuses": {
++      "version": "2.0.2",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.8"
++      }
++    },
++    "node_modules/streamsearch": {
++      "version": "1.1.0",
++      "engines": {
++        "node": ">=10.0.0"
++      }
++    },
++    "node_modules/stripe": {
++      "version": "23.0.0",
++      "license": "MIT",
++      "engines": {
++        "node": ">=20"
++      },
++      "peerDependencies": {
++        "@types/node": ">=20"
++      },
++      "peerDependenciesMeta": {
++        "@types/node": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/tailwindcss": {
++      "version": "4.3.3",
++      "license": "MIT"
++    },
++    "node_modules/tapable": {
++      "version": "2.3.3",
++      "license": "MIT",
++      "engines": {
++        "node": ">=6"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/webpack"
++      }
++    },
++    "node_modules/tinyglobby": {
++      "version": "0.2.17",
++      "license": "MIT",
++      "dependencies": {
++        "fdir": "^6.5.0",
++        "picomatch": "^4.0.4"
++      },
++      "engines": {
++        "node": ">=12.0.0"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/SuperchupuDev"
++      }
++    },
++    "node_modules/toidentifier": {
++      "version": "1.0.1",
++      "license": "MIT",
++      "engines": {
++        "node": ">=0.6"
++      }
++    },
++    "node_modules/tslib": {
++      "version": "2.8.1",
++      "license": "0BSD"
++    },
++    "node_modules/tsx": {
++      "version": "4.23.15",
++      "devOptional": true,
++      "license": "MIT",
++      "dependencies": {
++        "esbuild": "~0.28.0"
++      },
++      "bin": {
++        "tsx": "dist/cli.mjs"
++      },
++      "engines": {
++        "node": ">=18.0.0"
++      },
++      "optionalDependencies": {
++        "fsevents": "~2.3.3"
++      }
++    },
++    "node_modules/type-is": {
++      "version": "1.6.18",
++      "license": "MIT",
++      "dependencies": {
++        "media-typer": "0.3.0",
++        "mime-types": "~2.1.24"
++      },
++      "engines": {
++        "node": ">= 0.6"
++      }
++    },
++    "node_modules/typescript": {
++      "version": "7.0.2",
++      "dev": true,
++      "license": "Apache-2.0",
++      "bin": {
++        "tsc": "bin/tsc"
++      },
++      "engines": {
++        "node": ">=16.20.0"
++      },
++      "optionalDependencies": {
++        "@typescript/typescript-aix-ppc64": "7.0.2",
++        "@typescript/typescript-darwin-arm64": "7.0.2",
++        "@typescript/typescript-darwin-x64": "7.0.2",
++        "@typescript/typescript-freebsd-arm64": "7.0.2",
++        "@typescript/typescript-freebsd-x64": "7.0.2",
++        "@typescript/typescript-linux-arm": "7.0.2",
++        "@typescript/typescript-linux-arm64": "7.0.2",
++        "@typescript/typescript-linux-loong64": "7.0.2",
++        "@typescript/typescript-linux-mips64el": "7.0.2",
++        "@typescript/typescript-linux-ppc64": "7.0.2",
++        "@typescript/typescript-linux-riscv64": "7.0.2",
++        "@typescript/typescript-linux-s390x": "7.0.2",
++        "@typescript/typescript-linux-x64": "7.0.2",
++        "@typescript/typescript-netbsd-arm64": "7.0.2",
++        "@typescript/typescript-netbsd-x64": "7.0.2",
++        "@typescript/typescript-openbsd-arm64": "7.0.2",
++        "@typescript/typescript-openbsd-x64": "7.0.2",
++        "@typescript/typescript-sunos-x64": "7.0.2",
++        "@typescript/typescript-win32-arm64": "7.0.2",
++        "@typescript/typescript-win32-x64": "7.0.2"
++      }
++    },
++    "node_modules/undici-types": {
++      "version": "6.21.0",
++      "devOptional": true,
++      "license": "MIT"
++    },
++    "node_modules/unpipe": {
++      "version": "1.0.0",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.8"
++      }
++    },
++    "node_modules/update-browserslist-db": {
++      "version": "1.3.4",
++      "dev": true,
++      "funding": [
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/browserslist"
++        },
++        {
++          "type": "tidelift",
++          "url": "https://tidelift.com/funding/github/npm/browserslist"
++        },
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "escalade": "^3.2.0",
++        "picocolors": "^1.1.1"
++      },
++      "bin": {
++        "update-browserslist-db": "cli.js"
++      },
++      "peerDependencies": {
++        "browserslist": ">= 4.21.0"
++      }
++    },
++    "node_modules/utils-merge": {
++      "version": "1.0.1",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.4.0"
++      }
++    },
++    "node_modules/vary": {
++      "version": "1.1.2",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.8"
++      }
++    },
++    "node_modules/vite": {
++      "version": "8.3.4",
++      "license": "MIT",
++      "dependencies": {
++        "lightningcss": "^1.33.0",
++        "picomatch": "^4.0.7",
++        "postcss": "^8.5.29",
++        "rolldown": "~1.2.12",
++        "tinyglobby": "^0.2.17"
++      },
++      "bin": {
++        "vite": "bin/vite.js"
++      },
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      },
++      "funding": {
++        "url": "https://github.com/vitejs/vite?sponsor=1"
++      },
++      "optionalDependencies": {
++        "fsevents": "~2.3.3"
++      },
++      "peerDependencies": {
++        "@types/node": "^20.19.0 || >=22.12.0",
++        "@vitejs/devtools": "^0.7.1",
++        "esbuild": "^0.27.0 || ^0.28.0",
++        "jiti": ">=1.21.0",
++        "less": "^4.0.0",
++        "sass": "^1.70.0",
++        "sass-embedded": "^1.70.0",
++        "stylus": ">=0.54.8",
++        "sugarss": "^5.0.0",
++        "terser": "^5.16.0",
++        "tsx": "^4.8.1",
++        "yaml": "^2.4.2"
++      },
++      "peerDependenciesMeta": {
++        "@types/node": {
++          "optional": true
++        },
++        "@vitejs/devtools": {
++          "optional": true
++        },
++        "esbuild": {
++          "optional": true
++        },
++        "jiti": {
++          "optional": true
++        },
++        "less": {
++          "optional": true
++        },
++        "sass": {
++          "optional": true
++        },
++        "sass-embedded": {
++          "optional": true
++        },
++        "stylus": {
++          "optional": true
++        },
++        "sugarss": {
++          "optional": true
++        },
++        "terser": {
++          "optional": true
++        },
++        "tsx": {
++          "optional": true
++        },
++        "yaml": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/web-streams-polyfill": {
++      "version": "3.3.3",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 8"
++      }
++    },
++    "node_modules/ws": {
++      "version": "8.22.0",
++      "license": "MIT",
++      "engines": {
++        "node": ">=10.0.0"
++      },
++      "peerDependencies": {
++        "bufferutil": "^4.0.1",
++        "utf-8-validate": ">=5.0.2"
++      },
++      "peerDependenciesMeta": {
++        "bufferutil": {
++          "optional": true
++        },
++        "utf-8-validate": {
++          "optional": true
++        }
++      }
++    }
++  }
++}
+diff --git a/package.json b/package.json
+index 2ca6054..89868c4 100644
+--- a/package.json
++++ b/package.json
+@@ -34,7 +34,7 @@
+     "@types/react": "^19.3.0",
+     "@types/react-dom": "^19.3.0",
+     "autoprefixer": "^10.4.21",
+-    "esbuild": "^0.25.0",
++    "esbuild": "^0.28.0",
+     "tailwindcss": "^4.3.3",
+     "tsx": "^4.21.0",
+     "typescript": "^7.0.2"
+diff --git a/scripts/validate-env.ts b/scripts/validate-env.ts
+index b823ec0..aace454 100644
+--- a/scripts/validate-env.ts
++++ b/scripts/validate-env.ts
+@@ -196,6 +196,24 @@ export function validateBillingConfiguration(
+     });
+   }
+ 
++  // 6. Media Access Token Secret Validation
++  const mediaTokenSecret = env.MEDIA_TOKEN_SECRET?.trim() || '';
++  if (!mediaTokenSecret) {
++    if (mode === 'production') {
++      issues.push({
++        type: 'WARNING',
++        variable: 'MEDIA_TOKEN_SECRET',
++        message: 'MEDIA_TOKEN_SECRET is not set. Production server startup will fail fast unless MEDIA_TOKEN_SECRET is provided.',
++      });
++    } else {
++      issues.push({
++        type: 'INFO',
++        variable: 'MEDIA_TOKEN_SECRET',
++        message: 'MEDIA_TOKEN_SECRET not set. Development server will operate with per-process random fallback secret.',
++      });
++    }
++  }
++
+   const errorsCount = issues.filter((i) => i.type === 'ERROR').length;
+   const warningsCount = issues.filter((i) => i.type === 'WARNING').length;
+ 
+diff --git a/server.ts b/server.ts
+index fe7729e..6cb304d 100644
+--- a/server.ts
++++ b/server.ts
+@@ -2,7 +2,7 @@ import express from 'express';
+ import path from 'path';
+ import { fileURLToPath } from 'url';
+ import dotenv from 'dotenv';
+-import { apiRouter, configureTrustProxy, secureUploadsHandler } from './src/server/routes/api';
++import { apiRouter, configureTrustProxy, secureUploadsHandler, validateAndGetMediaTokenSecret } from './src/server/routes/api';
+ 
+ dotenv.config();
+ 
+@@ -14,6 +14,9 @@ async function startServer() {
+   const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+   const isProd = process.env.NODE_ENV === 'production';
+ 
++  // Validate critical security environment variables before accepting any traffic
++  validateAndGetMediaTokenSecret(process.env);
++
+   // Configure and validate reverse proxy trust settings at startup
+   configureTrustProxy(app, process.env.TRUST_PROXY);
+ 
+diff --git a/src/components/ComparisonView.tsx b/src/components/ComparisonView.tsx
+index 2160612..b688115 100644
+--- a/src/components/ComparisonView.tsx
++++ b/src/components/ComparisonView.tsx
+@@ -1,6 +1,6 @@
+ import React from 'react';
+ import { ReScanComparison } from '../types';
+-import { CheckCircle2, AlertTriangle, ArrowRight, TrendingUp, ShieldCheck, RefreshCw } from 'lucide-react';
++import { CheckCircle2, AlertTriangle, ArrowRight, TrendingUp, ShieldCheck, RefreshCw, HelpCircle, Info } from 'lucide-react';
+ 
+ interface ComparisonViewProps {
+   comparison: ReScanComparison;
+@@ -183,16 +183,62 @@ export const ComparisonView: React.FC<ComparisonViewProps> = ({
+           Resolved Signals ({comparison.resolvedIssues.length})
+         </h4>
+ 
+-        <div className="space-y-2">
+-          {comparison.resolvedIssues.map((issue, idx) => (
+-            <div key={idx} className="flex items-start gap-2.5 text-xs text-stone-700">
+-              <CheckCircle2 className="w-4 h-4 text-emerald-600 mt-0.5 shrink-0" />
+-              <span>{issue}</span>
+-            </div>
+-          ))}
+-        </div>
++        {comparison.resolvedIssues.length > 0 ? (
++          <div className="space-y-2">
++            {comparison.resolvedIssues.map((issue, idx) => (
++              <div key={idx} className="flex items-start gap-2.5 text-xs text-stone-700">
++                <CheckCircle2 className="w-4 h-4 text-emerald-600 mt-0.5 shrink-0" />
++                <span>{issue}</span>
++              </div>
++            ))}
++          </div>
++        ) : (
++          <div className="flex items-center gap-2 text-xs text-stone-500 py-1">
++            <Info className="w-4 h-4 text-stone-400 shrink-0" />
++            <span>No prior risk issues were verifiably resolved in this re-scan.</span>
++          </div>
++        )}
+       </div>
+ 
++      {/* NOT VERIFIED ISSUES (IF ANY) */}
++      {comparison.notVerifiedIssues && comparison.notVerifiedIssues.length > 0 && (
++        <div className="bg-amber-50/50 rounded-xl border border-amber-200 p-5 space-y-4">
++          <h4 className="font-bold text-sm text-amber-900 flex items-center gap-2">
++            <HelpCircle className="w-4 h-4 text-amber-600" />
++            Not Verified Signals ({comparison.notVerifiedIssues.length})
++          </h4>
++          <p className="text-xs text-amber-700">
++            These signals from the prior scan could not be verified as resolved due to unassessed detectors, insufficient evidence, or incomplete scan comparison.
++          </p>
++          <div className="space-y-2">
++            {comparison.notVerifiedIssues.map((issue, idx) => (
++              <div key={idx} className="flex items-start gap-2.5 text-xs text-amber-800">
++                <AlertTriangle className="w-4 h-4 text-amber-500 mt-0.5 shrink-0" />
++                <span>{issue}</span>
++              </div>
++            ))}
++          </div>
++        </div>
++      )}
++
++      {/* NEW ISSUES (IF ANY) */}
++      {comparison.newIssues && comparison.newIssues.length > 0 && (
++        <div className="bg-rose-50/50 rounded-xl border border-rose-200 p-5 space-y-4">
++          <h4 className="font-bold text-sm text-rose-900 flex items-center gap-2">
++            <AlertTriangle className="w-4 h-4 text-rose-600" />
++            New Signals Detected ({comparison.newIssues.length})
++          </h4>
++          <div className="space-y-2">
++            {comparison.newIssues.map((issue, idx) => (
++              <div key={idx} className="flex items-start gap-2.5 text-xs text-rose-800">
++                <span className="w-1.5 h-1.5 rounded-full bg-rose-500 mt-1.5 shrink-0" />
++                <span>{issue}</span>
++              </div>
++            ))}
++          </div>
++        </div>
++      )}
++
+       {/* IMPROVEMENTS HIGHLIGHTS */}
+       <div className="bg-stone-50 rounded-xl border border-stone-200 p-5 space-y-3">
+         <h4 className="font-bold text-xs uppercase tracking-wider text-stone-500">
+diff --git a/src/server/intelligence/policyIntelligence.ts b/src/server/intelligence/policyIntelligence.ts
+index da8cff5..80f3dc4 100644
+--- a/src/server/intelligence/policyIntelligence.ts
++++ b/src/server/intelligence/policyIntelligence.ts
+@@ -13,7 +13,8 @@ import {
+   ConfidenceLevel,
+   UncertaintyReason,
+   ThumbnailMetadata,
+-  ChannelContextProfile
++  ChannelContextProfile,
++  ComparisonOptions
+ } from '../../types';
+ import { AudioAnalysisResult } from '../pipeline/audioProcessor';
+ import { VideoAnalysisResult } from '../pipeline/videoProcessor';
+@@ -712,36 +713,152 @@ export class PolicyIntelligenceEngine {
+   }
+ 
+   /**
+-   * Compares Original Scan vs Revised Re-Scan with evidence-backed resolution tracking
++export interface ComparisonOptions {
++  originalScanRecord?: { status?: string; error?: string; completedStages?: string[] } | null;
++  revisedScanRecord?: { status?: string; error?: string; completedStages?: string[] } | null;
++  skippedDomains?: EvidenceDomain[];
++  isRevisedFailed?: boolean;
++}
++
++  /**
++   * Deterministic issue matching between two scans based on:
++   * 1. Stable issue ID (if present and non-empty)
++   * 2. Domain + Category + semantic match (same policy area, location / timestamp within threshold, or exact label)
++   */
++  private issuesMatch(a: TopIssue, b: TopIssue): boolean {
++    if (a.id && b.id && a.id === b.id) {
++      return true;
++    }
++    // Must belong to the exact same domain and category
++    if (a.domain !== b.domain || a.category !== b.category) {
++      return false;
++    }
++    // Exact label match
++    if (a.what === b.what) {
++      return true;
++    }
++    // Policy area and location correlation (within 5 seconds if timestamped)
++    const samePolicyArea = (a.policyArea || '').trim().toLowerCase() === (b.policyArea || '').trim().toLowerCase();
++    const sameWhere = (a.where || '').trim().toLowerCase() === (b.where || '').trim().toLowerCase();
++    const closeTimestamp = typeof a.timestampSeconds === 'number' && typeof b.timestampSeconds === 'number'
++      && Math.abs(a.timestampSeconds - b.timestampSeconds) <= 5;
++
++    if (samePolicyArea && (sameWhere || closeTimestamp)) {
++      return true;
++    }
++    return false;
++  }
++
++  /**
++   * Determines if a domain detector in the revised scan has sufficient evidence
++   * and completed execution to legitimately verify the absence/resolution of an issue.
++   */
++  private canVerifyResolution(
++    domain: EvidenceDomain,
++    originalReport: RiskReport,
++    revisedReport: RiskReport,
++    options?: ComparisonOptions
++  ): { verifiable: boolean; reason?: string } {
++    // 1. Revised scan failure check
++    if (options?.isRevisedFailed) {
++      return { verifiable: false, reason: 'revised scan job failed' };
++    }
++    if (options?.revisedScanRecord?.status === 'FAILED') {
++      return { verifiable: false, reason: 'revised scan status is FAILED' };
++    }
++    if (options?.revisedScanRecord?.error) {
++      return { verifiable: false, reason: `revised scan error: ${options.revisedScanRecord.error}` };
++    }
++
++    // 2. Baseline scan completeness check
++    const origDomain = originalReport?.domainReports?.[domain];
++    if (!origDomain) {
++      return { verifiable: false, reason: 'baseline scan missing domain report' };
++    }
++    if (options?.originalScanRecord?.status === 'FAILED') {
++      return { verifiable: false, reason: 'baseline scan was incomplete/failed' };
++    }
++
++    // 3. Skipped detector check
++    if (options?.skippedDomains && options.skippedDomains.includes(domain)) {
++      return { verifiable: false, reason: `detector for ${domain} was skipped` };
++    }
++
++    // 4. Revised domain report status check
++    const revDomain = revisedReport?.domainReports?.[domain];
++    if (!revDomain) {
++      return { verifiable: false, reason: `revised scan missing domain assessment for ${domain}` };
++    }
++    if (revDomain.status === 'NOT_ASSESSED') {
++      return { verifiable: false, reason: `detector for ${domain} was not assessed` };
++    }
++    if (revDomain.status === 'INSUFFICIENT_EVIDENCE') {
++      return { verifiable: false, reason: `detector for ${domain} reported insufficient evidence` };
++    }
++    if ((revDomain.status as string) === 'ERROR') {
++      return { verifiable: false, reason: `detector for ${domain} encountered an execution error` };
++    }
++
++    return { verifiable: true };
++  }
++
++  /**
++   * Compares Original Scan vs Revised Re-Scan with strict evidence-backed resolution tracking
+    */
+   public generateComparison(
+     originalReport: RiskReport, 
+-    revisedReport: RiskReport
++    revisedReport: RiskReport,
++    options?: ComparisonOptions
+   ): ReScanComparison {
+-    const originalSignals = originalReport.topIssues.length;
+-    const revisedSignals = revisedReport.topIssues.length;
++    const originalSignals = (originalReport.topIssues || []).length;
++    const revisedSignals = (revisedReport.topIssues || []).length;
+     const signalsDelta = revisedSignals - originalSignals;
+ 
+-    const originalIssueWhats = new Set(originalReport.topIssues.map(i => i.what));
+-    const revisedIssueWhats = new Set(revisedReport.topIssues.map(i => i.what));
++    const origIssues = originalReport.topIssues || [];
++    const revIssues = revisedReport.topIssues || [];
+ 
+     const resolvedIssues: string[] = [];
+-    originalIssueWhats.forEach(issue => {
+-      if (!revisedIssueWhats.has(issue)) {
+-        resolvedIssues.push(issue);
++    const remainingIssues: string[] = [];
++    const notVerifiedIssues: string[] = [];
++    const matchedRevIndices = new Set<number>();
++
++    // For each baseline issue, evaluate against revised issues
++    for (const origIssue of origIssues) {
++      const matchingIndices: number[] = [];
++      revIssues.forEach((revIssue, idx) => {
++        if (this.issuesMatch(origIssue, revIssue)) {
++          matchingIndices.push(idx);
++        }
++      });
++
++      if (matchingIndices.length > 1) {
++        // Ambiguous match: multiple revised issues match this baseline issue
++        notVerifiedIssues.push(`${origIssue.what} (NOT VERIFIED — ambiguous matching across multiple revised issues)`);
++        matchingIndices.forEach(idx => matchedRevIndices.add(idx));
++      } else if (matchingIndices.length === 1) {
++        // Exactly one match: persisting issue
++        matchedRevIndices.add(matchingIndices[0]);
++        remainingIssues.push(`${origIssue.where}: ${origIssue.what}`);
++      } else {
++        // No match in revised scan: check if resolution is verifiable
++        const verification = this.canVerifyResolution(origIssue.domain, originalReport, revisedReport, options);
++        if (verification.verifiable) {
++          resolvedIssues.push(origIssue.what);
++        } else {
++          notVerifiedIssues.push(`${origIssue.what} (NOT VERIFIED — ${verification.reason})`);
++        }
+       }
+-    });
++    }
+ 
++    // Unmatched revised issues are NEW issues
+     const newIssues: string[] = [];
+-    revisedIssueWhats.forEach(issue => {
+-      if (!originalIssueWhats.has(issue)) {
+-        newIssues.push(issue);
++    revIssues.forEach((revIssue, idx) => {
++      if (!matchedRevIndices.has(idx)) {
++        newIssues.push(`${revIssue.where}: ${revIssue.what}`);
+       }
+     });
+ 
+-    const remainingIssues = revisedReport.topIssues.map(i => `${i.where}: ${i.what}`);
+     const improvements: string[] = [];
+-
+     if (
+       typeof originalReport.originalContributionRatio === 'number' && 
+       typeof revisedReport.originalContributionRatio === 'number' &&
+@@ -749,12 +866,35 @@ export class PolicyIntelligenceEngine {
+     ) {
+       improvements.push(`Original commentary increased from ${originalReport.originalContributionRatio}% to ${revisedReport.originalContributionRatio}%`);
+     }
+-    if (revisedReport.reusedContentRatio < originalReport.reusedContentRatio) {
++    if (
++      typeof originalReport.reusedContentRatio === 'number' &&
++      typeof revisedReport.reusedContentRatio === 'number' &&
++      revisedReport.reusedContentRatio < originalReport.reusedContentRatio
++    ) {
+       improvements.push(`Reused material reduced from ${originalReport.reusedContentRatio}% to ${revisedReport.reusedContentRatio}%`);
+     }
+     if (originalReport.overallRisk !== revisedReport.overallRisk) {
+       improvements.push(`Overall risk evolved from ${originalReport.overallRisk} to ${revisedReport.overallRisk}`);
+     }
++    if (resolvedIssues.length > 0) {
++      improvements.push(`${resolvedIssues.length} prior risk signal(s) verifiably resolved with evidence`);
++    }
++
++    // Honest, factual comparison summary
++    let comparisonSummary: string;
++    if (resolvedIssues.length > 0) {
++      comparisonSummary = `Re-scan verified. Resolved ${resolvedIssues.length} prior risk signal(s) with evidence.`;
++    } else if (notVerifiedIssues.length > 0) {
++      comparisonSummary = `Re-scan completed. Issue resolution could not be verified (${notVerifiedIssues.length} item(s) unverified due to insufficient evidence or unassessed detectors).`;
++    } else if (remainingIssues.length > 0) {
++      comparisonSummary = `Re-scan completed. Previously detected issue(s) remain present (${remainingIssues.length} issue(s) persisting).`;
++    } else if (newIssues.length > 0) {
++      comparisonSummary = `Re-scan completed. New issue(s) detected in the latest scan (${newIssues.length} new signal(s)).`;
++    } else if (originalSignals === 0 && revisedSignals === 0) {
++      comparisonSummary = 'Baseline and revised scans both show clean status. No issues required resolution.';
++    } else {
++      comparisonSummary = 'Re-scan completed. No prior risk issues to compare.';
++    }
+ 
+     return {
+       originalScanId: originalReport.scanId,
+@@ -764,15 +904,12 @@ export class PolicyIntelligenceEngine {
+       originalSignalsCount: originalSignals,
+       revisedSignalsCount: revisedSignals,
+       signalsDelta,
+-      resolvedIssues: resolvedIssues.length > 0 
+-        ? resolvedIssues 
+-        : ['Re-scan completed with updated input package'],
++      resolvedIssues,
+       remainingIssues,
+       newIssues,
+-      improvements: improvements.length > 0 ? improvements : ['Revised assets verified against platform intelligence rules'],
+-      comparisonSummary: resolvedIssues.length > 0
+-        ? `Re-scan verified. Resolved ${resolvedIssues.length} prior risk signal(s) with evidence.`
+-        : 'Re-scan verified. Risk assessment updated based on revised timeline.',
++      notVerifiedIssues,
++      improvements,
++      comparisonSummary,
+       originalRatios: {
+         originalContribution: originalReport.originalContributionRatio ?? null,
+         reusedContent: originalReport.reusedContentRatio
+diff --git a/src/server/routes/api.ts b/src/server/routes/api.ts
+index 7e7e15e..cc53839 100644
+--- a/src/server/routes/api.ts
++++ b/src/server/routes/api.ts
+@@ -257,8 +257,41 @@ export async function requireAuth(req: Request, res: Response): Promise<UserAcco
+ /**
+  * Server-authoritative secret for signing short-lived, resource-scoped media access tokens.
+  * Kept isolated from primary session tokens and client credentials.
++ * Production strictly requires a pre-shared, non-empty MEDIA_TOKEN_SECRET.
+  */
+-const MEDIA_TOKEN_SECRET = process.env.MEDIA_TOKEN_SECRET || crypto.randomBytes(32).toString('hex');
++let testInjectedSecret: string | null = null;
++let devFallbackSecret: string | null = null;
++
++export function setMediaTokenSecretForTest(secret: string | null): void {
++  testInjectedSecret = secret;
++}
++
++export function validateAndGetMediaTokenSecret(env: NodeJS.ProcessEnv = process.env): string {
++  if (testInjectedSecret !== null) {
++    return testInjectedSecret;
++  }
++
++  const rawSecret = env.MEDIA_TOKEN_SECRET;
++  const isProd = env.NODE_ENV === 'production';
++
++  if (typeof rawSecret === 'string' && rawSecret.trim().length > 0) {
++    return rawSecret.trim();
++  }
++
++  if (isProd) {
++    throw new Error(
++      '[FATAL SECURITY CONFIGURATION ERROR] MEDIA_TOKEN_SECRET environment variable is missing, empty, or whitespace-only. ' +
++      'Production mode strictly requires an explicit, pre-shared MEDIA_TOKEN_SECRET to ensure multi-instance authorization integrity. ' +
++      'Server startup aborted.'
++    );
++  }
++
++  // Development / Test fallback: keep a stable secret per process lifecycle
++  if (!devFallbackSecret) {
++    devFallbackSecret = crypto.randomBytes(32).toString('hex');
++  }
++  return devFallbackSecret;
++}
+ 
+ export interface MediaAccessTokenPayload {
+   userId: string;
+@@ -290,7 +323,7 @@ export function createMediaAccessToken(
+   userId: string,
+   resourceId: string,
+   durationSeconds: number = 120,
+-  options?: { nowMs?: number }
++  options?: { nowMs?: number; secret?: string }
+ ): string {
+   if (!userId || typeof userId !== 'string') {
+     throw new Error('Valid userId is required to create media access token.');
+@@ -311,7 +344,8 @@ export function createMediaAccessToken(
+   };
+ 
+   const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+-  const signature = crypto.createHmac('sha256', MEDIA_TOKEN_SECRET).update(payloadB64).digest('base64url');
++  const signingSecret = options?.secret || validateAndGetMediaTokenSecret();
++  const signature = crypto.createHmac('sha256', signingSecret).update(payloadB64).digest('base64url');
+   return `${payloadB64}.${signature}`;
+ }
+ 
+@@ -325,7 +359,7 @@ export function createMediaAccessToken(
+ export function verifyMediaAccessToken(
+   tokenStr: string | undefined | null,
+   requestedRelativePath: string,
+-  options?: { nowMs?: number }
++  options?: { nowMs?: number; secret?: string }
+ ): { userId: string } | null {
+   if (!tokenStr || typeof tokenStr !== 'string') {
+     return null;
+@@ -340,7 +374,8 @@ export function verifyMediaAccessToken(
+   const [payloadB64, providedSig] = parts;
+ 
+   // Verify HMAC signature in constant time
+-  const expectedSig = crypto.createHmac('sha256', MEDIA_TOKEN_SECRET).update(payloadB64).digest('base64url');
++  const verificationSecret = options?.secret || validateAndGetMediaTokenSecret();
++  const expectedSig = crypto.createHmac('sha256', verificationSecret).update(payloadB64).digest('base64url');
+   const providedBuf = Buffer.from(providedSig);
+   const expectedBuf = Buffer.from(expectedSig);
+ 
+diff --git a/src/types/index.ts b/src/types/index.ts
+index 9404a09..ed4e300 100644
+--- a/src/types/index.ts
++++ b/src/types/index.ts
+@@ -274,6 +274,7 @@ export interface ReScanComparison {
+   resolvedIssues: string[];
+   remainingIssues: string[];
+   newIssues?: string[];
++  notVerifiedIssues?: string[];
+   improvements: string[];
+   comparisonSummary: string;
+   originalRatios: {
+@@ -286,6 +287,13 @@ export interface ReScanComparison {
+   };
+ }
+ 
++export interface ComparisonOptions {
++  isRevisedFailed?: boolean;
++  revisedScanRecord?: { status?: string; error?: string };
++  originalScanRecord?: { status?: string; error?: string };
++  skippedDomains?: EvidenceDomain[];
++}
++
+ export interface UserAccount {
+   id: string;
+   email: string;
+-- 
+2.34.1
+

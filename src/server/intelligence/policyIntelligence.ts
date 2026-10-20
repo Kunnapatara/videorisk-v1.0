@@ -13,7 +13,8 @@ import {
   ConfidenceLevel,
   UncertaintyReason,
   ThumbnailMetadata,
-  ChannelContextProfile
+  ChannelContextProfile,
+  ComparisonOptions
 } from '../../types';
 import { AudioAnalysisResult } from '../pipeline/audioProcessor';
 import { VideoAnalysisResult } from '../pipeline/videoProcessor';
@@ -712,36 +713,152 @@ export class PolicyIntelligenceEngine {
   }
 
   /**
-   * Compares Original Scan vs Revised Re-Scan with evidence-backed resolution tracking
+export interface ComparisonOptions {
+  originalScanRecord?: { status?: string; error?: string; completedStages?: string[] } | null;
+  revisedScanRecord?: { status?: string; error?: string; completedStages?: string[] } | null;
+  skippedDomains?: EvidenceDomain[];
+  isRevisedFailed?: boolean;
+}
+
+  /**
+   * Deterministic issue matching between two scans based on:
+   * 1. Stable issue ID (if present and non-empty)
+   * 2. Domain + Category + semantic match (same policy area, location / timestamp within threshold, or exact label)
+   */
+  private issuesMatch(a: TopIssue, b: TopIssue): boolean {
+    if (a.id && b.id && a.id === b.id) {
+      return true;
+    }
+    // Must belong to the exact same domain and category
+    if (a.domain !== b.domain || a.category !== b.category) {
+      return false;
+    }
+    // Exact label match
+    if (a.what === b.what) {
+      return true;
+    }
+    // Policy area and location correlation (within 5 seconds if timestamped)
+    const samePolicyArea = (a.policyArea || '').trim().toLowerCase() === (b.policyArea || '').trim().toLowerCase();
+    const sameWhere = (a.where || '').trim().toLowerCase() === (b.where || '').trim().toLowerCase();
+    const closeTimestamp = typeof a.timestampSeconds === 'number' && typeof b.timestampSeconds === 'number'
+      && Math.abs(a.timestampSeconds - b.timestampSeconds) <= 5;
+
+    if (samePolicyArea && (sameWhere || closeTimestamp)) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Determines if a domain detector in the revised scan has sufficient evidence
+   * and completed execution to legitimately verify the absence/resolution of an issue.
+   */
+  private canVerifyResolution(
+    domain: EvidenceDomain,
+    originalReport: RiskReport,
+    revisedReport: RiskReport,
+    options?: ComparisonOptions
+  ): { verifiable: boolean; reason?: string } {
+    // 1. Revised scan failure check
+    if (options?.isRevisedFailed) {
+      return { verifiable: false, reason: 'revised scan job failed' };
+    }
+    if (options?.revisedScanRecord?.status === 'FAILED') {
+      return { verifiable: false, reason: 'revised scan status is FAILED' };
+    }
+    if (options?.revisedScanRecord?.error) {
+      return { verifiable: false, reason: `revised scan error: ${options.revisedScanRecord.error}` };
+    }
+
+    // 2. Baseline scan completeness check
+    const origDomain = originalReport?.domainReports?.[domain];
+    if (!origDomain) {
+      return { verifiable: false, reason: 'baseline scan missing domain report' };
+    }
+    if (options?.originalScanRecord?.status === 'FAILED') {
+      return { verifiable: false, reason: 'baseline scan was incomplete/failed' };
+    }
+
+    // 3. Skipped detector check
+    if (options?.skippedDomains && options.skippedDomains.includes(domain)) {
+      return { verifiable: false, reason: `detector for ${domain} was skipped` };
+    }
+
+    // 4. Revised domain report status check
+    const revDomain = revisedReport?.domainReports?.[domain];
+    if (!revDomain) {
+      return { verifiable: false, reason: `revised scan missing domain assessment for ${domain}` };
+    }
+    if (revDomain.status === 'NOT_ASSESSED') {
+      return { verifiable: false, reason: `detector for ${domain} was not assessed` };
+    }
+    if (revDomain.status === 'INSUFFICIENT_EVIDENCE') {
+      return { verifiable: false, reason: `detector for ${domain} reported insufficient evidence` };
+    }
+    if ((revDomain.status as string) === 'ERROR') {
+      return { verifiable: false, reason: `detector for ${domain} encountered an execution error` };
+    }
+
+    return { verifiable: true };
+  }
+
+  /**
+   * Compares Original Scan vs Revised Re-Scan with strict evidence-backed resolution tracking
    */
   public generateComparison(
     originalReport: RiskReport, 
-    revisedReport: RiskReport
+    revisedReport: RiskReport,
+    options?: ComparisonOptions
   ): ReScanComparison {
-    const originalSignals = originalReport.topIssues.length;
-    const revisedSignals = revisedReport.topIssues.length;
+    const originalSignals = (originalReport.topIssues || []).length;
+    const revisedSignals = (revisedReport.topIssues || []).length;
     const signalsDelta = revisedSignals - originalSignals;
 
-    const originalIssueWhats = new Set(originalReport.topIssues.map(i => i.what));
-    const revisedIssueWhats = new Set(revisedReport.topIssues.map(i => i.what));
+    const origIssues = originalReport.topIssues || [];
+    const revIssues = revisedReport.topIssues || [];
 
     const resolvedIssues: string[] = [];
-    originalIssueWhats.forEach(issue => {
-      if (!revisedIssueWhats.has(issue)) {
-        resolvedIssues.push(issue);
-      }
-    });
+    const remainingIssues: string[] = [];
+    const notVerifiedIssues: string[] = [];
+    const matchedRevIndices = new Set<number>();
 
+    // For each baseline issue, evaluate against revised issues
+    for (const origIssue of origIssues) {
+      const matchingIndices: number[] = [];
+      revIssues.forEach((revIssue, idx) => {
+        if (this.issuesMatch(origIssue, revIssue)) {
+          matchingIndices.push(idx);
+        }
+      });
+
+      if (matchingIndices.length > 1) {
+        // Ambiguous match: multiple revised issues match this baseline issue
+        notVerifiedIssues.push(`${origIssue.what} (NOT VERIFIED — ambiguous matching across multiple revised issues)`);
+        matchingIndices.forEach(idx => matchedRevIndices.add(idx));
+      } else if (matchingIndices.length === 1) {
+        // Exactly one match: persisting issue
+        matchedRevIndices.add(matchingIndices[0]);
+        remainingIssues.push(`${origIssue.where}: ${origIssue.what}`);
+      } else {
+        // No match in revised scan: check if resolution is verifiable
+        const verification = this.canVerifyResolution(origIssue.domain, originalReport, revisedReport, options);
+        if (verification.verifiable) {
+          resolvedIssues.push(origIssue.what);
+        } else {
+          notVerifiedIssues.push(`${origIssue.what} (NOT VERIFIED — ${verification.reason})`);
+        }
+      }
+    }
+
+    // Unmatched revised issues are NEW issues
     const newIssues: string[] = [];
-    revisedIssueWhats.forEach(issue => {
-      if (!originalIssueWhats.has(issue)) {
-        newIssues.push(issue);
+    revIssues.forEach((revIssue, idx) => {
+      if (!matchedRevIndices.has(idx)) {
+        newIssues.push(`${revIssue.where}: ${revIssue.what}`);
       }
     });
 
-    const remainingIssues = revisedReport.topIssues.map(i => `${i.where}: ${i.what}`);
     const improvements: string[] = [];
-
     if (
       typeof originalReport.originalContributionRatio === 'number' && 
       typeof revisedReport.originalContributionRatio === 'number' &&
@@ -749,11 +866,34 @@ export class PolicyIntelligenceEngine {
     ) {
       improvements.push(`Original commentary increased from ${originalReport.originalContributionRatio}% to ${revisedReport.originalContributionRatio}%`);
     }
-    if (revisedReport.reusedContentRatio < originalReport.reusedContentRatio) {
+    if (
+      typeof originalReport.reusedContentRatio === 'number' &&
+      typeof revisedReport.reusedContentRatio === 'number' &&
+      revisedReport.reusedContentRatio < originalReport.reusedContentRatio
+    ) {
       improvements.push(`Reused material reduced from ${originalReport.reusedContentRatio}% to ${revisedReport.reusedContentRatio}%`);
     }
     if (originalReport.overallRisk !== revisedReport.overallRisk) {
       improvements.push(`Overall risk evolved from ${originalReport.overallRisk} to ${revisedReport.overallRisk}`);
+    }
+    if (resolvedIssues.length > 0) {
+      improvements.push(`${resolvedIssues.length} prior risk signal(s) verifiably resolved with evidence`);
+    }
+
+    // Honest, factual comparison summary
+    let comparisonSummary: string;
+    if (resolvedIssues.length > 0) {
+      comparisonSummary = `Re-scan verified. Resolved ${resolvedIssues.length} prior risk signal(s) with evidence.`;
+    } else if (notVerifiedIssues.length > 0) {
+      comparisonSummary = `Re-scan completed. Issue resolution could not be verified (${notVerifiedIssues.length} item(s) unverified due to insufficient evidence or unassessed detectors).`;
+    } else if (remainingIssues.length > 0) {
+      comparisonSummary = `Re-scan completed. Previously detected issue(s) remain present (${remainingIssues.length} issue(s) persisting).`;
+    } else if (newIssues.length > 0) {
+      comparisonSummary = `Re-scan completed. New issue(s) detected in the latest scan (${newIssues.length} new signal(s)).`;
+    } else if (originalSignals === 0 && revisedSignals === 0) {
+      comparisonSummary = 'Baseline and revised scans both show clean status. No issues required resolution.';
+    } else {
+      comparisonSummary = 'Re-scan completed. No prior risk issues to compare.';
     }
 
     return {
@@ -764,15 +904,12 @@ export class PolicyIntelligenceEngine {
       originalSignalsCount: originalSignals,
       revisedSignalsCount: revisedSignals,
       signalsDelta,
-      resolvedIssues: resolvedIssues.length > 0 
-        ? resolvedIssues 
-        : ['Re-scan completed with updated input package'],
+      resolvedIssues,
       remainingIssues,
       newIssues,
-      improvements: improvements.length > 0 ? improvements : ['Revised assets verified against platform intelligence rules'],
-      comparisonSummary: resolvedIssues.length > 0
-        ? `Re-scan verified. Resolved ${resolvedIssues.length} prior risk signal(s) with evidence.`
-        : 'Re-scan verified. Risk assessment updated based on revised timeline.',
+      notVerifiedIssues,
+      improvements,
+      comparisonSummary,
       originalRatios: {
         originalContribution: originalReport.originalContributionRatio ?? null,
         reusedContent: originalReport.reusedContentRatio

@@ -1,6 +1,6 @@
 import React from 'react';
 import { ReScanComparison } from '../types';
-import { CheckCircle2, AlertTriangle, ArrowRight, TrendingUp, ShieldCheck, RefreshCw } from 'lucide-react';
+import { CheckCircle2, AlertTriangle, ArrowRight, TrendingUp, ShieldCheck, RefreshCw, HelpCircle, Info } from 'lucide-react';
 
 interface ComparisonViewProps {
   comparison: ReScanComparison;
@@ -183,15 +183,61 @@ export const ComparisonView: React.FC<ComparisonViewProps> = ({
           Resolved Signals ({comparison.resolvedIssues.length})
         </h4>
 
-        <div className="space-y-2">
-          {comparison.resolvedIssues.map((issue, idx) => (
-            <div key={idx} className="flex items-start gap-2.5 text-xs text-stone-700">
-              <CheckCircle2 className="w-4 h-4 text-emerald-600 mt-0.5 shrink-0" />
-              <span>{issue}</span>
-            </div>
-          ))}
-        </div>
+        {comparison.resolvedIssues.length > 0 ? (
+          <div className="space-y-2">
+            {comparison.resolvedIssues.map((issue, idx) => (
+              <div key={idx} className="flex items-start gap-2.5 text-xs text-stone-700">
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 mt-0.5 shrink-0" />
+                <span>{issue}</span>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 text-xs text-stone-500 py-1">
+            <Info className="w-4 h-4 text-stone-400 shrink-0" />
+            <span>No prior risk issues were verifiably resolved in this re-scan.</span>
+          </div>
+        )}
       </div>
+
+      {/* NOT VERIFIED ISSUES (IF ANY) */}
+      {comparison.notVerifiedIssues && comparison.notVerifiedIssues.length > 0 && (
+        <div className="bg-amber-50/50 rounded-xl border border-amber-200 p-5 space-y-4">
+          <h4 className="font-bold text-sm text-amber-900 flex items-center gap-2">
+            <HelpCircle className="w-4 h-4 text-amber-600" />
+            Not Verified Signals ({comparison.notVerifiedIssues.length})
+          </h4>
+          <p className="text-xs text-amber-700">
+            These signals from the prior scan could not be verified as resolved due to unassessed detectors, insufficient evidence, or incomplete scan comparison.
+          </p>
+          <div className="space-y-2">
+            {comparison.notVerifiedIssues.map((issue, idx) => (
+              <div key={idx} className="flex items-start gap-2.5 text-xs text-amber-800">
+                <AlertTriangle className="w-4 h-4 text-amber-500 mt-0.5 shrink-0" />
+                <span>{issue}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* NEW ISSUES (IF ANY) */}
+      {comparison.newIssues && comparison.newIssues.length > 0 && (
+        <div className="bg-rose-50/50 rounded-xl border border-rose-200 p-5 space-y-4">
+          <h4 className="font-bold text-sm text-rose-900 flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-rose-600" />
+            New Signals Detected ({comparison.newIssues.length})
+          </h4>
+          <div className="space-y-2">
+            {comparison.newIssues.map((issue, idx) => (
+              <div key={idx} className="flex items-start gap-2.5 text-xs text-rose-800">
+                <span className="w-1.5 h-1.5 rounded-full bg-rose-500 mt-1.5 shrink-0" />
+                <span>{issue}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* IMPROVEMENTS HIGHLIGHTS */}
       <div className="bg-stone-50 rounded-xl border border-stone-200 p-5 space-y-3">

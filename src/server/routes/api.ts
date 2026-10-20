@@ -257,8 +257,41 @@ export async function requireAuth(req: Request, res: Response): Promise<UserAcco
 /**
  * Server-authoritative secret for signing short-lived, resource-scoped media access tokens.
  * Kept isolated from primary session tokens and client credentials.
+ * Production strictly requires a pre-shared, non-empty MEDIA_TOKEN_SECRET.
  */
-const MEDIA_TOKEN_SECRET = process.env.MEDIA_TOKEN_SECRET || crypto.randomBytes(32).toString('hex');
+let testInjectedSecret: string | null = null;
+let devFallbackSecret: string | null = null;
+
+export function setMediaTokenSecretForTest(secret: string | null): void {
+  testInjectedSecret = secret;
+}
+
+export function validateAndGetMediaTokenSecret(env: NodeJS.ProcessEnv = process.env): string {
+  if (testInjectedSecret !== null) {
+    return testInjectedSecret;
+  }
+
+  const rawSecret = env.MEDIA_TOKEN_SECRET;
+  const isProd = env.NODE_ENV === 'production';
+
+  if (typeof rawSecret === 'string' && rawSecret.trim().length > 0) {
+    return rawSecret.trim();
+  }
+
+  if (isProd) {
+    throw new Error(
+      '[FATAL SECURITY CONFIGURATION ERROR] MEDIA_TOKEN_SECRET environment variable is missing, empty, or whitespace-only. ' +
+      'Production mode strictly requires an explicit, pre-shared MEDIA_TOKEN_SECRET to ensure multi-instance authorization integrity. ' +
+      'Server startup aborted.'
+    );
+  }
+
+  // Development / Test fallback: keep a stable secret per process lifecycle
+  if (!devFallbackSecret) {
+    devFallbackSecret = crypto.randomBytes(32).toString('hex');
+  }
+  return devFallbackSecret;
+}
 
 export interface MediaAccessTokenPayload {
   userId: string;
@@ -290,7 +323,7 @@ export function createMediaAccessToken(
   userId: string,
   resourceId: string,
   durationSeconds: number = 120,
-  options?: { nowMs?: number }
+  options?: { nowMs?: number; secret?: string }
 ): string {
   if (!userId || typeof userId !== 'string') {
     throw new Error('Valid userId is required to create media access token.');
@@ -311,7 +344,8 @@ export function createMediaAccessToken(
   };
 
   const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
-  const signature = crypto.createHmac('sha256', MEDIA_TOKEN_SECRET).update(payloadB64).digest('base64url');
+  const signingSecret = options?.secret || validateAndGetMediaTokenSecret();
+  const signature = crypto.createHmac('sha256', signingSecret).update(payloadB64).digest('base64url');
   return `${payloadB64}.${signature}`;
 }
 
@@ -325,7 +359,7 @@ export function createMediaAccessToken(
 export function verifyMediaAccessToken(
   tokenStr: string | undefined | null,
   requestedRelativePath: string,
-  options?: { nowMs?: number }
+  options?: { nowMs?: number; secret?: string }
 ): { userId: string } | null {
   if (!tokenStr || typeof tokenStr !== 'string') {
     return null;
@@ -340,7 +374,8 @@ export function verifyMediaAccessToken(
   const [payloadB64, providedSig] = parts;
 
   // Verify HMAC signature in constant time
-  const expectedSig = crypto.createHmac('sha256', MEDIA_TOKEN_SECRET).update(payloadB64).digest('base64url');
+  const verificationSecret = options?.secret || validateAndGetMediaTokenSecret();
+  const expectedSig = crypto.createHmac('sha256', verificationSecret).update(payloadB64).digest('base64url');
   const providedBuf = Buffer.from(providedSig);
   const expectedBuf = Buffer.from(expectedSig);
 
