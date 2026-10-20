@@ -337,6 +337,10 @@ export function enforceTestDatabaseIsolation(
   env: NodeJS.ProcessEnv = process.env
 ): TestDatabaseResolution {
   const defaultTestPath = getDefaultTestDatabasePath();
+  const defaultTestDir = path.dirname(defaultTestPath);
+  if (!fs.existsSync(defaultTestDir)) {
+    fs.mkdirSync(defaultTestDir, { recursive: true });
+  }
 
   // If env.DATABASE_PATH is set and represents an original custom production database (not test db),
   // preserve it before changing env.DATABASE_PATH:
