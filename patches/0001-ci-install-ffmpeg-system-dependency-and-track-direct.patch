@@ -1,0 +1,39 @@
+From f8c302ab4a91831d35508d1d5a68989a34049b47 Mon Sep 17 00:00:00 2001
+From: Kunnapatara <kunnapatara@yahoo.com>
+Date: Wed, 21 Oct 2026 09:53:55 +0000
+Subject: [PATCH] ci: install ffmpeg system dependency and track directory
+ placeholders
+
+---
+ .github/workflows/ci.yml | 5 +++++
+ data/.gitkeep            | 0
+ uploads/.gitkeep         | 0
+ 3 files changed, 5 insertions(+)
+ create mode 100644 data/.gitkeep
+ create mode 100644 uploads/.gitkeep
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 5f847d8..7d16aa0 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -31,6 +31,11 @@ jobs:
+       - name: Run linter and typecheck
+         run: npm run lint
+ 
++      - name: Install system dependencies (FFmpeg)
++        run: |
++          sudo apt-get update
++          sudo apt-get install -y --no-install-recommends ffmpeg
++
+       - name: Run automated verification tests
+         run: npm test
+ 
+diff --git a/data/.gitkeep b/data/.gitkeep
+new file mode 100644
+index 0000000..e69de29
+diff --git a/uploads/.gitkeep b/uploads/.gitkeep
+new file mode 100644
+index 0000000..e69de29
+-- 
+2.34.1
+

@@ -31,6 +31,11 @@ jobs:
       - name: Run linter and typecheck
         run: npm run lint
 
+      - name: Install system dependencies (FFmpeg)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
       - name: Run automated verification tests
         run: npm test
 
