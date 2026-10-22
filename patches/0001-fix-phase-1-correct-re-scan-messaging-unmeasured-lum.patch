@@ -1,0 +1,485 @@
+From 668ff2e35a1d1f9f537b1261f352b43b2ac90436 Mon Sep 17 00:00:00 2001
+From: Kunnapatara <kunnapatara@yahoo.com>
+Date: Thu, 22 Oct 2026 08:31:47 +0000
+Subject: [PATCH] fix(phase-1): correct re-scan messaging, unmeasured luminance
+ nullability, and verification semantics
+
+- ComparisonView: eliminate misleading success banner triggered solely by signalsDelta < 0; display verified-resolution messaging only when prior findings are confirmed resolved with evidence; render persisting signals (remainingIssues); display (File comparison unverified) when SHA-256 is missing on either version.
+- thumbnailInspector: return meanLuminance as null when measurement fails or cannot be parsed instead of substituting default 128; expose parseLuminanceOutput.
+- policyIntelligence: reject resolution when revised domain status is NOT_PROVIDED; compute explicit comparisonStatus on mediaIdentity.
+- types: allow meanLuminance to be null in ThumbnailMetadata; add comparisonStatus to mediaIdentity.
+- tests: add regression tests for parseLuminanceOutput edge cases, failed luminance extraction, signalsDelta < 0 without verified resolution, skipped and NOT_PROVIDED domains, and SHA-256 comparisonStatus.
+---
+ src/components/ComparisonView.tsx             | 167 +++++++++++++-----
+ src/server/intelligence/policyIntelligence.ts |  24 ++-
+ src/server/pipeline/thumbnailInspector.ts     |  50 ++++--
+ src/types/index.ts                            |   3 +-
+ tests/evidence_integrity_hardening.test.ts    |  92 +++++++++-
+ 5 files changed, 261 insertions(+), 75 deletions(-)
+
+diff --git a/src/components/ComparisonView.tsx b/src/components/ComparisonView.tsx
+index 5d00089..5133efa 100644
+--- a/src/components/ComparisonView.tsx
++++ b/src/components/ComparisonView.tsx
+@@ -46,39 +46,77 @@ export const ComparisonView: React.FC<ComparisonViewProps> = ({
+       </div>
+ 
+       {/* Summary Banner */}
+-      <div className={`p-6 rounded-xl border ${
+-        comparison.signalsDelta <= 0 && comparison.revisedRisk !== 'HIGH_RISK'
+-          ? 'bg-emerald-50 border-emerald-200'
+-          : 'bg-amber-50 border-amber-200'
+-      }`}>
+-        <div className="flex items-start gap-3">
+-          {comparison.signalsDelta <= 0 && comparison.revisedRisk !== 'HIGH_RISK' ? (
+-            <ShieldCheck className="w-6 h-6 text-emerald-600 mt-0.5 shrink-0" />
+-          ) : (
+-            <AlertTriangle className="w-6 h-6 text-amber-600 mt-0.5 shrink-0" />
+-          )}
+-          <div>
+-            <h3 className={`font-bold text-base ${
+-              comparison.signalsDelta <= 0 && comparison.revisedRisk !== 'HIGH_RISK'
+-                ? 'text-emerald-950'
+-                : 'text-amber-950'
+-            }`}>
+-              {comparison.comparisonSummary}
+-            </h3>
+-            <p className={`text-xs mt-1 ${
+-              comparison.signalsDelta <= 0 && comparison.revisedRisk !== 'HIGH_RISK'
+-                ? 'text-emerald-800'
+-                : 'text-amber-800'
+-            }`}>
+-              {comparison.signalsDelta < 0
+-                ? 'Your edits have successfully addressed platform policy scrutiny points.'
+-                : comparison.signalsDelta === 0
+-                ? 'No net change in detected risk signals between cuts.'
+-                : 'Additional policy scrutiny signals were observed in this revision cut.'}
+-            </p>
++      {(() => {
++        const isFullyResolved = comparison.resolvedIssues.length > 0 &&
++          (!comparison.notVerifiedIssues || comparison.notVerifiedIssues.length === 0) &&
++          comparison.remainingIssues.length === 0 &&
++          (!comparison.newIssues || comparison.newIssues.length === 0) &&
++          comparison.revisedRisk !== 'HIGH_RISK';
++
++        const isCleanBaselineAndRevision = comparison.originalSignalsCount === 0 &&
++          comparison.revisedSignalsCount === 0 &&
++          comparison.revisedRisk !== 'HIGH_RISK';
++
++        const isGreen = isFullyResolved || isCleanBaselineAndRevision;
++        const isHighRisk = comparison.revisedRisk === 'HIGH_RISK';
++
++        let subtitle = 'No net change in detected risk signals between cuts.';
++        if (comparison.resolvedIssues.length > 0) {
++          if (comparison.remainingIssues.length === 0 && (!comparison.notVerifiedIssues || comparison.notVerifiedIssues.length === 0)) {
++            subtitle = `Verified with evidence: All ${comparison.resolvedIssues.length} prior policy scrutiny signal(s) have been resolved.`;
++          } else {
++            subtitle = `Partial resolution verified: ${comparison.resolvedIssues.length} prior signal(s) resolved with evidence, but additional signals remain present or unverified.`;
++          }
++        } else if (comparison.notVerifiedIssues && comparison.notVerifiedIssues.length > 0) {
++          subtitle = `Signal resolution could not be verified (${comparison.notVerifiedIssues.length} item(s) unverified due to unassessed detectors or insufficient evidence).`;
++        } else if (comparison.remainingIssues.length > 0) {
++          subtitle = `No prior risk signals were resolved. ${comparison.remainingIssues.length} signal(s) persist in this revision cut.`;
++        } else if (comparison.newIssues && comparison.newIssues.length > 0) {
++          subtitle = `New policy scrutiny signal(s) detected in this revision cut.`;
++        } else if (isCleanBaselineAndRevision) {
++          subtitle = 'No policy scrutiny signals detected in either cut.';
++        } else if (comparison.signalsDelta < 0) {
++          subtitle = `Fewer signals detected in this cut (${comparison.revisedSignalsCount} vs ${comparison.originalSignalsCount}), but no prior findings were verifiably resolved with evidence.`;
++        }
++
++        return (
++          <div className={`p-6 rounded-xl border ${
++            isGreen
++              ? 'bg-emerald-50 border-emerald-200'
++              : isHighRisk
++              ? 'bg-rose-50 border-rose-200'
++              : 'bg-amber-50 border-amber-200'
++          }`}>
++            <div className="flex items-start gap-3">
++              {isGreen ? (
++                <ShieldCheck className="w-6 h-6 text-emerald-600 mt-0.5 shrink-0" />
++              ) : (
++                <AlertTriangle className={`w-6 h-6 mt-0.5 shrink-0 ${isHighRisk ? 'text-rose-600' : 'text-amber-600'}`} />
++              )}
++              <div>
++                <h3 className={`font-bold text-base ${
++                  isGreen
++                    ? 'text-emerald-950'
++                    : isHighRisk
++                    ? 'text-rose-950'
++                    : 'text-amber-950'
++                }`}>
++                  {comparison.comparisonSummary}
++                </h3>
++                <p className={`text-xs mt-1 ${
++                  isGreen
++                    ? 'text-emerald-800'
++                    : isHighRisk
++                    ? 'text-rose-800'
++                    : 'text-amber-800'
++                }`}>
++                  {subtitle}
++                </p>
++              </div>
++            </div>
+           </div>
+-        </div>
+-      </div>
++        );
++      })()}
+ 
+       {/* BEFORE VS AFTER CARDS */}
+       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+@@ -186,8 +224,18 @@ export const ComparisonView: React.FC<ComparisonViewProps> = ({
+                 <span className="text-stone-500">Media SHA-256:</span>
+                 <span className="font-mono text-stone-700" title={comparison.mediaIdentity.revisedSha256}>
+                   {comparison.mediaIdentity.revisedSha256.slice(0, 10)}…
+-                  <span className={`ml-1 text-[10px] font-sans font-semibold ${comparison.mediaIdentity.isIdenticalMedia ? 'text-amber-700' : 'text-emerald-700'}`}>
+-                    ({comparison.mediaIdentity.isIdenticalMedia ? 'Identical file' : 'Modified file'})
++                  <span className={`ml-1 text-[10px] font-sans font-semibold ${
++                    comparison.mediaIdentity.comparisonStatus === 'IDENTICAL'
++                      ? 'text-amber-700'
++                      : comparison.mediaIdentity.comparisonStatus === 'DIFFERENT'
++                      ? 'text-emerald-700'
++                      : 'text-stone-500'
++                  }`}>
++                    {comparison.mediaIdentity.comparisonStatus === 'IDENTICAL'
++                      ? '(Identical file)'
++                      : comparison.mediaIdentity.comparisonStatus === 'DIFFERENT'
++                      ? '(Modified file)'
++                      : '(File comparison unverified)'}
+                   </span>
+                 </span>
+               </div>
+@@ -197,12 +245,11 @@ export const ComparisonView: React.FC<ComparisonViewProps> = ({
+       </div>
+ 
+       {/* RESOLVED ISSUES CHECKLIST */}
+-      <div className="bg-white rounded-xl border border-stone-200 p-5 space-y-4">
+-        <h4 className="font-bold text-sm text-stone-900">
+-          Resolved Signals ({comparison.resolvedIssues.length})
+-        </h4>
+-
+-        {comparison.resolvedIssues.length > 0 ? (
++      {comparison.resolvedIssues.length > 0 && (
++        <div className="bg-white rounded-xl border border-stone-200 p-5 space-y-4">
++          <h4 className="font-bold text-sm text-stone-900">
++            Resolved Signals ({comparison.resolvedIssues.length})
++          </h4>
+           <div className="space-y-2">
+             {comparison.resolvedIssues.map((issue, idx) => (
+               <div key={idx} className="flex items-start gap-2.5 text-xs text-stone-700">
+@@ -211,13 +258,29 @@ export const ComparisonView: React.FC<ComparisonViewProps> = ({
+               </div>
+             ))}
+           </div>
+-        ) : (
+-          <div className="flex items-center gap-2 text-xs text-stone-500 py-1">
+-            <Info className="w-4 h-4 text-stone-400 shrink-0" />
+-            <span>No prior risk issues were verifiably resolved in this re-scan.</span>
++        </div>
++      )}
++
++      {/* PERSISTING / REMAINING ISSUES (IF ANY) */}
++      {comparison.remainingIssues && comparison.remainingIssues.length > 0 && (
++        <div className="bg-white rounded-xl border border-amber-200 p-5 space-y-4">
++          <h4 className="font-bold text-sm text-amber-950 flex items-center gap-2">
++            <AlertTriangle className="w-4 h-4 text-amber-600" />
++            Persisting Signals ({comparison.remainingIssues.length})
++          </h4>
++          <p className="text-xs text-stone-500">
++            These signals detected in the original cut remain present in the revised cut.
++          </p>
++          <div className="space-y-2">
++            {comparison.remainingIssues.map((issue, idx) => (
++              <div key={idx} className="flex items-start gap-2.5 text-xs text-stone-800">
++                <span className="w-1.5 h-1.5 rounded-full bg-amber-500 mt-1.5 shrink-0" />
++                <span>{issue}</span>
++              </div>
++            ))}
+           </div>
+-        )}
+-      </div>
++        </div>
++      )}
+ 
+       {/* NOT VERIFIED ISSUES (IF ANY) */}
+       {comparison.notVerifiedIssues && comparison.notVerifiedIssues.length > 0 && (
+@@ -258,6 +321,18 @@ export const ComparisonView: React.FC<ComparisonViewProps> = ({
+         </div>
+       )}
+ 
++      {/* EMPTY STATE WHEN NO ISSUES TO COMPARE */}
++      {comparison.resolvedIssues.length === 0 &&
++       comparison.remainingIssues.length === 0 &&
++       (!comparison.notVerifiedIssues || comparison.notVerifiedIssues.length === 0) &&
++       (!comparison.newIssues || comparison.newIssues.length === 0) && (
++        <div className="bg-white rounded-xl border border-stone-200 p-6 text-center text-xs text-stone-500 space-y-2">
++          <Info className="w-5 h-5 text-stone-400 mx-auto" />
++          <p className="font-semibold text-stone-700">No Policy Scrutiny Signals to Compare</p>
++          <p>Both original and revised cuts evaluated with zero detected policy issues.</p>
++        </div>
++      )}
++
+       {/* IMPROVEMENTS HIGHLIGHTS */}
+       <div className="bg-stone-50 rounded-xl border border-stone-200 p-5 space-y-3">
+         <h4 className="font-bold text-xs uppercase tracking-wider text-stone-500">
+diff --git a/src/server/intelligence/policyIntelligence.ts b/src/server/intelligence/policyIntelligence.ts
+index bbc78bc..7aac7a0 100644
+--- a/src/server/intelligence/policyIntelligence.ts
++++ b/src/server/intelligence/policyIntelligence.ts
+@@ -808,6 +808,9 @@ export interface ComparisonOptions {
+     if (!revDomain) {
+       return { verifiable: false, reason: `revised scan missing domain assessment for ${domain}` };
+     }
++    if (revDomain.status === 'NOT_PROVIDED') {
++      return { verifiable: false, reason: `detector for ${domain} was not provided in revised scan` };
++    }
+     if (revDomain.status === 'NOT_ASSESSED') {
+       return { verifiable: false, reason: `detector for ${domain} was not assessed` };
+     }
+@@ -902,19 +905,28 @@ export interface ComparisonOptions {
+     // Media version identity tracking via SHA-256
+     const origSha = options?.originalScanRecord?.metadata?.sha256;
+     const revSha = options?.revisedScanRecord?.metadata?.sha256;
+-    const isIdenticalMedia = Boolean(origSha && revSha && origSha === revSha);
++    const hasBothHashes = Boolean(origSha && revSha);
++    const isIdenticalMedia = Boolean(hasBothHashes && origSha === revSha);
++    const comparisonStatus: 'IDENTICAL' | 'DIFFERENT' | 'UNVERIFIED' = hasBothHashes
++      ? (isIdenticalMedia ? 'IDENTICAL' : 'DIFFERENT')
++      : 'UNVERIFIED';
+ 
+     const mediaIdentity = (origSha || revSha) ? {
+       originalSha256: origSha,
+       revisedSha256: revSha,
+-      isIdenticalMedia
++      isIdenticalMedia,
++      comparisonStatus
+     } : undefined;
+ 
+     if (mediaIdentity) {
+-      if (isIdenticalMedia) {
+-        improvements.push('Note: Re-scan analyzed an identical media file version (matching SHA-256).');
+-      } else if (origSha && revSha) {
+-        improvements.push('Verified revised media file version (different SHA-256).');
++      if (hasBothHashes) {
++        if (isIdenticalMedia) {
++          improvements.push('Note: Re-scan analyzed an identical media file version (matching SHA-256).');
++        } else {
++          improvements.push('Verified revised media file version (different SHA-256).');
++        }
++      } else {
++        improvements.push('Note: Media SHA-256 identity comparison unverified (hash missing on one version).');
+       }
+     }
+ 
+diff --git a/src/server/pipeline/thumbnailInspector.ts b/src/server/pipeline/thumbnailInspector.ts
+index 1a90097..8732908 100644
+--- a/src/server/pipeline/thumbnailInspector.ts
++++ b/src/server/pipeline/thumbnailInspector.ts
+@@ -59,23 +59,7 @@ export class ThumbnailInspector {
+       const aspectRatioLabel = is16by9 ? '16:9' : `${(ratio).toFixed(2)}:1`;
+ 
+       // Extract basic luminance sample via ffmpeg signalstats filter or deterministic probe
+-      let meanLuminance = 128;
+-
+-      try {
+-        const statsArgs = [
+-          '-i', imagePath,
+-          '-vf', 'signalstats,metadata=print:key=lavfi.signalstats.YAVG',
+-          '-f', 'null',
+-          '-'
+-        ];
+-        const res = await execFileAsync('ffmpeg', statsArgs, { timeout: 15000 }).catch(e => ({ stderr: e.stderr || '' }));
+-        const lumMatch = String(res.stderr || '').match(/YAVG=([\d.]+)/);
+-        if (lumMatch) {
+-          meanLuminance = Math.round(parseFloat(lumMatch[1]));
+-        }
+-      } catch {
+-        // Fallback to neutral luminance
+-      }
++      const meanLuminance = await this.extractLuminance(imagePath);
+ 
+       // Evidence integrity: Visual text overlays, OCR, and graphic clickbait cues (arrows/circles)
+       // cannot be honestly inferred from luminance thresholds or filename strings alone.
+@@ -115,6 +99,38 @@ export class ThumbnailInspector {
+       throw new ThumbnailInspectionError(`Failed to inspect thumbnail image: ${err.message || 'Corrupted or unsupported format.'}`);
+     }
+   }
++
++  /**
++   * Deterministically measures mean luminance from image frames using FFmpeg signalstats.
++   * Returns null if measurement fails, returns empty output, or produces non-numeric output.
++   */
++  public async extractLuminance(imagePath: string): Promise<number | null> {
++    try {
++      const statsArgs = [
++        '-i', imagePath,
++        '-vf', 'signalstats,metadata=print:key=lavfi.signalstats.YAVG',
++        '-f', 'null',
++        '-'
++      ];
++      const res = await execFileAsync('ffmpeg', statsArgs, { timeout: 15000 }).catch(e => ({ stderr: e.stderr || '' }));
++      return this.parseLuminanceOutput(String(res.stderr || ''));
++    } catch {
++      return null;
++    }
++  }
++
++  /**
++   * Parses YAVG numeric value from signalstats output string.
++   * Explicitly returns null for missing, NaN, non-finite, or malformed data.
++   */
++  public parseLuminanceOutput(output: string): number | null {
++    if (!output || typeof output !== 'string') return null;
++    const lumMatch = output.match(/YAVG=([\d.]+)/);
++    if (!lumMatch) return null;
++    const parsed = parseFloat(lumMatch[1]);
++    if (!Number.isFinite(parsed) || isNaN(parsed)) return null;
++    return Math.round(parsed);
++  }
+ }
+ 
+ export const thumbnailInspector = new ThumbnailInspector();
+diff --git a/src/types/index.ts b/src/types/index.ts
+index d752f6a..519a664 100644
+--- a/src/types/index.ts
++++ b/src/types/index.ts
+@@ -167,7 +167,7 @@ export interface ThumbnailMetadata {
+   aspectRatio: string;
+   isStandardAspect: boolean; // 16:9 check
+   format: string;
+-  meanLuminance: number; // 0 to 255
++  meanLuminance: number | null; // null if unmeasured or measurement failed
+   hasHighContrastText?: boolean | null;
+   hasSensationalElements?: boolean | null;
+   visualAnalysisStatus?: DomainAssessmentStatus;
+@@ -291,6 +291,7 @@ export interface ReScanComparison {
+     originalSha256?: string;
+     revisedSha256?: string;
+     isIdenticalMedia: boolean;
++    comparisonStatus?: 'IDENTICAL' | 'DIFFERENT' | 'UNVERIFIED';
+   };
+ }
+ 
+diff --git a/tests/evidence_integrity_hardening.test.ts b/tests/evidence_integrity_hardening.test.ts
+index 5b3772a..50ba0d7 100644
+--- a/tests/evidence_integrity_hardening.test.ts
++++ b/tests/evidence_integrity_hardening.test.ts
+@@ -7,7 +7,7 @@ import { promisify } from 'util';
+ import { audioProcessor, AudioProcessor, AudioProcessingError } from '../src/server/pipeline/audioProcessor';
+ import { videoProcessor } from '../src/server/pipeline/videoProcessor';
+ import { mediaInspector } from '../src/server/pipeline/mediaInspector';
+-import { thumbnailInspector } from '../src/server/pipeline/thumbnailInspector';
++import { thumbnailInspector, ThumbnailInspector } from '../src/server/pipeline/thumbnailInspector';
+ import { policyIntelligenceEngine } from '../src/server/intelligence/policyIntelligence';
+ import { InMemoryStorageRepository } from '../src/server/storage';
+ import { ScanJob, UserAccount, MediaMetadata } from '../src/types';
+@@ -448,10 +448,25 @@ export async function runEvidenceIntegrityHardeningTests() {
+     const darkMeta = await thumbnailInspector.inspect(thumbDark, 'dark.jpg');
+     const brightMeta = await thumbnailInspector.inspect(thumbBright, 'bright.jpg');
+ 
+-    assert(darkMeta.hasHighContrastText === null, '4.2 Dark image luminance does NOT claim high-contrast text exists');
+-    assert(brightMeta.hasHighContrastText === null, '4.2 Bright image luminance does NOT claim high-contrast text exists');
+-    assert(darkMeta.meanLuminance < 30, '4.2 Dark image has measured low luminance');
+-    assert(brightMeta.meanLuminance > 220, '4.2 Bright image has measured high luminance');
++    assert(darkMeta.meanLuminance !== null && darkMeta.meanLuminance < 30, '4.2 Dark image has measured low luminance');
++    assert(brightMeta.meanLuminance !== null && brightMeta.meanLuminance > 220, '4.2 Bright image has measured high luminance');
++
++    // 4.2b Thumbnail luminance failure handling (Step 4 verification)
++    assert(thumbnailInspector.parseLuminanceOutput('') === null, '4.2b Empty output returns null (no default 128)');
++    assert(thumbnailInspector.parseLuminanceOutput('Fatal error reading image') === null, '4.2b Missing YAVG returns null');
++    assert(thumbnailInspector.parseLuminanceOutput('[Parsed_metadata_1] lavfi.signalstats.YAVG=NaN') === null, '4.2b Non-numeric NaN returns null');
++    assert(thumbnailInspector.parseLuminanceOutput('[Parsed_metadata_1] lavfi.signalstats.YAVG=Infinity') === null, '4.2b Infinite value returns null');
++    assert(thumbnailInspector.parseLuminanceOutput('[Parsed_metadata_1] lavfi.signalstats.YAVG=128.4') === 128, '4.2b Valid YAVG parses to rounded integer');
++
++    class FailingLuminanceInspector extends ThumbnailInspector {
++      public async extractLuminance(): Promise<number | null> {
++        return null; // Simulate FFmpeg signalstats process failure or timeout
++      }
++    }
++    const failingLuminanceInspector = new FailingLuminanceInspector();
++    const failingLumMeta = await failingLuminanceInspector.inspect(thumbDark, 'dark.jpg');
++    assert(failingLumMeta.meanLuminance === null, '4.2b Failed signalstats returns null (no synthetic 128 default)');
++    assert(failingLumMeta.width === 1280 && failingLumMeta.height === 720, '4.2b Dimensions remain measured despite luminance failure');
+ 
+     // Test 3: Unavailable thumbnail analysis is reported as unassessed, not as a verified negative
+     const timelineThumb = policyIntelligenceEngine.generateEvidenceTimeline({
+@@ -659,6 +674,73 @@ export async function runEvidenceIntegrityHardeningTests() {
+     assert(scanRecordA.userId === userA.id, '4.9 Scan record strictly associated with User A');
+     assert(scanRecordA.userId !== userB.id, '4.9 User B cannot be assigned User A scan ownership');
+ 
++    // Test 10: Step 2 regression: signalsDelta < 0 alone cannot claim resolution or success
++    assert(compUnassessed.signalsDelta < 0, '4.10 signalsDelta is negative when findings disappear due to unassessed detector');
++    assert(compUnassessed.resolvedIssues.length === 0, '4.10 No issues marked resolved despite negative signalsDelta');
++    assert(!compUnassessed.comparisonSummary.toLowerCase().includes('resolved 1'), '4.10 comparisonSummary does NOT claim findings were resolved');
++    assert(compUnassessed.comparisonSummary.includes('could not be verified'), '4.10 comparisonSummary explicitly declares resolution could not be verified');
++
++    // Test 11: Step 6 regression: Skipped domain in revised scan prevents resolution
++    const compSkipped = policyIntelligenceEngine.generateComparison(
++      baselineReportWithIssue,
++      cleanRevisedReport,
++      { skippedDomains: ['thumbnail'] }
++    );
++    assert(compSkipped.resolvedIssues.length === 0, '4.11 Skipped domain does NOT resolve prior finding');
++    assert(Boolean(compSkipped.notVerifiedIssues?.some(i => i.includes('was skipped'))), '4.11 Skipped domain explicitly noted in notVerifiedIssues');
++
++    // Test 12: Step 6 regression: NOT_PROVIDED domain in revised cut prevents resolution
++    const notProvidedRevisedReport = {
++      ...cleanRevisedReport,
++      domainReports: {
++        ...cleanRevisedReport.domainReports,
++        thumbnail: {
++          ...cleanRevisedReport.domainReports.thumbnail,
++          status: 'NOT_PROVIDED' as const
++        }
++      }
++    };
++    const compNotProvided = policyIntelligenceEngine.generateComparison(
++      baselineReportWithIssue,
++      notProvidedRevisedReport
++    );
++    assert(compNotProvided.resolvedIssues.length === 0, '4.12 NOT_PROVIDED domain does NOT resolve prior finding');
++    assert(Boolean(compNotProvided.notVerifiedIssues?.some(i => i.includes('not provided'))), '4.12 NOT_PROVIDED explicitly recorded in notVerifiedIssues');
++
++    // Test 13: Step 5 regression: Partial media identity hashes handle unknown comparison safely
++    const compMissingHash = policyIntelligenceEngine.generateComparison(
++      baselineReportWithIssue,
++      cleanRevisedReport,
++      {
++        originalScanRecord: { status: 'COMPLETED', metadata: { ...metaOriginal, sha256: undefined } },
++        revisedScanRecord: { status: 'COMPLETED', metadata: metaDifferent }
++      }
++    );
++    assert(compMissingHash.mediaIdentity?.comparisonStatus === 'UNVERIFIED', '4.13 Missing baseline hash produces comparisonStatus UNVERIFIED');
++    assert(compMissingHash.mediaIdentity?.isIdenticalMedia === false, '4.13 Missing hash does not claim identical media');
++
++    // Test 14: Step 5 & 6 regression: Identical file re-scan correctly tracks persistent findings
++    const compIdentical = policyIntelligenceEngine.generateComparison(
++      multiIssueBaseline,
++      multiIssueBaseline,
++      {
++        originalScanRecord: { status: 'COMPLETED', metadata: metaOriginal },
++        revisedScanRecord: { status: 'COMPLETED', metadata: metaOriginal }
++      }
++    );
++    assert(compIdentical.mediaIdentity?.comparisonStatus === 'IDENTICAL', '4.14 Matching hashes produce comparisonStatus IDENTICAL');
++    assert(compIdentical.mediaIdentity?.isIdenticalMedia === true, '4.14 Matching hashes confirm isIdenticalMedia is true');
++    assert(compIdentical.remainingIssues.length === 2, '4.14 Both findings persist on identical media re-scan');
++    assert(compIdentical.resolvedIssues.length === 0, '4.14 Zero resolved issues on identical media with same findings');
++
++    // Test 15: Step 6 regression: Clean baseline and clean revision produces accurate empty-state summary
++    const cleanBaseline = { ...cleanRevisedReport, scanId: 'clean_base', topIssues: [] };
++    const cleanRevised = { ...cleanRevisedReport, scanId: 'clean_rev', topIssues: [] };
++    const compClean = policyIntelligenceEngine.generateComparison(cleanBaseline, cleanRevised);
++    assert(compClean.resolvedIssues.length === 0, '4.15 Zero resolved issues when baseline had no findings');
++    assert(compClean.remainingIssues.length === 0, '4.15 Zero remaining issues when baseline had no findings');
++    assert(compClean.comparisonSummary.includes('clean status'), '4.15 Accurate summary for clean baseline and revision');
++
+     console.log(`\n======================================================`);
+     console.log(`TEST SUITE 6 COMPLETE: ${passed}/${total} assertions passed!`);
+     console.log(`======================================================\n`);
+-- 
+2.34.1
+

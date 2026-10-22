@@ -808,6 +808,9 @@ export interface ComparisonOptions {
     if (!revDomain) {
       return { verifiable: false, reason: `revised scan missing domain assessment for ${domain}` };
     }
+    if (revDomain.status === 'NOT_PROVIDED') {
+      return { verifiable: false, reason: `detector for ${domain} was not provided in revised scan` };
+    }
     if (revDomain.status === 'NOT_ASSESSED') {
       return { verifiable: false, reason: `detector for ${domain} was not assessed` };
     }
@@ -902,19 +905,28 @@ export interface ComparisonOptions {
     // Media version identity tracking via SHA-256
     const origSha = options?.originalScanRecord?.metadata?.sha256;
     const revSha = options?.revisedScanRecord?.metadata?.sha256;
-    const isIdenticalMedia = Boolean(origSha && revSha && origSha === revSha);
+    const hasBothHashes = Boolean(origSha && revSha);
+    const isIdenticalMedia = Boolean(hasBothHashes && origSha === revSha);
+    const comparisonStatus: 'IDENTICAL' | 'DIFFERENT' | 'UNVERIFIED' = hasBothHashes
+      ? (isIdenticalMedia ? 'IDENTICAL' : 'DIFFERENT')
+      : 'UNVERIFIED';
 
     const mediaIdentity = (origSha || revSha) ? {
       originalSha256: origSha,
       revisedSha256: revSha,
-      isIdenticalMedia
+      isIdenticalMedia,
+      comparisonStatus
     } : undefined;
 
     if (mediaIdentity) {
-      if (isIdenticalMedia) {
-        improvements.push('Note: Re-scan analyzed an identical media file version (matching SHA-256).');
-      } else if (origSha && revSha) {
-        improvements.push('Verified revised media file version (different SHA-256).');
+      if (hasBothHashes) {
+        if (isIdenticalMedia) {
+          improvements.push('Note: Re-scan analyzed an identical media file version (matching SHA-256).');
+        } else {
+          improvements.push('Verified revised media file version (different SHA-256).');
+        }
+      } else {
+        improvements.push('Note: Media SHA-256 identity comparison unverified (hash missing on one version).');
       }
     }
 

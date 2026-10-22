@@ -59,23 +59,7 @@ export class ThumbnailInspector {
       const aspectRatioLabel = is16by9 ? '16:9' : `${(ratio).toFixed(2)}:1`;
 
       // Extract basic luminance sample via ffmpeg signalstats filter or deterministic probe
-      let meanLuminance = 128;
-
-      try {
-        const statsArgs = [
-          '-i', imagePath,
-          '-vf', 'signalstats,metadata=print:key=lavfi.signalstats.YAVG',
-          '-f', 'null',
-          '-'
-        ];
-        const res = await execFileAsync('ffmpeg', statsArgs, { timeout: 15000 }).catch(e => ({ stderr: e.stderr || '' }));
-        const lumMatch = String(res.stderr || '').match(/YAVG=([\d.]+)/);
-        if (lumMatch) {
-          meanLuminance = Math.round(parseFloat(lumMatch[1]));
-        }
-      } catch {
-        // Fallback to neutral luminance
-      }
+      const meanLuminance = await this.extractLuminance(imagePath);
 
       // Evidence integrity: Visual text overlays, OCR, and graphic clickbait cues (arrows/circles)
       // cannot be honestly inferred from luminance thresholds or filename strings alone.
@@ -114,6 +98,38 @@ export class ThumbnailInspector {
       if (err instanceof ThumbnailInspectionError) throw err;
       throw new ThumbnailInspectionError(`Failed to inspect thumbnail image: ${err.message || 'Corrupted or unsupported format.'}`);
     }
+  }
+
+  /**
+   * Deterministically measures mean luminance from image frames using FFmpeg signalstats.
+   * Returns null if measurement fails, returns empty output, or produces non-numeric output.
+   */
+  public async extractLuminance(imagePath: string): Promise<number | null> {
+    try {
+      const statsArgs = [
+        '-i', imagePath,
+        '-vf', 'signalstats,metadata=print:key=lavfi.signalstats.YAVG',
+        '-f', 'null',
+        '-'
+      ];
+      const res = await execFileAsync('ffmpeg', statsArgs, { timeout: 15000 }).catch(e => ({ stderr: e.stderr || '' }));
+      return this.parseLuminanceOutput(String(res.stderr || ''));
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Parses YAVG numeric value from signalstats output string.
+   * Explicitly returns null for missing, NaN, non-finite, or malformed data.
+   */
+  public parseLuminanceOutput(output: string): number | null {
+    if (!output || typeof output !== 'string') return null;
+    const lumMatch = output.match(/YAVG=([\d.]+)/);
+    if (!lumMatch) return null;
+    const parsed = parseFloat(lumMatch[1]);
+    if (!Number.isFinite(parsed) || isNaN(parsed)) return null;
+    return Math.round(parsed);
   }
 }
 

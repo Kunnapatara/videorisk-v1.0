@@ -167,7 +167,7 @@ export interface ThumbnailMetadata {
   aspectRatio: string;
   isStandardAspect: boolean; // 16:9 check
   format: string;
-  meanLuminance: number; // 0 to 255
+  meanLuminance: number | null; // null if unmeasured or measurement failed
   hasHighContrastText?: boolean | null;
   hasSensationalElements?: boolean | null;
   visualAnalysisStatus?: DomainAssessmentStatus;
@@ -291,6 +291,7 @@ export interface ReScanComparison {
     originalSha256?: string;
     revisedSha256?: string;
     isIdenticalMedia: boolean;
+    comparisonStatus?: 'IDENTICAL' | 'DIFFERENT' | 'UNVERIFIED';
   };
 }
 

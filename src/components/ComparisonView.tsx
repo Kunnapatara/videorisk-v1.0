@@ -46,39 +46,77 @@ export const ComparisonView: React.FC<ComparisonViewProps> = ({
       </div>
 
       {/* Summary Banner */}
-      <div className={`p-6 rounded-xl border ${
-        comparison.signalsDelta <= 0 && comparison.revisedRisk !== 'HIGH_RISK'
-          ? 'bg-emerald-50 border-emerald-200'
-          : 'bg-amber-50 border-amber-200'
-      }`}>
-        <div className="flex items-start gap-3">
-          {comparison.signalsDelta <= 0 && comparison.revisedRisk !== 'HIGH_RISK' ? (
-            <ShieldCheck className="w-6 h-6 text-emerald-600 mt-0.5 shrink-0" />
-          ) : (
-            <AlertTriangle className="w-6 h-6 text-amber-600 mt-0.5 shrink-0" />
-          )}
-          <div>
-            <h3 className={`font-bold text-base ${
-              comparison.signalsDelta <= 0 && comparison.revisedRisk !== 'HIGH_RISK'
-                ? 'text-emerald-950'
-                : 'text-amber-950'
-            }`}>
-              {comparison.comparisonSummary}
-            </h3>
-            <p className={`text-xs mt-1 ${
-              comparison.signalsDelta <= 0 && comparison.revisedRisk !== 'HIGH_RISK'
-                ? 'text-emerald-800'
-                : 'text-amber-800'
-            }`}>
-              {comparison.signalsDelta < 0
-                ? 'Your edits have successfully addressed platform policy scrutiny points.'
-                : comparison.signalsDelta === 0
-                ? 'No net change in detected risk signals between cuts.'
-                : 'Additional policy scrutiny signals were observed in this revision cut.'}
-            </p>
+      {(() => {
+        const isFullyResolved = comparison.resolvedIssues.length > 0 &&
+          (!comparison.notVerifiedIssues || comparison.notVerifiedIssues.length === 0) &&
+          comparison.remainingIssues.length === 0 &&
+          (!comparison.newIssues || comparison.newIssues.length === 0) &&
+          comparison.revisedRisk !== 'HIGH_RISK';
+
+        const isCleanBaselineAndRevision = comparison.originalSignalsCount === 0 &&
+          comparison.revisedSignalsCount === 0 &&
+          comparison.revisedRisk !== 'HIGH_RISK';
+
+        const isGreen = isFullyResolved || isCleanBaselineAndRevision;
+        const isHighRisk = comparison.revisedRisk === 'HIGH_RISK';
+
+        let subtitle = 'No net change in detected risk signals between cuts.';
+        if (comparison.resolvedIssues.length > 0) {
+          if (comparison.remainingIssues.length === 0 && (!comparison.notVerifiedIssues || comparison.notVerifiedIssues.length === 0)) {
+            subtitle = `Verified with evidence: All ${comparison.resolvedIssues.length} prior policy scrutiny signal(s) have been resolved.`;
+          } else {
+            subtitle = `Partial resolution verified: ${comparison.resolvedIssues.length} prior signal(s) resolved with evidence, but additional signals remain present or unverified.`;
+          }
+        } else if (comparison.notVerifiedIssues && comparison.notVerifiedIssues.length > 0) {
+          subtitle = `Signal resolution could not be verified (${comparison.notVerifiedIssues.length} item(s) unverified due to unassessed detectors or insufficient evidence).`;
+        } else if (comparison.remainingIssues.length > 0) {
+          subtitle = `No prior risk signals were resolved. ${comparison.remainingIssues.length} signal(s) persist in this revision cut.`;
+        } else if (comparison.newIssues && comparison.newIssues.length > 0) {
+          subtitle = `New policy scrutiny signal(s) detected in this revision cut.`;
+        } else if (isCleanBaselineAndRevision) {
+          subtitle = 'No policy scrutiny signals detected in either cut.';
+        } else if (comparison.signalsDelta < 0) {
+          subtitle = `Fewer signals detected in this cut (${comparison.revisedSignalsCount} vs ${comparison.originalSignalsCount}), but no prior findings were verifiably resolved with evidence.`;
+        }
+
+        return (
+          <div className={`p-6 rounded-xl border ${
+            isGreen
+              ? 'bg-emerald-50 border-emerald-200'
+              : isHighRisk
+              ? 'bg-rose-50 border-rose-200'
+              : 'bg-amber-50 border-amber-200'
+          }`}>
+            <div className="flex items-start gap-3">
+              {isGreen ? (
+                <ShieldCheck className="w-6 h-6 text-emerald-600 mt-0.5 shrink-0" />
+              ) : (
+                <AlertTriangle className={`w-6 h-6 mt-0.5 shrink-0 ${isHighRisk ? 'text-rose-600' : 'text-amber-600'}`} />
+              )}
+              <div>
+                <h3 className={`font-bold text-base ${
+                  isGreen
+                    ? 'text-emerald-950'
+                    : isHighRisk
+                    ? 'text-rose-950'
+                    : 'text-amber-950'
+                }`}>
+                  {comparison.comparisonSummary}
+                </h3>
+                <p className={`text-xs mt-1 ${
+                  isGreen
+                    ? 'text-emerald-800'
+                    : isHighRisk
+                    ? 'text-rose-800'
+                    : 'text-amber-800'
+                }`}>
+                  {subtitle}
+                </p>
+              </div>
+            </div>
           </div>
-        </div>
-      </div>
+        );
+      })()}
 
       {/* BEFORE VS AFTER CARDS */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -186,8 +224,18 @@ export const ComparisonView: React.FC<ComparisonViewProps> = ({
                 <span className="text-stone-500">Media SHA-256:</span>
                 <span className="font-mono text-stone-700" title={comparison.mediaIdentity.revisedSha256}>
                   {comparison.mediaIdentity.revisedSha256.slice(0, 10)}…
-                  <span className={`ml-1 text-[10px] font-sans font-semibold ${comparison.mediaIdentity.isIdenticalMedia ? 'text-amber-700' : 'text-emerald-700'}`}>
-                    ({comparison.mediaIdentity.isIdenticalMedia ? 'Identical file' : 'Modified file'})
+                  <span className={`ml-1 text-[10px] font-sans font-semibold ${
+                    comparison.mediaIdentity.comparisonStatus === 'IDENTICAL'
+                      ? 'text-amber-700'
+                      : comparison.mediaIdentity.comparisonStatus === 'DIFFERENT'
+                      ? 'text-emerald-700'
+                      : 'text-stone-500'
+                  }`}>
+                    {comparison.mediaIdentity.comparisonStatus === 'IDENTICAL'
+                      ? '(Identical file)'
+                      : comparison.mediaIdentity.comparisonStatus === 'DIFFERENT'
+                      ? '(Modified file)'
+                      : '(File comparison unverified)'}
                   </span>
                 </span>
               </div>
@@ -197,12 +245,11 @@ export const ComparisonView: React.FC<ComparisonViewProps> = ({
       </div>
 
       {/* RESOLVED ISSUES CHECKLIST */}
-      <div className="bg-white rounded-xl border border-stone-200 p-5 space-y-4">
-        <h4 className="font-bold text-sm text-stone-900">
-          Resolved Signals ({comparison.resolvedIssues.length})
-        </h4>
-
-        {comparison.resolvedIssues.length > 0 ? (
+      {comparison.resolvedIssues.length > 0 && (
+        <div className="bg-white rounded-xl border border-stone-200 p-5 space-y-4">
+          <h4 className="font-bold text-sm text-stone-900">
+            Resolved Signals ({comparison.resolvedIssues.length})
+          </h4>
           <div className="space-y-2">
             {comparison.resolvedIssues.map((issue, idx) => (
               <div key={idx} className="flex items-start gap-2.5 text-xs text-stone-700">
@@ -211,13 +258,29 @@ export const ComparisonView: React.FC<ComparisonViewProps> = ({
               </div>
             ))}
           </div>
-        ) : (
-          <div className="flex items-center gap-2 text-xs text-stone-500 py-1">
-            <Info className="w-4 h-4 text-stone-400 shrink-0" />
-            <span>No prior risk issues were verifiably resolved in this re-scan.</span>
+        </div>
+      )}
+
+      {/* PERSISTING / REMAINING ISSUES (IF ANY) */}
+      {comparison.remainingIssues && comparison.remainingIssues.length > 0 && (
+        <div className="bg-white rounded-xl border border-amber-200 p-5 space-y-4">
+          <h4 className="font-bold text-sm text-amber-950 flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-amber-600" />
+            Persisting Signals ({comparison.remainingIssues.length})
+          </h4>
+          <p className="text-xs text-stone-500">
+            These signals detected in the original cut remain present in the revised cut.
+          </p>
+          <div className="space-y-2">
+            {comparison.remainingIssues.map((issue, idx) => (
+              <div key={idx} className="flex items-start gap-2.5 text-xs text-stone-800">
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-500 mt-1.5 shrink-0" />
+                <span>{issue}</span>
+              </div>
+            ))}
           </div>
-        )}
-      </div>
+        </div>
+      )}
 
       {/* NOT VERIFIED ISSUES (IF ANY) */}
       {comparison.notVerifiedIssues && comparison.notVerifiedIssues.length > 0 && (
@@ -255,6 +318,18 @@ export const ComparisonView: React.FC<ComparisonViewProps> = ({
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* EMPTY STATE WHEN NO ISSUES TO COMPARE */}
+      {comparison.resolvedIssues.length === 0 &&
+       comparison.remainingIssues.length === 0 &&
+       (!comparison.notVerifiedIssues || comparison.notVerifiedIssues.length === 0) &&
+       (!comparison.newIssues || comparison.newIssues.length === 0) && (
+        <div className="bg-white rounded-xl border border-stone-200 p-6 text-center text-xs text-stone-500 space-y-2">
+          <Info className="w-5 h-5 text-stone-400 mx-auto" />
+          <p className="font-semibold text-stone-700">No Policy Scrutiny Signals to Compare</p>
+          <p>Both original and revised cuts evaluated with zero detected policy issues.</p>
         </div>
       )}
 

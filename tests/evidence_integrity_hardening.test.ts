@@ -7,7 +7,7 @@ import { promisify } from 'util';
 import { audioProcessor, AudioProcessor, AudioProcessingError } from '../src/server/pipeline/audioProcessor';
 import { videoProcessor } from '../src/server/pipeline/videoProcessor';
 import { mediaInspector } from '../src/server/pipeline/mediaInspector';
-import { thumbnailInspector } from '../src/server/pipeline/thumbnailInspector';
+import { thumbnailInspector, ThumbnailInspector } from '../src/server/pipeline/thumbnailInspector';
 import { policyIntelligenceEngine } from '../src/server/intelligence/policyIntelligence';
 import { InMemoryStorageRepository } from '../src/server/storage';
 import { ScanJob, UserAccount, MediaMetadata } from '../src/types';
@@ -448,10 +448,25 @@ export async function runEvidenceIntegrityHardeningTests() {
     const darkMeta = await thumbnailInspector.inspect(thumbDark, 'dark.jpg');
     const brightMeta = await thumbnailInspector.inspect(thumbBright, 'bright.jpg');
 
-    assert(darkMeta.hasHighContrastText === null, '4.2 Dark image luminance does NOT claim high-contrast text exists');
-    assert(brightMeta.hasHighContrastText === null, '4.2 Bright image luminance does NOT claim high-contrast text exists');
-    assert(darkMeta.meanLuminance < 30, '4.2 Dark image has measured low luminance');
-    assert(brightMeta.meanLuminance > 220, '4.2 Bright image has measured high luminance');
+    assert(darkMeta.meanLuminance !== null && darkMeta.meanLuminance < 30, '4.2 Dark image has measured low luminance');
+    assert(brightMeta.meanLuminance !== null && brightMeta.meanLuminance > 220, '4.2 Bright image has measured high luminance');
+
+    // 4.2b Thumbnail luminance failure handling (Step 4 verification)
+    assert(thumbnailInspector.parseLuminanceOutput('') === null, '4.2b Empty output returns null (no default 128)');
+    assert(thumbnailInspector.parseLuminanceOutput('Fatal error reading image') === null, '4.2b Missing YAVG returns null');
+    assert(thumbnailInspector.parseLuminanceOutput('[Parsed_metadata_1] lavfi.signalstats.YAVG=NaN') === null, '4.2b Non-numeric NaN returns null');
+    assert(thumbnailInspector.parseLuminanceOutput('[Parsed_metadata_1] lavfi.signalstats.YAVG=Infinity') === null, '4.2b Infinite value returns null');
+    assert(thumbnailInspector.parseLuminanceOutput('[Parsed_metadata_1] lavfi.signalstats.YAVG=128.4') === 128, '4.2b Valid YAVG parses to rounded integer');
+
+    class FailingLuminanceInspector extends ThumbnailInspector {
+      public async extractLuminance(): Promise<number | null> {
+        return null; // Simulate FFmpeg signalstats process failure or timeout
+      }
+    }
+    const failingLuminanceInspector = new FailingLuminanceInspector();
+    const failingLumMeta = await failingLuminanceInspector.inspect(thumbDark, 'dark.jpg');
+    assert(failingLumMeta.meanLuminance === null, '4.2b Failed signalstats returns null (no synthetic 128 default)');
+    assert(failingLumMeta.width === 1280 && failingLumMeta.height === 720, '4.2b Dimensions remain measured despite luminance failure');
 
     // Test 3: Unavailable thumbnail analysis is reported as unassessed, not as a verified negative
     const timelineThumb = policyIntelligenceEngine.generateEvidenceTimeline({
@@ -658,6 +673,73 @@ export async function runEvidenceIntegrityHardeningTests() {
 
     assert(scanRecordA.userId === userA.id, '4.9 Scan record strictly associated with User A');
     assert(scanRecordA.userId !== userB.id, '4.9 User B cannot be assigned User A scan ownership');
+
+    // Test 10: Step 2 regression: signalsDelta < 0 alone cannot claim resolution or success
+    assert(compUnassessed.signalsDelta < 0, '4.10 signalsDelta is negative when findings disappear due to unassessed detector');
+    assert(compUnassessed.resolvedIssues.length === 0, '4.10 No issues marked resolved despite negative signalsDelta');
+    assert(!compUnassessed.comparisonSummary.toLowerCase().includes('resolved 1'), '4.10 comparisonSummary does NOT claim findings were resolved');
+    assert(compUnassessed.comparisonSummary.includes('could not be verified'), '4.10 comparisonSummary explicitly declares resolution could not be verified');
+
+    // Test 11: Step 6 regression: Skipped domain in revised scan prevents resolution
+    const compSkipped = policyIntelligenceEngine.generateComparison(
+      baselineReportWithIssue,
+      cleanRevisedReport,
+      { skippedDomains: ['thumbnail'] }
+    );
+    assert(compSkipped.resolvedIssues.length === 0, '4.11 Skipped domain does NOT resolve prior finding');
+    assert(Boolean(compSkipped.notVerifiedIssues?.some(i => i.includes('was skipped'))), '4.11 Skipped domain explicitly noted in notVerifiedIssues');
+
+    // Test 12: Step 6 regression: NOT_PROVIDED domain in revised cut prevents resolution
+    const notProvidedRevisedReport = {
+      ...cleanRevisedReport,
+      domainReports: {
+        ...cleanRevisedReport.domainReports,
+        thumbnail: {
+          ...cleanRevisedReport.domainReports.thumbnail,
+          status: 'NOT_PROVIDED' as const
+        }
+      }
+    };
+    const compNotProvided = policyIntelligenceEngine.generateComparison(
+      baselineReportWithIssue,
+      notProvidedRevisedReport
+    );
+    assert(compNotProvided.resolvedIssues.length === 0, '4.12 NOT_PROVIDED domain does NOT resolve prior finding');
+    assert(Boolean(compNotProvided.notVerifiedIssues?.some(i => i.includes('not provided'))), '4.12 NOT_PROVIDED explicitly recorded in notVerifiedIssues');
+
+    // Test 13: Step 5 regression: Partial media identity hashes handle unknown comparison safely
+    const compMissingHash = policyIntelligenceEngine.generateComparison(
+      baselineReportWithIssue,
+      cleanRevisedReport,
+      {
+        originalScanRecord: { status: 'COMPLETED', metadata: { ...metaOriginal, sha256: undefined } },
+        revisedScanRecord: { status: 'COMPLETED', metadata: metaDifferent }
+      }
+    );
+    assert(compMissingHash.mediaIdentity?.comparisonStatus === 'UNVERIFIED', '4.13 Missing baseline hash produces comparisonStatus UNVERIFIED');
+    assert(compMissingHash.mediaIdentity?.isIdenticalMedia === false, '4.13 Missing hash does not claim identical media');
+
+    // Test 14: Step 5 & 6 regression: Identical file re-scan correctly tracks persistent findings
+    const compIdentical = policyIntelligenceEngine.generateComparison(
+      multiIssueBaseline,
+      multiIssueBaseline,
+      {
+        originalScanRecord: { status: 'COMPLETED', metadata: metaOriginal },
+        revisedScanRecord: { status: 'COMPLETED', metadata: metaOriginal }
+      }
+    );
+    assert(compIdentical.mediaIdentity?.comparisonStatus === 'IDENTICAL', '4.14 Matching hashes produce comparisonStatus IDENTICAL');
+    assert(compIdentical.mediaIdentity?.isIdenticalMedia === true, '4.14 Matching hashes confirm isIdenticalMedia is true');
+    assert(compIdentical.remainingIssues.length === 2, '4.14 Both findings persist on identical media re-scan');
+    assert(compIdentical.resolvedIssues.length === 0, '4.14 Zero resolved issues on identical media with same findings');
+
+    // Test 15: Step 6 regression: Clean baseline and clean revision produces accurate empty-state summary
+    const cleanBaseline = { ...cleanRevisedReport, scanId: 'clean_base', topIssues: [] };
+    const cleanRevised = { ...cleanRevisedReport, scanId: 'clean_rev', topIssues: [] };
+    const compClean = policyIntelligenceEngine.generateComparison(cleanBaseline, cleanRevised);
+    assert(compClean.resolvedIssues.length === 0, '4.15 Zero resolved issues when baseline had no findings');
+    assert(compClean.remainingIssues.length === 0, '4.15 Zero remaining issues when baseline had no findings');
+    assert(compClean.comparisonSummary.includes('clean status'), '4.15 Accurate summary for clean baseline and revision');
 
     console.log(`\n======================================================`);
     console.log(`TEST SUITE 6 COMPLETE: ${passed}/${total} assertions passed!`);
