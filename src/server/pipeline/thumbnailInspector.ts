@@ -102,7 +102,7 @@ export class ThumbnailInspector {
 
   /**
    * Deterministically measures mean luminance from image frames using FFmpeg signalstats.
-   * Returns null if measurement fails, returns empty output, or produces non-numeric output.
+   * Returns null if process fails (non-zero exit/crash/timeout), returns empty output, or produces non-numeric output.
    */
   public async extractLuminance(imagePath: string): Promise<number | null> {
     try {
@@ -112,11 +112,21 @@ export class ThumbnailInspector {
         '-f', 'null',
         '-'
       ];
-      const res = await execFileAsync('ffmpeg', statsArgs, { timeout: 15000 }).catch(e => ({ stderr: e.stderr || '' }));
-      return this.parseLuminanceOutput(String(res.stderr || ''));
+      const { stderr } = await execFileAsync('ffmpeg', statsArgs, { timeout: 15000 });
+      return this.evaluateLuminanceExecution(String(stderr || ''), false);
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Evaluates FFmpeg execution result for luminance measurement.
+   * If hasError is true (e.g. non-zero exit code, process crash, timeout), returns null
+   * even if partial output contains a signalstats value.
+   */
+  public evaluateLuminanceExecution(output: string, hasError: boolean): number | null {
+    if (hasError) return null;
+    return this.parseLuminanceOutput(output);
   }
 
   /**

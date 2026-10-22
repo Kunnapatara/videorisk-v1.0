@@ -2,6 +2,59 @@ import React from 'react';
 import { ReScanComparison } from '../types';
 import { CheckCircle2, AlertTriangle, ArrowRight, TrendingUp, ShieldCheck, RefreshCw, HelpCircle, Info } from 'lucide-react';
 
+export interface MediaIdentityDisplay {
+  comparisonStatus: 'IDENTICAL' | 'DIFFERENT' | 'UNVERIFIED';
+  statusLabel: string;
+  statusBadgeText: string;
+  originalHashDisplay: string;
+  originalHashTitle?: string;
+  revisedHashDisplay: string;
+  revisedHashTitle?: string;
+}
+
+export function isValidSha256(hash?: string): boolean {
+  if (typeof hash !== 'string') return false;
+  return /^[a-fA-F0-9]{64}$/.test(hash.trim());
+}
+
+export function formatMediaIdentityDisplay(
+  originalSha256?: string,
+  revisedSha256?: string
+): MediaIdentityDisplay {
+  const validOrig = isValidSha256(originalSha256);
+  const validRev = isValidSha256(revisedSha256);
+
+  const origClean = validOrig ? originalSha256!.trim().toLowerCase() : undefined;
+  const revClean = validRev ? revisedSha256!.trim().toLowerCase() : undefined;
+
+  let comparisonStatus: 'IDENTICAL' | 'DIFFERENT' | 'UNVERIFIED' = 'UNVERIFIED';
+  let statusBadgeText = '(File comparison unverified)';
+
+  if (validOrig && validRev) {
+    if (origClean === revClean) {
+      comparisonStatus = 'IDENTICAL';
+      statusBadgeText = '(Identical file)';
+    } else {
+      comparisonStatus = 'DIFFERENT';
+      statusBadgeText = '(Modified file)';
+    }
+  }
+
+  return {
+    comparisonStatus,
+    statusBadgeText,
+    statusLabel: comparisonStatus === 'IDENTICAL'
+      ? 'Identical file'
+      : comparisonStatus === 'DIFFERENT'
+      ? 'Modified file'
+      : 'File comparison unverified',
+    originalHashDisplay: validOrig ? `${origClean!.slice(0, 10)}…` : 'Unavailable',
+    originalHashTitle: validOrig ? originalSha256 : undefined,
+    revisedHashDisplay: validRev ? `${revClean!.slice(0, 10)}…` : 'Unavailable',
+    revisedHashTitle: validRev ? revisedSha256 : undefined,
+  };
+}
+
 interface ComparisonViewProps {
   comparison: ReScanComparison;
   onBackToReport: () => void;
@@ -154,14 +207,20 @@ export const ComparisonView: React.FC<ComparisonViewProps> = ({
               <span className="text-stone-500">Reused Material:</span>
               <strong className="text-stone-900">{comparison.originalRatios.reusedContent}%</strong>
             </div>
-            {comparison.mediaIdentity?.originalSha256 && (
-              <div className="flex justify-between py-1.5 border-b border-stone-50 text-[11px]">
-                <span className="text-stone-500">Media SHA-256:</span>
-                <span className="font-mono text-stone-700" title={comparison.mediaIdentity.originalSha256}>
-                  {comparison.mediaIdentity.originalSha256.slice(0, 10)}…
-                </span>
-              </div>
-            )}
+            {comparison.mediaIdentity && (() => {
+              const display = formatMediaIdentityDisplay(
+                comparison.mediaIdentity.originalSha256,
+                comparison.mediaIdentity.revisedSha256
+              );
+              return (
+                <div className="flex justify-between py-1.5 border-b border-stone-50 text-[11px]">
+                  <span className="text-stone-500">Media SHA-256:</span>
+                  <span className="font-mono text-stone-700" title={display.originalHashTitle}>
+                    {display.originalHashDisplay}
+                  </span>
+                </div>
+              );
+            })()}
           </div>
         </div>
 
@@ -219,27 +278,29 @@ export const ComparisonView: React.FC<ComparisonViewProps> = ({
                 {comparison.revisedRatios.reusedContent}% ({comparison.revisedRatios.reusedContent - comparison.originalRatios.reusedContent >= 0 ? '+' : ''}${comparison.revisedRatios.reusedContent - comparison.originalRatios.reusedContent}%)
               </strong>
             </div>
-            {comparison.mediaIdentity?.revisedSha256 && (
-              <div className="flex justify-between py-1.5 border-b border-stone-50 text-[11px]">
-                <span className="text-stone-500">Media SHA-256:</span>
-                <span className="font-mono text-stone-700" title={comparison.mediaIdentity.revisedSha256}>
-                  {comparison.mediaIdentity.revisedSha256.slice(0, 10)}…
-                  <span className={`ml-1 text-[10px] font-sans font-semibold ${
-                    comparison.mediaIdentity.comparisonStatus === 'IDENTICAL'
-                      ? 'text-amber-700'
-                      : comparison.mediaIdentity.comparisonStatus === 'DIFFERENT'
-                      ? 'text-emerald-700'
-                      : 'text-stone-500'
-                  }`}>
-                    {comparison.mediaIdentity.comparisonStatus === 'IDENTICAL'
-                      ? '(Identical file)'
-                      : comparison.mediaIdentity.comparisonStatus === 'DIFFERENT'
-                      ? '(Modified file)'
-                      : '(File comparison unverified)'}
+            {comparison.mediaIdentity && (() => {
+              const display = formatMediaIdentityDisplay(
+                comparison.mediaIdentity.originalSha256,
+                comparison.mediaIdentity.revisedSha256
+              );
+              return (
+                <div className="flex justify-between py-1.5 border-b border-stone-50 text-[11px]">
+                  <span className="text-stone-500">Media SHA-256:</span>
+                  <span className="font-mono text-stone-700" title={display.revisedHashTitle}>
+                    {display.revisedHashDisplay}
+                    <span className={`ml-1 text-[10px] font-sans font-semibold ${
+                      display.comparisonStatus === 'IDENTICAL'
+                        ? 'text-amber-700'
+                        : display.comparisonStatus === 'DIFFERENT'
+                        ? 'text-emerald-700'
+                        : 'text-stone-500'
+                    }`}>
+                      {display.statusBadgeText}
+                    </span>
                   </span>
-                </span>
-              </div>
-            )}
+                </div>
+              );
+            })()}
           </div>
         </div>
       </div>

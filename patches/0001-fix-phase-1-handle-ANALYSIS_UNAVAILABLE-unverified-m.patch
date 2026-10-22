@@ -1,0 +1,351 @@
+From 6712e5cb6ce7fce064bab158f9e174ad6c593239 Mon Sep 17 00:00:00 2001
+From: Kunnapatara <kunnapatara@yahoo.com>
+Date: Thu, 22 Oct 2026 08:48:18 +0000
+Subject: [PATCH] fix(phase-1): handle ANALYSIS_UNAVAILABLE, unverified media
+ identity, and luminance fail-closed
+
+---
+ src/components/ComparisonView.tsx             | 117 +++++++++++++-----
+ src/server/intelligence/policyIntelligence.ts |  12 +-
+ src/server/pipeline/thumbnailInspector.ts     |  16 ++-
+ tests/evidence_integrity_hardening.test.ts    | 101 +++++++++++++++
+ 4 files changed, 212 insertions(+), 34 deletions(-)
+
+diff --git a/src/components/ComparisonView.tsx b/src/components/ComparisonView.tsx
+index 5133efa..80ec856 100644
+--- a/src/components/ComparisonView.tsx
++++ b/src/components/ComparisonView.tsx
+@@ -2,6 +2,59 @@ import React from 'react';
+ import { ReScanComparison } from '../types';
+ import { CheckCircle2, AlertTriangle, ArrowRight, TrendingUp, ShieldCheck, RefreshCw, HelpCircle, Info } from 'lucide-react';
+ 
++export interface MediaIdentityDisplay {
++  comparisonStatus: 'IDENTICAL' | 'DIFFERENT' | 'UNVERIFIED';
++  statusLabel: string;
++  statusBadgeText: string;
++  originalHashDisplay: string;
++  originalHashTitle?: string;
++  revisedHashDisplay: string;
++  revisedHashTitle?: string;
++}
++
++export function isValidSha256(hash?: string): boolean {
++  if (typeof hash !== 'string') return false;
++  return /^[a-fA-F0-9]{64}$/.test(hash.trim());
++}
++
++export function formatMediaIdentityDisplay(
++  originalSha256?: string,
++  revisedSha256?: string
++): MediaIdentityDisplay {
++  const validOrig = isValidSha256(originalSha256);
++  const validRev = isValidSha256(revisedSha256);
++
++  const origClean = validOrig ? originalSha256!.trim().toLowerCase() : undefined;
++  const revClean = validRev ? revisedSha256!.trim().toLowerCase() : undefined;
++
++  let comparisonStatus: 'IDENTICAL' | 'DIFFERENT' | 'UNVERIFIED' = 'UNVERIFIED';
++  let statusBadgeText = '(File comparison unverified)';
++
++  if (validOrig && validRev) {
++    if (origClean === revClean) {
++      comparisonStatus = 'IDENTICAL';
++      statusBadgeText = '(Identical file)';
++    } else {
++      comparisonStatus = 'DIFFERENT';
++      statusBadgeText = '(Modified file)';
++    }
++  }
++
++  return {
++    comparisonStatus,
++    statusBadgeText,
++    statusLabel: comparisonStatus === 'IDENTICAL'
++      ? 'Identical file'
++      : comparisonStatus === 'DIFFERENT'
++      ? 'Modified file'
++      : 'File comparison unverified',
++    originalHashDisplay: validOrig ? `${origClean!.slice(0, 10)}…` : 'Unavailable',
++    originalHashTitle: validOrig ? originalSha256 : undefined,
++    revisedHashDisplay: validRev ? `${revClean!.slice(0, 10)}…` : 'Unavailable',
++    revisedHashTitle: validRev ? revisedSha256 : undefined,
++  };
++}
++
+ interface ComparisonViewProps {
+   comparison: ReScanComparison;
+   onBackToReport: () => void;
+@@ -154,14 +207,20 @@ export const ComparisonView: React.FC<ComparisonViewProps> = ({
+               <span className="text-stone-500">Reused Material:</span>
+               <strong className="text-stone-900">{comparison.originalRatios.reusedContent}%</strong>
+             </div>
+-            {comparison.mediaIdentity?.originalSha256 && (
+-              <div className="flex justify-between py-1.5 border-b border-stone-50 text-[11px]">
+-                <span className="text-stone-500">Media SHA-256:</span>
+-                <span className="font-mono text-stone-700" title={comparison.mediaIdentity.originalSha256}>
+-                  {comparison.mediaIdentity.originalSha256.slice(0, 10)}…
+-                </span>
+-              </div>
+-            )}
++            {comparison.mediaIdentity && (() => {
++              const display = formatMediaIdentityDisplay(
++                comparison.mediaIdentity.originalSha256,
++                comparison.mediaIdentity.revisedSha256
++              );
++              return (
++                <div className="flex justify-between py-1.5 border-b border-stone-50 text-[11px]">
++                  <span className="text-stone-500">Media SHA-256:</span>
++                  <span className="font-mono text-stone-700" title={display.originalHashTitle}>
++                    {display.originalHashDisplay}
++                  </span>
++                </div>
++              );
++            })()}
+           </div>
+         </div>
+ 
+@@ -219,27 +278,29 @@ export const ComparisonView: React.FC<ComparisonViewProps> = ({
+                 {comparison.revisedRatios.reusedContent}% ({comparison.revisedRatios.reusedContent - comparison.originalRatios.reusedContent >= 0 ? '+' : ''}${comparison.revisedRatios.reusedContent - comparison.originalRatios.reusedContent}%)
+               </strong>
+             </div>
+-            {comparison.mediaIdentity?.revisedSha256 && (
+-              <div className="flex justify-between py-1.5 border-b border-stone-50 text-[11px]">
+-                <span className="text-stone-500">Media SHA-256:</span>
+-                <span className="font-mono text-stone-700" title={comparison.mediaIdentity.revisedSha256}>
+-                  {comparison.mediaIdentity.revisedSha256.slice(0, 10)}…
+-                  <span className={`ml-1 text-[10px] font-sans font-semibold ${
+-                    comparison.mediaIdentity.comparisonStatus === 'IDENTICAL'
+-                      ? 'text-amber-700'
+-                      : comparison.mediaIdentity.comparisonStatus === 'DIFFERENT'
+-                      ? 'text-emerald-700'
+-                      : 'text-stone-500'
+-                  }`}>
+-                    {comparison.mediaIdentity.comparisonStatus === 'IDENTICAL'
+-                      ? '(Identical file)'
+-                      : comparison.mediaIdentity.comparisonStatus === 'DIFFERENT'
+-                      ? '(Modified file)'
+-                      : '(File comparison unverified)'}
++            {comparison.mediaIdentity && (() => {
++              const display = formatMediaIdentityDisplay(
++                comparison.mediaIdentity.originalSha256,
++                comparison.mediaIdentity.revisedSha256
++              );
++              return (
++                <div className="flex justify-between py-1.5 border-b border-stone-50 text-[11px]">
++                  <span className="text-stone-500">Media SHA-256:</span>
++                  <span className="font-mono text-stone-700" title={display.revisedHashTitle}>
++                    {display.revisedHashDisplay}
++                    <span className={`ml-1 text-[10px] font-sans font-semibold ${
++                      display.comparisonStatus === 'IDENTICAL'
++                        ? 'text-amber-700'
++                        : display.comparisonStatus === 'DIFFERENT'
++                        ? 'text-emerald-700'
++                        : 'text-stone-500'
++                    }`}>
++                      {display.statusBadgeText}
++                    </span>
+                   </span>
+-                </span>
+-              </div>
+-            )}
++                </div>
++              );
++            })()}
+           </div>
+         </div>
+       </div>
+diff --git a/src/server/intelligence/policyIntelligence.ts b/src/server/intelligence/policyIntelligence.ts
+index 7aac7a0..36c50ef 100644
+--- a/src/server/intelligence/policyIntelligence.ts
++++ b/src/server/intelligence/policyIntelligence.ts
+@@ -814,6 +814,9 @@ export interface ComparisonOptions {
+     if (revDomain.status === 'NOT_ASSESSED') {
+       return { verifiable: false, reason: `detector for ${domain} was not assessed` };
+     }
++    if (revDomain.status === 'ANALYSIS_UNAVAILABLE') {
++      return { verifiable: false, reason: `analysis for ${domain} was unavailable` };
++    }
+     if (revDomain.status === 'INSUFFICIENT_EVIDENCE') {
+       return { verifiable: false, reason: `detector for ${domain} reported insufficient evidence` };
+     }
+@@ -905,13 +908,16 @@ export interface ComparisonOptions {
+     // Media version identity tracking via SHA-256
+     const origSha = options?.originalScanRecord?.metadata?.sha256;
+     const revSha = options?.revisedScanRecord?.metadata?.sha256;
+-    const hasBothHashes = Boolean(origSha && revSha);
+-    const isIdenticalMedia = Boolean(hasBothHashes && origSha === revSha);
++    const isValidSha = (h?: string): boolean => typeof h === 'string' && /^[a-fA-F0-9]{64}$/.test(h.trim());
++    const validOrig = isValidSha(origSha);
++    const validRev = isValidSha(revSha);
++    const hasBothHashes = Boolean(validOrig && validRev);
++    const isIdenticalMedia = Boolean(hasBothHashes && origSha!.trim().toLowerCase() === revSha!.trim().toLowerCase());
+     const comparisonStatus: 'IDENTICAL' | 'DIFFERENT' | 'UNVERIFIED' = hasBothHashes
+       ? (isIdenticalMedia ? 'IDENTICAL' : 'DIFFERENT')
+       : 'UNVERIFIED';
+ 
+-    const mediaIdentity = (origSha || revSha) ? {
++    const mediaIdentity = (origSha || revSha || options?.originalScanRecord?.metadata || options?.revisedScanRecord?.metadata) ? {
+       originalSha256: origSha,
+       revisedSha256: revSha,
+       isIdenticalMedia,
+diff --git a/src/server/pipeline/thumbnailInspector.ts b/src/server/pipeline/thumbnailInspector.ts
+index 8732908..91a5f68 100644
+--- a/src/server/pipeline/thumbnailInspector.ts
++++ b/src/server/pipeline/thumbnailInspector.ts
+@@ -102,7 +102,7 @@ export class ThumbnailInspector {
+ 
+   /**
+    * Deterministically measures mean luminance from image frames using FFmpeg signalstats.
+-   * Returns null if measurement fails, returns empty output, or produces non-numeric output.
++   * Returns null if process fails (non-zero exit/crash/timeout), returns empty output, or produces non-numeric output.
+    */
+   public async extractLuminance(imagePath: string): Promise<number | null> {
+     try {
+@@ -112,13 +112,23 @@ export class ThumbnailInspector {
+         '-f', 'null',
+         '-'
+       ];
+-      const res = await execFileAsync('ffmpeg', statsArgs, { timeout: 15000 }).catch(e => ({ stderr: e.stderr || '' }));
+-      return this.parseLuminanceOutput(String(res.stderr || ''));
++      const { stderr } = await execFileAsync('ffmpeg', statsArgs, { timeout: 15000 });
++      return this.evaluateLuminanceExecution(String(stderr || ''), false);
+     } catch {
+       return null;
+     }
+   }
+ 
++  /**
++   * Evaluates FFmpeg execution result for luminance measurement.
++   * If hasError is true (e.g. non-zero exit code, process crash, timeout), returns null
++   * even if partial output contains a signalstats value.
++   */
++  public evaluateLuminanceExecution(output: string, hasError: boolean): number | null {
++    if (hasError) return null;
++    return this.parseLuminanceOutput(output);
++  }
++
+   /**
+    * Parses YAVG numeric value from signalstats output string.
+    * Explicitly returns null for missing, NaN, non-finite, or malformed data.
+diff --git a/tests/evidence_integrity_hardening.test.ts b/tests/evidence_integrity_hardening.test.ts
+index 50ba0d7..0b8b845 100644
+--- a/tests/evidence_integrity_hardening.test.ts
++++ b/tests/evidence_integrity_hardening.test.ts
+@@ -9,6 +9,7 @@ import { videoProcessor } from '../src/server/pipeline/videoProcessor';
+ import { mediaInspector } from '../src/server/pipeline/mediaInspector';
+ import { thumbnailInspector, ThumbnailInspector } from '../src/server/pipeline/thumbnailInspector';
+ import { policyIntelligenceEngine } from '../src/server/intelligence/policyIntelligence';
++import { formatMediaIdentityDisplay, isValidSha256 } from '../src/components/ComparisonView';
+ import { InMemoryStorageRepository } from '../src/server/storage';
+ import { ScanJob, UserAccount, MediaMetadata } from '../src/types';
+ 
+@@ -741,6 +742,106 @@ export async function runEvidenceIntegrityHardeningTests() {
+     assert(compClean.remainingIssues.length === 0, '4.15 Zero remaining issues when baseline had no findings');
+     assert(compClean.comparisonSummary.includes('clean status'), '4.15 Accurate summary for clean baseline and revision');
+ 
++    // Test 16: ANALYSIS_UNAVAILABLE in revised scan domain prevents resolution
++    const analysisUnavailableRevisedReport = {
++      ...cleanRevisedReport,
++      domainReports: {
++        ...cleanRevisedReport.domainReports,
++        thumbnail: {
++          ...cleanRevisedReport.domainReports.thumbnail,
++          status: 'ANALYSIS_UNAVAILABLE' as const
++        }
++      }
++    };
++    const compAnalysisUnavailable = policyIntelligenceEngine.generateComparison(
++      baselineReportWithIssue,
++      analysisUnavailableRevisedReport
++    );
++    assert(compAnalysisUnavailable.resolvedIssues.length === 0, '4.16 ANALYSIS_UNAVAILABLE domain does NOT resolve prior finding');
++    assert(Boolean(compAnalysisUnavailable.notVerifiedIssues?.some(i => i.includes('analysis for thumbnail was unavailable'))), '4.16 ANALYSIS_UNAVAILABLE explicitly recorded with reason in notVerifiedIssues');
++
++    // Test 17: Genuinely verifiable clean domain resolves prior finding
++    const compVerifiable = policyIntelligenceEngine.generateComparison(
++      baselineReportWithIssue,
++      cleanRevisedReport
++    );
++    assert(compVerifiable.resolvedIssues.length === 1, '4.17 Verified clean domain successfully resolves prior finding');
++    assert(compVerifiable.resolvedIssues[0] === 'Non-Standard Aspect Ratio', '4.17 Resolved issue name matches baseline');
++    assert(!compVerifiable.notVerifiedIssues?.length, '4.17 notVerifiedIssues is empty for verified clean domain');
++
++    // Test 18: Media identity display helper edge cases
++    const validHashA = 'a'.repeat(64);
++    const validHashB = 'b'.repeat(64);
++
++    // Both present and equal
++    const idEqual = formatMediaIdentityDisplay(validHashA, validHashA);
++    assert(idEqual.comparisonStatus === 'IDENTICAL', '4.18 Both hashes equal produces IDENTICAL');
++    assert(idEqual.statusBadgeText === '(Identical file)', '4.18 Both hashes equal produces (Identical file)');
++    assert(idEqual.statusLabel === 'Identical file', '4.18 Both hashes equal produces statusLabel Identical file');
++    assert(idEqual.originalHashDisplay === `${validHashA.slice(0, 10)}…`, '4.18 Original hash display truncated');
++    assert(idEqual.revisedHashDisplay === `${validHashA.slice(0, 10)}…`, '4.18 Revised hash display truncated');
++
++    // Both present and different
++    const idDiff = formatMediaIdentityDisplay(validHashA, validHashB);
++    assert(idDiff.comparisonStatus === 'DIFFERENT', '4.18 Both hashes different produces DIFFERENT');
++    assert(idDiff.statusBadgeText === '(Modified file)', '4.18 Both hashes different produces (Modified file)');
++    assert(idDiff.statusLabel === 'Modified file', '4.18 Both hashes different produces statusLabel Modified file');
++
++    // Original present but revised missing
++    const idRevMissing = formatMediaIdentityDisplay(validHashA, undefined);
++    assert(idRevMissing.comparisonStatus === 'UNVERIFIED', '4.18 Missing revised hash produces UNVERIFIED');
++    assert(idRevMissing.statusBadgeText === '(File comparison unverified)', '4.18 Missing revised hash produces (File comparison unverified)');
++    assert(idRevMissing.statusLabel === 'File comparison unverified', '4.18 Missing revised hash produces statusLabel File comparison unverified');
++    assert(idRevMissing.originalHashDisplay === `${validHashA.slice(0, 10)}…`, '4.18 Original hash displayed when present');
++    assert(idRevMissing.revisedHashDisplay === 'Unavailable', '4.18 Revised hash displayed as Unavailable when missing');
++
++    // Revised present but original missing
++    const idOrigMissing = formatMediaIdentityDisplay(undefined, validHashB);
++    assert(idOrigMissing.comparisonStatus === 'UNVERIFIED', '4.18 Missing original hash produces UNVERIFIED');
++    assert(idOrigMissing.statusBadgeText === '(File comparison unverified)', '4.18 Missing original hash produces (File comparison unverified)');
++    assert(idOrigMissing.originalHashDisplay === 'Unavailable', '4.18 Original hash displayed as Unavailable when missing');
++    assert(idOrigMissing.revisedHashDisplay === `${validHashB.slice(0, 10)}…`, '4.18 Revised hash displayed when present');
++
++    // Both hashes missing
++    const idBothMissing = formatMediaIdentityDisplay(undefined, undefined);
++    assert(idBothMissing.comparisonStatus === 'UNVERIFIED', '4.18 Both hashes missing produces UNVERIFIED');
++    assert(idBothMissing.statusBadgeText === '(File comparison unverified)', '4.18 Both missing produces (File comparison unverified)');
++    assert(idBothMissing.originalHashDisplay === 'Unavailable', '4.18 Both missing sets original to Unavailable');
++    assert(idBothMissing.revisedHashDisplay === 'Unavailable', '4.18 Both missing sets revised to Unavailable');
++
++    // Empty or malformed hash values
++    const idMalformed = formatMediaIdentityDisplay('short_hash', '12345nonhex'.padEnd(64, 'z'));
++    assert(idMalformed.comparisonStatus === 'UNVERIFIED', '4.18 Malformed hashes produce UNVERIFIED');
++    assert(idMalformed.statusBadgeText === '(File comparison unverified)', '4.18 Malformed hashes produce (File comparison unverified)');
++    assert(idMalformed.originalHashDisplay === 'Unavailable', '4.18 Malformed original displays Unavailable');
++    assert(idMalformed.revisedHashDisplay === 'Unavailable', '4.18 Malformed revised displays Unavailable');
++
++    const idEmpty = formatMediaIdentityDisplay('', '   ');
++    assert(idEmpty.comparisonStatus === 'UNVERIFIED', '4.18 Empty string hashes produce UNVERIFIED');
++    assert(idEmpty.originalHashDisplay === 'Unavailable', '4.18 Empty string original displays Unavailable');
++    assert(idEmpty.revisedHashDisplay === 'Unavailable', '4.18 Empty string revised displays Unavailable');
++
++    // Test 19: Failed FFmpeg luminance execution must not return a measurement from partial output
++    const partialYavgOutput = '[Parsed_metadata_1] lavfi.signalstats.YAVG=42.0\nFatal error in decoder: broken pipe';
++    assert(
++      thumbnailInspector.evaluateLuminanceExecution(partialYavgOutput, true) === null,
++      '4.19 Failed FFmpeg process (hasError=true) returns null even with partial YAVG'
++    );
++    assert(
++      thumbnailInspector.evaluateLuminanceExecution(partialYavgOutput, false) === 42,
++      '4.19 Successful FFmpeg process (hasError=false) parses YAVG to 42'
++    );
++
++    // Non-existent or invalid image file in extractLuminance fails closed to null without throwing
++    const nonExistentImgPath = path.resolve(testDir, 'does_not_exist.jpg');
++    const nonExistentLum = await thumbnailInspector.extractLuminance(nonExistentImgPath);
++    assert(nonExistentLum === null, '4.19 extractLuminance returns null when FFmpeg process fails on missing file');
++
++    const corruptImgPath = path.resolve(testDir, 'corrupt_img.jpg');
++    fs.writeFileSync(corruptImgPath, 'NOT_AN_IMAGE_FILE_DATA');
++    const corruptLum = await thumbnailInspector.extractLuminance(corruptImgPath);
++    assert(corruptLum === null, '4.19 extractLuminance returns null when FFmpeg fails on corrupted image');
++
+     console.log(`\n======================================================`);
+     console.log(`TEST SUITE 6 COMPLETE: ${passed}/${total} assertions passed!`);
+     console.log(`======================================================\n`);
+-- 
+2.34.1
+

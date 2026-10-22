@@ -9,6 +9,7 @@ import { videoProcessor } from '../src/server/pipeline/videoProcessor';
 import { mediaInspector } from '../src/server/pipeline/mediaInspector';
 import { thumbnailInspector, ThumbnailInspector } from '../src/server/pipeline/thumbnailInspector';
 import { policyIntelligenceEngine } from '../src/server/intelligence/policyIntelligence';
+import { formatMediaIdentityDisplay, isValidSha256 } from '../src/components/ComparisonView';
 import { InMemoryStorageRepository } from '../src/server/storage';
 import { ScanJob, UserAccount, MediaMetadata } from '../src/types';
 
@@ -740,6 +741,106 @@ export async function runEvidenceIntegrityHardeningTests() {
     assert(compClean.resolvedIssues.length === 0, '4.15 Zero resolved issues when baseline had no findings');
     assert(compClean.remainingIssues.length === 0, '4.15 Zero remaining issues when baseline had no findings');
     assert(compClean.comparisonSummary.includes('clean status'), '4.15 Accurate summary for clean baseline and revision');
+
+    // Test 16: ANALYSIS_UNAVAILABLE in revised scan domain prevents resolution
+    const analysisUnavailableRevisedReport = {
+      ...cleanRevisedReport,
+      domainReports: {
+        ...cleanRevisedReport.domainReports,
+        thumbnail: {
+          ...cleanRevisedReport.domainReports.thumbnail,
+          status: 'ANALYSIS_UNAVAILABLE' as const
+        }
+      }
+    };
+    const compAnalysisUnavailable = policyIntelligenceEngine.generateComparison(
+      baselineReportWithIssue,
+      analysisUnavailableRevisedReport
+    );
+    assert(compAnalysisUnavailable.resolvedIssues.length === 0, '4.16 ANALYSIS_UNAVAILABLE domain does NOT resolve prior finding');
+    assert(Boolean(compAnalysisUnavailable.notVerifiedIssues?.some(i => i.includes('analysis for thumbnail was unavailable'))), '4.16 ANALYSIS_UNAVAILABLE explicitly recorded with reason in notVerifiedIssues');
+
+    // Test 17: Genuinely verifiable clean domain resolves prior finding
+    const compVerifiable = policyIntelligenceEngine.generateComparison(
+      baselineReportWithIssue,
+      cleanRevisedReport
+    );
+    assert(compVerifiable.resolvedIssues.length === 1, '4.17 Verified clean domain successfully resolves prior finding');
+    assert(compVerifiable.resolvedIssues[0] === 'Non-Standard Aspect Ratio', '4.17 Resolved issue name matches baseline');
+    assert(!compVerifiable.notVerifiedIssues?.length, '4.17 notVerifiedIssues is empty for verified clean domain');
+
+    // Test 18: Media identity display helper edge cases
+    const validHashA = 'a'.repeat(64);
+    const validHashB = 'b'.repeat(64);
+
+    // Both present and equal
+    const idEqual = formatMediaIdentityDisplay(validHashA, validHashA);
+    assert(idEqual.comparisonStatus === 'IDENTICAL', '4.18 Both hashes equal produces IDENTICAL');
+    assert(idEqual.statusBadgeText === '(Identical file)', '4.18 Both hashes equal produces (Identical file)');
+    assert(idEqual.statusLabel === 'Identical file', '4.18 Both hashes equal produces statusLabel Identical file');
+    assert(idEqual.originalHashDisplay === `${validHashA.slice(0, 10)}…`, '4.18 Original hash display truncated');
+    assert(idEqual.revisedHashDisplay === `${validHashA.slice(0, 10)}…`, '4.18 Revised hash display truncated');
+
+    // Both present and different
+    const idDiff = formatMediaIdentityDisplay(validHashA, validHashB);
+    assert(idDiff.comparisonStatus === 'DIFFERENT', '4.18 Both hashes different produces DIFFERENT');
+    assert(idDiff.statusBadgeText === '(Modified file)', '4.18 Both hashes different produces (Modified file)');
+    assert(idDiff.statusLabel === 'Modified file', '4.18 Both hashes different produces statusLabel Modified file');
+
+    // Original present but revised missing
+    const idRevMissing = formatMediaIdentityDisplay(validHashA, undefined);
+    assert(idRevMissing.comparisonStatus === 'UNVERIFIED', '4.18 Missing revised hash produces UNVERIFIED');
+    assert(idRevMissing.statusBadgeText === '(File comparison unverified)', '4.18 Missing revised hash produces (File comparison unverified)');
+    assert(idRevMissing.statusLabel === 'File comparison unverified', '4.18 Missing revised hash produces statusLabel File comparison unverified');
+    assert(idRevMissing.originalHashDisplay === `${validHashA.slice(0, 10)}…`, '4.18 Original hash displayed when present');
+    assert(idRevMissing.revisedHashDisplay === 'Unavailable', '4.18 Revised hash displayed as Unavailable when missing');
+
+    // Revised present but original missing
+    const idOrigMissing = formatMediaIdentityDisplay(undefined, validHashB);
+    assert(idOrigMissing.comparisonStatus === 'UNVERIFIED', '4.18 Missing original hash produces UNVERIFIED');
+    assert(idOrigMissing.statusBadgeText === '(File comparison unverified)', '4.18 Missing original hash produces (File comparison unverified)');
+    assert(idOrigMissing.originalHashDisplay === 'Unavailable', '4.18 Original hash displayed as Unavailable when missing');
+    assert(idOrigMissing.revisedHashDisplay === `${validHashB.slice(0, 10)}…`, '4.18 Revised hash displayed when present');
+
+    // Both hashes missing
+    const idBothMissing = formatMediaIdentityDisplay(undefined, undefined);
+    assert(idBothMissing.comparisonStatus === 'UNVERIFIED', '4.18 Both hashes missing produces UNVERIFIED');
+    assert(idBothMissing.statusBadgeText === '(File comparison unverified)', '4.18 Both missing produces (File comparison unverified)');
+    assert(idBothMissing.originalHashDisplay === 'Unavailable', '4.18 Both missing sets original to Unavailable');
+    assert(idBothMissing.revisedHashDisplay === 'Unavailable', '4.18 Both missing sets revised to Unavailable');
+
+    // Empty or malformed hash values
+    const idMalformed = formatMediaIdentityDisplay('short_hash', '12345nonhex'.padEnd(64, 'z'));
+    assert(idMalformed.comparisonStatus === 'UNVERIFIED', '4.18 Malformed hashes produce UNVERIFIED');
+    assert(idMalformed.statusBadgeText === '(File comparison unverified)', '4.18 Malformed hashes produce (File comparison unverified)');
+    assert(idMalformed.originalHashDisplay === 'Unavailable', '4.18 Malformed original displays Unavailable');
+    assert(idMalformed.revisedHashDisplay === 'Unavailable', '4.18 Malformed revised displays Unavailable');
+
+    const idEmpty = formatMediaIdentityDisplay('', '   ');
+    assert(idEmpty.comparisonStatus === 'UNVERIFIED', '4.18 Empty string hashes produce UNVERIFIED');
+    assert(idEmpty.originalHashDisplay === 'Unavailable', '4.18 Empty string original displays Unavailable');
+    assert(idEmpty.revisedHashDisplay === 'Unavailable', '4.18 Empty string revised displays Unavailable');
+
+    // Test 19: Failed FFmpeg luminance execution must not return a measurement from partial output
+    const partialYavgOutput = '[Parsed_metadata_1] lavfi.signalstats.YAVG=42.0\nFatal error in decoder: broken pipe';
+    assert(
+      thumbnailInspector.evaluateLuminanceExecution(partialYavgOutput, true) === null,
+      '4.19 Failed FFmpeg process (hasError=true) returns null even with partial YAVG'
+    );
+    assert(
+      thumbnailInspector.evaluateLuminanceExecution(partialYavgOutput, false) === 42,
+      '4.19 Successful FFmpeg process (hasError=false) parses YAVG to 42'
+    );
+
+    // Non-existent or invalid image file in extractLuminance fails closed to null without throwing
+    const nonExistentImgPath = path.resolve(testDir, 'does_not_exist.jpg');
+    const nonExistentLum = await thumbnailInspector.extractLuminance(nonExistentImgPath);
+    assert(nonExistentLum === null, '4.19 extractLuminance returns null when FFmpeg process fails on missing file');
+
+    const corruptImgPath = path.resolve(testDir, 'corrupt_img.jpg');
+    fs.writeFileSync(corruptImgPath, 'NOT_AN_IMAGE_FILE_DATA');
+    const corruptLum = await thumbnailInspector.extractLuminance(corruptImgPath);
+    assert(corruptLum === null, '4.19 extractLuminance returns null when FFmpeg fails on corrupted image');
 
     console.log(`\n======================================================`);
     console.log(`TEST SUITE 6 COMPLETE: ${passed}/${total} assertions passed!`);

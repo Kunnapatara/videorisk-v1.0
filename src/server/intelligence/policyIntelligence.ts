@@ -814,6 +814,9 @@ export interface ComparisonOptions {
     if (revDomain.status === 'NOT_ASSESSED') {
       return { verifiable: false, reason: `detector for ${domain} was not assessed` };
     }
+    if (revDomain.status === 'ANALYSIS_UNAVAILABLE') {
+      return { verifiable: false, reason: `analysis for ${domain} was unavailable` };
+    }
     if (revDomain.status === 'INSUFFICIENT_EVIDENCE') {
       return { verifiable: false, reason: `detector for ${domain} reported insufficient evidence` };
     }
@@ -905,13 +908,16 @@ export interface ComparisonOptions {
     // Media version identity tracking via SHA-256
     const origSha = options?.originalScanRecord?.metadata?.sha256;
     const revSha = options?.revisedScanRecord?.metadata?.sha256;
-    const hasBothHashes = Boolean(origSha && revSha);
-    const isIdenticalMedia = Boolean(hasBothHashes && origSha === revSha);
+    const isValidSha = (h?: string): boolean => typeof h === 'string' && /^[a-fA-F0-9]{64}$/.test(h.trim());
+    const validOrig = isValidSha(origSha);
+    const validRev = isValidSha(revSha);
+    const hasBothHashes = Boolean(validOrig && validRev);
+    const isIdenticalMedia = Boolean(hasBothHashes && origSha!.trim().toLowerCase() === revSha!.trim().toLowerCase());
     const comparisonStatus: 'IDENTICAL' | 'DIFFERENT' | 'UNVERIFIED' = hasBothHashes
       ? (isIdenticalMedia ? 'IDENTICAL' : 'DIFFERENT')
       : 'UNVERIFIED';
 
-    const mediaIdentity = (origSha || revSha) ? {
+    const mediaIdentity = (origSha || revSha || options?.originalScanRecord?.metadata || options?.revisedScanRecord?.metadata) ? {
       originalSha256: origSha,
       revisedSha256: revSha,
       isIdenticalMedia,
