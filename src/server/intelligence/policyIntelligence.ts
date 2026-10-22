@@ -368,25 +368,42 @@ export class PolicyIntelligenceEngine {
         });
       }
 
-      if (thumbnailMetadata.hasSensationalElements) {
+      if (thumbnailMetadata.originalSize > 2 * 1024 * 1024) {
         addItem({
           domain: 'thumbnail',
           start: 0,
           end: 0,
-          assetLocation: 'Thumbnail visual cues',
-          type: 'sensational_thumbnail_flag',
+          assetLocation: 'Thumbnail file size',
+          type: 'thumbnail_file_size',
           category: 'thumbnail_integrity',
           severity: 'warning',
-          confidence: 0.75,
-          confidenceLevel: 'MEDIUM',
-          provenance: 'image:visual_heuristic_scanner',
+          confidence: 0.99,
+          confidenceLevel: 'HIGH',
+          provenance: 'fs:stat_file_size',
           source: 'thumbnail_inspector',
-          label: '🟡 Sensational Thumbnail Visual Elements',
-          details: 'Filename or high-contrast cues indicate exaggerated clickbait elements (e.g. shock arrows/circles).',
-          contextualInterpretation: 'While common on YouTube, highly misleading visual claims can increase audience bounce rate and policy scrutiny.',
-          recommendedAction: 'Verify that the visual imagery accurately reflects the substance of the video.'
+          label: `🟡 Thumbnail Size Exceeds Limit (${(thumbnailMetadata.originalSize / (1024 * 1024)).toFixed(2)} MB)`,
+          details: 'Image exceeds the YouTube Studio upload limit of 2 MB.',
+          recommendedAction: 'Compress or re-export thumbnail under 2 MB.'
         });
       }
+
+      // Explicitly document that visual text, OCR, and sensational graphic cues are not assessed without visual models
+      addItem({
+        domain: 'thumbnail',
+        start: 0,
+        end: 0,
+        assetLocation: 'Thumbnail visual elements',
+        type: 'thumbnail_visual_unassessed',
+        category: 'thumbnail_integrity',
+        severity: 'info',
+        confidence: 0.95,
+        confidenceLevel: 'HIGH',
+        provenance: 'pipeline:capability_declaration',
+        source: 'thumbnail_inspector',
+        label: 'ℹ️ Thumbnail Visual Content: Not Assessed',
+        details: 'Visual text overlays, graphics, and clickbait cues are not assessed without visual AI models. Container format and dimensions were verified.',
+        recommendedAction: 'Ensure thumbnail text and imagery truthfully represent the video.'
+      });
     }
 
     // ==========================================
@@ -564,13 +581,15 @@ export class PolicyIntelligenceEngine {
           ? 'NOT_PROVIDED'
           : timeline.some(t => t.domain === 'thumbnail' && t.severity === 'warning')
             ? 'REVIEW_RECOMMENDED'
-            : 'NO_MAJOR_RISK_SIGNALS_DETECTED',
+            : (thumbnailMetadata.visualAnalysisStatus === 'NOT_ASSESSED' || thumbnailMetadata.hasSensationalElements === null)
+              ? 'NOT_ASSESSED'
+              : 'NO_MAJOR_RISK_SIGNALS_DETECTED',
         summary: thumbnailMetadata
-          ? `Image inspected (${thumbnailMetadata.width}x${thumbnailMetadata.height}, ${thumbnailMetadata.aspectRatio}). ${thumbnailMetadata.notes || 'Meets standard 16:9 layout.'}`
+          ? `Image inspected (${thumbnailMetadata.width}x${thumbnailMetadata.height}, ${thumbnailMetadata.aspectRatio}). Format and framing verified; visual text & clickbait cues not assessed.`
           : 'Thumbnail image was not uploaded for this scan.',
         findingsCount: timeline.filter(t => t.domain === 'thumbnail' && t.severity !== 'info').length,
-        confidence: thumbnailMetadata ? 'HIGH' : 'UNKNOWN',
-        limitations: 'Validates file format, aspect ratio, luminance, and visual heuristics; does not guarantee YouTube CTR.'
+        confidence: thumbnailMetadata ? (timeline.some(t => t.domain === 'thumbnail' && t.severity === 'warning') ? 'HIGH' : 'LOW') : 'UNKNOWN',
+        limitations: 'Validates file format, resolution, size, and aspect ratio; visual text OCR and clickbait detection are not assessed.'
       },
       channel_context: {
         domain: 'channel_context',
@@ -880,6 +899,25 @@ export interface ComparisonOptions {
       improvements.push(`${resolvedIssues.length} prior risk signal(s) verifiably resolved with evidence`);
     }
 
+    // Media version identity tracking via SHA-256
+    const origSha = options?.originalScanRecord?.metadata?.sha256;
+    const revSha = options?.revisedScanRecord?.metadata?.sha256;
+    const isIdenticalMedia = Boolean(origSha && revSha && origSha === revSha);
+
+    const mediaIdentity = (origSha || revSha) ? {
+      originalSha256: origSha,
+      revisedSha256: revSha,
+      isIdenticalMedia
+    } : undefined;
+
+    if (mediaIdentity) {
+      if (isIdenticalMedia) {
+        improvements.push('Note: Re-scan analyzed an identical media file version (matching SHA-256).');
+      } else if (origSha && revSha) {
+        improvements.push('Verified revised media file version (different SHA-256).');
+      }
+    }
+
     // Honest, factual comparison summary
     let comparisonSummary: string;
     if (resolvedIssues.length > 0) {
@@ -917,7 +955,8 @@ export interface ComparisonOptions {
       revisedRatios: {
         originalContribution: revisedReport.originalContributionRatio ?? null,
         reusedContent: revisedReport.reusedContentRatio
-      }
+      },
+      mediaIdentity
     };
   }
 }

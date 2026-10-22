@@ -64,6 +64,7 @@ export interface MediaMetadata {
   audioCodec?: string;
   videoCodec?: string;
   isProxyUsed: boolean;
+  sha256?: string;
 }
 
 export type EvidenceCategory = 
@@ -167,8 +168,9 @@ export interface ThumbnailMetadata {
   isStandardAspect: boolean; // 16:9 check
   format: string;
   meanLuminance: number; // 0 to 255
-  hasHighContrastText: boolean;
-  hasSensationalElements: boolean;
+  hasHighContrastText?: boolean | null;
+  hasSensationalElements?: boolean | null;
+  visualAnalysisStatus?: DomainAssessmentStatus;
   notes?: string;
 }
 
@@ -285,12 +287,17 @@ export interface ReScanComparison {
     originalContribution?: number | null;
     reusedContent: number;
   };
+  mediaIdentity?: {
+    originalSha256?: string;
+    revisedSha256?: string;
+    isIdenticalMedia: boolean;
+  };
 }
 
 export interface ComparisonOptions {
   isRevisedFailed?: boolean;
-  revisedScanRecord?: { status?: string; error?: string };
-  originalScanRecord?: { status?: string; error?: string };
+  revisedScanRecord?: { status?: string; error?: string; metadata?: MediaMetadata };
+  originalScanRecord?: { status?: string; error?: string; metadata?: MediaMetadata };
   skippedDomains?: EvidenceDomain[];
 }
 

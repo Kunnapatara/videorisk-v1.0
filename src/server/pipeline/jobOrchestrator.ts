@@ -422,8 +422,12 @@ export class JobOrchestrator {
       // If this is a re-scan, generate and save the comparison with parent scan
       if (scan.parentScanId) {
         const parentReport = await this.storageRepo.scans.getReport(scan.parentScanId);
+        const parentScan = await this.storageRepo.scans.getScan(scan.parentScanId);
         if (parentReport) {
-          const comparison = policyIntelligenceEngine.generateComparison(parentReport, report);
+          const comparison = policyIntelligenceEngine.generateComparison(parentReport, report, {
+            originalScanRecord: parentScan || undefined,
+            revisedScanRecord: { ...scan, metadata },
+          });
           checkLease();
           await this.storageRepo.scans.saveComparison(comparison, leaseToken);
         }

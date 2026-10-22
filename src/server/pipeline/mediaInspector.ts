@@ -1,6 +1,7 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs';
+import crypto from 'crypto';
 import { MediaMetadata } from '../../types';
 
 const execFileAsync = promisify(execFile);
@@ -99,6 +100,15 @@ export class MediaInspector {
       const hasAudio = !!audioStream;
       const isProxyNeeded = (width > 1920 || height > 1080);
 
+      // Compute exact SHA-256 hash of media file for version identity
+      const sha256 = await new Promise<string>((resolve, reject) => {
+        const hash = crypto.createHash('sha256');
+        const stream = fs.createReadStream(filePath);
+        stream.on('data', chunk => hash.update(chunk));
+        stream.on('end', () => resolve(hash.digest('hex')));
+        stream.on('error', reject);
+      });
+
       return {
         filename: originalFilename,
         originalSize,
@@ -111,6 +121,7 @@ export class MediaInspector {
         audioCodec: audioStream?.codec_name,
         videoCodec: videoStream?.codec_name,
         isProxyUsed: isProxyNeeded,
+        sha256,
       };
     } catch (err: any) {
       if (err instanceof MediaInspectionError) {

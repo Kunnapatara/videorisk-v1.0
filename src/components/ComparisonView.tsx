@@ -116,6 +116,14 @@ export const ComparisonView: React.FC<ComparisonViewProps> = ({
               <span className="text-stone-500">Reused Material:</span>
               <strong className="text-stone-900">{comparison.originalRatios.reusedContent}%</strong>
             </div>
+            {comparison.mediaIdentity?.originalSha256 && (
+              <div className="flex justify-between py-1.5 border-b border-stone-50 text-[11px]">
+                <span className="text-stone-500">Media SHA-256:</span>
+                <span className="font-mono text-stone-700" title={comparison.mediaIdentity.originalSha256}>
+                  {comparison.mediaIdentity.originalSha256.slice(0, 10)}…
+                </span>
+              </div>
+            )}
           </div>
         </div>
 
@@ -173,6 +181,17 @@ export const ComparisonView: React.FC<ComparisonViewProps> = ({
                 {comparison.revisedRatios.reusedContent}% ({comparison.revisedRatios.reusedContent - comparison.originalRatios.reusedContent >= 0 ? '+' : ''}${comparison.revisedRatios.reusedContent - comparison.originalRatios.reusedContent}%)
               </strong>
             </div>
+            {comparison.mediaIdentity?.revisedSha256 && (
+              <div className="flex justify-between py-1.5 border-b border-stone-50 text-[11px]">
+                <span className="text-stone-500">Media SHA-256:</span>
+                <span className="font-mono text-stone-700" title={comparison.mediaIdentity.revisedSha256}>
+                  {comparison.mediaIdentity.revisedSha256.slice(0, 10)}…
+                  <span className={`ml-1 text-[10px] font-sans font-semibold ${comparison.mediaIdentity.isIdenticalMedia ? 'text-amber-700' : 'text-emerald-700'}`}>
+                    ({comparison.mediaIdentity.isIdenticalMedia ? 'Identical file' : 'Modified file'})
+                  </span>
+                </span>
+              </div>
+            )}
           </div>
         </div>
       </div>

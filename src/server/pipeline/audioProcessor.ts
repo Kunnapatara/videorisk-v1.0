@@ -1,7 +1,7 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs';
-import { MediaMetadata } from '../../types';
+import { MediaMetadata, DomainAssessmentStatus } from '../../types';
 
 const execFileAsync = promisify(execFile);
 
@@ -22,6 +22,8 @@ export interface AudioAnalysisResult {
   advertiserSpeechFlags: Array<{ word: string; timestamp: number; category: string }>;
   segments: Array<{ start: number; end: number; type: 'voice' | 'music' | 'silence' | 'mixed' }>;
   transcriptSummary: string;
+  speechAnalysisStatus?: DomainAssessmentStatus;
+  musicAnalysisStatus?: DomainAssessmentStatus;
 }
 
 export class AudioProcessor {
@@ -51,7 +53,9 @@ export class AudioProcessor {
         isAudible: false,
         advertiserSpeechFlags: [],
         segments: [{ start: 0, end: durationSeconds, type: 'silence' }],
-        transcriptSummary: 'No audio stream detected in container.'
+        transcriptSummary: 'No audio stream detected in container.',
+        speechAnalysisStatus: 'NOT_PROVIDED',
+        musicAnalysisStatus: 'NOT_PROVIDED'
       };
     }
 
@@ -160,7 +164,9 @@ export class AudioProcessor {
         segments,
         transcriptSummary: isAudible 
           ? `Audio stream inspected. Acoustic energy present across ${Math.round(activeRatio * 100)}% of the timeline (mean volume ${meanVol} dB). Speech and voice narration are unverified without transcript analysis.`
-          : 'Low volume or quiet audio track.'
+          : 'Low volume or quiet audio track.',
+        speechAnalysisStatus: 'NOT_ASSESSED',
+        musicAnalysisStatus: 'NOT_ASSESSED'
       };
     } catch (err: any) {
       if (err instanceof AudioProcessingError) {

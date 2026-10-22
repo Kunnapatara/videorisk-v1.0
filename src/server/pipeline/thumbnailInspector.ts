@@ -60,13 +60,11 @@ export class ThumbnailInspector {
 
       // Extract basic luminance sample via ffmpeg signalstats filter or deterministic probe
       let meanLuminance = 128;
-      let hasHighContrastText = false;
-      let hasSensationalElements = false;
 
       try {
         const statsArgs = [
           '-i', imagePath,
-          '-vf', 'signalstats',
+          '-vf', 'signalstats,metadata=print:key=lavfi.signalstats.YAVG',
           '-f', 'null',
           '-'
         ];
@@ -79,16 +77,12 @@ export class ThumbnailInspector {
         // Fallback to neutral luminance
       }
 
-      // Check if image is extremely high contrast or extreme saturation (often indicative of clickbait text/borders)
-      if (meanLuminance > 220 || meanLuminance < 30) {
-        hasHighContrastText = true;
-      }
-
-      // Filename or format check
-      const lowerName = originalFilename.toLowerCase();
-      if (lowerName.includes('shock') || lowerName.includes('insane') || lowerName.includes('red_circle') || lowerName.includes('arrow')) {
-        hasSensationalElements = true;
-      }
+      // Evidence integrity: Visual text overlays, OCR, and graphic clickbait cues (arrows/circles)
+      // cannot be honestly inferred from luminance thresholds or filename strings alone.
+      // Explicitly represent visual content analysis as NOT_ASSESSED.
+      const hasHighContrastText: boolean | null = null;
+      const hasSensationalElements: boolean | null = null;
+      const visualAnalysisStatus = 'NOT_ASSESSED' as const;
 
       const notes: string[] = [];
       if (!is16by9) {
@@ -100,6 +94,7 @@ export class ThumbnailInspector {
       if (width < 640) {
         notes.push('Resolution is below 640px wide. May appear blurry on high-DPI desktop feeds.');
       }
+      notes.push('Visual text, graphic overlays, and sensational cues are not assessed without visual AI models.');
 
       return {
         filename: originalFilename,
@@ -112,6 +107,7 @@ export class ThumbnailInspector {
         meanLuminance,
         hasHighContrastText,
         hasSensationalElements,
+        visualAnalysisStatus,
         notes: notes.join(' ')
       };
     } catch (err: any) {

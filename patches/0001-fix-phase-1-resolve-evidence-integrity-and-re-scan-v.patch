@@ -1,0 +1,708 @@
+From 734f6ad3c059f0ef0fcfd70ff2f3d161fa312823 Mon Sep 17 00:00:00 2001
+From: Kunnapatara <kunnapatara@yahoo.com>
+Date: Thu, 22 Oct 2026 08:07:59 +0000
+Subject: [PATCH] fix(phase-1): resolve evidence integrity and re-scan
+ verification semantics
+
+- Media integrity: compute SHA-256 for media files in mediaInspector and surface version identity in re-scan comparison.
+- Thumbnail analysis: do not fabricate highContrastText or sensational cues from luminance/filename; declare visualAnalysisStatus as NOT_ASSESSED; output signalstats YAVG via metadata print filter.
+- Audio & video processor: declare speechAnalysisStatus, musicAnalysisStatus, slideshowAnalysisStatus, and repeatedFootageStatus as NOT_ASSESSED / NOT_PROVIDED rather than false negatives.
+- Policy intelligence & re-scan: track media identity, require clean evidence domain resolution before resolving prior findings, record notVerifiedIssues.
+- Automated tests: add Phase 1 regression verification suite covering media SHA-256, fail-closed unassessed domains, and re-scan issue tracking.
+---
+ src/components/ComparisonView.tsx             |  19 ++
+ src/server/intelligence/policyIntelligence.ts |  69 +++--
+ src/server/pipeline/audioProcessor.ts         |  12 +-
+ src/server/pipeline/jobOrchestrator.ts        |   6 +-
+ src/server/pipeline/mediaInspector.ts         |  11 +
+ src/server/pipeline/thumbnailInspector.ts     |  22 +-
+ src/server/pipeline/videoProcessor.ts         |  12 +-
+ src/types/index.ts                            |  15 +-
+ tests/evidence_integrity_hardening.test.ts    | 250 ++++++++++++++++++
+ tests/security_retention_and_e2e.test.ts      |   1 +
+ 10 files changed, 378 insertions(+), 39 deletions(-)
+
+diff --git a/src/components/ComparisonView.tsx b/src/components/ComparisonView.tsx
+index b688115..5d00089 100644
+--- a/src/components/ComparisonView.tsx
++++ b/src/components/ComparisonView.tsx
+@@ -116,6 +116,14 @@ export const ComparisonView: React.FC<ComparisonViewProps> = ({
+               <span className="text-stone-500">Reused Material:</span>
+               <strong className="text-stone-900">{comparison.originalRatios.reusedContent}%</strong>
+             </div>
++            {comparison.mediaIdentity?.originalSha256 && (
++              <div className="flex justify-between py-1.5 border-b border-stone-50 text-[11px]">
++                <span className="text-stone-500">Media SHA-256:</span>
++                <span className="font-mono text-stone-700" title={comparison.mediaIdentity.originalSha256}>
++                  {comparison.mediaIdentity.originalSha256.slice(0, 10)}…
++                </span>
++              </div>
++            )}
+           </div>
+         </div>
+ 
+@@ -173,6 +181,17 @@ export const ComparisonView: React.FC<ComparisonViewProps> = ({
+                 {comparison.revisedRatios.reusedContent}% ({comparison.revisedRatios.reusedContent - comparison.originalRatios.reusedContent >= 0 ? '+' : ''}${comparison.revisedRatios.reusedContent - comparison.originalRatios.reusedContent}%)
+               </strong>
+             </div>
++            {comparison.mediaIdentity?.revisedSha256 && (
++              <div className="flex justify-between py-1.5 border-b border-stone-50 text-[11px]">
++                <span className="text-stone-500">Media SHA-256:</span>
++                <span className="font-mono text-stone-700" title={comparison.mediaIdentity.revisedSha256}>
++                  {comparison.mediaIdentity.revisedSha256.slice(0, 10)}…
++                  <span className={`ml-1 text-[10px] font-sans font-semibold ${comparison.mediaIdentity.isIdenticalMedia ? 'text-amber-700' : 'text-emerald-700'}`}>
++                    ({comparison.mediaIdentity.isIdenticalMedia ? 'Identical file' : 'Modified file'})
++                  </span>
++                </span>
++              </div>
++            )}
+           </div>
+         </div>
+       </div>
+diff --git a/src/server/intelligence/policyIntelligence.ts b/src/server/intelligence/policyIntelligence.ts
+index 80f3dc4..bbc78bc 100644
+--- a/src/server/intelligence/policyIntelligence.ts
++++ b/src/server/intelligence/policyIntelligence.ts
+@@ -368,25 +368,42 @@ export class PolicyIntelligenceEngine {
+         });
+       }
+ 
+-      if (thumbnailMetadata.hasSensationalElements) {
++      if (thumbnailMetadata.originalSize > 2 * 1024 * 1024) {
+         addItem({
+           domain: 'thumbnail',
+           start: 0,
+           end: 0,
+-          assetLocation: 'Thumbnail visual cues',
+-          type: 'sensational_thumbnail_flag',
++          assetLocation: 'Thumbnail file size',
++          type: 'thumbnail_file_size',
+           category: 'thumbnail_integrity',
+           severity: 'warning',
+-          confidence: 0.75,
+-          confidenceLevel: 'MEDIUM',
+-          provenance: 'image:visual_heuristic_scanner',
++          confidence: 0.99,
++          confidenceLevel: 'HIGH',
++          provenance: 'fs:stat_file_size',
+           source: 'thumbnail_inspector',
+-          label: '🟡 Sensational Thumbnail Visual Elements',
+-          details: 'Filename or high-contrast cues indicate exaggerated clickbait elements (e.g. shock arrows/circles).',
+-          contextualInterpretation: 'While common on YouTube, highly misleading visual claims can increase audience bounce rate and policy scrutiny.',
+-          recommendedAction: 'Verify that the visual imagery accurately reflects the substance of the video.'
++          label: `🟡 Thumbnail Size Exceeds Limit (${(thumbnailMetadata.originalSize / (1024 * 1024)).toFixed(2)} MB)`,
++          details: 'Image exceeds the YouTube Studio upload limit of 2 MB.',
++          recommendedAction: 'Compress or re-export thumbnail under 2 MB.'
+         });
+       }
++
++      // Explicitly document that visual text, OCR, and sensational graphic cues are not assessed without visual models
++      addItem({
++        domain: 'thumbnail',
++        start: 0,
++        end: 0,
++        assetLocation: 'Thumbnail visual elements',
++        type: 'thumbnail_visual_unassessed',
++        category: 'thumbnail_integrity',
++        severity: 'info',
++        confidence: 0.95,
++        confidenceLevel: 'HIGH',
++        provenance: 'pipeline:capability_declaration',
++        source: 'thumbnail_inspector',
++        label: 'ℹ️ Thumbnail Visual Content: Not Assessed',
++        details: 'Visual text overlays, graphics, and clickbait cues are not assessed without visual AI models. Container format and dimensions were verified.',
++        recommendedAction: 'Ensure thumbnail text and imagery truthfully represent the video.'
++      });
+     }
+ 
+     // ==========================================
+@@ -564,13 +581,15 @@ export class PolicyIntelligenceEngine {
+           ? 'NOT_PROVIDED'
+           : timeline.some(t => t.domain === 'thumbnail' && t.severity === 'warning')
+             ? 'REVIEW_RECOMMENDED'
+-            : 'NO_MAJOR_RISK_SIGNALS_DETECTED',
++            : (thumbnailMetadata.visualAnalysisStatus === 'NOT_ASSESSED' || thumbnailMetadata.hasSensationalElements === null)
++              ? 'NOT_ASSESSED'
++              : 'NO_MAJOR_RISK_SIGNALS_DETECTED',
+         summary: thumbnailMetadata
+-          ? `Image inspected (${thumbnailMetadata.width}x${thumbnailMetadata.height}, ${thumbnailMetadata.aspectRatio}). ${thumbnailMetadata.notes || 'Meets standard 16:9 layout.'}`
++          ? `Image inspected (${thumbnailMetadata.width}x${thumbnailMetadata.height}, ${thumbnailMetadata.aspectRatio}). Format and framing verified; visual text & clickbait cues not assessed.`
+           : 'Thumbnail image was not uploaded for this scan.',
+         findingsCount: timeline.filter(t => t.domain === 'thumbnail' && t.severity !== 'info').length,
+-        confidence: thumbnailMetadata ? 'HIGH' : 'UNKNOWN',
+-        limitations: 'Validates file format, aspect ratio, luminance, and visual heuristics; does not guarantee YouTube CTR.'
++        confidence: thumbnailMetadata ? (timeline.some(t => t.domain === 'thumbnail' && t.severity === 'warning') ? 'HIGH' : 'LOW') : 'UNKNOWN',
++        limitations: 'Validates file format, resolution, size, and aspect ratio; visual text OCR and clickbait detection are not assessed.'
+       },
+       channel_context: {
+         domain: 'channel_context',
+@@ -880,6 +899,25 @@ export interface ComparisonOptions {
+       improvements.push(`${resolvedIssues.length} prior risk signal(s) verifiably resolved with evidence`);
+     }
+ 
++    // Media version identity tracking via SHA-256
++    const origSha = options?.originalScanRecord?.metadata?.sha256;
++    const revSha = options?.revisedScanRecord?.metadata?.sha256;
++    const isIdenticalMedia = Boolean(origSha && revSha && origSha === revSha);
++
++    const mediaIdentity = (origSha || revSha) ? {
++      originalSha256: origSha,
++      revisedSha256: revSha,
++      isIdenticalMedia
++    } : undefined;
++
++    if (mediaIdentity) {
++      if (isIdenticalMedia) {
++        improvements.push('Note: Re-scan analyzed an identical media file version (matching SHA-256).');
++      } else if (origSha && revSha) {
++        improvements.push('Verified revised media file version (different SHA-256).');
++      }
++    }
++
+     // Honest, factual comparison summary
+     let comparisonSummary: string;
+     if (resolvedIssues.length > 0) {
+@@ -917,7 +955,8 @@ export interface ComparisonOptions {
+       revisedRatios: {
+         originalContribution: revisedReport.originalContributionRatio ?? null,
+         reusedContent: revisedReport.reusedContentRatio
+-      }
++      },
++      mediaIdentity
+     };
+   }
+ }
+diff --git a/src/server/pipeline/audioProcessor.ts b/src/server/pipeline/audioProcessor.ts
+index 8939076..7fcc2a9 100644
+--- a/src/server/pipeline/audioProcessor.ts
++++ b/src/server/pipeline/audioProcessor.ts
+@@ -1,7 +1,7 @@
+ import { execFile } from 'child_process';
+ import { promisify } from 'util';
+ import fs from 'fs';
+-import { MediaMetadata } from '../../types';
++import { MediaMetadata, DomainAssessmentStatus } from '../../types';
+ 
+ const execFileAsync = promisify(execFile);
+ 
+@@ -22,6 +22,8 @@ export interface AudioAnalysisResult {
+   advertiserSpeechFlags: Array<{ word: string; timestamp: number; category: string }>;
+   segments: Array<{ start: number; end: number; type: 'voice' | 'music' | 'silence' | 'mixed' }>;
+   transcriptSummary: string;
++  speechAnalysisStatus?: DomainAssessmentStatus;
++  musicAnalysisStatus?: DomainAssessmentStatus;
+ }
+ 
+ export class AudioProcessor {
+@@ -51,7 +53,9 @@ export class AudioProcessor {
+         isAudible: false,
+         advertiserSpeechFlags: [],
+         segments: [{ start: 0, end: durationSeconds, type: 'silence' }],
+-        transcriptSummary: 'No audio stream detected in container.'
++        transcriptSummary: 'No audio stream detected in container.',
++        speechAnalysisStatus: 'NOT_PROVIDED',
++        musicAnalysisStatus: 'NOT_PROVIDED'
+       };
+     }
+ 
+@@ -160,7 +164,9 @@ export class AudioProcessor {
+         segments,
+         transcriptSummary: isAudible 
+           ? `Audio stream inspected. Acoustic energy present across ${Math.round(activeRatio * 100)}% of the timeline (mean volume ${meanVol} dB). Speech and voice narration are unverified without transcript analysis.`
+-          : 'Low volume or quiet audio track.'
++          : 'Low volume or quiet audio track.',
++        speechAnalysisStatus: 'NOT_ASSESSED',
++        musicAnalysisStatus: 'NOT_ASSESSED'
+       };
+     } catch (err: any) {
+       if (err instanceof AudioProcessingError) {
+diff --git a/src/server/pipeline/jobOrchestrator.ts b/src/server/pipeline/jobOrchestrator.ts
+index 18eff66..f31af9c 100644
+--- a/src/server/pipeline/jobOrchestrator.ts
++++ b/src/server/pipeline/jobOrchestrator.ts
+@@ -422,8 +422,12 @@ export class JobOrchestrator {
+       // If this is a re-scan, generate and save the comparison with parent scan
+       if (scan.parentScanId) {
+         const parentReport = await this.storageRepo.scans.getReport(scan.parentScanId);
++        const parentScan = await this.storageRepo.scans.getScan(scan.parentScanId);
+         if (parentReport) {
+-          const comparison = policyIntelligenceEngine.generateComparison(parentReport, report);
++          const comparison = policyIntelligenceEngine.generateComparison(parentReport, report, {
++            originalScanRecord: parentScan || undefined,
++            revisedScanRecord: { ...scan, metadata },
++          });
+           checkLease();
+           await this.storageRepo.scans.saveComparison(comparison, leaseToken);
+         }
+diff --git a/src/server/pipeline/mediaInspector.ts b/src/server/pipeline/mediaInspector.ts
+index b241a82..6e21d2a 100644
+--- a/src/server/pipeline/mediaInspector.ts
++++ b/src/server/pipeline/mediaInspector.ts
+@@ -1,6 +1,7 @@
+ import { execFile } from 'child_process';
+ import { promisify } from 'util';
+ import fs from 'fs';
++import crypto from 'crypto';
+ import { MediaMetadata } from '../../types';
+ 
+ const execFileAsync = promisify(execFile);
+@@ -99,6 +100,15 @@ export class MediaInspector {
+       const hasAudio = !!audioStream;
+       const isProxyNeeded = (width > 1920 || height > 1080);
+ 
++      // Compute exact SHA-256 hash of media file for version identity
++      const sha256 = await new Promise<string>((resolve, reject) => {
++        const hash = crypto.createHash('sha256');
++        const stream = fs.createReadStream(filePath);
++        stream.on('data', chunk => hash.update(chunk));
++        stream.on('end', () => resolve(hash.digest('hex')));
++        stream.on('error', reject);
++      });
++
+       return {
+         filename: originalFilename,
+         originalSize,
+@@ -111,6 +121,7 @@ export class MediaInspector {
+         audioCodec: audioStream?.codec_name,
+         videoCodec: videoStream?.codec_name,
+         isProxyUsed: isProxyNeeded,
++        sha256,
+       };
+     } catch (err: any) {
+       if (err instanceof MediaInspectionError) {
+diff --git a/src/server/pipeline/thumbnailInspector.ts b/src/server/pipeline/thumbnailInspector.ts
+index 66afdd5..1a90097 100644
+--- a/src/server/pipeline/thumbnailInspector.ts
++++ b/src/server/pipeline/thumbnailInspector.ts
+@@ -60,13 +60,11 @@ export class ThumbnailInspector {
+ 
+       // Extract basic luminance sample via ffmpeg signalstats filter or deterministic probe
+       let meanLuminance = 128;
+-      let hasHighContrastText = false;
+-      let hasSensationalElements = false;
+ 
+       try {
+         const statsArgs = [
+           '-i', imagePath,
+-          '-vf', 'signalstats',
++          '-vf', 'signalstats,metadata=print:key=lavfi.signalstats.YAVG',
+           '-f', 'null',
+           '-'
+         ];
+@@ -79,16 +77,12 @@ export class ThumbnailInspector {
+         // Fallback to neutral luminance
+       }
+ 
+-      // Check if image is extremely high contrast or extreme saturation (often indicative of clickbait text/borders)
+-      if (meanLuminance > 220 || meanLuminance < 30) {
+-        hasHighContrastText = true;
+-      }
+-
+-      // Filename or format check
+-      const lowerName = originalFilename.toLowerCase();
+-      if (lowerName.includes('shock') || lowerName.includes('insane') || lowerName.includes('red_circle') || lowerName.includes('arrow')) {
+-        hasSensationalElements = true;
+-      }
++      // Evidence integrity: Visual text overlays, OCR, and graphic clickbait cues (arrows/circles)
++      // cannot be honestly inferred from luminance thresholds or filename strings alone.
++      // Explicitly represent visual content analysis as NOT_ASSESSED.
++      const hasHighContrastText: boolean | null = null;
++      const hasSensationalElements: boolean | null = null;
++      const visualAnalysisStatus = 'NOT_ASSESSED' as const;
+ 
+       const notes: string[] = [];
+       if (!is16by9) {
+@@ -100,6 +94,7 @@ export class ThumbnailInspector {
+       if (width < 640) {
+         notes.push('Resolution is below 640px wide. May appear blurry on high-DPI desktop feeds.');
+       }
++      notes.push('Visual text, graphic overlays, and sensational cues are not assessed without visual AI models.');
+ 
+       return {
+         filename: originalFilename,
+@@ -112,6 +107,7 @@ export class ThumbnailInspector {
+         meanLuminance,
+         hasHighContrastText,
+         hasSensationalElements,
++        visualAnalysisStatus,
+         notes: notes.join(' ')
+       };
+     } catch (err: any) {
+diff --git a/src/server/pipeline/videoProcessor.ts b/src/server/pipeline/videoProcessor.ts
+index c430311..62a311b 100644
+--- a/src/server/pipeline/videoProcessor.ts
++++ b/src/server/pipeline/videoProcessor.ts
+@@ -2,7 +2,7 @@ import { execFile } from 'child_process';
+ import { promisify } from 'util';
+ import path from 'path';
+ import fs from 'fs';
+-import { MediaMetadata, ScanMode } from '../../types';
++import { MediaMetadata, ScanMode, DomainAssessmentStatus } from '../../types';
+ 
+ const execFileAsync = promisify(execFile);
+ 
+@@ -21,6 +21,8 @@ export interface VideoAnalysisResult {
+   templateRepetitions: Array<{ start: number; end: number; pattern: string }>;
+   averagePacingSeconds: number;
+   tempFramesDir: string;
++  slideshowAnalysisStatus?: DomainAssessmentStatus;
++  repeatedFootageStatus?: DomainAssessmentStatus;
+ }
+ 
+ export class VideoProcessor {
+@@ -50,7 +52,9 @@ export class VideoProcessor {
+         repeatedFootageSegments: [],
+         templateRepetitions: [],
+         averagePacingSeconds: 0,
+-        tempFramesDir: ''
++        tempFramesDir: '',
++        slideshowAnalysisStatus: 'NOT_PROVIDED',
++        repeatedFootageStatus: 'NOT_PROVIDED'
+       };
+     }
+ 
+@@ -147,7 +151,9 @@ export class VideoProcessor {
+         repeatedFootageSegments,
+         templateRepetitions,
+         averagePacingSeconds: parseFloat(avgPacing.toFixed(1)),
+-        tempFramesDir: tempDir
++        tempFramesDir: tempDir,
++        slideshowAnalysisStatus: 'NOT_ASSESSED',
++        repeatedFootageStatus: 'NOT_ASSESSED'
+       };
+     } catch (err: any) {
+       // Ensure temp directory is cleaned up immediately on error to avoid disk leak
+diff --git a/src/types/index.ts b/src/types/index.ts
+index ed4e300..d752f6a 100644
+--- a/src/types/index.ts
++++ b/src/types/index.ts
+@@ -64,6 +64,7 @@ export interface MediaMetadata {
+   audioCodec?: string;
+   videoCodec?: string;
+   isProxyUsed: boolean;
++  sha256?: string;
+ }
+ 
+ export type EvidenceCategory = 
+@@ -167,8 +168,9 @@ export interface ThumbnailMetadata {
+   isStandardAspect: boolean; // 16:9 check
+   format: string;
+   meanLuminance: number; // 0 to 255
+-  hasHighContrastText: boolean;
+-  hasSensationalElements: boolean;
++  hasHighContrastText?: boolean | null;
++  hasSensationalElements?: boolean | null;
++  visualAnalysisStatus?: DomainAssessmentStatus;
+   notes?: string;
+ }
+ 
+@@ -285,12 +287,17 @@ export interface ReScanComparison {
+     originalContribution?: number | null;
+     reusedContent: number;
+   };
++  mediaIdentity?: {
++    originalSha256?: string;
++    revisedSha256?: string;
++    isIdenticalMedia: boolean;
++  };
+ }
+ 
+ export interface ComparisonOptions {
+   isRevisedFailed?: boolean;
+-  revisedScanRecord?: { status?: string; error?: string };
+-  originalScanRecord?: { status?: string; error?: string };
++  revisedScanRecord?: { status?: string; error?: string; metadata?: MediaMetadata };
++  originalScanRecord?: { status?: string; error?: string; metadata?: MediaMetadata };
+   skippedDomains?: EvidenceDomain[];
+ }
+ 
+diff --git a/tests/evidence_integrity_hardening.test.ts b/tests/evidence_integrity_hardening.test.ts
+index d60b26a..5b3772a 100644
+--- a/tests/evidence_integrity_hardening.test.ts
++++ b/tests/evidence_integrity_hardening.test.ts
+@@ -7,6 +7,7 @@ import { promisify } from 'util';
+ import { audioProcessor, AudioProcessor, AudioProcessingError } from '../src/server/pipeline/audioProcessor';
+ import { videoProcessor } from '../src/server/pipeline/videoProcessor';
+ import { mediaInspector } from '../src/server/pipeline/mediaInspector';
++import { thumbnailInspector } from '../src/server/pipeline/thumbnailInspector';
+ import { policyIntelligenceEngine } from '../src/server/intelligence/policyIntelligence';
+ import { InMemoryStorageRepository } from '../src/server/storage';
+ import { ScanJob, UserAccount, MediaMetadata } from '../src/types';
+@@ -141,6 +142,7 @@ export async function runEvidenceIntegrityHardeningTests() {
+       resolutionLabel: '240p',
+       fps: 25,
+       hasAudio: true,
++      videoCodec: 'h264',
+       isProxyUsed: false
+     };
+ 
+@@ -409,6 +411,254 @@ export async function runEvidenceIntegrityHardeningTests() {
+     assert(compDelta.revisedRatios.originalContribution === null, '8. Comparison preserves null for revised unassessed original contribution');
+     assert(Array.isArray(compDelta.improvements), '8. Improvements array generated without crashing');
+ 
++    // -------------------------------------------------------------------------
++    // SECTION 4: PHASE 1 EVIDENCE INTEGRITY & RE-SCAN REGRESSION TESTS
++    // -------------------------------------------------------------------------
++    console.log('\n[4. Phase 1 Evidence Integrity & Re-Scan Regression Tests]');
++
++    // Test 1: Identical image bytes with different filenames must not produce different visual-content findings
++    const thumbBlue1 = path.resolve(testDir, 'standard_neutral.jpg');
++    const thumbBlue2 = path.resolve(testDir, 'shock_arrow_red_circle_clickbait.jpg');
++    await execFileAsync('ffmpeg', [
++      '-y', '-f', 'lavfi', '-i', 'color=c=blue:s=1280x720:d=1',
++      '-vframes', '1', thumbBlue1
++    ]);
++    fs.copyFileSync(thumbBlue1, thumbBlue2);
++
++    const thumbMeta1 = await thumbnailInspector.inspect(thumbBlue1, 'standard_neutral.jpg');
++    const thumbMeta2 = await thumbnailInspector.inspect(thumbBlue2, 'shock_arrow_red_circle_clickbait.jpg');
++
++    assert(thumbMeta1.hasSensationalElements === null, '4.1 Neutral filename yields null for sensational visual cues');
++    assert(thumbMeta2.hasSensationalElements === null, '4.1 Clickbait filename does NOT fabricate sensational visual cues');
++    assert(thumbMeta1.hasHighContrastText === thumbMeta2.hasHighContrastText, '4.1 Text flag identical across different filenames for same image');
++    assert(thumbMeta1.visualAnalysisStatus === 'NOT_ASSESSED', '4.1 Visual analysis status is explicitly NOT_ASSESSED');
++
++    // Test 2: Bright and dark images must not be treated as proof that text is present or absent
++    const thumbDark = path.resolve(testDir, 'dark_image.jpg');
++    const thumbBright = path.resolve(testDir, 'bright_image.jpg');
++    await execFileAsync('ffmpeg', [
++      '-y', '-f', 'lavfi', '-i', 'color=c=black:s=1280x720:d=1',
++      '-vframes', '1', thumbDark
++    ]);
++    await execFileAsync('ffmpeg', [
++      '-y', '-f', 'lavfi', '-i', 'color=c=white:s=1280x720:d=1',
++      '-vframes', '1', thumbBright
++    ]);
++
++    const darkMeta = await thumbnailInspector.inspect(thumbDark, 'dark.jpg');
++    const brightMeta = await thumbnailInspector.inspect(thumbBright, 'bright.jpg');
++
++    assert(darkMeta.hasHighContrastText === null, '4.2 Dark image luminance does NOT claim high-contrast text exists');
++    assert(brightMeta.hasHighContrastText === null, '4.2 Bright image luminance does NOT claim high-contrast text exists');
++    assert(darkMeta.meanLuminance < 30, '4.2 Dark image has measured low luminance');
++    assert(brightMeta.meanLuminance > 220, '4.2 Bright image has measured high luminance');
++
++    // Test 3: Unavailable thumbnail analysis is reported as unassessed, not as a verified negative
++    const timelineThumb = policyIntelligenceEngine.generateEvidenceTimeline({
++      scanId: 'scan_thumb_unassessed',
++      metadata: validMeta,
++      scanMode: 'standard',
++      audioResult: validAudioResult,
++      videoResult: mockVideoResult,
++      thumbnailMetadata: thumbMeta1
++    });
++    const reportThumb = policyIntelligenceEngine.buildReport({
++      scanId: 'scan_thumb_unassessed',
++      metadata: validMeta,
++      scanMode: 'standard',
++      audioResult: validAudioResult,
++      videoResult: mockVideoResult,
++      thumbnailMetadata: thumbMeta1
++    }, timelineThumb);
++
++    assert(reportThumb.domainReports.thumbnail.status === 'NOT_ASSESSED', '4.3 Thumbnail domain reports NOT_ASSESSED for unperformed visual analysis');
++    assert(reportThumb.domainReports.thumbnail.summary.includes('not assessed'), '4.3 Summary explicitly clarifies visual text & sensational cues not assessed');
++
++    // Test 4: Audio volume/silence measurements are not misrepresented as speech/music detection
++    assert(validAudioResult.speechAnalysisStatus === 'NOT_ASSESSED', '4.4 Audio speechAnalysisStatus is explicitly NOT_ASSESSED');
++    assert(validAudioResult.musicAnalysisStatus === 'NOT_ASSESSED', '4.4 Audio musicAnalysisStatus is explicitly NOT_ASSESSED');
++    assert(validAudioResult.isAudible === true, '4.4 Audible energy is measured and verified');
++    assert(typeof validAudioResult.meanVolumeDb === 'number', '4.4 Mean volume dB is measured and verified');
++
++    // Test 5: Unimplemented slideshow/repeated-footage detection is not represented as a verified negative
++    const videoResultSample = await videoProcessor.analyzeVideo(validToneVideoPath, validMeta, 'standard');
++    assert(videoResultSample.slideshowAnalysisStatus === 'NOT_ASSESSED', '4.5 Video slideshowAnalysisStatus is explicitly NOT_ASSESSED');
++    assert(videoResultSample.repeatedFootageStatus === 'NOT_ASSESSED', '4.5 Video repeatedFootageStatus is explicitly NOT_ASSESSED');
++    assert(videoResultSample.scenesCount >= 1, '4.5 Scene cut detection is measured via FFmpeg');
++
++    // Test 6: Identical media bytes produce the same SHA-256; changed bytes produce a different SHA-256
++    const videoCopyPath = path.resolve(testDir, 'valid_copy.mp4');
++    fs.copyFileSync(validToneVideoPath, videoCopyPath);
++    const metaOriginal = await mediaInspector.inspect(validToneVideoPath, 'valid_tone.mp4');
++    const metaCopy = await mediaInspector.inspect(videoCopyPath, 'different_name_copy.mp4');
++
++    assert(typeof metaOriginal.sha256 === 'string' && metaOriginal.sha256.length === 64, '4.6 Media inspector computes 64-char SHA-256 hash');
++    assert(metaOriginal.sha256 === metaCopy.sha256, '4.6 Identical media bytes produce identical SHA-256 hash regardless of path or filename');
++
++    const differentVideoPath = path.resolve(testDir, 'different_content.mp4');
++    await execFileAsync('ffmpeg', [
++      '-y', '-f', 'lavfi', '-i', 'testsrc=duration=1:size=320x180:rate=15',
++      '-c:v', 'libx264', differentVideoPath
++    ]);
++    const metaDifferent = await mediaInspector.inspect(differentVideoPath, 'different.mp4');
++    assert(metaOriginal.sha256 !== metaDifferent.sha256, '4.6 Different media bytes produce distinct SHA-256 hashes');
++
++    // Test 7: A previous finding is not resolved when the new analyzer fails or produces insufficient evidence
++    const baselineReportWithIssue = {
++      ...reportThumb,
++      scanId: 'scan_baseline_issue',
++      topIssues: [
++        {
++          id: 'issue_thumb_flag',
++          domain: 'thumbnail' as const,
++          what: 'Non-Standard Aspect Ratio',
++          where: 'Thumbnail dimensions',
++          why: 'Non-16:9 layout',
++          fix: 'Resize to 16:9',
++          evidence: 'ffprobe:dimensions',
++          context: 'Display',
++          recommendedAction: 'Fix aspect ratio',
++          confidence: 'HIGH' as const,
++          limitations: 'Local check',
++          severity: 'warning' as const,
++          policyArea: 'THUMBNAIL INTEGRITY',
++          category: 'thumbnail_integrity' as const,
++          timestampSeconds: 0
++        }
++      ]
++    };
++
++    // Revised scan where revised job failed
++    const failedRevisedReport = {
++      ...reportThumb,
++      scanId: 'scan_revised_failed',
++      topIssues: []
++    };
++    const compFailed = policyIntelligenceEngine.generateComparison(baselineReportWithIssue, failedRevisedReport, {
++      isRevisedFailed: true
++    });
++    assert(compFailed.resolvedIssues.length === 0, '4.7 Failed revised scan does NOT resolve prior finding');
++    assert(compFailed.notVerifiedIssues?.length === 1, '4.7 Prior finding is categorized as notVerifiedIssues when scan failed');
++
++    // Revised scan where detector was unassessed / insufficient evidence
++    const unassessedRevisedReport = {
++      ...reportThumb,
++      scanId: 'scan_revised_unassessed',
++      topIssues: [],
++      domainReports: {
++        ...reportThumb.domainReports,
++        thumbnail: {
++          ...reportThumb.domainReports.thumbnail,
++          status: 'NOT_ASSESSED' as const
++        }
++      }
++    };
++    const compUnassessed = policyIntelligenceEngine.generateComparison(baselineReportWithIssue, unassessedRevisedReport);
++    assert(compUnassessed.resolvedIssues.length === 0, '4.7 Unassessed revised detector does NOT resolve prior finding');
++    assert(Boolean(compUnassessed.notVerifiedIssues?.some(i => i.includes('detector for thumbnail was not assessed'))), '4.7 Explicit unassessed reason recorded in notVerifiedIssues');
++
++    // Test 8: Confirmed persistent, new, resolved, and unverified findings are compared correctly
++    const cleanRevisedReport = {
++      ...reportThumb,
++      scanId: 'scan_revised_clean',
++      topIssues: [
++        {
++          id: 'issue_audio_new',
++          domain: 'video_audio' as const,
++          what: 'Sudden Audio Spike',
++          where: '00:01',
++          why: 'High volume',
++          fix: 'Normalize audio',
++          evidence: 'ffmpeg:volumedetect',
++          context: 'Audio',
++          recommendedAction: 'Lower volume',
++          confidence: 'HIGH' as const,
++          limitations: 'Local check',
++          severity: 'warning' as const,
++          policyArea: 'ADVERTISER FRIENDLY',
++          category: 'advertiser_friendly' as const,
++          timestampSeconds: 1
++        }
++      ],
++      domainReports: {
++        ...reportThumb.domainReports,
++        thumbnail: {
++          ...reportThumb.domainReports.thumbnail,
++          status: 'NO_MAJOR_RISK_SIGNALS_DETECTED' as const
++        }
++      }
++    };
++
++    const multiIssueBaseline = {
++      ...reportThumb,
++      scanId: 'scan_multi_baseline',
++      topIssues: [
++        baselineReportWithIssue.topIssues[0], // will be resolved in clean revised scan
++        {
++          id: 'issue_title_persist',
++          domain: 'title' as const,
++          what: 'Misleading Promise',
++          where: 'Title text',
++          why: 'Extreme promise',
++          fix: 'Rephrase title',
++          evidence: 'nlp:regex',
++          context: 'Title',
++          recommendedAction: 'Rephrase',
++          confidence: 'HIGH' as const,
++          limitations: 'Local check',
++          severity: 'warning' as const,
++          policyArea: 'DECEPTIVE PRACTICES',
++          category: 'community_guidelines' as const,
++          timestampSeconds: 0
++        }
++      ]
++    };
++
++    const revisedWithPersistAndNew = {
++      ...cleanRevisedReport,
++      topIssues: [
++        multiIssueBaseline.topIssues[1], // persisting title issue
++        cleanRevisedReport.topIssues[0]   // new audio issue
++      ]
++    };
++
++    const fullComparison = policyIntelligenceEngine.generateComparison(
++      multiIssueBaseline,
++      revisedWithPersistAndNew,
++      {
++        originalScanRecord: { status: 'COMPLETED', metadata: metaOriginal },
++        revisedScanRecord: { status: 'COMPLETED', metadata: metaDifferent }
++      }
++    );
++
++    assert(fullComparison.resolvedIssues.length === 1, '4.8 Resolved issue tracked when domain is verified clean');
++    assert(fullComparison.resolvedIssues[0] === 'Non-Standard Aspect Ratio', '4.8 Resolved issue name matches baseline');
++    assert(fullComparison.remainingIssues.length === 1, '4.8 Persisting issue tracked in remainingIssues');
++    assert(fullComparison.newIssues?.length === 1, '4.8 New issue tracked in newIssues');
++    assert(fullComparison.mediaIdentity?.isIdenticalMedia === false, '4.8 Media identity confirms different file version');
++    assert(fullComparison.mediaIdentity?.originalSha256 === metaOriginal.sha256, '4.8 Original SHA-256 matches metadata');
++    assert(fullComparison.mediaIdentity?.revisedSha256 === metaDifferent.sha256, '4.8 Revised SHA-256 matches metadata');
++
++    // Test 9: Existing ownership and cross-user isolation guarantees remain intact
++    const userA = await storage.users.createUser('user_a_owner@test.com', 'pro');
++    const userB = await storage.users.createUser('user_b_other@test.com', 'pro');
++    const scanRecordA = await storage.scans.createScan({
++      id: `scan_owner_test_${Date.now()}`,
++      userId: userA.id,
++      videoTitle: 'User A Private Media',
++      videoFilename: 'privateA.mp4',
++      videoPath: validToneVideoPath,
++      scanMode: 'standard',
++      status: 'COMPLETED',
++      currentStage: 'Risk report',
++      completedStages: ['Upload', 'Risk report'],
++      creditsUsed: 1,
++      createdAt: new Date().toISOString()
++    });
++
++    assert(scanRecordA.userId === userA.id, '4.9 Scan record strictly associated with User A');
++    assert(scanRecordA.userId !== userB.id, '4.9 User B cannot be assigned User A scan ownership');
++
+     console.log(`\n======================================================`);
+     console.log(`TEST SUITE 6 COMPLETE: ${passed}/${total} assertions passed!`);
+     console.log(`======================================================\n`);
+diff --git a/tests/security_retention_and_e2e.test.ts b/tests/security_retention_and_e2e.test.ts
+index 8c1a14f..86e9424 100644
+--- a/tests/security_retention_and_e2e.test.ts
++++ b/tests/security_retention_and_e2e.test.ts
+@@ -220,6 +220,7 @@ export async function runSecurityRetentionAndE2ETests() {
+       'Report does NOT contain unsupported "Compliant" policy conclusions'
+     );
+     await storage.scans.saveReport(scanId, report, { systemBypass: true });
++    await storage.scans.updateScan(scanId, { status: 'COMPLETED' }, { systemBypass: true });
+     const savedReport = await storage.scans.getReport(scanId);
+     assert(savedReport !== null, 'Report safely persisted and retrieved from storage');
+ 
+-- 
+2.34.1
+

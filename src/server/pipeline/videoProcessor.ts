@@ -2,7 +2,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
 import fs from 'fs';
-import { MediaMetadata, ScanMode } from '../../types';
+import { MediaMetadata, ScanMode, DomainAssessmentStatus } from '../../types';
 
 const execFileAsync = promisify(execFile);
 
@@ -21,6 +21,8 @@ export interface VideoAnalysisResult {
   templateRepetitions: Array<{ start: number; end: number; pattern: string }>;
   averagePacingSeconds: number;
   tempFramesDir: string;
+  slideshowAnalysisStatus?: DomainAssessmentStatus;
+  repeatedFootageStatus?: DomainAssessmentStatus;
 }
 
 export class VideoProcessor {
@@ -50,7 +52,9 @@ export class VideoProcessor {
         repeatedFootageSegments: [],
         templateRepetitions: [],
         averagePacingSeconds: 0,
-        tempFramesDir: ''
+        tempFramesDir: '',
+        slideshowAnalysisStatus: 'NOT_PROVIDED',
+        repeatedFootageStatus: 'NOT_PROVIDED'
       };
     }
 
@@ -147,7 +151,9 @@ export class VideoProcessor {
         repeatedFootageSegments,
         templateRepetitions,
         averagePacingSeconds: parseFloat(avgPacing.toFixed(1)),
-        tempFramesDir: tempDir
+        tempFramesDir: tempDir,
+        slideshowAnalysisStatus: 'NOT_ASSESSED',
+        repeatedFootageStatus: 'NOT_ASSESSED'
       };
     } catch (err: any) {
       // Ensure temp directory is cleaned up immediately on error to avoid disk leak

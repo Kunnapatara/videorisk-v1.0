@@ -220,6 +220,7 @@ export async function runSecurityRetentionAndE2ETests() {
       'Report does NOT contain unsupported "Compliant" policy conclusions'
     );
     await storage.scans.saveReport(scanId, report, { systemBypass: true });
+    await storage.scans.updateScan(scanId, { status: 'COMPLETED' }, { systemBypass: true });
     const savedReport = await storage.scans.getReport(scanId);
     assert(savedReport !== null, 'Report safely persisted and retrieved from storage');
 
