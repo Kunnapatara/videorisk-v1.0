@@ -55,6 +55,65 @@ export function formatMediaIdentityDisplay(
   };
 }
 
+export function getComparisonSubtitle(comparison: ReScanComparison): string {
+  // Case 1: Revised media SHA-256 is unavailable: explicitly state that media comparison is unverified
+  if (comparison.mediaIdentity && !isValidSha256(comparison.mediaIdentity.revisedSha256)) {
+    return 'Media comparison is unverified: revised media SHA-256 is unavailable.';
+  }
+
+  const isCleanBaselineAndRevision = comparison.originalSignalsCount === 0 &&
+    comparison.revisedSignalsCount === 0 &&
+    comparison.revisedRisk !== 'HIGH_RISK';
+
+  // Case 2 & 3: Previous findings were resolved
+  if (comparison.resolvedIssues.length > 0) {
+    if (comparison.remainingIssues.length === 0 && (!comparison.notVerifiedIssues || comparison.notVerifiedIssues.length === 0)) {
+      if (comparison.newIssues && comparison.newIssues.length > 0) {
+        // Case 2: Previous findings resolved, but new risk signals appeared
+        return `Prior signal(s) resolved with evidence (${comparison.resolvedIssues.length}), but ${comparison.newIssues.length} new risk signal(s) were introduced in this cut.`;
+      }
+      // Case 3: Previous findings resolved with evidence and no new findings appeared
+      return `Verified with evidence: All ${comparison.resolvedIssues.length} prior policy scrutiny signal(s) have been resolved.`;
+    } else {
+      if (comparison.newIssues && comparison.newIssues.length > 0) {
+        return `Partial resolution verified: ${comparison.resolvedIssues.length} prior signal(s) resolved with evidence, but ${comparison.newIssues.length} new risk signal(s) appeared alongside remaining or unverified signals.`;
+      }
+      return `Partial resolution verified: ${comparison.resolvedIssues.length} prior signal(s) resolved with evidence, but additional signals remain present or unverified.`;
+    }
+  }
+
+  // Case 4: Previous findings remain or their resolution could not be verified
+  if (comparison.notVerifiedIssues && comparison.notVerifiedIssues.length > 0) {
+    if (comparison.remainingIssues.length > 0) {
+      return `Prior findings persist (${comparison.remainingIssues.length}) and resolution could not be verified for ${comparison.notVerifiedIssues.length} signal(s) due to unassessed detectors or insufficient evidence.`;
+    }
+    return `Signal resolution could not be verified (${comparison.notVerifiedIssues.length} item(s) unverified due to unassessed detectors or insufficient evidence).`;
+  }
+
+  if (comparison.remainingIssues.length > 0) {
+    if (comparison.newIssues && comparison.newIssues.length > 0) {
+      return `No prior risk signals were resolved. ${comparison.remainingIssues.length} prior signal(s) persist and ${comparison.newIssues.length} new signal(s) were introduced.`;
+    }
+    return `No prior risk signals were resolved. ${comparison.remainingIssues.length} signal(s) persist in this revision cut.`;
+  }
+
+  // Case 5: No risk signals detected in either cut
+  if (isCleanBaselineAndRevision) {
+    return 'No policy scrutiny signals detected in either cut.';
+  }
+
+  // Case 6: No prior findings were resolved, but fewer signals appear in the revision
+  if (comparison.signalsDelta < 0) {
+    return `Fewer signals detected in this cut (${comparison.revisedSignalsCount} vs ${comparison.originalSignalsCount}), but no prior findings were verifiably resolved with evidence.`;
+  }
+
+  if (comparison.newIssues && comparison.newIssues.length > 0) {
+    return `New policy scrutiny signal(s) detected in this revision cut (${comparison.newIssues.length} signal(s)).`;
+  }
+
+  return 'No net change in detected risk signals between cuts.';
+}
+
 interface ComparisonViewProps {
   comparison: ReScanComparison;
   onBackToReport: () => void;
@@ -100,37 +159,25 @@ export const ComparisonView: React.FC<ComparisonViewProps> = ({
 
       {/* Summary Banner */}
       {(() => {
-        const isFullyResolved = comparison.resolvedIssues.length > 0 &&
+        const isMediaUnverified = Boolean(
+          comparison.mediaIdentity && !isValidSha256(comparison.mediaIdentity.revisedSha256)
+        );
+
+        const isFullyResolved = !isMediaUnverified &&
+          comparison.resolvedIssues.length > 0 &&
           (!comparison.notVerifiedIssues || comparison.notVerifiedIssues.length === 0) &&
           comparison.remainingIssues.length === 0 &&
           (!comparison.newIssues || comparison.newIssues.length === 0) &&
           comparison.revisedRisk !== 'HIGH_RISK';
 
-        const isCleanBaselineAndRevision = comparison.originalSignalsCount === 0 &&
+        const isCleanBaselineAndRevision = !isMediaUnverified &&
+          comparison.originalSignalsCount === 0 &&
           comparison.revisedSignalsCount === 0 &&
           comparison.revisedRisk !== 'HIGH_RISK';
 
         const isGreen = isFullyResolved || isCleanBaselineAndRevision;
         const isHighRisk = comparison.revisedRisk === 'HIGH_RISK';
-
-        let subtitle = 'No net change in detected risk signals between cuts.';
-        if (comparison.resolvedIssues.length > 0) {
-          if (comparison.remainingIssues.length === 0 && (!comparison.notVerifiedIssues || comparison.notVerifiedIssues.length === 0)) {
-            subtitle = `Verified with evidence: All ${comparison.resolvedIssues.length} prior policy scrutiny signal(s) have been resolved.`;
-          } else {
-            subtitle = `Partial resolution verified: ${comparison.resolvedIssues.length} prior signal(s) resolved with evidence, but additional signals remain present or unverified.`;
-          }
-        } else if (comparison.notVerifiedIssues && comparison.notVerifiedIssues.length > 0) {
-          subtitle = `Signal resolution could not be verified (${comparison.notVerifiedIssues.length} item(s) unverified due to unassessed detectors or insufficient evidence).`;
-        } else if (comparison.remainingIssues.length > 0) {
-          subtitle = `No prior risk signals were resolved. ${comparison.remainingIssues.length} signal(s) persist in this revision cut.`;
-        } else if (comparison.newIssues && comparison.newIssues.length > 0) {
-          subtitle = `New policy scrutiny signal(s) detected in this revision cut.`;
-        } else if (isCleanBaselineAndRevision) {
-          subtitle = 'No policy scrutiny signals detected in either cut.';
-        } else if (comparison.signalsDelta < 0) {
-          subtitle = `Fewer signals detected in this cut (${comparison.revisedSignalsCount} vs ${comparison.originalSignalsCount}), but no prior findings were verifiably resolved with evidence.`;
-        }
+        const subtitle = getComparisonSubtitle(comparison);
 
         return (
           <div className={`p-6 rounded-xl border ${

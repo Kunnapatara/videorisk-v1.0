@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import { storage, IStorageRepository } from '../storage';
 import { mediaInspector, MediaInspectionError } from './mediaInspector';
-import { proxyGenerator } from './proxyGenerator';
+import { proxyGenerator, ProxyGenerationError } from './proxyGenerator';
 import { audioProcessor, AudioProcessingError } from './audioProcessor';
 import { videoProcessor, VideoProcessingError } from './videoProcessor';
 import { thumbnailInspector } from './thumbnailInspector';
@@ -208,7 +208,7 @@ export class JobOrchestrator {
         try {
           await this.storageRepo.scans.updateScan(scanId, {
             status: 'FAILED',
-            error: (err instanceof MediaInspectionError || err instanceof VideoProcessingError || err instanceof AudioProcessingError)
+            error: (err instanceof MediaInspectionError || err instanceof VideoProcessingError || err instanceof AudioProcessingError || err instanceof ProxyGenerationError)
               ? err.message
               : 'We couldn’t complete this scan. Your video was not published or shared. Credits have been refunded. Please try again.'
           }, leaseToken);

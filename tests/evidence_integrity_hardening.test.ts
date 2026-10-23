@@ -8,10 +8,11 @@ import { audioProcessor, AudioProcessor, AudioProcessingError } from '../src/ser
 import { videoProcessor } from '../src/server/pipeline/videoProcessor';
 import { mediaInspector } from '../src/server/pipeline/mediaInspector';
 import { thumbnailInspector, ThumbnailInspector } from '../src/server/pipeline/thumbnailInspector';
+import { proxyGenerator, ProxyGenerationError } from '../src/server/pipeline/proxyGenerator';
 import { policyIntelligenceEngine } from '../src/server/intelligence/policyIntelligence';
-import { formatMediaIdentityDisplay, isValidSha256 } from '../src/components/ComparisonView';
+import { formatMediaIdentityDisplay, isValidSha256, getComparisonSubtitle } from '../src/components/ComparisonView';
 import { InMemoryStorageRepository } from '../src/server/storage';
-import { ScanJob, UserAccount, MediaMetadata } from '../src/types';
+import { ScanJob, UserAccount, MediaMetadata, ReScanComparison } from '../src/types';
 
 const execFileAsync = promisify(execFile);
 
@@ -841,6 +842,208 @@ export async function runEvidenceIntegrityHardeningTests() {
     fs.writeFileSync(corruptImgPath, 'NOT_AN_IMAGE_FILE_DATA');
     const corruptLum = await thumbnailInspector.extractLuminance(corruptImgPath);
     assert(corruptLum === null, '4.19 extractLuminance returns null when FFmpeg fails on corrupted image');
+
+    // Test 20: Proxy generation fail-closed, caching, and input media preservation
+    const standard1080Meta: MediaMetadata = {
+      filename: 'sample_1080p.mp4',
+      originalSize: 1000,
+      durationSeconds: 10,
+      width: 1920,
+      height: 1080,
+      resolutionLabel: '1080p Full HD',
+      fps: 30,
+      hasAudio: true,
+      isProxyUsed: false
+    };
+    const noProxyNeededResult = await proxyGenerator.generateProxyIfNeeded(validToneVideoPath, standard1080Meta);
+    assert(noProxyNeededResult === validToneVideoPath, '4.20 Standard 1080p video returns original inputPath without generating proxy');
+
+    const uhd4kMeta: MediaMetadata = {
+      filename: 'sample_4k.mp4',
+      originalSize: 50000000,
+      durationSeconds: 1,
+      width: 3840,
+      height: 2160,
+      resolutionLabel: '4K Ultra HD',
+      fps: 30,
+      hasAudio: true,
+      isProxyUsed: true
+    };
+
+    // 20a: Failed FFmpeg call throws ProxyGenerationError
+    let proxyErrorThrown = false;
+    let proxyErrorMessage = '';
+    const nonExistentPath = path.resolve(testDir, 'non_existent_4k.mp4');
+    try {
+      await proxyGenerator.generateProxyIfNeeded(nonExistentPath, uhd4kMeta);
+    } catch (err: any) {
+      proxyErrorThrown = err instanceof ProxyGenerationError;
+      proxyErrorMessage = err?.message || '';
+    }
+    assert(proxyErrorThrown, '4.20 Failed 4K proxy generation throws ProxyGenerationError instead of silently returning raw 4K path');
+    assert(proxyErrorMessage.includes('Failed to generate required 1080p proxy for high-resolution (4K Ultra HD) video'), '4.20 Proxy error message explains high-resolution requirement');
+
+    // 20b: Successful proxy generation creates a valid non-empty proxy
+    const originalInputBytesBefore = fs.statSync(validToneVideoPath).size;
+    const generatedProxy = await proxyGenerator.generateProxyIfNeeded(validToneVideoPath, uhd4kMeta);
+    assert(fs.existsSync(generatedProxy), '4.20 Generated proxy file exists on disk');
+    assert(fs.statSync(generatedProxy).size > 0, '4.20 Generated proxy file is non-empty');
+    assert(generatedProxy !== validToneVideoPath, '4.20 Generated proxy path is distinct from original input');
+    assert(fs.statSync(validToneVideoPath).size === originalInputBytesBefore, '4.20 Original media file is completely preserved');
+
+    // 20c: Cached valid proxy is reused
+    const reusedProxy = await proxyGenerator.generateProxyIfNeeded(validToneVideoPath, uhd4kMeta);
+    assert(reusedProxy === generatedProxy, '4.20 Existing non-empty proxy is reused');
+
+    // 20d: Invalid zero-byte cached proxy is unlinked and regenerated, not accepted
+    fs.writeFileSync(generatedProxy, ''); // truncate to 0 bytes
+    assert(fs.statSync(generatedProxy).size === 0, '4.20 Proxy truncated to 0 bytes for cache test');
+    const regeneratedProxy = await proxyGenerator.generateProxyIfNeeded(validToneVideoPath, uhd4kMeta);
+    assert(fs.statSync(regeneratedProxy).size > 0, '4.20 Zero-byte cached proxy was regenerated to a valid non-empty proxy');
+
+    // 20e: If FFmpeg fails on corrupted input, original input is NOT deleted
+    const corruptInputPath = path.resolve(testDir, 'corrupt_input_media.mp4');
+    fs.writeFileSync(corruptInputPath, 'CORRUPTED_NON_VIDEO_DATA');
+    try {
+      await proxyGenerator.generateProxyIfNeeded(corruptInputPath, uhd4kMeta);
+    } catch (err) {
+      assert(err instanceof ProxyGenerationError, '4.20 Corrupt input proxy generation throws ProxyGenerationError');
+    }
+    assert(fs.existsSync(corruptInputPath), '4.20 Original input media is NEVER deleted during proxy generation failure');
+
+    // Test 21: getComparisonSubtitle reflects newly introduced issues, unverified hashes, and persistent findings
+    const compBaseMock: ReScanComparison = {
+      originalScanId: 's1',
+      revisedScanId: 's2',
+      originalRisk: 'NEEDS_REVIEW',
+      revisedRisk: 'LOW_RISK',
+      originalSignalsCount: 1,
+      revisedSignalsCount: 0,
+      signalsDelta: -1,
+      originalRatios: { originalContribution: 80, reusedContent: 20 },
+      revisedRatios: { originalContribution: 90, reusedContent: 10 },
+      resolvedIssues: ['Non-Standard Aspect Ratio'],
+      remainingIssues: [],
+      improvements: ['Prior issue resolved'],
+      comparisonSummary: 'Summary'
+    };
+
+    // 21a: Subtitle when all resolved and no new issues
+    const subClean = getComparisonSubtitle(compBaseMock);
+    assert(subClean.includes('All 1 prior policy scrutiny signal(s) have been resolved'), '4.21 Subtitle confirms all prior signals resolved when no new issues');
+
+    // 21b: Subtitle when prior resolved but new issues introduced
+    const compWithNewMock: ReScanComparison = {
+      ...compBaseMock,
+      newIssues: ['Extended Silence / Unedited Gap'],
+      revisedSignalsCount: 1,
+      signalsDelta: 0
+    };
+    const subWithNew = getComparisonSubtitle(compWithNewMock);
+    assert(subWithNew.includes('Prior signal(s) resolved with evidence (1), but 1 new risk signal(s) were introduced'), '4.21 Subtitle explicitly warns of new issues introduced despite prior resolution');
+
+    // 21c: Subtitle when resolution cannot be verified due to unassessed detectors
+    const compUnverifiedMock: ReScanComparison = {
+      ...compBaseMock,
+      resolvedIssues: [],
+      notVerifiedIssues: ['Non-Standard Aspect Ratio (unverified: analysis for thumbnail was unavailable)'],
+      revisedSignalsCount: 0,
+      signalsDelta: -1
+    };
+    const subUnverified = getComparisonSubtitle(compUnverifiedMock);
+    assert(subUnverified.includes('Signal resolution could not be verified (1 item(s) unverified'), '4.21 Subtitle clarifies resolution could not be verified');
+
+    // 21d: Subtitle when revised media SHA-256 is unavailable
+    const compMissingRevisedSha: ReScanComparison = {
+      ...compBaseMock,
+      mediaIdentity: {
+        originalSha256: 'a'.repeat(64),
+        revisedSha256: undefined,
+        isIdenticalMedia: false,
+        comparisonStatus: 'UNVERIFIED'
+      }
+    };
+    const subMissingSha = getComparisonSubtitle(compMissingRevisedSha);
+    assert(subMissingSha === 'Media comparison is unverified: revised media SHA-256 is unavailable.', '4.21 Subtitle explicitly states media comparison is unverified when revised SHA-256 is missing');
+
+    // 21e: Subtitle when findings persist without resolution
+    const compPersistingMock: ReScanComparison = {
+      ...compBaseMock,
+      resolvedIssues: [],
+      remainingIssues: ['Thumbnail dimensions: Non-Standard Aspect Ratio'],
+      revisedSignalsCount: 1,
+      signalsDelta: 0
+    };
+    const subPersist = getComparisonSubtitle(compPersistingMock);
+    assert(subPersist.includes('No prior risk signals were resolved. 1 signal(s) persist'), '4.21 Subtitle states persistent findings accurately');
+
+    // 21f: Subtitle when clean baseline and clean revision
+    const compCleanCutsMock: ReScanComparison = {
+      ...compBaseMock,
+      originalSignalsCount: 0,
+      revisedSignalsCount: 0,
+      resolvedIssues: [],
+      remainingIssues: [],
+      signalsDelta: 0
+    };
+    const subCleanCuts = getComparisonSubtitle(compCleanCutsMock);
+    assert(subCleanCuts === 'No policy scrutiny signals detected in either cut.', '4.21 Subtitle confirms clean status in both cuts');
+
+    // 21g: Subtitle when fewer signals detected but no prior issues verifiably resolved
+    const compFewerSignalsMock: ReScanComparison = {
+      ...compBaseMock,
+      originalSignalsCount: 3,
+      revisedSignalsCount: 1,
+      signalsDelta: -2,
+      resolvedIssues: [],
+      remainingIssues: []
+    };
+    const subFewer = getComparisonSubtitle(compFewerSignalsMock);
+    assert(subFewer.includes('Fewer signals detected in this cut (1 vs 3), but no prior findings were verifiably resolved with evidence.'), '4.21 Subtitle forbids claiming resolution on unexplained signal drop');
+
+    // Test 22: Orchestrator retry and terminal failure credit accounting lifecycle
+    const orchTestUser = await storage.users.createUser('orch_user_test@domain.com', undefined, undefined, 10, 'pro');
+    const initialCredits = (await storage.users.getUser(orchTestUser.id))!.creditsRemaining;
+
+    // Scan record with 1 credit deducted
+    const orchScanJobId = `scan_orch_test_${Date.now()}`;
+    await storage.scans.createScan({
+      id: orchScanJobId,
+      userId: orchTestUser.id,
+      videoTitle: 'Orchestrator Lifecycle Test',
+      videoFilename: 'test.mp4',
+      videoPath: validToneVideoPath,
+      scanMode: 'standard',
+      status: 'QUEUED',
+      currentStage: 'Upload',
+      completedStages: ['Upload'],
+      creditsUsed: 1,
+      createdAt: new Date().toISOString()
+    });
+    const deductRes = await storage.scans.deductScanCredits(orchScanJobId, orchTestUser.id, 1, { systemBypass: true });
+    assert(deductRes === true, '4.22 Initial scan credit deduction succeeds');
+    assert((await storage.users.getUser(orchTestUser.id))!.creditsRemaining === initialCredits - 1, '4.22 User credits reduced by 1');
+
+    // Simulated retry attempt 1: scan remains QUEUED, credits are NOT refunded
+    await storage.scans.updateScan(orchScanJobId, {
+      status: 'QUEUED',
+      error: 'Transient issue: retrying (attempt 1/3)...'
+    }, { systemBypass: true });
+    const scanAfterRetry1 = await storage.scans.getScan(orchScanJobId);
+    assert(scanAfterRetry1?.status === 'QUEUED', '4.22 Retryable error keeps scan in QUEUED status');
+    assert(scanAfterRetry1?.creditsRefunded !== true, '4.22 Credits are NOT refunded during retry attempt');
+    assert((await storage.users.getUser(orchTestUser.id))!.creditsRemaining === initialCredits - 1, '4.22 User credits remain unchanged during retry');
+
+    // Simulated terminal failure after exhausted retries: refund credits idempotently
+    const orchRefundResult1 = await storage.scans.refundScanCredits(orchScanJobId, undefined, { systemBypass: true });
+    assert(orchRefundResult1.refunded === true, '4.22 Terminal failure executes credit refund');
+    assert(orchRefundResult1.amount === 1, '4.22 Refunded amount matches deducted credits');
+    assert((await storage.users.getUser(orchTestUser.id))!.creditsRemaining === initialCredits, '4.22 User balance fully restored after terminal refund');
+
+    // Verify idempotency of refund: second refund attempt does not double refund
+    const orchRefundResult2 = await storage.scans.refundScanCredits(orchScanJobId, undefined, { systemBypass: true });
+    assert(orchRefundResult2.refunded === false, '4.22 Subsequent refund call is idempotent (does not double refund)');
+    assert((await storage.users.getUser(orchTestUser.id))!.creditsRemaining === initialCredits, '4.22 User balance intact after redundant refund');
 
     console.log(`\n======================================================`);
     console.log(`TEST SUITE 6 COMPLETE: ${passed}/${total} assertions passed!`);
