@@ -9,6 +9,7 @@ import { videoProcessor } from '../src/server/pipeline/videoProcessor';
 import { mediaInspector } from '../src/server/pipeline/mediaInspector';
 import { thumbnailInspector, ThumbnailInspector } from '../src/server/pipeline/thumbnailInspector';
 import { proxyGenerator, ProxyGenerationError } from '../src/server/pipeline/proxyGenerator';
+import { JobOrchestrator } from '../src/server/pipeline/jobOrchestrator';
 import { policyIntelligenceEngine } from '../src/server/intelligence/policyIntelligence';
 import { formatMediaIdentityDisplay, isValidSha256, getComparisonSubtitle } from '../src/components/ComparisonView';
 import { InMemoryStorageRepository } from '../src/server/storage';
@@ -870,7 +871,7 @@ export async function runEvidenceIntegrityHardeningTests() {
       isProxyUsed: true
     };
 
-    // 20a: Failed FFmpeg call throws ProxyGenerationError
+    // 20a: Failed FFmpeg call throws ProxyGenerationError with user-safe message (Fix A)
     let proxyErrorThrown = false;
     let proxyErrorMessage = '';
     const nonExistentPath = path.resolve(testDir, 'non_existent_4k.mp4');
@@ -882,26 +883,39 @@ export async function runEvidenceIntegrityHardeningTests() {
     }
     assert(proxyErrorThrown, '4.20 Failed 4K proxy generation throws ProxyGenerationError instead of silently returning raw 4K path');
     assert(proxyErrorMessage.includes('Failed to generate required 1080p proxy for high-resolution (4K Ultra HD) video'), '4.20 Proxy error message explains high-resolution requirement');
+    assert(!proxyErrorMessage.includes(testDir), '4.20 Proxy error message does NOT leak internal test directory path');
+    assert(!proxyErrorMessage.includes('-vf'), '4.20 Proxy error message does NOT leak command arguments');
+    assert(!proxyErrorMessage.includes('scale='), '4.20 Proxy error message does NOT leak internal scale parameters');
 
-    // 20b: Successful proxy generation creates a valid non-empty proxy
+    // 20b: Successful proxy generation creates a valid non-empty proxy and passes media validation (Fix B)
     const originalInputBytesBefore = fs.statSync(validToneVideoPath).size;
     const generatedProxy = await proxyGenerator.generateProxyIfNeeded(validToneVideoPath, uhd4kMeta);
     assert(fs.existsSync(generatedProxy), '4.20 Generated proxy file exists on disk');
     assert(fs.statSync(generatedProxy).size > 0, '4.20 Generated proxy file is non-empty');
+    assert(await proxyGenerator.isValidMediaProxy(generatedProxy) === true, '4.20 Generated proxy is validated as readable media via ffprobe (Fix B)');
     assert(generatedProxy !== validToneVideoPath, '4.20 Generated proxy path is distinct from original input');
     assert(fs.statSync(validToneVideoPath).size === originalInputBytesBefore, '4.20 Original media file is completely preserved');
 
-    // 20c: Cached valid proxy is reused
+    // 20c: Cached valid proxy is verified and reused
     const reusedProxy = await proxyGenerator.generateProxyIfNeeded(validToneVideoPath, uhd4kMeta);
-    assert(reusedProxy === generatedProxy, '4.20 Existing non-empty proxy is reused');
+    assert(reusedProxy === generatedProxy, '4.20 Existing valid proxy is reused');
 
     // 20d: Invalid zero-byte cached proxy is unlinked and regenerated, not accepted
     fs.writeFileSync(generatedProxy, ''); // truncate to 0 bytes
     assert(fs.statSync(generatedProxy).size === 0, '4.20 Proxy truncated to 0 bytes for cache test');
+    assert(await proxyGenerator.isValidMediaProxy(generatedProxy) === false, '4.20 Zero-byte proxy fails isValidMediaProxy');
     const regeneratedProxy = await proxyGenerator.generateProxyIfNeeded(validToneVideoPath, uhd4kMeta);
     assert(fs.statSync(regeneratedProxy).size > 0, '4.20 Zero-byte cached proxy was regenerated to a valid non-empty proxy');
+    assert(await proxyGenerator.isValidMediaProxy(regeneratedProxy) === true, '4.20 Regenerated proxy from empty cache is valid media');
 
-    // 20e: If FFmpeg fails on corrupted input, original input is NOT deleted
+    // 20e: Non-empty corrupted cached proxy (e.g. text bytes) is detected, rejected, and regenerated (Fix B)
+    fs.writeFileSync(generatedProxy, 'CORRUPTED_TEXT_NOT_VIDEO_BYTES_CACHE_TEST');
+    assert(fs.statSync(generatedProxy).size > 0, '4.20 Corrupt cached proxy has non-zero file size');
+    assert(await proxyGenerator.isValidMediaProxy(generatedProxy) === false, '4.20 Corrupt non-empty cached proxy fails isValidMediaProxy');
+    const regeneratedFromCorrupt = await proxyGenerator.generateProxyIfNeeded(validToneVideoPath, uhd4kMeta);
+    assert(await proxyGenerator.isValidMediaProxy(regeneratedFromCorrupt) === true, '4.20 Corrupt cached proxy was detected, rejected, and cleanly regenerated to valid media');
+
+    // 20f: If FFmpeg fails on corrupted input, original input is NOT deleted
     const corruptInputPath = path.resolve(testDir, 'corrupt_input_media.mp4');
     fs.writeFileSync(corruptInputPath, 'CORRUPTED_NON_VIDEO_DATA');
     try {
@@ -1001,17 +1015,17 @@ export async function runEvidenceIntegrityHardeningTests() {
     const subFewer = getComparisonSubtitle(compFewerSignalsMock);
     assert(subFewer.includes('Fewer signals detected in this cut (1 vs 3), but no prior findings were verifiably resolved with evidence.'), '4.21 Subtitle forbids claiming resolution on unexplained signal drop');
 
-    // Test 22: Orchestrator retry and terminal failure credit accounting lifecycle
-    const orchTestUser = await storage.users.createUser('orch_user_test@domain.com', undefined, undefined, 10, 'pro');
+    // Test 22: Actual Orchestrator Retry and Terminal Failure Lifecycle (Fix C)
+    const orchTestUser = await storage.users.createUser('orch_real_flow@domain.com', undefined, undefined, 10, 'pro');
     const initialCredits = (await storage.users.getUser(orchTestUser.id))!.creditsRemaining;
 
     // Scan record with 1 credit deducted
-    const orchScanJobId = `scan_orch_test_${Date.now()}`;
+    const orchScanJobId = `scan_orch_real_${Date.now()}`;
     await storage.scans.createScan({
       id: orchScanJobId,
       userId: orchTestUser.id,
-      videoTitle: 'Orchestrator Lifecycle Test',
-      videoFilename: 'test.mp4',
+      videoTitle: 'Real Orchestrator Failure Flow',
+      videoFilename: 'valid_tone.mp4',
       videoPath: validToneVideoPath,
       scanMode: 'standard',
       status: 'QUEUED',
@@ -1024,26 +1038,98 @@ export async function runEvidenceIntegrityHardeningTests() {
     assert(deductRes === true, '4.22 Initial scan credit deduction succeeds');
     assert((await storage.users.getUser(orchTestUser.id))!.creditsRemaining === initialCredits - 1, '4.22 User credits reduced by 1');
 
-    // Simulated retry attempt 1: scan remains QUEUED, credits are NOT refunded
-    await storage.scans.updateScan(orchScanJobId, {
-      status: 'QUEUED',
-      error: 'Transient issue: retrying (attempt 1/3)...'
-    }, { systemBypass: true });
-    const scanAfterRetry1 = await storage.scans.getScan(orchScanJobId);
-    assert(scanAfterRetry1?.status === 'QUEUED', '4.22 Retryable error keeps scan in QUEUED status');
-    assert(scanAfterRetry1?.creditsRefunded !== true, '4.22 Credits are NOT refunded during retry attempt');
-    assert((await storage.users.getUser(orchTestUser.id))!.creditsRemaining === initialCredits - 1, '4.22 User credits remain unchanged during retry');
+    // Instantiate a dedicated orchestrator without background polling to deterministically execute jobs
+    const realOrchestrator = new JobOrchestrator(storage, false);
+    const orchestratorWorkerId = (realOrchestrator as any).workerId;
 
-    // Simulated terminal failure after exhausted retries: refund credits idempotently
-    const orchRefundResult1 = await storage.scans.refundScanCredits(orchScanJobId, undefined, { systemBypass: true });
-    assert(orchRefundResult1.refunded === true, '4.22 Terminal failure executes credit refund');
-    assert(orchRefundResult1.amount === 1, '4.22 Refunded amount matches deducted credits');
-    assert((await storage.users.getUser(orchTestUser.id))!.creditsRemaining === initialCredits, '4.22 User balance fully restored after terminal refund');
+    // Drain or complete any leftover jobs from earlier unit tests so orchScanJobId is next in line
+    for (const j of Object.values((storage as any).state.jobQueue as Record<string, any>)) {
+      if (j.scanId !== orchScanJobId && (j.status === 'QUEUED' || j.status === 'RETRYABLE')) {
+        j.status = 'COMPLETED';
+      }
+    }
 
-    // Verify idempotency of refund: second refund attempt does not double refund
-    const orchRefundResult2 = await storage.scans.refundScanCredits(orchScanJobId, undefined, { systemBypass: true });
-    assert(orchRefundResult2.refunded === false, '4.22 Subsequent refund call is idempotent (does not double refund)');
-    assert((await storage.users.getUser(orchTestUser.id))!.creditsRemaining === initialCredits, '4.22 User balance intact after redundant refund');
+    // Spy on mediaInspector.inspect and proxyGenerator.generateProxyIfNeeded to trigger ProxyGenerationError in orchestrator
+    const origInspect = mediaInspector.inspect;
+    const origGenerateProxy = proxyGenerator.generateProxyIfNeeded;
+    let proxyGenerationAttempts = 0;
+
+    mediaInspector.inspect = async (fPath, fname) => {
+      const meta = await origInspect.call(mediaInspector, fPath, fname);
+      return { ...meta, isProxyUsed: true, resolutionLabel: '4K Ultra HD' };
+    };
+
+    proxyGenerator.generateProxyIfNeeded = async (_input, meta) => {
+      proxyGenerationAttempts++;
+      throw new ProxyGenerationError(
+        `Failed to generate required 1080p proxy for high-resolution (${meta.resolutionLabel}) video: conversion process failed.`
+      );
+    };
+
+    try {
+      // --- Attempt 1: Worker claims job and executes via orchestrator ---
+      const claim1 = await storage.queue.claimNextJob(orchestratorWorkerId, 10000);
+      assert(claim1 !== null && claim1.scanId === orchScanJobId, '4.22 Job claimed for real Attempt 1 (scanId matches)');
+      assert(claim1?.attempts === 1, '4.22 Job attempts equals 1 on first claim');
+      await realOrchestrator.executeJob(claim1!);
+
+      // Verify orchestrator triggered retryable failure behavior:
+      const scanAfterAttempt1 = await storage.scans.getScan(orchScanJobId);
+      assert(scanAfterAttempt1?.status === 'QUEUED', '4.22 Orchestrator keeps scan in QUEUED status after retryable failure');
+      assert(scanAfterAttempt1?.creditsRefunded !== true, '4.22 Credits are NOT refunded on Attempt 1 while retries remain');
+      assert((await storage.users.getUser(orchTestUser.id))!.creditsRemaining === initialCredits - 1, '4.22 User balance untouched during Attempt 1');
+      const queueRecord1 = await storage.queue.getJobByScanId(orchScanJobId);
+      assert(queueRecord1?.status === 'RETRYABLE', '4.22 Queue job status is RETRYABLE with exponential backoff');
+
+      // --- Attempt 2: Reset runAt and execute Attempt 2 via orchestrator ---
+      queueRecord1!.runAt = new Date(Date.now() - 5000).toISOString();
+      (storage as any).state.jobQueue[orchScanJobId].runAt = new Date(Date.now() - 5000).toISOString();
+
+      const claim2 = await storage.queue.claimNextJob(orchestratorWorkerId, 10000);
+      assert(claim2 !== null && claim2.attempts === 2, '4.22 Job claimed for real Attempt 2 (attempts = 2)');
+      await realOrchestrator.executeJob(claim2!);
+
+      const scanAfterAttempt2 = await storage.scans.getScan(orchScanJobId);
+      assert(scanAfterAttempt2?.status === 'QUEUED', '4.22 Scan remains QUEUED after Attempt 2');
+      assert(scanAfterAttempt2?.creditsRefunded !== true, '4.22 Credits are NOT refunded on Attempt 2');
+      assert((await storage.users.getUser(orchTestUser.id))!.creditsRemaining === initialCredits - 1, '4.22 User balance untouched during Attempt 2');
+
+      // --- Attempt 3: Exhaust retry limit (maxAttempts = 3) to trigger terminal failure ---
+      const queueRecord2 = await storage.queue.getJobByScanId(orchScanJobId);
+      queueRecord2!.runAt = new Date(Date.now() - 5000).toISOString();
+      (storage as any).state.jobQueue[orchScanJobId].runAt = new Date(Date.now() - 5000).toISOString();
+
+      const claim3 = await storage.queue.claimNextJob(orchestratorWorkerId, 10000);
+      assert(claim3 !== null && claim3.attempts === 3, '4.22 Job claimed for Attempt 3 (exhausts maxAttempts 3)');
+      await realOrchestrator.executeJob(claim3!);
+
+      // Verify orchestrator executed terminal failure path and refunded credits
+      const scanTerminal = await storage.scans.getScan(orchScanJobId);
+      assert(scanTerminal?.status === 'FAILED', '4.22 Scan reaches terminal FAILED status after retry exhaustion');
+      assert(scanTerminal?.creditsRefunded === true, '4.22 Orchestrator marks creditsRefunded as true on terminal failure');
+      assert(scanTerminal?.creditsRefundedAmount === 1, '4.22 Refunded amount matches deducted credits (1 credit)');
+      assert(Boolean(scanTerminal?.error?.includes('Failed to generate required 1080p proxy for high-resolution (4K Ultra HD) video')), '4.22 Terminal error surfaces user-safe proxy message');
+      assert(!scanTerminal?.error?.includes(testDir), '4.22 Terminal error does NOT leak internal test directory path');
+      assert(!scanTerminal?.error?.includes('ffmpeg'), '4.22 Terminal error does NOT leak internal ffmpeg command info');
+
+      const userAfterTerminal = await storage.users.getUser(orchTestUser.id);
+      assert(userAfterTerminal!.creditsRemaining === initialCredits, '4.22 User credits fully restored by orchestrator terminal refund');
+
+      const queueRecord3 = await storage.queue.getJobByScanId(orchScanJobId);
+      assert(queueRecord3?.status === 'FAILED', '4.22 Queue job status set to FAILED on terminal failure');
+
+      // Verify duplicate refund attempt is rejected idempotently
+      const dupRefund = await storage.scans.refundScanCredits(orchScanJobId, undefined, { systemBypass: true });
+      assert(dupRefund.refunded === false && dupRefund.amount === 0, '4.22 Subsequent refund call is idempotent (does not double refund)');
+      assert((await storage.users.getUser(orchTestUser.id))!.creditsRemaining === initialCredits, '4.22 User balance remains intact after redundant refund attempt');
+
+      // Verify original input file is completely preserved
+      assert(fs.existsSync(validToneVideoPath), '4.22 Original input video remains intact after failure flow');
+      assert(proxyGenerationAttempts === 3, '4.22 Exactly 3 proxy generation attempts occurred across retry lifecycle');
+    } finally {
+      mediaInspector.inspect = origInspect;
+      proxyGenerator.generateProxyIfNeeded = origGenerateProxy;
+    }
 
     console.log(`\n======================================================`);
     console.log(`TEST SUITE 6 COMPLETE: ${passed}/${total} assertions passed!`);

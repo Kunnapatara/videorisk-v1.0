@@ -15,6 +15,35 @@ export class ProxyGenerationError extends Error {
 
 export class ProxyGenerator {
   /**
+   * Validates that a candidate proxy file is an actual valid, readable media file
+   * containing a playable video stream, using ffprobe.
+   * Never relies on existence or non-zero size alone.
+   */
+  public async isValidMediaProxy(filePath: string): Promise<boolean> {
+    if (!fs.existsSync(filePath)) return false;
+    try {
+      const stats = fs.statSync(filePath);
+      if (stats.size === 0) return false;
+
+      const args = [
+        '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=codec_type,width,height',
+        '-print_format', 'json',
+        filePath
+      ];
+
+      const { stdout } = await execFileAsync('ffprobe', args, { timeout: 10000 });
+      const parsed = JSON.parse(stdout);
+      const stream = parsed.streams?.[0];
+      return stream?.codec_type === 'video' && Number(stream.width) > 0 && Number(stream.height) > 0;
+    } catch (err: any) {
+      console.warn('[ProxyGenerator] Proxy media validation failed for %s:', path.basename(filePath), err?.message || err);
+      return false;
+    }
+  }
+
+  /**
    * Generates a 1080p proxy file for 4K / UHD footage to control compute costs.
    * If proxy generation fails or times out, fails closed to prevent overloading
    * downstream analyzers with raw high-resolution media.
@@ -32,17 +61,15 @@ export class ProxyGenerator {
 
     const proxyPath = path.join(outputDir, `proxy_${path.basename(inputPath, path.extname(inputPath))}.mp4`);
 
+    // Fix B: Validate cached proxy media using ffprobe, not merely non-zero file size
     if (fs.existsSync(proxyPath)) {
-      try {
-        const stats = fs.statSync(proxyPath);
-        if (stats.size > 0) {
-          return proxyPath;
-        }
-        if (proxyPath !== inputPath) {
-          fs.unlinkSync(proxyPath);
-        }
-      } catch {
-        // ignore and regenerate
+      const isValidCached = await this.isValidMediaProxy(proxyPath);
+      if (isValidCached) {
+        return proxyPath;
+      }
+      // Cached proxy is invalid, corrupt, or empty: safely remove and regenerate
+      if (proxyPath !== inputPath && fs.existsSync(proxyPath)) {
+        try { fs.unlinkSync(proxyPath); } catch { /* ignore */ }
       }
     }
 
@@ -61,23 +88,38 @@ export class ProxyGenerator {
 
       await execFileAsync('ffmpeg', args, { timeout: 60000 });
 
-      if (!fs.existsSync(proxyPath) || fs.statSync(proxyPath).size === 0) {
+      // Verify that the generated file exists and is valid readable video media
+      const isValidGenerated = await this.isValidMediaProxy(proxyPath);
+      if (!isValidGenerated) {
         if (proxyPath !== inputPath && fs.existsSync(proxyPath)) {
           try { fs.unlinkSync(proxyPath); } catch { /* ignore */ }
         }
-        throw new ProxyGenerationError('Generated proxy video file is missing or empty.');
+        throw new ProxyGenerationError(
+          `Failed to generate required 1080p proxy for high-resolution (${metadata.resolutionLabel}) video: generated output is invalid or corrupted.`
+        );
       }
 
       return proxyPath;
     } catch (err: any) {
+      // Safe cleanup of partial or corrupt proxy, never touching original input
       if (proxyPath !== inputPath && fs.existsSync(proxyPath)) {
         try { fs.unlinkSync(proxyPath); } catch { /* ignore */ }
       }
       if (err instanceof ProxyGenerationError) throw err;
+
+      // Fix A: Log full technical diagnostic to server logs without leaking internal paths or commands to user
+      console.error(
+        '[ProxyGenerator] FFmpeg conversion failed for %s (%s):',
+        path.basename(inputPath),
+        metadata.resolutionLabel,
+        err?.message || err
+      );
+
       const isTimeout = err?.killed || err?.signal === 'SIGTERM';
       const detail = isTimeout 
-        ? 'Processing timed out after 60 seconds'
-        : (err?.message ? `FFmpeg error: ${err.message}` : 'FFmpeg process error');
+        ? 'conversion timed out after 60 seconds.'
+        : 'conversion process failed.';
+
       throw new ProxyGenerationError(
         `Failed to generate required 1080p proxy for high-resolution (${metadata.resolutionLabel}) video: ${detail}`
       );
