@@ -336,10 +336,14 @@ export class JobOrchestrator {
 
       // Thumbnail Inspection if provided
       let thumbnailMetadata: ThumbnailMetadata | null = null;
-      if (scan.thumbnailPath && scan.thumbnailFilename) {
+      let thumbnailInspectionError: string | null = null;
+      const thumbnailProvided = Boolean(scan.thumbnailPath && scan.thumbnailFilename);
+
+      if (thumbnailProvided) {
         try {
-          thumbnailMetadata = await thumbnailInspector.inspect(scan.thumbnailPath, scan.thumbnailFilename);
-        } catch (thumbErr) {
+          thumbnailMetadata = await thumbnailInspector.inspect(scan.thumbnailPath!, scan.thumbnailFilename!);
+        } catch (thumbErr: any) {
+          thumbnailInspectionError = thumbErr?.message || 'Failed to inspect thumbnail image.';
           console.warn('[JobOrchestrator] Thumbnail inspection error:', thumbErr);
         }
       }
@@ -358,6 +362,8 @@ export class JobOrchestrator {
         videoDescription: scan.videoDescription,
         videoTags: scan.videoTags,
         thumbnailMetadata,
+        thumbnailProvided,
+        thumbnailInspectionError,
         channelProfile,
         isRescan: scan.isRescan,
       });
@@ -395,6 +401,8 @@ export class JobOrchestrator {
         videoDescription: scan.videoDescription,
         videoTags: scan.videoTags,
         thumbnailMetadata,
+        thumbnailProvided,
+        thumbnailInspectionError,
         channelProfile,
         isRescan: scan.isRescan,
       }, timeline);

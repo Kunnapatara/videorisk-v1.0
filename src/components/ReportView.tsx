@@ -460,6 +460,12 @@ export const ReportView: React.FC<ReportViewProps> = ({
               <p className="text-xs text-stone-800 leading-relaxed font-medium">
                 {dom.summary}
               </p>
+              {dom.domain === 'thumbnail' && dom.details?.visualAnalysisStatus === 'NOT_ASSESSED' && (
+                <div className="p-2.5 bg-amber-50/70 rounded-xl text-[11px] text-amber-900 border border-amber-200/70">
+                  <span className="font-bold block mb-0.5">Visual Content Analysis: Not Assessed</span>
+                  <span>Visual text overlays, OCR, and graphic clickbait cues were not evaluated. Only container format, dimensions, size, and aspect ratio were verified.</span>
+                </div>
+              )}
               <div className="p-3 bg-stone-50 rounded-xl text-[11px] text-stone-500 border border-stone-100">
                 <span className="font-bold text-stone-700 block mb-0.5">Known Analyzer Boundary:</span>
                 <span>{dom.limitations}</span>

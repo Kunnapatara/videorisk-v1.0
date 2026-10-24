@@ -158,9 +158,9 @@ export const EvidenceTimeline: React.FC<EvidenceTimelineProps> = ({ timeline, on
                   Recommended Action
                 </div>
                 <div className="text-stone-700">
-                  {selectedItem.severity === 'info' 
-                    ? 'Retain this structure. Healthy original commentary aids monetization compliance.' 
-                    : 'Consider adding spoken context or transforming with personal editorial critique.'}
+                  {selectedItem.recommendedAction && selectedItem.recommendedAction.trim().length > 0
+                    ? selectedItem.recommendedAction
+                    : 'No specific corrective action was provided for this finding.'}
                 </div>
               </div>
             </div>

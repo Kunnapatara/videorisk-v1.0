@@ -1131,6 +1131,351 @@ export async function runEvidenceIntegrityHardeningTests() {
       proxyGenerator.generateProxyIfNeeded = origGenerateProxy;
     }
 
+    // -------------------------------------------------------------------------
+    // SECTION 5: EVIDENCE RECOMMENDATIONS, THUMBNAIL STATES & RE-SCAN INTEGRITY
+    // -------------------------------------------------------------------------
+    console.log('\n[5. Evidence Recommendations, Thumbnail States & Re-Scan Integrity]');
+
+    // Test 23: EvidenceItem recommendedAction and neutral fallback
+    const mockEvidenceWithRec: any = {
+      id: 'ev_rec_1',
+      scanId: 's_rec',
+      domain: 'video_audio',
+      timestampStart: 0,
+      timestampEnd: 10,
+      timestampLabel: '00:00–00:10',
+      type: 'extended_silence',
+      category: 'original_contribution',
+      severity: 'warning',
+      confidence: 0.9,
+      confidenceLevel: 'HIGH',
+      provenance: 'ffmpeg:silencedetect',
+      source: 'silence_detect',
+      label: '🟡 Extended Silence / Unedited Gap',
+      details: 'Prolonged silence gap of 6s detected.',
+      recommendedAction: 'Check audio track pacing and trim unintended dead air.'
+    };
+
+    const mockEvidenceWithoutRec: any = {
+      ...mockEvidenceWithRec,
+      id: 'ev_rec_2',
+      recommendedAction: undefined
+    };
+
+    const mockEvidenceEmptyRec: any = {
+      ...mockEvidenceWithRec,
+      id: 'ev_rec_3',
+      recommendedAction: '   '
+    };
+
+    // Helper simulating EvidenceTimeline recommendation resolution
+    const resolveTimelineRec = (item: any): string => {
+      if (item.recommendedAction && item.recommendedAction.trim().length > 0) {
+        return item.recommendedAction;
+      }
+      return 'No specific corrective action was provided for this finding.';
+    };
+
+    assert(
+      resolveTimelineRec(mockEvidenceWithRec) === 'Check audio track pacing and trim unintended dead air.',
+      '5.23 Item with specific recommendedAction resolves the exact recommendation'
+    );
+    assert(
+      resolveTimelineRec(mockEvidenceWithoutRec) === 'No specific corrective action was provided for this finding.',
+      '5.23 Item without recommendedAction resolves honest neutral fallback'
+    );
+    assert(
+      resolveTimelineRec(mockEvidenceEmptyRec) === 'No specific corrective action was provided for this finding.',
+      '5.23 Item with whitespace-only recommendedAction resolves honest neutral fallback'
+    );
+    assert(
+      !resolveTimelineRec(mockEvidenceWithoutRec).includes('monetization compliance') &&
+      !resolveTimelineRec(mockEvidenceWithoutRec).includes('personal editorial critique'),
+      '5.23 Generic advice based on severity is never substituted for missing recommendation'
+    );
+
+    // Test 24: Thumbnail Assessment States
+    const dummyAudioRes: any = { silenceRatio: 0.1, hasVoiceover: false, voiceoverRatio: 0, segments: [] };
+    const dummyVideoRes: any = { scenesCount: 1, averagePacingSeconds: 5, framesSampled: 5 };
+    const dummyMeta: MediaMetadata = {
+      filename: 'test.mp4',
+      originalSize: 1000,
+      durationSeconds: 10,
+      width: 1920,
+      height: 1080,
+      resolutionLabel: '1080p',
+      fps: 30,
+      hasAudio: true,
+      isProxyUsed: false
+    };
+
+    // 24a: No thumbnail supplied -> NOT_PROVIDED
+    const timelineNoThumb = policyIntelligenceEngine.generateEvidenceTimeline({
+      scanId: 's_no_thumb',
+      metadata: dummyMeta,
+      scanMode: 'standard',
+      audioResult: dummyAudioRes,
+      videoResult: dummyVideoRes,
+      thumbnailMetadata: null,
+      thumbnailProvided: false
+    });
+    const reportNoThumb = policyIntelligenceEngine.buildReport({
+      scanId: 's_no_thumb',
+      metadata: dummyMeta,
+      scanMode: 'standard',
+      audioResult: dummyAudioRes,
+      videoResult: dummyVideoRes,
+      thumbnailMetadata: null,
+      thumbnailProvided: false
+    }, timelineNoThumb);
+
+    assert(reportNoThumb.domainReports.thumbnail.status === 'NOT_PROVIDED', '5.24 No thumbnail supplied yields NOT_PROVIDED');
+    assert(reportNoThumb.domainReports.thumbnail.summary.includes('Thumbnail image was not uploaded'), '5.24 No thumbnail summary states image was not uploaded');
+
+    // 24b: Thumbnail supplied but inspection failed -> ANALYSIS_UNAVAILABLE
+    const timelineFailedThumb = policyIntelligenceEngine.generateEvidenceTimeline({
+      scanId: 's_failed_thumb',
+      metadata: dummyMeta,
+      scanMode: 'standard',
+      audioResult: dummyAudioRes,
+      videoResult: dummyVideoRes,
+      thumbnailMetadata: null,
+      thumbnailProvided: true,
+      thumbnailInspectionError: 'Corrupted image header or unreadable file.'
+    });
+    const reportFailedThumb = policyIntelligenceEngine.buildReport({
+      scanId: 's_failed_thumb',
+      metadata: dummyMeta,
+      scanMode: 'standard',
+      audioResult: dummyAudioRes,
+      videoResult: dummyVideoRes,
+      thumbnailMetadata: null,
+      thumbnailProvided: true,
+      thumbnailInspectionError: 'Corrupted image header or unreadable file.'
+    }, timelineFailedThumb);
+
+    assert(reportFailedThumb.domainReports.thumbnail.status === 'ANALYSIS_UNAVAILABLE', '5.24 Thumbnail inspection failure yields ANALYSIS_UNAVAILABLE');
+    assert(!reportFailedThumb.domainReports.thumbnail.summary.includes('Thumbnail image was not uploaded'), '5.24 Inspection failure does NOT report image was not uploaded');
+    assert(reportFailedThumb.domainReports.thumbnail.summary.includes('technical inspection failed'), '5.24 Inspection failure honestly explains technical inspection failed');
+    assert(timelineFailedThumb.some(t => t.type === 'thumbnail_inspection_failed'), '5.24 Timeline includes thumbnail_inspection_failed finding');
+
+    // 24c: Thumbnail supplied and technical properties valid -> NO_MAJOR_RISK_SIGNALS_DETECTED
+    const valid16x9ThumbMeta = {
+      filename: 'thumb_valid.jpg',
+      originalSize: 500000,
+      width: 1280,
+      height: 720,
+      aspectRatio: '16:9',
+      isStandardAspect: true,
+      format: 'jpeg',
+      meanLuminance: 45,
+      hasHighContrastText: null,
+      hasSensationalElements: null,
+      visualAnalysisStatus: 'NOT_ASSESSED' as const
+    };
+    const timelineValidThumb = policyIntelligenceEngine.generateEvidenceTimeline({
+      scanId: 's_valid_thumb',
+      metadata: dummyMeta,
+      scanMode: 'standard',
+      audioResult: dummyAudioRes,
+      videoResult: dummyVideoRes,
+      thumbnailMetadata: valid16x9ThumbMeta
+    });
+    const reportValidThumb = policyIntelligenceEngine.buildReport({
+      scanId: 's_valid_thumb',
+      metadata: dummyMeta,
+      scanMode: 'standard',
+      audioResult: dummyAudioRes,
+      videoResult: dummyVideoRes,
+      thumbnailMetadata: valid16x9ThumbMeta
+    }, timelineValidThumb);
+
+    assert(reportValidThumb.domainReports.thumbnail.status === 'NOT_ASSESSED', '5.24 Valid 16:9 thumbnail yields NOT_ASSESSED for visual analysis while confirming technical properties');
+    assert(reportValidThumb.domainReports.thumbnail.details?.technicalInspection === 'NO_MAJOR_RISK_SIGNALS_DETECTED', '5.24 Details declare technicalInspection as NO_MAJOR_RISK_SIGNALS_DETECTED');
+    assert(reportValidThumb.domainReports.thumbnail.details?.technicalPropertiesAssessed === true, '5.24 Details declare technicalPropertiesAssessed is true');
+    assert(reportValidThumb.domainReports.thumbnail.details?.visualAnalysisStatus === 'NOT_ASSESSED', '5.24 Details declare visualAnalysisStatus as NOT_ASSESSED');
+    assert(reportValidThumb.domainReports.thumbnail.details?.visualOcrAssessed === false, '5.24 Details honestly declare visualOcrAssessed is false');
+    assert(reportValidThumb.domainReports.thumbnail.limitations.includes('visual text OCR and clickbait detection are not assessed'), '5.24 Limitations declare visual text OCR and clickbait not assessed');
+
+    // 24d: Thumbnail supplied with non-standard aspect ratio -> REVIEW_RECOMMENDED
+    const squareThumbMeta = {
+      ...valid16x9ThumbMeta,
+      width: 600,
+      height: 600,
+      aspectRatio: '1.00:1',
+      isStandardAspect: false
+    };
+    const timelineSquareThumb = policyIntelligenceEngine.generateEvidenceTimeline({
+      scanId: 's_square_thumb',
+      metadata: dummyMeta,
+      scanMode: 'standard',
+      audioResult: dummyAudioRes,
+      videoResult: dummyVideoRes,
+      thumbnailMetadata: squareThumbMeta
+    });
+    const reportSquareThumb = policyIntelligenceEngine.buildReport({
+      scanId: 's_square_thumb',
+      metadata: dummyMeta,
+      scanMode: 'standard',
+      audioResult: dummyAudioRes,
+      videoResult: dummyVideoRes,
+      thumbnailMetadata: squareThumbMeta
+    }, timelineSquareThumb);
+
+    assert(reportSquareThumb.domainReports.thumbnail.status === 'REVIEW_RECOMMENDED', '5.24 Non-standard aspect ratio yields REVIEW_RECOMMENDED');
+    assert(timelineSquareThumb.some(t => t.type === 'thumbnail_aspect_ratio'), '5.24 Timeline includes thumbnail_aspect_ratio warning');
+
+    // Test 25: Re-scan Resolution Verification & Ambiguity Protection
+    // 25a: Resolution verified when detector assessed revised scan and finding is absent
+    const cleanThumbReport = {
+      ...reportValidThumb,
+      domainReports: {
+        ...reportValidThumb.domainReports,
+        thumbnail: {
+          ...reportValidThumb.domainReports.thumbnail,
+          status: 'NO_MAJOR_RISK_SIGNALS_DETECTED' as const
+        }
+      }
+    };
+    const compResolved = policyIntelligenceEngine.generateComparison(reportSquareThumb, cleanThumbReport);
+    assert(compResolved.resolvedIssues.length === 1, '5.25 Fixing non-standard aspect ratio with valid thumbnail is verifiably resolved');
+    assert(compResolved.resolvedIssues[0].includes('Non-Standard Thumbnail Aspect Ratio'), '5.25 Aspect ratio finding is in resolvedIssues');
+    assert(compResolved.remainingIssues.length === 0, '5.25 No remaining issues when aspect ratio resolved');
+
+    // 25b: Issue NOT resolved when revised scan omitted the thumbnail detector (NOT_PROVIDED)
+    const compNotProvidedThumb = policyIntelligenceEngine.generateComparison(reportSquareThumb, reportNoThumb);
+    assert(compNotProvidedThumb.resolvedIssues.length === 0, '5.25 Prior thumbnail issue is NOT resolved when revised scan did not provide thumbnail');
+    assert(compNotProvidedThumb.notVerifiedIssues?.length === 1, '5.25 Omitted detector leads to NOT VERIFIED status');
+    assert(compNotProvidedThumb.notVerifiedIssues![0].includes('not provided'), '5.25 NOT VERIFIED reason states detector was not provided');
+
+    // 25c: Issue NOT resolved when revised scan thumbnail inspection failed (ANALYSIS_UNAVAILABLE)
+    const compFailedThumb = policyIntelligenceEngine.generateComparison(reportSquareThumb, reportFailedThumb);
+    assert(compFailedThumb.resolvedIssues.length === 0, '5.25 Prior issue is NOT resolved when revised thumbnail inspection failed');
+    assert(compFailedThumb.notVerifiedIssues?.length === 1, '5.25 Failed inspection leads to NOT VERIFIED status');
+    assert(compFailedThumb.notVerifiedIssues![0].includes('unavailable'), '5.25 Reason mentions analysis was unavailable');
+
+    // 25d: Ambiguous 1-to-many match: baseline issue matches multiple revised findings -> NOT VERIFIED, neither new nor resolved
+    const mockBaselineReport: any = {
+      scanId: 's_orig',
+      overallRisk: 'NEEDS_REVIEW',
+      topIssues: [
+        {
+          id: 'i1',
+          domain: 'video_audio',
+          type: 'extended_silence',
+          what: '🟡 Extended Silence / Unedited Gap',
+          where: '00:04–00:10',
+          policyArea: 'ORIGINAL CONTRIBUTION',
+          category: 'original_contribution',
+          timestampSeconds: 4
+        }
+      ],
+      domainReports: {
+        video_audio: { domain: 'video_audio', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED' }
+      }
+    };
+
+    const mockRevisedAmbiguousReport: any = {
+      scanId: 's_rev',
+      overallRisk: 'NEEDS_REVIEW',
+      topIssues: [
+        {
+          id: 'i_rev1',
+          domain: 'video_audio',
+          type: 'extended_silence',
+          what: '🟡 Extended Silence / Unedited Gap',
+          where: '00:05–00:11',
+          policyArea: 'ORIGINAL CONTRIBUTION',
+          category: 'original_contribution',
+          timestampSeconds: 5
+        },
+        {
+          id: 'i_rev2',
+          domain: 'video_audio',
+          type: 'extended_silence',
+          what: '🟡 Extended Silence / Unedited Gap',
+          where: '00:06–00:12',
+          policyArea: 'ORIGINAL CONTRIBUTION',
+          category: 'original_contribution',
+          timestampSeconds: 6
+        }
+      ],
+      domainReports: {
+        video_audio: { domain: 'video_audio', status: 'REVIEW_RECOMMENDED' }
+      }
+    };
+
+    const compAmbiguous1toMany = policyIntelligenceEngine.generateComparison(mockBaselineReport, mockRevisedAmbiguousReport);
+    assert(compAmbiguous1toMany.resolvedIssues.length === 0, '5.25 Ambiguous 1-to-many match is NOT resolved');
+    assert(compAmbiguous1toMany.notVerifiedIssues?.length === 1, '5.25 Ambiguous 1-to-many match is marked NOT VERIFIED');
+    assert(compAmbiguous1toMany.notVerifiedIssues![0].includes('ambiguous matching across multiple revised issues'), '5.25 NOT VERIFIED reason notes ambiguous matching');
+    assert(!compAmbiguous1toMany.newIssues || compAmbiguous1toMany.newIssues.length === 0, '5.25 Ambiguous matched revised findings are NOT classified as new issues');
+
+    // 25e: Ambiguous many-to-1 match: multiple baseline issues match single revised finding -> NOT VERIFIED, neither new nor resolved
+    const mockBaselineMultiReport: any = {
+      scanId: 's_orig_multi',
+      overallRisk: 'NEEDS_REVIEW',
+      topIssues: [
+        {
+          id: 'i_base1',
+          domain: 'video_audio',
+          type: 'extended_silence',
+          what: '🟡 Extended Silence / Unedited Gap',
+          where: '00:04–00:10',
+          policyArea: 'ORIGINAL CONTRIBUTION',
+          category: 'original_contribution',
+          timestampSeconds: 4
+        },
+        {
+          id: 'i_base2',
+          domain: 'video_audio',
+          type: 'extended_silence',
+          what: '🟡 Extended Silence / Unedited Gap',
+          where: '00:06–00:12',
+          policyArea: 'ORIGINAL CONTRIBUTION',
+          category: 'original_contribution',
+          timestampSeconds: 6
+        }
+      ],
+      domainReports: {
+        video_audio: { domain: 'video_audio', status: 'REVIEW_RECOMMENDED' }
+      }
+    };
+
+    const mockRevisedSingleReport: any = {
+      scanId: 's_rev_single',
+      overallRisk: 'NEEDS_REVIEW',
+      topIssues: [
+        {
+          id: 'i_rev_single',
+          domain: 'video_audio',
+          type: 'extended_silence',
+          what: '🟡 Extended Silence / Unedited Gap',
+          where: '00:05–00:11',
+          policyArea: 'ORIGINAL CONTRIBUTION',
+          category: 'original_contribution',
+          timestampSeconds: 5
+        }
+      ],
+      domainReports: {
+        video_audio: { domain: 'video_audio', status: 'REVIEW_RECOMMENDED' }
+      }
+    };
+
+    const compAmbiguousManyTo1 = policyIntelligenceEngine.generateComparison(mockBaselineMultiReport, mockRevisedSingleReport);
+    assert(compAmbiguousManyTo1.resolvedIssues.length === 0, '5.25 Multiple baseline matching single revised finding does NOT falsely resolve any issue');
+    assert(compAmbiguousManyTo1.notVerifiedIssues?.length === 2, '5.25 Both baseline issues marked NOT VERIFIED due to ambiguity');
+    assert(!compAmbiguousManyTo1.newIssues || compAmbiguousManyTo1.newIssues.length === 0, '5.25 Revised finding matched to ambiguous baseline issues is NOT classified as new');
+
+    // 25f: SHA-256 identity disclaimer establishes version identity only
+    const compShaDisclaimer = policyIntelligenceEngine.generateComparison(reportSquareThumb, reportValidThumb, {
+      originalScanRecord: { metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+    });
+    const shaImprovement = compShaDisclaimer.improvements.find(i => i.includes('SHA-256 establishes file identity only'));
+    assert(Boolean(shaImprovement), '5.25 SHA-256 improvement explicitly notes hash establishes file identity only');
+    assert(Boolean(shaImprovement?.includes('does not verify visual content changes, originality, or copyright clearance')), '5.25 SHA-256 disclaimer forbids claiming visual changes or copyright clearance');
+
     console.log(`\n======================================================`);
     console.log(`TEST SUITE 6 COMPLETE: ${passed}/${total} assertions passed!`);
     console.log(`======================================================\n`);

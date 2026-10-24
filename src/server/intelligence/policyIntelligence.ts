@@ -30,6 +30,8 @@ export interface IntelligenceInput {
   videoDescription?: string;
   videoTags?: string[];
   thumbnailMetadata?: ThumbnailMetadata | null;
+  thumbnailProvided?: boolean;
+  thumbnailInspectionError?: string | null;
   channelProfile?: ChannelContextProfile | null;
   isRescan?: boolean;
 }
@@ -348,6 +350,8 @@ export class PolicyIntelligenceEngine {
     // ==========================================
     // DOMAIN 4: THUMBNAIL ANALYSIS
     // ==========================================
+    const isThumbProvided = Boolean(thumbnailMetadata || input.thumbnailProvided || input.thumbnailInspectionError);
+
     if (thumbnailMetadata) {
       if (!thumbnailMetadata.isStandardAspect) {
         addItem({
@@ -403,6 +407,26 @@ export class PolicyIntelligenceEngine {
         label: 'ℹ️ Thumbnail Visual Content: Not Assessed',
         details: 'Visual text overlays, graphics, and clickbait cues are not assessed without visual AI models. Container format and dimensions were verified.',
         recommendedAction: 'Ensure thumbnail text and imagery truthfully represent the video.'
+      });
+    } else if (isThumbProvided) {
+      // Thumbnail was supplied, but inspection failed
+      addItem({
+        domain: 'thumbnail',
+        start: 0,
+        end: 0,
+        assetLocation: 'Thumbnail file',
+        type: 'thumbnail_inspection_failed',
+        category: 'thumbnail_integrity',
+        severity: 'warning',
+        confidence: 0.95,
+        confidenceLevel: 'HIGH',
+        provenance: 'thumbnail_inspector:inspection_error',
+        source: 'thumbnail_inspector',
+        label: '🟡 Thumbnail Inspection Failed',
+        details: input.thumbnailInspectionError 
+          ? `Thumbnail image was supplied, but technical inspection failed: ${input.thumbnailInspectionError}`
+          : 'Thumbnail image was supplied, but technical inspection failed. File may be corrupted, unreadable, or in an unsupported format.',
+        recommendedAction: 'Verify the thumbnail image file is a valid, uncorrupted JPEG, PNG, or WebP image under 10 MB and re-upload.'
       });
     }
 
@@ -510,6 +534,7 @@ export class PolicyIntelligenceEngine {
       .map(e => ({
         id: `issue_${e.id}`,
         domain: e.domain,
+        type: e.type,
         what: e.label,
         where: e.assetLocation || e.timestampLabel,
         why: e.details,
@@ -574,23 +599,59 @@ export class PolicyIntelligenceEngine {
         confidence: videoDescription ? 'HIGH' : 'UNKNOWN',
         limitations: 'Evaluates text disclosures and sensitive policy terms; does not verify external outbound hyperlink targets.'
       },
-      thumbnail: {
-        domain: 'thumbnail',
-        domainLabel: 'Thumbnail Analysis',
-        status: !thumbnailMetadata
-          ? 'NOT_PROVIDED'
-          : timeline.some(t => t.domain === 'thumbnail' && t.severity === 'warning')
-            ? 'REVIEW_RECOMMENDED'
-            : (thumbnailMetadata.visualAnalysisStatus === 'NOT_ASSESSED' || thumbnailMetadata.hasSensationalElements === null)
-              ? 'NOT_ASSESSED'
-              : 'NO_MAJOR_RISK_SIGNALS_DETECTED',
-        summary: thumbnailMetadata
-          ? `Image inspected (${thumbnailMetadata.width}x${thumbnailMetadata.height}, ${thumbnailMetadata.aspectRatio}). Format and framing verified; visual text & clickbait cues not assessed.`
-          : 'Thumbnail image was not uploaded for this scan.',
-        findingsCount: timeline.filter(t => t.domain === 'thumbnail' && t.severity !== 'info').length,
-        confidence: thumbnailMetadata ? (timeline.some(t => t.domain === 'thumbnail' && t.severity === 'warning') ? 'HIGH' : 'LOW') : 'UNKNOWN',
-        limitations: 'Validates file format, resolution, size, and aspect ratio; visual text OCR and clickbait detection are not assessed.'
-      },
+      thumbnail: (() => {
+        const isThumbProvided = Boolean(thumbnailMetadata || input.thumbnailProvided || input.thumbnailInspectionError);
+
+        if (!isThumbProvided) {
+          // Situation 1: No thumbnail was supplied
+          return {
+            domain: 'thumbnail' as const,
+            domainLabel: 'Thumbnail Analysis',
+            status: 'NOT_PROVIDED' as const,
+            summary: 'Thumbnail image was not uploaded for this scan.',
+            findingsCount: 0,
+            confidence: 'UNKNOWN' as const,
+            limitations: 'Validates file format, resolution, size, and aspect ratio; visual text OCR and clickbait detection are not assessed.'
+          };
+        }
+
+        if (!thumbnailMetadata) {
+          // Situation 2: Thumbnail was supplied but inspection failed
+          const errDetail = input.thumbnailInspectionError 
+            ? ` (${input.thumbnailInspectionError})` 
+            : ' (corrupted, unreadable, or unsupported format).';
+          return {
+            domain: 'thumbnail' as const,
+            domainLabel: 'Thumbnail Analysis',
+            status: 'ANALYSIS_UNAVAILABLE' as const,
+            summary: `Thumbnail image was supplied, but technical inspection failed${errDetail}`,
+            findingsCount: timeline.filter(t => t.domain === 'thumbnail' && t.severity !== 'info').length,
+            confidence: 'LOW' as const,
+            limitations: 'Validates file format, resolution, size, and aspect ratio; visual text OCR and clickbait detection are not assessed.'
+          };
+        }
+
+        // Situation 3 & 4: Thumbnail was supplied and supported technical properties were assessed
+        const hasWarning = timeline.some(t => t.domain === 'thumbnail' && t.severity === 'warning');
+        return {
+          domain: 'thumbnail' as const,
+          domainLabel: 'Thumbnail Analysis',
+          status: hasWarning 
+            ? ('REVIEW_RECOMMENDED' as const) 
+            : ('NOT_ASSESSED' as const),
+          summary: `Image inspected (${thumbnailMetadata.width}x${thumbnailMetadata.height}, ${thumbnailMetadata.aspectRatio}). Format and framing verified; visual text & clickbait cues not assessed.`,
+          findingsCount: timeline.filter(t => t.domain === 'thumbnail' && t.severity !== 'info').length,
+          confidence: hasWarning ? ('HIGH' as const) : ('LOW' as const),
+          limitations: 'Validates file format, resolution, size, and aspect ratio; visual text OCR and clickbait detection are not assessed.',
+          details: {
+            technicalPropertiesAssessed: true,
+            technicalInspection: hasWarning ? 'REVIEW_RECOMMENDED' : 'NO_MAJOR_RISK_SIGNALS_DETECTED',
+            visualAnalysisStatus: 'NOT_ASSESSED',
+            visualOcrAssessed: false,
+            clickbaitAssessed: false,
+          }
+        };
+      })(),
       channel_context: {
         domain: 'channel_context',
         domainLabel: 'Channel Context Profile',
@@ -756,13 +817,42 @@ export interface ComparisonOptions {
     if (a.what === b.what) {
       return true;
     }
-    // Policy area and location correlation (within 5 seconds if timestamped)
+    // If issue type is defined on both, types MUST match
+    if (a.type && b.type && a.type !== b.type) {
+      return false;
+    }
+
+    // Specific keyword scrutiny issues only match if they target the exact same word
+    if ((a.type === 'sensitive_title_term' || a.type === 'sensitive_description_term') && a.what !== b.what) {
+      return false;
+    }
+
     const samePolicyArea = (a.policyArea || '').trim().toLowerCase() === (b.policyArea || '').trim().toLowerCase();
     const sameWhere = (a.where || '').trim().toLowerCase() === (b.where || '').trim().toLowerCase();
-    const closeTimestamp = typeof a.timestampSeconds === 'number' && typeof b.timestampSeconds === 'number'
-      && Math.abs(a.timestampSeconds - b.timestampSeconds) <= 5;
 
-    if (samePolicyArea && (sameWhere || closeTimestamp)) {
+    // Timestamp proximity ONLY applies to video_audio domain where time actually represents media intervals
+    if (a.domain === 'video_audio') {
+      const closeTimestamp = typeof a.timestampSeconds === 'number' && typeof b.timestampSeconds === 'number'
+        && Math.abs(a.timestampSeconds - b.timestampSeconds) <= 5;
+      
+      if (samePolicyArea && (sameWhere || closeTimestamp)) {
+        const aPrefix = a.what.split(':')[0].trim();
+        const bPrefix = b.what.split(':')[0].trim();
+        if (a.type && b.type ? a.type === b.type : (aPrefix === bPrefix || sameWhere)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    // For non-time domains (title, description_tags, thumbnail, channel_context):
+    // Timestamp proximity MUST NOT be used because dummy timestamps (0) falsely match unrelated issues.
+    if (a.type && b.type && a.type === b.type) {
+      return true;
+    }
+    const aPrefix = a.what.split(':')[0].trim();
+    const bPrefix = b.what.split(':')[0].trim();
+    if (samePolicyArea && sameWhere && aPrefix === bPrefix) {
       return true;
     }
     return false;
@@ -776,7 +866,8 @@ export interface ComparisonOptions {
     domain: EvidenceDomain,
     originalReport: RiskReport,
     revisedReport: RiskReport,
-    options?: ComparisonOptions
+    options?: ComparisonOptions,
+    origIssue?: TopIssue
   ): { verifiable: boolean; reason?: string } {
     // 1. Revised scan failure check
     if (options?.isRevisedFailed) {
@@ -845,40 +936,66 @@ export interface ComparisonOptions {
     const resolvedIssues: string[] = [];
     const remainingIssues: string[] = [];
     const notVerifiedIssues: string[] = [];
-    const matchedRevIndices = new Set<number>();
 
-    // For each baseline issue, evaluate against revised issues
-    for (const origIssue of origIssues) {
-      const matchingIndices: number[] = [];
-      revIssues.forEach((revIssue, idx) => {
+    // Map each baseline issue to matching revised issues
+    const origToRevMatches: number[][] = origIssues.map(origIssue => {
+      const matches: number[] = [];
+      revIssues.forEach((revIssue, revIdx) => {
         if (this.issuesMatch(origIssue, revIssue)) {
-          matchingIndices.push(idx);
+          matches.push(revIdx);
         }
       });
+      return matches;
+    });
 
-      if (matchingIndices.length > 1) {
-        // Ambiguous match: multiple revised issues match this baseline issue
-        notVerifiedIssues.push(`${origIssue.what} (NOT VERIFIED — ambiguous matching across multiple revised issues)`);
-        matchingIndices.forEach(idx => matchedRevIndices.add(idx));
-      } else if (matchingIndices.length === 1) {
-        // Exactly one match: persisting issue
-        matchedRevIndices.add(matchingIndices[0]);
-        remainingIssues.push(`${origIssue.where}: ${origIssue.what}`);
-      } else {
+    // Map each revised issue to matching baseline issues
+    const revToOrigMatches: number[][] = revIssues.map((revIssue, revIdx) => {
+      const matches: number[] = [];
+      origIssues.forEach((origIssue, origIdx) => {
+        if (this.issuesMatch(origIssue, revIssue)) {
+          matches.push(origIdx);
+        }
+      });
+      return matches;
+    });
+
+    const matchedRevIndices = new Set<number>();
+
+    // Evaluate each baseline issue
+    origIssues.forEach((origIssue, origIdx) => {
+      const matchingRevIndices = origToRevMatches[origIdx];
+
+      if (matchingRevIndices.length === 0) {
         // No match in revised scan: check if resolution is verifiable
-        const verification = this.canVerifyResolution(origIssue.domain, originalReport, revisedReport, options);
+        const verification = this.canVerifyResolution(origIssue.domain, originalReport, revisedReport, options, origIssue);
         if (verification.verifiable) {
           resolvedIssues.push(origIssue.what);
         } else {
           notVerifiedIssues.push(`${origIssue.what} (NOT VERIFIED — ${verification.reason})`);
         }
+      } else if (matchingRevIndices.length === 1) {
+        const revIdx = matchingRevIndices[0];
+        // Check if that revised issue is uniquely matched to this baseline issue
+        if (revToOrigMatches[revIdx].length === 1) {
+          // Clean 1-to-1 match: persisting issue
+          matchedRevIndices.add(revIdx);
+          remainingIssues.push(`${origIssue.where}: ${origIssue.what}`);
+        } else {
+          // Ambiguous: multiple baseline issues match this single revised finding
+          matchedRevIndices.add(revIdx);
+          notVerifiedIssues.push(`${origIssue.what} (NOT VERIFIED — ambiguous matching across baseline issues)`);
+        }
+      } else {
+        // Ambiguous: multiple revised issues match this single baseline issue
+        matchingRevIndices.forEach(idx => matchedRevIndices.add(idx));
+        notVerifiedIssues.push(`${origIssue.what} (NOT VERIFIED — ambiguous matching across multiple revised issues)`);
       }
-    }
+    });
 
     // Unmatched revised issues are NEW issues
     const newIssues: string[] = [];
     revIssues.forEach((revIssue, idx) => {
-      if (!matchedRevIndices.has(idx)) {
+      if (!matchedRevIndices.has(idx) && revToOrigMatches[idx].length === 0) {
         newIssues.push(`${revIssue.where}: ${revIssue.what}`);
       }
     });
@@ -929,7 +1046,7 @@ export interface ComparisonOptions {
         if (isIdenticalMedia) {
           improvements.push('Note: Re-scan analyzed an identical media file version (matching SHA-256).');
         } else {
-          improvements.push('Verified revised media file version (different SHA-256).');
+          improvements.push('Verified revised media file version (different SHA-256). Note: SHA-256 establishes file identity only; it does not verify visual content changes, originality, or copyright clearance.');
         }
       } else {
         improvements.push('Note: Media SHA-256 identity comparison unverified (hash missing on one version).');

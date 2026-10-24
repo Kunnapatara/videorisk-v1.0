@@ -107,6 +107,7 @@ export interface EvidenceItem {
 export interface TopIssue {
   id: string;
   domain: EvidenceDomain;
+  type?: string;
   what: string;
   where: string;
   why: string;
