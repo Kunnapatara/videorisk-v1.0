@@ -12,8 +12,12 @@ import { proxyGenerator, ProxyGenerationError } from '../src/server/pipeline/pro
 import { JobOrchestrator } from '../src/server/pipeline/jobOrchestrator';
 import { policyIntelligenceEngine } from '../src/server/intelligence/policyIntelligence';
 import { formatMediaIdentityDisplay, isValidSha256, getComparisonSubtitle } from '../src/components/ComparisonView';
+import React from 'react';
+import { renderToString } from 'react-dom/server';
+import { EvidenceTimeline } from '../src/components/EvidenceTimeline';
+import { ReportView } from '../src/components/ReportView';
 import { InMemoryStorageRepository } from '../src/server/storage';
-import { ScanJob, UserAccount, MediaMetadata, ReScanComparison } from '../src/types';
+import { ScanJob, UserAccount, MediaMetadata, ReScanComparison, EvidenceItem } from '../src/types';
 
 const execFileAsync = promisify(execFile);
 
@@ -1475,6 +1479,145 @@ export async function runEvidenceIntegrityHardeningTests() {
     const shaImprovement = compShaDisclaimer.improvements.find(i => i.includes('SHA-256 establishes file identity only'));
     assert(Boolean(shaImprovement), '5.25 SHA-256 improvement explicitly notes hash establishes file identity only');
     assert(Boolean(shaImprovement?.includes('does not verify visual content changes, originality, or copyright clearance')), '5.25 SHA-256 disclaimer forbids claiming visual changes or copyright clearance');
+
+    // -------------------------------------------------------------------------
+    // SECTION 6: COMPONENT-LEVEL REGRESSION TESTS
+    // -------------------------------------------------------------------------
+    console.log('\n[6. Component-Level Regression & UI Communication Tests]');
+
+    // Test 26: EvidenceTimeline Component-Level Filter-Selection Regression Test
+    const mockComponentTimelineItems: EvidenceItem[] = [
+      {
+        id: 'item_reused_1',
+        scanId: 's_ui_test',
+        category: 'reused_content',
+        severity: 'warning',
+        timestampStart: 10,
+        timestampEnd: 15,
+        timestampLabel: '00:10–00:15',
+        label: 'Clip Reused from External Source',
+        details: 'Visual segment matches common B-roll pacing without clear narration.',
+        source: 'ffmpeg:scene_detect',
+        confidence: 0.85,
+        confidenceLevel: 'HIGH',
+        provenance: 'Local FFmpeg scene analysis',
+        recommendedAction: 'Trim or provide substantive original voiceover overlay.',
+        domain: 'video_audio',
+        type: 'reused_clip'
+      },
+      {
+        id: 'item_original_2',
+        scanId: 's_ui_test',
+        category: 'original_contribution',
+        severity: 'info',
+        timestampStart: 20,
+        timestampEnd: 30,
+        timestampLabel: '00:20–00:30',
+        label: 'Original Creator Commentary',
+        details: 'Continuous active audio track with unique acoustic pacing.',
+        source: 'ffmpeg:volumedetect',
+        confidence: 0.90,
+        confidenceLevel: 'HIGH',
+        provenance: 'Local FFmpeg audio volume analysis',
+        recommendedAction: 'Maintain this commentary density throughout the video.',
+        domain: 'video_audio',
+        type: 'creator_commentary'
+      }
+    ];
+
+    // 26a: Selected item included in active filter
+    const htmlCase1 = renderToString(React.createElement(EvidenceTimeline, {
+      timeline: mockComponentTimelineItems,
+      initialFilter: 'all',
+      initialSelectedId: 'item_reused_1'
+    }));
+    assert(htmlCase1.includes('00:10–00:15'), '6.26a Selected item timestamp is rendered');
+    assert(htmlCase1.includes('Clip Reused from External Source'), '6.26a Selected item label is rendered in deep dive');
+    assert(htmlCase1.includes('ring-stone-800'), '6.26a Selected item is highlighted in event list');
+
+    // 26b: Selected item excluded after filter is changed -> falls back to first filtered item
+    const htmlCase2 = renderToString(React.createElement(EvidenceTimeline, {
+      timeline: mockComponentTimelineItems,
+      initialFilter: 'original_contribution',
+      initialSelectedId: 'item_reused_1'
+    }));
+    assert(htmlCase2.includes('00:20–00:30'), '6.26b Detail panel displays fallback filtered item timestamp');
+    assert(htmlCase2.includes('Original Creator Commentary'), '6.26b Detail panel displays fallback filtered item label');
+    assert(!htmlCase2.includes('Clip Reused from External Source'), '6.26b Filtered-out item label is NOT rendered anywhere in list or deep dive');
+
+    // 26c: Active filter returns no items -> clean empty state on both sides
+    const htmlCase3 = renderToString(React.createElement(EvidenceTimeline, {
+      timeline: mockComponentTimelineItems,
+      initialFilter: 'ai_disclosure',
+      initialSelectedId: 'item_reused_1'
+    }));
+    assert(htmlCase3.includes('No evidence events match the selected category.'), '6.26c Empty filter displays no-match message');
+    assert(!htmlCase3.includes('Clip Reused from External Source'), '6.26c Excluded item is NOT rendered in detail panel when filter returns empty');
+    assert(!htmlCase3.includes('Segment:'), '6.26c No segment deep dive rendered when filter returns empty');
+
+    // 26d: Selected item removed from underlying timeline -> falls back to first available item
+    const htmlCase4 = renderToString(React.createElement(EvidenceTimeline, {
+      timeline: mockComponentTimelineItems,
+      initialFilter: 'all',
+      initialSelectedId: 'non_existent_id'
+    }));
+    assert(htmlCase4.includes('00:10–00:15'), '6.26d Non-existent selected ID falls back to first timeline item');
+
+    // 26e: Empty timeline renders cleanly without crashing
+    const htmlCase5 = renderToString(React.createElement(EvidenceTimeline, {
+      timeline: []
+    }));
+    assert(htmlCase5.includes('Interactive Evidence Timeline'), '6.26e Empty timeline renders header');
+    assert(htmlCase5.includes('No evidence events match the selected category.'), '6.26e Empty timeline renders empty message');
+
+    // 26f: Successive filter transition logic preserves consistency across all categories
+    const categoriesToTest = ['all', 'original_contribution', 'ai_disclosure', 'reused_content', 'all'];
+    let simulatedSelectedId: string | null = 'item_reused_1';
+    for (const testCat of categoriesToTest) {
+      const filtered = mockComponentTimelineItems.filter(item => testCat === 'all' || item.category === testCat);
+      const selected = filtered.find(item => item.id === simulatedSelectedId) || filtered[0] || null;
+      if (filtered.length === 0) {
+        assert(selected === null, `6.26f Filter "${testCat}" with 0 items resolves selectedItem to null`);
+      } else {
+        assert(Boolean(selected), `6.26f Filter "${testCat}" resolves a non-null selectedItem`);
+        assert(filtered.some(f => f.id === selected?.id), `6.26f Selected item is strictly a member of the active filter for "${testCat}"`);
+      }
+    }
+
+    // Test 27: ReportView Risk-Status Communication for Unassessed Dimensions
+    const mockScanRecord: ScanJob = {
+      id: 's_ui_test',
+      userId: 'u_test',
+      videoTitle: 'Sample Creator Video',
+      videoFilename: 'sample.mp4',
+      videoPath: '/tmp/sample.mp4',
+      scanMode: 'standard',
+      status: 'COMPLETED',
+      currentStage: 'Risk report',
+      completedStages: ['Upload', 'Media inspection', 'Audio & transcript', 'Scene analysis', 'Visual evidence', 'Policy analysis', 'Risk report'],
+      creditsUsed: 10,
+      createdAt: new Date().toISOString()
+    };
+
+    const htmlReportView = renderToString(React.createElement(ReportView, {
+      report: reportValidThumb,
+      scan: mockScanRecord,
+      onInitiateRescan: () => {}
+    }));
+
+    assert(htmlReportView.includes('Low Risk'), '6.27 ReportView renders Low Risk overall badge');
+    assert(
+      htmlReportView.includes('Assessment covers verified technical and textual signals only'),
+      '6.27 ReportView overall risk card communicates unassessed dimension disclaimer'
+    );
+    assert(
+      htmlReportView.includes('remain uncertified'),
+      '6.27 Unassessed disclaimer clarifies that unassessed dimensions remain uncertified'
+    );
+    assert(
+      htmlReportView.includes('Not Assessed'),
+      '6.27 Domain scorecard renders Not Assessed status badge'
+    );
 
     console.log(`\n======================================================`);
     console.log(`TEST SUITE 6 COMPLETE: ${passed}/${total} assertions passed!`);

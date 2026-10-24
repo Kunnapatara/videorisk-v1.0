@@ -180,6 +180,12 @@ export const ReportView: React.FC<ReportViewProps> = ({
               <p className="text-xs text-stone-700">
                 {report.riskSummary}
               </p>
+              {report.domainReports && Object.values(report.domainReports).some(d => d.status === 'NOT_ASSESSED' || d.status === 'ANALYSIS_UNAVAILABLE') && (
+                <div className="mt-2 text-[11px] text-stone-600 flex items-center gap-1.5 font-medium">
+                  <Info className="w-3.5 h-3.5 text-stone-500 shrink-0" />
+                  <span>Assessment covers verified technical and textual signals only. Dimensions marked “Not Assessed” or “Unavailable” below remain uncertified.</span>
+                </div>
+              )}
             </div>
           </div>
 

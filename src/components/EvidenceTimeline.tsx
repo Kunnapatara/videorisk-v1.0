@@ -5,18 +5,27 @@ import { Clock, AlertTriangle, CheckCircle, Info, ShieldAlert, Sparkles, Filter 
 interface EvidenceTimelineProps {
   timeline: EvidenceItem[];
   onSelectTimestamp?: (timestamp: number) => void;
+  initialFilter?: string;
+  initialSelectedId?: string | null;
 }
 
-export const EvidenceTimeline: React.FC<EvidenceTimelineProps> = ({ timeline, onSelectTimestamp }) => {
-  const [filter, setFilter] = useState<string>('all');
-  const [selectedId, setSelectedId] = useState<string | null>(timeline[0]?.id || null);
+export const EvidenceTimeline: React.FC<EvidenceTimelineProps> = ({ 
+  timeline, 
+  onSelectTimestamp,
+  initialFilter = 'all',
+  initialSelectedId
+}) => {
+  const [filter, setFilter] = useState<string>(initialFilter);
+  const [selectedId, setSelectedId] = useState<string | null>(
+    initialSelectedId !== undefined ? initialSelectedId : (timeline[0]?.id || null)
+  );
 
   const filteredItems = timeline.filter(item => {
     if (filter === 'all') return true;
     return item.category === filter;
   });
 
-  const selectedItem = timeline.find(item => item.id === selectedId) || filteredItems[0];
+  const selectedItem = filteredItems.find(item => item.id === selectedId) || filteredItems[0] || null;
 
   const getCategoryIcon = (category: EvidenceCategory, severity: string) => {
     if (severity === 'high') return <AlertTriangle className="w-4 h-4 text-rose-600" />;
@@ -166,7 +175,9 @@ export const EvidenceTimeline: React.FC<EvidenceTimelineProps> = ({ timeline, on
             </div>
           ) : (
             <div className="p-8 text-center text-stone-400 text-xs">
-              Select an item on the timeline to view details.
+              {filteredItems.length === 0
+                ? 'No evidence events match the selected category.'
+                : 'Select an item on the timeline to view details.'}
             </div>
           )}
         </div>
