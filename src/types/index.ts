@@ -193,6 +193,7 @@ export interface ThumbnailMetadata {
   hasSensationalElements?: boolean | null;
   visualAnalysisStatus?: DomainAssessmentStatus;
   ocrAnalysisStatus?: DetectorExecutionStatus | DomainAssessmentStatus;
+  contrastAnalysisStatus?: DetectorExecutionStatus | DomainAssessmentStatus;
   extractedText?: string | null;
   textDensityRatio?: number | null;
   notes?: string;

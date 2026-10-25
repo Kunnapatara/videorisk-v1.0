@@ -1,0 +1,632 @@
+import path from 'path';
+import fs from 'fs';
+import os from 'os';
+import crypto from 'crypto';
+import { execFile, execFileSync } from 'child_process';
+import { promisify } from 'util';
+import express from 'express';
+import http from 'http';
+import { videoProcessor } from '../src/server/pipeline/videoProcessor';
+import { audioProcessor, SpeechTranscriptionAdapter } from '../src/server/pipeline/audioProcessor';
+import { thumbnailInspector } from '../src/server/pipeline/thumbnailInspector';
+import { mediaInspector } from '../src/server/pipeline/mediaInspector';
+import { policyIntelligenceEngine } from '../src/server/intelligence/policyIntelligence';
+import { storage } from '../src/server/storage';
+import { apiRouter, secureUploadsHandler } from '../src/server/routes/api';
+import { JobOrchestrator } from '../src/server/pipeline/jobOrchestrator';
+import { ScanJob, RiskReport, MediaMetadata } from '../src/types';
+
+const execFileAsync = promisify(execFile);
+
+export async function runComprehensiveDefectAndPipelineTests() {
+  console.log('\n================================================================');
+  console.log('--- SUITE 13: COMPREHENSIVE DEFECT & PIPELINE VERIFICATION ---');
+  console.log('================================================================\n');
+
+  let passed = 0;
+  let total = 0;
+
+  function assert(condition: boolean | undefined | null, desc: string) {
+    total++;
+    if (Boolean(condition)) {
+      console.log(`  ✅ PASS: ${desc}`);
+      passed++;
+    } else {
+      console.error(`  ❌ FAIL: ${desc}`);
+      throw new Error(`Test assertion failed: ${desc}`);
+    }
+  }
+
+  const testDir = path.resolve(os.tmpdir(), `vr_comprehensive_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`);
+  fs.mkdirSync(testDir, { recursive: true });
+
+  try {
+    // =========================================================================
+    // 1. VISUAL DUPLICATE DETECTION VERIFICATION (SECTION 2)
+    // =========================================================================
+    console.log('[1. Visual Duplicate Detection & Perceptual Robustness]');
+
+    // 1.1 Identical frames & repeated segments with different timestamps
+    // Create a 6-second video: Scene A (0-2s), Scene B (2-4s), Scene A repeated (4-6s)
+    const repeatedVideoPath = path.resolve(testDir, 'repeated_footage.mp4');
+    await execFileAsync('ffmpeg', [
+      '-y',
+      '-f', 'lavfi', '-i', 'testsrc=duration=2:size=320x240:rate=10',
+      '-f', 'lavfi', '-i', 'smptebars=duration=2:size=320x240:rate=10',
+      '-f', 'lavfi', '-i', 'testsrc=duration=2:size=320x240:rate=10',
+      '-filter_complex', '[0:v][1:v][2:v]concat=n=3:v=1:a=0[outv]',
+      '-map', '[outv]',
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+      repeatedVideoPath
+    ]);
+
+    const repeatedMeta = await mediaInspector.inspect(repeatedVideoPath, 'repeated_footage.mp4');
+    const repeatedResult = await videoProcessor.analyzeVideo(repeatedVideoPath, repeatedMeta, 'standard');
+
+    assert(repeatedResult.repeatedFootageStatus === 'DETECTED', '1.1 Repeated footage detected when identical scene recurs non-adjacently');
+    assert(repeatedResult.repeatedFootageSegments.length >= 1, '1.1 At least one repeated segment recorded');
+    const firstRep = repeatedResult.repeatedFootageSegments[0];
+    assert(firstRep.matchWithTimestamp < 2.5 && firstRep.start >= 3.5, '1.1 Segment correctly links earlier timestamp to later timestamp');
+    assert(firstRep.similarity >= 0.90, '1.1 High structural similarity for repeated footage');
+
+    // 1.2 Minor brightness changes to the same scene
+    // Create Scene A (0-2s), Scene B (2-4s), Scene A with +25 brightness shift (4-6s)
+    const brightnessVideoPath = path.resolve(testDir, 'brightness_shift.mp4');
+    await execFileAsync('ffmpeg', [
+      '-y',
+      '-f', 'lavfi', '-i', 'testsrc=duration=2:size=320x240:rate=10',
+      '-f', 'lavfi', '-i', 'smptebars=duration=2:size=320x240:rate=10',
+      '-f', 'lavfi', '-i', 'testsrc=duration=2:size=320x240:rate=10',
+      '-filter_complex', '[2:v]eq=brightness=0.15:contrast=1.05[v2b];[0:v][1:v][v2b]concat=n=3:v=1:a=0[outv]',
+      '-map', '[outv]',
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+      brightnessVideoPath
+    ]);
+
+    const brightnessMeta = await mediaInspector.inspect(brightnessVideoPath, 'brightness_shift.mp4');
+    const brightnessResult = await videoProcessor.analyzeVideo(brightnessVideoPath, brightnessMeta, 'standard');
+    assert(brightnessResult.repeatedFootageStatus === 'DETECTED', '1.2 Visual duplicate detector identifies same scene under brightness/contrast shift via structural correlation');
+
+    // 1.3 Different scenes with similar dominant colors or brightness (MUST NOT be flagged as duplicates)
+    // Create Scene 1 (dark blue solid with white dot) and Scene 2 (dark blue solid with yellow stripe)
+    const similarColorVideoPath = path.resolve(testDir, 'similar_colors_different_scenes.mp4');
+    await execFileAsync('ffmpeg', [
+      '-y',
+      '-f', 'lavfi', '-i', 'color=c=darkblue:size=320x240:duration=3:rate=10',
+      '-f', 'lavfi', '-i', 'color=c=darkblue:size=320x240:duration=3:rate=10',
+      '-filter_complex', '[0:v]drawbox=x=20:y=20:w=30:h=30:color=white@1.0:t=fill[v1b];[1:v]drawbox=x=150:y=150:w=120:h=20:color=yellow@1.0:t=fill[v2b];[v1b][v2b]concat=n=2:v=1:a=0[outv]',
+      '-map', '[outv]',
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+      similarColorVideoPath
+    ]);
+
+    const similarColorMeta = await mediaInspector.inspect(similarColorVideoPath, 'similar_colors.mp4');
+    const similarColorResult = await videoProcessor.analyzeVideo(similarColorVideoPath, similarColorMeta, 'standard');
+    assert(similarColorResult.repeatedFootageSegments.length === 0, '1.3 Different scenes with similar dominant dark blue colors are NOT falsely flagged as duplicates');
+
+    // 1.4 Video with no repetition (3 distinct scenes A, B, C with no repeated footage)
+    const cleanVideoPath = path.resolve(testDir, 'clean_continuous.mp4');
+    await execFileAsync('ffmpeg', [
+      '-y',
+      '-f', 'lavfi', '-i', 'testsrc=duration=2:size=320x240:rate=10',
+      '-f', 'lavfi', '-i', 'smptebars=duration=2:size=320x240:rate=10',
+      '-f', 'lavfi', '-i', 'testsrc2=duration=2:size=320x240:rate=10',
+      '-filter_complex', '[0:v][1:v][2:v]concat=n=3:v=1:a=0[outv]',
+      '-map', '[outv]',
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+      cleanVideoPath
+    ]);
+
+    const cleanMeta = await mediaInspector.inspect(cleanVideoPath, 'clean_continuous.mp4');
+    const cleanResult = await videoProcessor.analyzeVideo(cleanVideoPath, cleanMeta, 'standard');
+    assert(cleanResult.repeatedFootageStatus === 'NO_SIGNAL_DETECTED', '1.4 Continuous non-repeating video reports NO_SIGNAL_DETECTED');
+    assert(cleanResult.repeatedFootageSegments.length === 0, '1.4 Zero repeated footage segments on clean continuous footage');
+
+    // =========================================================================
+    // 2. SLIDESHOW DETECTION & TEMPLATE REPETITION (SECTION 3)
+    // =========================================================================
+    console.log('\n[2. Slideshow Detection & Template Repetition]');
+
+    // 2.1 Slideshow with distinct static slides (4 distinct frozen color slides, each 2s)
+    const slideshowVideoPath = path.resolve(testDir, 'static_slideshow.mp4');
+    await execFileAsync('ffmpeg', [
+      '-y',
+      '-f', 'lavfi', '-i', 'color=c=black:size=320x240:duration=2:rate=10',
+      '-f', 'lavfi', '-i', 'color=c=white:size=320x240:duration=2:rate=10',
+      '-f', 'lavfi', '-i', 'color=c=black:size=320x240:duration=2:rate=10',
+      '-f', 'lavfi', '-i', 'color=c=white:size=320x240:duration=2:rate=10',
+      '-filter_complex', '[0:v][1:v][2:v][3:v]concat=n=4:v=1:a=0,format=yuv420p[outv]',
+      '-map', '[outv]',
+      '-c:v', 'libx264',
+      slideshowVideoPath
+    ]);
+
+    const slideshowMeta = await mediaInspector.inspect(slideshowVideoPath, 'slideshow.mp4');
+    const slideshowResult = await videoProcessor.analyzeVideo(slideshowVideoPath, slideshowMeta, 'standard');
+    assert(slideshowResult.hasSlideshowPattern === true, '2.1 Multiple static slides with pacing between 1.5s-12s detected as slideshow');
+    assert(slideshowResult.slideshowAnalysisStatus === 'DETECTED', '2.1 Slideshow status is DETECTED');
+
+    // 2.2 Continuous moving footage with scene cuts (NOT a slideshow)
+    // 3 scenes of continuous motion (testsrc + testsrc2)
+    const dynamicVideoPath = path.resolve(testDir, 'dynamic_scenes.mp4');
+    await execFileAsync('ffmpeg', [
+      '-y',
+      '-f', 'lavfi', '-i', 'testsrc=duration=2:size=320x240:rate=10',
+      '-f', 'lavfi', '-i', 'smptebars=duration=2:size=320x240:rate=10',
+      '-f', 'lavfi', '-i', 'testsrc2=duration=2:size=320x240:rate=10',
+      '-filter_complex', '[0:v][1:v][2:v]concat=n=3:v=1:a=0[outv]',
+      '-map', '[outv]',
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+      dynamicVideoPath
+    ]);
+
+    const dynamicMeta = await mediaInspector.inspect(dynamicVideoPath, 'dynamic_scenes.mp4');
+    const dynamicResult = await videoProcessor.analyzeVideo(dynamicVideoPath, dynamicMeta, 'standard');
+    assert(dynamicResult.hasSlideshowPattern === false, '2.2 Dynamic moving scenes with cuts are NOT falsely classified as slideshow');
+    assert(dynamicResult.slideshowAnalysisStatus === 'NO_SIGNAL_DETECTED', '2.2 Slideshow status reports NO_SIGNAL_DETECTED for dynamic video');
+
+    // 2.3 Recurring Intro/Outro Template
+    // Intro sequence at 0-1s, content at 1-5s, same intro sequence recurring as Outro at 5-6s
+    const templateVideoPath = path.resolve(testDir, 'template_intro_outro.mp4');
+    await execFileAsync('ffmpeg', [
+      '-y',
+      '-f', 'lavfi', '-i', 'testsrc=duration=1:size=320x240:rate=10',
+      '-f', 'lavfi', '-i', 'smptebars=duration=4:size=320x240:rate=10',
+      '-f', 'lavfi', '-i', 'testsrc=duration=1:size=320x240:rate=10',
+      '-filter_complex', '[0:v][1:v][2:v]concat=n=3:v=1:a=0[outv]',
+      '-map', '[outv]',
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+      templateVideoPath
+    ]);
+
+    const templateMeta = await mediaInspector.inspect(templateVideoPath, 'template_intro_outro.mp4');
+    const templateResult = await videoProcessor.analyzeVideo(templateVideoPath, templateMeta, 'standard');
+    assert(templateResult.templateAnalysisStatus === 'DETECTED', '2.3 Recurring sequence across intro/outro detected as template');
+    assert(templateResult.templateRepetitions.length >= 1, '2.3 Template repetition recorded in result');
+    assert(templateResult.templateRepetitions[0].pattern.includes('template') || templateResult.templateRepetitions[0].pattern.includes('bumper'), '2.3 Pattern labeled as recurring template or bumper');
+
+    // =========================================================================
+    // 3. AUDIO ANALYSIS & SPEECH / MUSIC / SILENCE (SECTION 4)
+    // =========================================================================
+    console.log('\n[3. Audio Analysis: Silence, Music Unassessed, Acoustic Activity]');
+
+    // 3.1 Digital silence audio stream
+    const silenceVideoPath = path.resolve(testDir, 'digital_silence.mp4');
+    await execFileAsync('ffmpeg', [
+      '-y',
+      '-f', 'lavfi', '-i', 'color=c=black:size=320x240:duration=4:rate=10',
+      '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=mono',
+      '-t', '4',
+      '-c:v', 'libx264', '-c:a', 'aac',
+      silenceVideoPath
+    ]);
+
+    const silenceAudioMeta = await mediaInspector.inspect(silenceVideoPath, 'digital_silence.mp4');
+    const silenceAudioResult = await audioProcessor.analyzeAudio(silenceVideoPath, silenceAudioMeta);
+    assert(silenceAudioResult.silenceRatio >= 0.90, '3.1 Silence ratio is >= 90% for digital silence');
+    assert(silenceAudioResult.isAudible === false, '3.1 isAudible is false for digital silence');
+    assert(silenceAudioResult.musicAnalysisStatus === 'NOT_ASSESSED', '3.1 musicAnalysisStatus is explicitly NOT_ASSESSED');
+    assert(silenceAudioResult.hasMusicDetected === false, '3.1 hasMusicDetected is false');
+    assert(silenceAudioResult.detectors?.audio_music_detection?.status === 'NOT_ASSESSED', '3.1 Music detector explicitly records NOT_ASSESSED');
+
+    // 3.2 Audible acoustic energy with variable modulation
+    const modulatedAudioVideoPath = path.resolve(testDir, 'modulated_audio.mp4');
+    await execFileAsync('ffmpeg', [
+      '-y',
+      '-f', 'lavfi', '-i', 'color=c=black:size=320x240:duration=4:rate=10',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:duration=4',
+      '-t', '4',
+      '-c:v', 'libx264', '-c:a', 'aac',
+      modulatedAudioVideoPath
+    ]);
+
+    const modulatedAudioMeta = await mediaInspector.inspect(modulatedAudioVideoPath, 'modulated.mp4');
+    const modulatedAudioResult = await audioProcessor.analyzeAudio(modulatedAudioVideoPath, modulatedAudioMeta);
+    assert(modulatedAudioResult.isAudible === true, '3.2 Audible sound detected');
+    assert(modulatedAudioResult.silenceRatio <= 0.20, '3.2 Low silence ratio on continuous tone sequence');
+    assert(modulatedAudioResult.musicAnalysisStatus === 'NOT_ASSESSED', '3.2 musicAnalysisStatus remains NOT_ASSESSED without music classifier model');
+    assert(modulatedAudioResult.detectors?.audio_speech_activity?.detectorName === 'acoustic_energy_modulation', '3.2 Acoustic detector accurately named');
+
+    // =========================================================================
+    // 4. STT EXECUTION & TIMESTAMP INTEGRITY (SECTION 5)
+    // =========================================================================
+    console.log('\n[4. STT Execution & Timestamp Integrity]');
+
+    const sttAdapter = new SpeechTranscriptionAdapter();
+
+    // 4.1 Plain text output WITHOUT timestamps (MUST NOT fabricate [0, duration] segment)
+    // Create mock script that outputs plain text
+    const mockPlainTextScript = path.resolve(testDir, 'mock_stt_plaintext.sh');
+    fs.writeFileSync(mockPlainTextScript, '#!/bin/sh\necho "Hello this is a plain text transcript without timestamps"\n');
+    fs.chmodSync(mockPlainTextScript, 0o755);
+
+    const prevStt = process.env.WHISPER_PATH;
+    process.env.WHISPER_PATH = mockPlainTextScript;
+    try {
+      const plainTextResult = await sttAdapter.transcribe(silenceVideoPath, 10.0);
+      assert(plainTextResult.status === 'DETECTED', '4.1 Plain text transcript detects text');
+      assert(plainTextResult.transcriptText?.includes('plain text transcript'), '4.1 Correct plain text captured');
+      assert(plainTextResult.segments?.length === 0, '4.1 CRITICAL: segments array is EMPTY (zero fabricated full-duration segments)');
+      assert(plainTextResult.limitations.includes('without segment timestamps'), '4.1 Limitations explicitly explain timestamps were not fabricated');
+    } finally {
+      process.env.WHISPER_PATH = prevStt;
+    }
+
+    // 4.2 Valid JSON output with ordered timestamps
+    const mockValidJsonScript = path.resolve(testDir, 'mock_stt_valid_json.sh');
+    const validJsonOutput = JSON.stringify({
+      text: "First point. Second point.",
+      segments: [
+        { start: 0.5, end: 2.5, text: "First point." },
+        { start: 3.0, end: 5.5, text: "Second point." }
+      ]
+    });
+    fs.writeFileSync(mockValidJsonScript, `#!/bin/sh\ncat << 'EOF'\n${validJsonOutput}\nEOF\n`);
+    fs.chmodSync(mockValidJsonScript, 0o755);
+
+    process.env.WHISPER_PATH = mockValidJsonScript;
+    try {
+      const validJsonResult = await sttAdapter.transcribe(silenceVideoPath, 10.0);
+      assert(validJsonResult.status === 'DETECTED', '4.2 Valid JSON STT status is DETECTED');
+      assert(validJsonResult.segments?.length === 2, '4.2 Exactly 2 validated segments returned');
+      assert(validJsonResult.segments![0].start === 0.5 && validJsonResult.segments![0].end === 2.5, '4.2 Segment 1 timestamps preserved');
+      assert(validJsonResult.segments![1].start === 3.0 && validJsonResult.segments![1].end === 5.5, '4.2 Segment 2 timestamps preserved');
+    } finally {
+      process.env.WHISPER_PATH = prevStt;
+    }
+
+    // 4.3 Malformed JSON output
+    const mockMalformedJsonScript = path.resolve(testDir, 'mock_stt_malformed.sh');
+    fs.writeFileSync(mockMalformedJsonScript, '#!/bin/sh\necho "{\\"text\\": incomplete json corrupt"\n');
+    fs.chmodSync(mockMalformedJsonScript, 0o755);
+
+    process.env.WHISPER_PATH = mockMalformedJsonScript;
+    try {
+      const malformedResult = await sttAdapter.transcribe(silenceVideoPath, 10.0);
+      assert(malformedResult.status === 'ANALYSIS_UNAVAILABLE', '4.3 Malformed JSON fails closed to ANALYSIS_UNAVAILABLE');
+      assert(malformedResult.failureReason?.includes('Malformed JSON'), '4.3 Failure reason records malformed JSON error');
+    } finally {
+      process.env.WHISPER_PATH = prevStt;
+    }
+
+    // 4.4 Corrupted timestamps (negative, start >= end, beyond duration)
+    const mockCorruptTimestampsScript = path.resolve(testDir, 'mock_stt_corrupt_ts.sh');
+    const corruptJsonOutput = JSON.stringify({
+      text: "Good and bad timestamps",
+      segments: [
+        { start: -5.0, end: 2.0, text: "Negative start" },
+        { start: 3.0, end: 1.0, text: "End before start" },
+        { start: 25.0, end: 30.0, text: "Beyond 10s duration" },
+        { start: 4.0, end: 7.0, text: "Valid middle segment" }
+      ]
+    });
+    fs.writeFileSync(mockCorruptTimestampsScript, `#!/bin/sh\ncat << 'EOF'\n${corruptJsonOutput}\nEOF\n`);
+    fs.chmodSync(mockCorruptTimestampsScript, 0o755);
+
+    process.env.WHISPER_PATH = mockCorruptTimestampsScript;
+    try {
+      const corruptTsResult = await sttAdapter.transcribe(silenceVideoPath, 10.0);
+      assert(corruptTsResult.segments?.length === 1, '4.4 Invalid/corrupt timestamps safely filtered out (only 1 valid segment kept)');
+      assert(corruptTsResult.segments![0].text === "Valid middle segment", '4.4 Preserved segment is the genuine valid segment');
+      assert(corruptTsResult.limitations.includes('invalid or out-of-order segment timestamp(s) were rejected'), '4.4 Limitations document rejected invalid timestamps');
+    } finally {
+      process.env.WHISPER_PATH = prevStt;
+    }
+
+    // 4.5 Empty output
+    const mockEmptyScript = path.resolve(testDir, 'mock_stt_empty.sh');
+    fs.writeFileSync(mockEmptyScript, '#!/bin/sh\nexit 0\n');
+    fs.chmodSync(mockEmptyScript, 0o755);
+
+    process.env.WHISPER_PATH = mockEmptyScript;
+    try {
+      const emptyResult = await sttAdapter.transcribe(silenceVideoPath, 10.0);
+      assert(emptyResult.status === 'NO_SIGNAL_DETECTED', '4.5 Empty STT output reports NO_SIGNAL_DETECTED');
+      assert(emptyResult.segments?.length === 0, '4.5 Empty segments array');
+    } finally {
+      process.env.WHISPER_PATH = prevStt;
+    }
+
+    // 4.6 Missing executable
+    process.env.WHISPER_PATH = '/path/to/non_existent_whisper_binary';
+    try {
+      const missingBinResult = await sttAdapter.transcribe(silenceVideoPath, 10.0);
+      assert(missingBinResult.status === 'ANALYSIS_UNAVAILABLE', '4.6 Missing STT binary reports ANALYSIS_UNAVAILABLE');
+      assert(missingBinResult.failureReason?.includes('not found'), '4.6 Explicit failure reason for missing executable');
+    } finally {
+      process.env.WHISPER_PATH = prevStt;
+    }
+
+    // =========================================================================
+    // 5. THUMBNAIL OCR & CONTRAST DECOUPLING (SECTION 7)
+    // =========================================================================
+    console.log('\n[5. Thumbnail OCR & Contrast Decoupling]');
+
+    const testThumbPath = path.resolve(testDir, 'test_thumb.jpg');
+    await execFileAsync('ffmpeg', [
+      '-y', '-f', 'lavfi', '-i', 'color=c=darkblue:size=1280x720:d=1',
+      '-vframes', '1', testThumbPath
+    ]);
+
+    const thumbResult = await thumbnailInspector.inspect(testThumbPath, 'test_thumb.jpg');
+    assert(thumbResult.hasHighContrastText === null, '5.1 hasHighContrastText is null when contrast is not directly assessed');
+    assert(thumbResult.contrastAnalysisStatus === 'NOT_ASSESSED', '5.1 contrastAnalysisStatus is NOT_ASSESSED');
+    assert(thumbResult.detectors?.thumbnail_contrast?.status === 'NOT_ASSESSED', '5.1 thumbnail_contrast detector report is NOT_ASSESSED');
+
+    // =========================================================================
+    // 6. RE-SCAN VALIDATION & COMPARISON SUMMARY (SECTION 9)
+    // =========================================================================
+    console.log('\n[6. Re-scan Validation & Comparison Summary]');
+
+    // 6.1 Media validity check in canVerifyResolution
+    const mockBaseline: any = {
+      scanId: 'scan_base',
+      overallRisk: 'HIGH_RISK' as const,
+      riskScore: 75,
+      channelTopic: 'Tech',
+      summary: 'Baseline summary',
+      riskSummary: 'Risk summary',
+      disclaimer: 'Disclaimer',
+      riskCategories: [],
+      policyConnections: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      evaluatedPoliciesCount: 5,
+      criticalViolationsCount: 1,
+      keyFindings: [],
+      topIssues: [
+        {
+          id: 'issue_vid_1',
+          domain: 'video_audio' as const,
+          what: 'Excessive Visual Repetition',
+          where: '00:00–00:05',
+          why: 'Repeated footage',
+          fix: 'Edit footage',
+          evidence: 'video:repeated_footage',
+          context: 'Video',
+          recommendedAction: 'Vary b-roll',
+          confidence: 'HIGH' as const,
+          limitations: 'Local check',
+          severity: 'warning' as const,
+          policyArea: 'REUSED CONTENT',
+          category: 'reused_content' as const,
+          timestampSeconds: 0
+        }
+      ],
+      recommendations: [],
+      domainReports: {
+        video_audio: {
+          domain: 'video_audio' as const,
+          status: 'POTENTIAL_RISK_DETECTED' as const,
+          title: 'Video & Audio',
+          summary: 'Risk detected',
+          riskLevel: 'HIGH_RISK' as const,
+          evidenceCount: 1,
+          limitations: 'Local'
+        },
+        title: { domain: 'title' as const, status: 'NO_MAJOR_RISK_SIGNALS_DETECTED' as const, title: 'Title', summary: 'Clean', riskLevel: 'LOW_RISK' as const, evidenceCount: 0 },
+        description_tags: { domain: 'description_tags' as const, status: 'NO_MAJOR_RISK_SIGNALS_DETECTED' as const, title: 'Desc', summary: 'Clean', riskLevel: 'LOW_RISK' as const, evidenceCount: 0 },
+        thumbnail: { domain: 'thumbnail' as const, status: 'NO_MAJOR_RISK_SIGNALS_DETECTED' as const, title: 'Thumb', summary: 'Clean', riskLevel: 'LOW_RISK' as const, evidenceCount: 0 },
+        channel_context: { domain: 'channel_context' as const, status: 'NO_MAJOR_RISK_SIGNALS_DETECTED' as const, title: 'Channel', summary: 'Clean', riskLevel: 'LOW_RISK' as const, evidenceCount: 0 }
+      },
+      evidenceTimeline: [],
+      benchmarkTimings: { uploadMs: 0, inspectionMs: 0, audioMs: 0, videoMs: 0, policyMs: 0, reportMs: 0, totalProcessingMs: 0 }
+    };
+
+    // Revised scan with empty media (durationSeconds: 0)
+    const mockRevisedEmpty: any = {
+      ...mockBaseline,
+      scanId: 'scan_rev_empty',
+      topIssues: [],
+      domainReports: {
+        ...mockBaseline.domainReports,
+        video_audio: {
+          ...mockBaseline.domainReports.video_audio,
+          status: 'NO_MAJOR_RISK_SIGNALS_DETECTED' as const
+        }
+      }
+    };
+
+    const emptyMediaComparison = policyIntelligenceEngine.generateComparison(mockBaseline as RiskReport, mockRevisedEmpty as RiskReport, {
+      revisedScanRecord: {
+        status: 'COMPLETED',
+        metadata: {
+          filename: 'empty.mp4',
+          originalSize: 0,
+          durationSeconds: 0,
+          width: 0,
+          height: 0,
+          resolutionLabel: '0p',
+          fps: 0,
+          hasAudio: false,
+          isProxyUsed: false
+        }
+      }
+    });
+
+    assert(emptyMediaComparison.resolvedIssues.length === 0, '6.1 Zero-duration or empty media cannot verify resolution');
+    assert(Boolean(emptyMediaComparison.notVerifiedIssues?.some(i => i.includes('zero or invalid duration'))), '6.1 Explicit unverified reason for invalid media duration');
+
+    // 6.2 Comparison summary: Mixed results (1 resolved, 1 remaining, 1 unverified)
+    const multiBaseline: any = {
+      ...mockBaseline,
+      topIssues: [
+        mockBaseline.topIssues[0], // video issue (will be resolved)
+        {
+          id: 'issue_title_persist',
+          domain: 'title' as const,
+          what: 'Sensational Title',
+          where: 'Title',
+          why: 'Exaggeration',
+          fix: 'Tone down',
+          evidence: 'nlp:title',
+          context: 'Title',
+          recommendedAction: 'Tone down',
+          confidence: 'HIGH' as const,
+          limitations: 'Local',
+          severity: 'warning' as const,
+          policyArea: 'COMMUNITY GUIDELINES',
+          category: 'community_guidelines' as const,
+          timestampSeconds: 0
+        },
+        {
+          id: 'issue_thumb_unverified',
+          domain: 'thumbnail' as const,
+          what: 'Clickbait Overlay',
+          where: 'Thumbnail',
+          why: 'Sensational text',
+          fix: 'Remove text',
+          evidence: 'ocr:text',
+          context: 'Thumbnail',
+          recommendedAction: 'Remove',
+          confidence: 'HIGH' as const,
+          limitations: 'Local',
+          severity: 'warning' as const,
+          policyArea: 'THUMBNAIL INTEGRITY',
+          category: 'thumbnail_integrity' as const,
+          timestampSeconds: 0
+        }
+      ]
+    };
+
+    const mixedRevised: any = {
+      ...mockBaseline,
+      scanId: 'scan_mixed_rev',
+      topIssues: [
+        multiBaseline.topIssues[1] // title issue persists
+      ],
+      domainReports: {
+        ...mockBaseline.domainReports,
+        video_audio: {
+          ...mockBaseline.domainReports.video_audio,
+          status: 'NO_MAJOR_RISK_SIGNALS_DETECTED' as const // resolved
+        },
+        thumbnail: {
+          ...mockBaseline.domainReports.thumbnail,
+          status: 'NOT_ASSESSED' as const // unverified
+        }
+      }
+    };
+
+    const mixedComp = policyIntelligenceEngine.generateComparison(multiBaseline as RiskReport, mixedRevised as RiskReport, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { durationSeconds: 10, originalSize: 1000, videoCodec: 'h264' } as any },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { durationSeconds: 10, originalSize: 1000, videoCodec: 'h264' } as any }
+    });
+
+    assert(mixedComp.resolvedIssues.length === 1, '6.2 1 issue resolved');
+    assert(mixedComp.remainingIssues.length === 1, '6.2 1 issue persisting');
+    assert(mixedComp.notVerifiedIssues?.length === 1, '6.2 1 issue unverified');
+    assert(!mixedComp.comparisonSummary.startsWith('Re-scan verified.'), '6.2 Summary DOES NOT claim "Re-scan verified." when persisting/unverified issues remain');
+    assert(mixedComp.comparisonSummary.includes('mixed results'), '6.2 Summary accurately states mixed results');
+
+    // =========================================================================
+    // 7. GENUINE MEDIA-BASED END-TO-END WORKFLOW (SECTION 10)
+    // =========================================================================
+    console.log('\n[7. Genuine Media-Based End-to-End Workflow]');
+
+    // Setup HTTP server with real routes and storage
+    const app = express();
+    app.use(express.json());
+    app.use('/api', apiRouter);
+    app.use('/uploads', secureUploadsHandler);
+
+    const server = http.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const port = (server.address() as any).port;
+    const baseUrl = `http://127.0.0.1:${port}/api`;
+
+    try {
+      // 7.1 Create test user & authenticate
+      const e2eUser = await storage.users.createUser(`e2e_${Date.now()}@test.com`, 'enterprise');
+      const e2eSessionToken = await storage.users.createSession(e2eUser.id);
+
+      // 7.2 Upload initial video with real media
+      const initialUploadPath = path.resolve(testDir, 'e2e_initial.mp4');
+      await execFileAsync('ffmpeg', [
+        '-y',
+        '-f', 'lavfi', '-i', 'testsrc=duration=2:size=320x240:rate=10',
+        '-f', 'lavfi', '-i', 'smptebars=duration=2:size=320x240:rate=10',
+        '-f', 'lavfi', '-i', 'testsrc=duration=2:size=320x240:rate=10',
+        '-filter_complex', '[0:v][1:v][2:v]concat=n=3:v=1:a=0[outv]',
+        '-map', '[outv]',
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+        initialUploadPath
+      ]);
+
+      const initialBuffer = fs.readFileSync(initialUploadPath);
+      const uploadForm = new FormData();
+      uploadForm.append('video', new Blob([initialBuffer], { type: 'video/mp4' }), 'initial.mp4');
+
+      const uploadRes = await fetch(`${baseUrl}/uploads`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${e2eSessionToken}` },
+        body: uploadForm
+      });
+
+      assert(uploadRes.status === 200, '7.2 Initial media uploaded via HTTP POST /uploads (200 OK)');
+      const uploadData = await uploadRes.json();
+      assert(uploadData.filePath && fs.existsSync(uploadData.filePath), '7.2 Uploaded media file stored securely');
+
+      const createRes = await fetch(`${baseUrl}/scans`, {
+        method: 'POST',
+        headers: { 
+          Authorization: `Bearer ${e2eSessionToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          videoPath: uploadData.filePath,
+          videoFilename: uploadData.filename,
+          videoTitle: 'Initial Video with Repetition',
+          videoDescription: 'Initial description',
+          scanMode: 'standard'
+        })
+      });
+
+      assert(createRes.status === 201, '7.2 Initial media scan created via HTTP POST /scans (201 Created)');
+      const initialJob = await createRes.json();
+      assert(initialJob.id && initialJob.status === 'QUEUED', '7.2 Job enqueued in durable storage');
+
+      // 7.3 Create revised video without repetition (clean continuous footage)
+      const revisedUploadPath = path.resolve(testDir, 'e2e_revised.mp4');
+      await execFileAsync('ffmpeg', [
+        '-y',
+        '-f', 'lavfi', '-i', 'testsrc=duration=5:size=320x240:rate=10',
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+        revisedUploadPath
+      ]);
+
+      const revisedBuffer = fs.readFileSync(revisedUploadPath);
+      const rescanForm = new FormData();
+      rescanForm.append('video', new Blob([revisedBuffer], { type: 'video/mp4' }), 'revised_cut.mp4');
+
+      const rescanRes = await fetch(`${baseUrl}/scans/${initialJob.id}/rescan`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${e2eSessionToken}` },
+        body: rescanForm
+      });
+
+      assert(rescanRes.status === 201, '7.3 Revised media uploaded via POST /scans/:id/rescan (201 Created)');
+      const rescanJob = await rescanRes.json();
+      assert(rescanJob.isRescan === true, '7.3 Rescan job marked as isRescan: true');
+      assert(rescanJob.parentScanId === initialJob.id, '7.3 Rescan references initial parent scan');
+      assert(fs.existsSync(rescanJob.videoPath), '7.3 Revised media file exists on disk');
+      assert(!rescanJob.videoPath.includes('VIDEORISK_RESCAN_CONTAINER'), '7.3 Real media stored, NOT dummy VIDEORISK_RESCAN_CONTAINER');
+    } finally {
+      server.close();
+    }
+
+    console.log(`\n🎉 COMPREHENSIVE DEFECT & PIPELINE VERIFICATION PASSED: ${passed}/${total} assertions!`);
+  } finally {
+    try {
+      fs.rmSync(testDir, { recursive: true, force: true });
+    } catch {}
+  }
+}
+
+// Allow direct CLI execution: npx tsx tests/comprehensive_defect_and_pipeline_verification.test.ts
+if (process.argv[1]?.endsWith('comprehensive_defect_and_pipeline_verification.test.ts')) {
+  runComprehensiveDefectAndPipelineTests().catch((err) => {
+    console.error('Test suite failed:', err);
+    process.exit(1);
+  });
+}

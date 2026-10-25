@@ -3,6 +3,7 @@ import http from 'http';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import { execFileSync } from 'child_process';
 import { 
   apiRouter, 
   secureUploadsHandler,
@@ -262,13 +263,23 @@ export async function runAuthAndOwnershipTests() {
     // ---------------------------------------------------------
     console.log('\n[2. Resource Ownership & IDOR Protection]');
 
+    // Ensure valid fixture exists for User A's project_a.mp4
+    const projectAPath = path.resolve(process.cwd(), 'uploads', 'project_a.mp4');
+    if (!fs.existsSync(projectAPath)) {
+      try {
+        execFileSync('ffmpeg', ['-y', '-f', 'lavfi', '-i', 'testsrc=duration=1:size=320x240:rate=10', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', projectAPath]);
+      } catch {
+        fs.writeFileSync(projectAPath, 'VALID_PROJECT_A_TEST_MEDIA_BYTES');
+      }
+    }
+
     // Create a scan belonging to User A
     const scanA = await storage.scans.createScan({
       id: `scan_test_a_${Date.now()}`,
       userId: userA.id,
       videoTitle: 'User A Private Project Video',
       videoFilename: 'project_a.mp4',
-      videoPath: path.resolve(process.cwd(), 'uploads', 'project_a.mp4'),
+      videoPath: projectAPath,
       scanMode: 'standard',
       status: 'COMPLETED',
       currentStage: 'Risk report',
@@ -564,6 +575,33 @@ export async function runAuthAndOwnershipTests() {
     const rescanData = await noFileRescanRes.json();
     assert(rescanData.isRescan === true, 'Created rescan job marked as isRescan: true');
     assert(rescanData.parentScanId === scanA.id, 'Created rescan job correctly references parentScanId');
+
+    // Test 3b.9: Re-scan without a new upload fails with HTTP 400 when original media is missing
+    const missingMediaScan = await storage.scans.createScan({
+      id: `scan_missing_media_${Date.now()}`,
+      userId: userA.id,
+      videoTitle: 'Missing Media Scan',
+      videoFilename: 'missing_file.mp4',
+      videoPath: path.resolve(process.cwd(), 'uploads', `non_existent_${Date.now()}.mp4`),
+      scanMode: 'standard',
+      status: 'COMPLETED',
+      currentStage: 'Risk report',
+      completedStages: ['Upload', 'Risk report'],
+      creditsUsed: 1,
+      createdAt: new Date().toISOString()
+    });
+
+    const missingMediaRescanRes = await fetch(`${baseUrl}/scans/${missingMediaScan.id}/rescan`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${activeTokenA}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({})
+    });
+    assert(missingMediaRescanRes.status === 400, 'Re-scan with missing media fails closed with HTTP 400 Bad Request');
+    const missingMediaJson = await missingMediaRescanRes.json();
+    assert(missingMediaJson.error.includes('unavailable or missing on disk'), 'Returns explicit error that media is missing on disk without creating dummy container');
 
     // ---------------------------------------------------------
     // 3c. SECURE MEDIA ACCESS HARDENING (ISSUES A, B, C)

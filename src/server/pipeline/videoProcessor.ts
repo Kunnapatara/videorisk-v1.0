@@ -225,15 +225,149 @@ export class VideoProcessor {
         sampledIntervals.push({ start: sTime, end: eTime });
       }
 
-      // Frame similarity helper (Normalized RMS similarity across 192 RGB bytes: 1.0 = identical, >0.94 = near duplicate)
-      const computeFrameSimilarity = (off1: number, off2: number): number => {
+      // Precompute per-frame luminance grid (8x8 = 64 pixels), statistics, and gradient dHash bits
+      interface FrameSignature {
+        index: number;
+        offset: number;
+        luminance: Float32Array; // 64 values
+        meanY: number;
+        varY: number;
+        stdDevY: number;
+        meanR: number;
+        meanG: number;
+        meanB: number;
+        hGradients: boolean[]; // 56 horizontal bits
+        vGradients: boolean[]; // 56 vertical bits
+      }
+
+      const frameSignatures: FrameSignature[] = [];
+      for (let i = 0; i < totalRawFrames; i++) {
+        const off = i * bytesPerFrame;
+        const lum = new Float32Array(64);
+        let sumY = 0;
+        let sumR = 0;
+        let sumG = 0;
+        let sumB = 0;
+
+        for (let p = 0; p < 64; p++) {
+          const r = rawFramesBuffer[off + p * 3];
+          const g = rawFramesBuffer[off + p * 3 + 1];
+          const b = rawFramesBuffer[off + p * 3 + 2];
+          sumR += r;
+          sumG += g;
+          sumB += b;
+          const y = 0.299 * r + 0.587 * g + 0.114 * b;
+          lum[p] = y;
+          sumY += y;
+        }
+
+        const meanY = sumY / 64;
+        let sumSqY = 0;
+        for (let p = 0; p < 64; p++) {
+          const dy = lum[p] - meanY;
+          sumSqY += dy * dy;
+        }
+        const varY = sumSqY / 64;
+        const stdDevY = Math.sqrt(varY);
+
+        // 56 horizontal gradient comparisons: Y(x+1, y) > Y(x, y)
+        const hGradients: boolean[] = [];
+        for (let y = 0; y < 8; y++) {
+          for (let x = 0; x < 7; x++) {
+            hGradients.push(lum[y * 8 + x + 1] > lum[y * 8 + x]);
+          }
+        }
+
+        // 56 vertical gradient comparisons: Y(x, y+1) > Y(x, y)
+        const vGradients: boolean[] = [];
+        for (let x = 0; x < 8; x++) {
+          for (let y = 0; y < 7; y++) {
+            vGradients.push(lum[(y + 1) * 8 + x] > lum[y * 8 + x]);
+          }
+        }
+
+        frameSignatures.push({
+          index: i,
+          offset: off,
+          luminance: lum,
+          meanY,
+          varY,
+          stdDevY,
+          meanR: sumR / 64,
+          meanG: sumG / 64,
+          meanB: sumB / 64,
+          hGradients,
+          vGradients
+        });
+      }
+
+      // Compute comprehensive similarity between two frames:
+      // Combines:
+      // 1. Normalized zero-mean luminance cross-correlation (NCC) - invariant to overall brightness shifts
+      // 2. Luminance gradient difference hash match ratio (dHash) - captures structural edge layout
+      // 3. Color difference (Delta RGB) - rejects wildly disparate color palettes
+      // 4. Raw pixel RMS similarity (for flat/solid scenes where gradient variance is near zero)
+      const evaluateFramePair = (f1: FrameSignature, f2: FrameSignature): { isDuplicate: boolean; similarity: number } => {
+        // Raw RMS similarity across 192 RGB bytes
         let sumSq = 0;
         for (let k = 0; k < bytesPerFrame; k++) {
-          const diff = rawFramesBuffer[off1 + k] - rawFramesBuffer[off2 + k];
+          const diff = rawFramesBuffer[f1.offset + k] - rawFramesBuffer[f2.offset + k];
           sumSq += diff * diff;
         }
         const rms = Math.sqrt(sumSq / bytesPerFrame);
-        return Math.max(0, 1 - (rms / 255));
+        const rawRmsSim = Math.max(0, 1 - (rms / 255));
+
+        // Mean color difference normalized to [0, 1]
+        const colorDiff = (
+          Math.abs(f1.meanR - f2.meanR) +
+          Math.abs(f1.meanG - f2.meanG) +
+          Math.abs(f1.meanB - f2.meanB)
+        ) / (3 * 255);
+        const colorSim = Math.max(0, 1 - colorDiff);
+
+        // Low texture / flat frames (standard deviation of luminance < 2.5)
+        const isFlat1 = f1.stdDevY < 2.5;
+        const isFlat2 = f2.stdDevY < 2.5;
+
+        if (isFlat1 || isFlat2) {
+          if (isFlat1 && isFlat2) {
+            // Both frames are flat/solid. They only match if raw RMS color is nearly identical
+            const isMatch = rawRmsSim >= 0.96;
+            return { isDuplicate: isMatch, similarity: rawRmsSim };
+          }
+          // One flat, one textured: cannot be duplicate
+          return { isDuplicate: false, similarity: Math.min(rawRmsSim, 0.70) };
+        }
+
+        // Textured frames: compute normalized cross-correlation (NCC)
+        let nccSum = 0;
+        for (let p = 0; p < 64; p++) {
+          nccSum += (f1.luminance[p] - f1.meanY) * (f2.luminance[p] - f2.meanY);
+        }
+        const ncc = nccSum / (64 * Math.max(0.1, f1.stdDevY * f2.stdDevY));
+
+        // Compute gradient match ratio (112 bits)
+        let gradMatches = 0;
+        for (let b = 0; b < 56; b++) {
+          if (f1.hGradients[b] === f2.hGradients[b]) gradMatches++;
+          if (f1.vGradients[b] === f2.vGradients[b]) gradMatches++;
+        }
+        const gradMatchRatio = gradMatches / 112;
+
+        // Composite structural similarity:
+        // Weight: 50% NCC correlation, 30% gradient dHash, 20% color similarity
+        const compositeSim = 0.50 * Math.max(0, ncc) + 0.30 * gradMatchRatio + 0.20 * colorSim;
+
+        // Duplicate criteria for textured frames:
+        // 1. High correlation (ncc >= 0.86)
+        // 2. High gradient agreement (gradMatchRatio >= 0.85)
+        // 3. Compatible color palette (colorDiff <= 0.22, accommodating lighting adjustments)
+        const isDuplicate = ncc >= 0.86 && gradMatchRatio >= 0.85 && colorDiff <= 0.22;
+
+        return {
+          isDuplicate,
+          similarity: parseFloat(Math.max(0, Math.min(1.0, isDuplicate ? Math.max(compositeSim, rawRmsSim) : compositeSim)).toFixed(3))
+        };
       };
 
       // Intra-scene frame stability evaluation for slideshow heuristic
@@ -246,19 +380,16 @@ export class VideoProcessor {
       const rawMatches: Array<{ i: number; j: number; sim: number }> = [];
 
       for (let i = 0; i < totalRawFrames; i++) {
-        const offI = i * bytesPerFrame;
         const timeI = i * sampleInterval;
 
         // Check intra-scene continuity with adjacent frame i+1
         if (i + 1 < totalRawFrames) {
-          const timeNext = (i + 1) * sampleInterval;
-          // Verify if there is no cut transition between timeI and timeNext
-          const hasCutBetween = cutTimestamps.some(cut => cut >= timeI - 0.2 && cut <= timeNext + 0.2);
-          const adjSim = computeFrameSimilarity(offI, (i + 1) * bytesPerFrame);
-          // If there is an abrupt visual cut (adjSim < 0.85), it is a scene/slide boundary, not intra-scene
-          if (!hasCutBetween && adjSim >= 0.85) {
+          const adjResult = evaluateFramePair(frameSignatures[i], frameSignatures[i + 1]);
+          // If there is an abrupt visual transition (similarity < 0.85), it is a scene/slide boundary, not intra-scene
+          if (adjResult.similarity >= 0.85) {
             intraSceneFramePairs++;
-            if (adjSim >= 0.95) {
+            // A static slide has near-zero movement: similarity >= 0.97
+            if (adjResult.similarity >= 0.97) {
               intraSceneStaticPairs++;
             }
           }
@@ -266,11 +397,10 @@ export class VideoProcessor {
 
         // Compare against non-adjacent frames j > i
         for (let j = i + minIndexGap; j < totalRawFrames; j++) {
-          const offJ = j * bytesPerFrame;
-          const sim = computeFrameSimilarity(offI, offJ);
+          const pairResult = evaluateFramePair(frameSignatures[i], frameSignatures[j]);
 
-          // Near-duplicate threshold: >= 0.94 similarity (accounts for compression/resizing)
-          if (sim >= 0.94) {
+          // Near-duplicate threshold supported by structural evidence
+          if (pairResult.isDuplicate) {
             // To be repeated footage (rather than an uninterrupted static long take),
             // there must be an intervening scene cut OR intervening distinct visual content
             const timeJ = j * sampleInterval;
@@ -278,7 +408,8 @@ export class VideoProcessor {
             let hasInterveningDifference = hasInterveningCut;
             if (!hasInterveningDifference) {
               for (let k = i + 1; k < j; k++) {
-                if (computeFrameSimilarity(offI, k * bytesPerFrame) < 0.90) {
+                const midResult = evaluateFramePair(frameSignatures[i], frameSignatures[k]);
+                if (!midResult.isDuplicate || midResult.similarity < 0.88) {
                   hasInterveningDifference = true;
                   break;
                 }
@@ -286,7 +417,7 @@ export class VideoProcessor {
             }
 
             if (hasInterveningDifference) {
-              rawMatches.push({ i, j, sim });
+              rawMatches.push({ i, j, sim: pairResult.similarity });
             }
           }
         }
@@ -356,19 +487,30 @@ export class VideoProcessor {
       }
       consolidatedRepeats.sort((a, b) => a.start - b.start);
 
-      // 5. Template Repetition Heuristic
-      // Identifies repeated visual intro/outro cards or recurrent bumper templates across distinct scenes
+      // 5. Template Repetition Analysis
+      // Detects recurring structural sequences (such as intro bumpers, outro cards, or chapter stings)
+      // that appear at specific structural boundaries (e.g. near video start, video end, or across distinct scenes).
+      // Distinct from general repeated footage (which may be b-roll or editing loops).
       if (consolidatedRepeats.length > 0 && scenesCount >= 2) {
         for (const seg of consolidatedRepeats) {
-          // If the repeated segment is brief (1s-6s) and occurs at structural points across scenes
           const segDuration = seg.end - seg.start;
-          if (segDuration <= 6) {
-            templateRepetitions.push({
-              start: seg.start,
-              end: seg.end,
-              pattern: 'recurring_visual_sequence',
-              similarity: seg.similarity
-            });
+          if (segDuration >= 0.5 && segDuration <= 8.0) {
+            // Check structural sequence position:
+            // Intro: first occurrence is within first 25% of timeline or <= 5s
+            // Outro / bumper: recurrence is near end (>= 75% or >= dur - 6s) or across separate scene cut boundaries
+            const isNearStart = seg.matchWithTimestamp <= Math.max(5, dur * 0.25);
+            const isNearEnd = seg.start >= Math.min(dur - 6, dur * 0.75);
+            const alignsWithSceneCut = cutTimestamps.some(cut => Math.abs(cut - seg.start) < 1.0) ||
+              cutTimestamps.some(cut => Math.abs(cut - seg.matchWithTimestamp) < 1.0);
+
+            if ((isNearStart && isNearEnd) || alignsWithSceneCut) {
+              templateRepetitions.push({
+                start: seg.start,
+                end: seg.end,
+                pattern: (isNearStart && isNearEnd) ? 'recurring_intro_outro_template' : 'recurring_structural_bumper',
+                similarity: seg.similarity
+              });
+            }
           }
         }
       }

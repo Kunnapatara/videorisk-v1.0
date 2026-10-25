@@ -87,34 +87,108 @@ export class SpeechTranscriptionAdapter {
       // Execute local STT binary safely without shell expansion
       const { stdout } = await execFileAsync(sttPath, [videoPath, '--output_format', 'json'], { timeout: 60000 });
       const elapsed = Date.now() - startTime;
-      let parsed: any = null;
-      try {
-        parsed = JSON.parse(stdout);
-      } catch {
-        // Plain text transcript output
-        const text = stdout.trim();
+      const rawOutput = (stdout || '').trim();
+
+      if (!rawOutput) {
         return {
-          status: text.length > 0 ? 'DETECTED' : 'NO_SIGNAL_DETECTED',
-          transcriptText: text,
-          segments: text.length > 0 ? [{ start: 0, end: durationSeconds, text }] : [],
-          limitations: 'Transcribed via local STT executable; automated transcripts may contain phonetic inaccuracies.',
+          status: 'NO_SIGNAL_DETECTED',
+          transcriptText: '',
+          segments: [],
+          limitations: 'STT executable completed with empty output; no speech detected.',
           executionDurationMs: elapsed
         };
       }
 
-      const segments = Array.isArray(parsed.segments)
-        ? parsed.segments.map((s: any) => ({
-            start: Number(s.start || 0),
-            end: Number(s.end || durationSeconds),
-            text: String(s.text || '').trim()
-          }))
-        : [];
+      let parsed: any = null;
+      let isJson = false;
+
+      // Check if output looks like JSON
+      if (rawOutput.startsWith('{') || rawOutput.startsWith('[')) {
+        try {
+          parsed = JSON.parse(rawOutput);
+          isJson = true;
+        } catch {
+          // Output attempted JSON formatting but is malformed
+          return {
+            status: 'ANALYSIS_UNAVAILABLE',
+            failureReason: 'Malformed JSON output from STT executable',
+            limitations: 'STT executable produced invalid JSON structure that could not be parsed.',
+            executionDurationMs: elapsed
+          };
+        }
+      }
+
+      if (!isJson) {
+        // Plain text transcript output without timestamps
+        // CRITICAL: NEVER fabricate a full-duration segment [0, durationSeconds] from plain text
+        return {
+          status: rawOutput.length > 0 ? 'DETECTED' : 'NO_SIGNAL_DETECTED',
+          transcriptText: rawOutput,
+          segments: [], // Segments MUST remain empty when timestamps are absent
+          limitations: 'Plain text transcript returned without segment timestamps; segment-level timestamps are unavailable and were not fabricated.',
+          executionDurationMs: elapsed
+        };
+      }
+
+      // Process and validate JSON segments
+      const rawSegments = Array.isArray(parsed.segments) ? parsed.segments : [];
+      const validSegments: Array<{ start: number; end: number; text: string; confidence?: number }> = [];
+      let rejectedTimestampsCount = 0;
+
+      for (const s of rawSegments) {
+        const start = typeof s?.start === 'number' ? s.start : parseFloat(s?.start);
+        const end = typeof s?.end === 'number' ? s.end : parseFloat(s?.end);
+        const text = String(s?.text || '').trim();
+
+        // Validate finite, non-negative, ordered (start < end), and within media duration
+        if (
+          !Number.isFinite(start) || 
+          !Number.isFinite(end) || 
+          start < 0 || 
+          end <= start || 
+          start >= durationSeconds + 0.1
+        ) {
+          rejectedTimestampsCount++;
+          continue;
+        }
+
+        const clampedEnd = Math.min(parseFloat(end.toFixed(2)), durationSeconds);
+        const clampedStart = parseFloat(start.toFixed(2));
+
+        if (clampedStart < clampedEnd) {
+          validSegments.push({
+            start: clampedStart,
+            end: clampedEnd,
+            text,
+            confidence: typeof s?.confidence === 'number' && Number.isFinite(s.confidence) ? s.confidence : undefined
+          });
+        }
+      }
+
+      const transcriptText = typeof parsed.text === 'string' 
+        ? parsed.text.trim() 
+        : validSegments.map(s => s.text).join(' ');
+
+      let limitationNotes = 'Transcribed via local STT executable; automated transcripts may contain phonetic inaccuracies.';
+      if (rejectedTimestampsCount > 0) {
+        limitationNotes += ` Note: ${rejectedTimestampsCount} invalid or out-of-order segment timestamp(s) were rejected.`;
+      }
+
+      let status: DetectorExecutionStatus;
+      if (validSegments.length > 0 || transcriptText.length > 0) {
+        status = 'DETECTED';
+      } else if (rawSegments.length > 0 && validSegments.length === 0) {
+        status = 'INSUFFICIENT_EVIDENCE';
+        limitationNotes += ' All reported segment timestamps were invalid or out of bounds.';
+      } else {
+        status = 'NO_SIGNAL_DETECTED';
+      }
 
       return {
-        status: segments.length > 0 ? 'DETECTED' : 'NO_SIGNAL_DETECTED',
-        transcriptText: parsed.text || '',
-        segments,
-        limitations: 'Transcribed via local STT executable; automated transcripts may contain phonetic inaccuracies.',
+        status,
+        transcriptText,
+        segments: validSegments,
+        limitations: limitationNotes,
         executionDurationMs: elapsed
       };
     } catch (err: any) {
@@ -413,7 +487,7 @@ export class AudioProcessor {
           status: speechDetectionStatus,
           executionDurationMs: totalMs,
           confidence: 0.85,
-          limitations: 'Detects acoustic modulation patterns characteristic of voice speech; does not produce textual transcripts.'
+          limitations: 'Acoustic activity heuristic based on energy envelope modulation; does not produce verified speech semantics or textual transcripts.'
         },
         audio_transcription: {
           detectorName: 'local_speech_to_text_adapter',
@@ -422,6 +496,13 @@ export class AudioProcessor {
           executionDurationMs: sttResult.executionDurationMs,
           limitations: sttResult.limitations,
           failureReason: sttResult.failureReason
+        },
+        audio_music_detection: {
+          detectorName: 'music_classification_analyzer',
+          version: '1.0.0',
+          status: 'NOT_ASSESSED',
+          executionDurationMs: 0,
+          limitations: 'Music detection and classification model not configured or evaluated in local environment; music presence is unverified.'
         },
         audio_repeated_segments: {
           detectorName: 'within_video_audio_fingerprint',

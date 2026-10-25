@@ -2202,10 +2202,13 @@ apiRouter.post('/scans/:id/rescan', requireAuthMiddleware, validateRescanAuthori
       if (uploadRec && uploadRec.userId !== user.id) {
         return res.status(403).json({ error: 'Access denied: Video file belongs to another user.' });
       }
-    } else {
+    } else if (parentScan.videoPath && fs.existsSync(parentScan.videoPath) && isSafeUploadPath(parentScan.videoPath)) {
+      filePath = parentScan.videoPath;
       filename = `Revised_${parentScan.videoFilename}`;
-      filePath = path.join(uploadDir, `demo_rescan_${Date.now()}.mp4`);
-      fs.writeFileSync(filePath, 'VIDEORISK_RESCAN_CONTAINER');
+    } else {
+      return res.status(400).json({ 
+        error: 'Video media is required for re-scan. No revised video file was uploaded and original media file is unavailable or missing on disk.' 
+      });
     }
 
     const newScanId = `scan_rescan_${Date.now()}`;

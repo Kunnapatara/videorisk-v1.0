@@ -38,6 +38,7 @@ async function main() {
     const { runLeaseFencingAndHeartbeatTests } = await import('./lease_fencing_and_heartbeat.test');
     const { runScanDeletionAndMediaCleanupTests } = await import('./scan_deletion_and_media_cleanup.test');
     const { runRateLimitingAndAbuseProtectionTests } = await import('./rate_limiting_and_abuse_protection.test');
+    const { runComprehensiveDefectAndPipelineTests } = await import('./comprehensive_defect_and_pipeline_verification.test');
 
     // Narrowly scoped cleanup of test-specific rate limits (never deletes real/unrelated records)
     await storage.rateLimits.clearRateLimits?.();
@@ -77,6 +78,9 @@ async function main() {
 
     // Run Suite 12: Route-Level Rate Limiting & Abuse Protection
     await runRateLimitingAndAbuseProtectionTests();
+
+    // Run Suite 13: Comprehensive Defect & Pipeline Verification
+    await runComprehensiveDefectAndPipelineTests();
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log(`\n🎉 ALL AUTOMATED VERIFICATION SUITES COMPLETED SUCCESSFULLY in ${elapsed}s!`);

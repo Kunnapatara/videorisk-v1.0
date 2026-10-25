@@ -162,9 +162,13 @@ export class ThumbnailInspector {
       // Run optional local OCR analysis
       const ocrResult = await this.ocrAdapter.extractText(imagePath, width, height);
 
-      const hasHighContrastText: boolean | null = ocrResult.status === 'DETECTED' 
-        ? true 
-        : (ocrResult.status === 'NO_SIGNAL_DETECTED' ? false : null);
+      // Distinguish text presence from high-contrast text.
+      // Text presence is measured via OCR adapter. Contrast evaluation on text overlay
+      // requires bounding-box segmentation and local WCAG edge contrast measurement.
+      // When local bounding-box contrast is not assessed, report null rather than inferring
+      // contrast from text detection or lack thereof.
+      const hasHighContrastText: boolean | null = null;
+      const contrastAnalysisStatus: DetectorExecutionStatus = 'NOT_ASSESSED';
 
       const hasSensationalElements: boolean | null = null;
       const visualAnalysisStatus = ocrResult.status === 'DETECTED'
@@ -214,6 +218,13 @@ export class ThumbnailInspector {
           confidence: ocrResult.confidence,
           limitations: ocrResult.limitations,
           failureReason: ocrResult.failureReason
+        },
+        thumbnail_contrast: {
+          detectorName: 'text_overlay_contrast_evaluator',
+          version: '1.0.0',
+          status: contrastAnalysisStatus,
+          executionDurationMs: 0,
+          limitations: 'Text overlay bounding-box segmentation and localized WCAG contrast measurement are not assessed.'
         }
       };
 
@@ -230,6 +241,7 @@ export class ThumbnailInspector {
         hasSensationalElements,
         visualAnalysisStatus,
         ocrAnalysisStatus: ocrResult.status,
+        contrastAnalysisStatus,
         extractedText: ocrResult.extractedText,
         textDensityRatio: ocrResult.textDensityRatio,
         notes: notes.join(' '),

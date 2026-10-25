@@ -1015,6 +1015,20 @@ export interface ComparisonOptions {
       return { verifiable: false, reason: `revised scan error: ${options.revisedScanRecord.error}` };
     }
 
+    // 1b. Revised scan media validity check
+    const revMeta = options?.revisedScanRecord?.metadata;
+    if (revMeta) {
+      if (typeof revMeta.durationSeconds === 'number' && revMeta.durationSeconds <= 0) {
+        return { verifiable: false, reason: 'revised scan media has zero or invalid duration' };
+      }
+      if (typeof revMeta.originalSize === 'number' && revMeta.originalSize <= 0) {
+        return { verifiable: false, reason: 'revised scan media is empty (0 bytes)' };
+      }
+      if (domain === 'video_audio' && origIssue?.evidence?.startsWith('video:') && !revMeta.videoCodec) {
+        return { verifiable: false, reason: 'revised scan contains no video stream to verify visual resolution' };
+      }
+    }
+
     // 2. Baseline scan completeness check
     const origDomain = originalReport?.domainReports?.[domain];
     if (!origDomain) {
@@ -1188,10 +1202,18 @@ export interface ComparisonOptions {
       }
     }
 
-    // Honest, factual comparison summary
+    // Honest, factual comparison summary:
+    // Never claim 'Re-scan verified' or complete pass if any issues persist, new issues appeared, or unverified findings remain.
     let comparisonSummary: string;
-    if (resolvedIssues.length > 0) {
+    if (resolvedIssues.length > 0 && remainingIssues.length === 0 && newIssues.length === 0 && notVerifiedIssues.length === 0) {
       comparisonSummary = `Re-scan verified. Resolved ${resolvedIssues.length} prior risk signal(s) with evidence.`;
+    } else if (resolvedIssues.length > 0) {
+      const parts: string[] = [];
+      parts.push(`${resolvedIssues.length} resolved`);
+      if (remainingIssues.length > 0) parts.push(`${remainingIssues.length} persisting`);
+      if (newIssues.length > 0) parts.push(`${newIssues.length} new`);
+      if (notVerifiedIssues.length > 0) parts.push(`${notVerifiedIssues.length} unverified`);
+      comparisonSummary = `Re-scan completed with mixed results (${parts.join(', ')}). Prior findings cannot be certified as fully resolved.`;
     } else if (notVerifiedIssues.length > 0) {
       comparisonSummary = `Re-scan completed. Issue resolution could not be verified (${notVerifiedIssues.length} item(s) unverified due to insufficient evidence or unassessed detectors).`;
     } else if (remainingIssues.length > 0) {
