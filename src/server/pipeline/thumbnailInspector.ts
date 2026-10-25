@@ -2,7 +2,11 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs';
 import path from 'path';
-import { ThumbnailMetadata } from '../../types';
+import { 
+  ThumbnailMetadata, 
+  DetectorExecutionStatus, 
+  DetectorReport 
+} from '../../types';
 
 const execFileAsync = promisify(execFile);
 
@@ -13,12 +17,106 @@ export class ThumbnailInspectionError extends Error {
   }
 }
 
+export interface ThumbnailOcrResult {
+  status: DetectorExecutionStatus;
+  extractedText: string | null;
+  textDensityRatio: number | null;
+  confidence: number;
+  limitations: string;
+  failureReason?: string;
+  executionDurationMs: number;
+}
+
+/**
+ * Adapter for local thumbnail OCR text extraction.
+ * Checks TESSERACT_PATH or system tesseract binary.
+ * Gracefully reports NOT_ASSESSED when OCR tool is not configured/installed,
+ * rather than fabricating text or claiming visual semantics.
+ */
+export class ThumbnailOcrAdapter {
+  public async extractText(imagePath: string, width: number, height: number): Promise<ThumbnailOcrResult> {
+    const startTime = Date.now();
+    const tesseractPath = process.env.TESSERACT_PATH;
+
+    // Check explicit path or system tool
+    let executable: string | null = null;
+    if (tesseractPath && fs.existsSync(tesseractPath)) {
+      executable = tesseractPath;
+    } else if (tesseractPath) {
+      return {
+        status: 'ANALYSIS_UNAVAILABLE',
+        extractedText: null,
+        textDensityRatio: null,
+        confidence: 0,
+        failureReason: `Configured TESSERACT_PATH not found at ${tesseractPath}`,
+        limitations: 'OCR engine path was configured but executable is missing.',
+        executionDurationMs: Date.now() - startTime
+      };
+    }
+
+    if (!executable) {
+      return {
+        status: 'NOT_ASSESSED',
+        extractedText: null,
+        textDensityRatio: null,
+        confidence: 0,
+        limitations: 'Visual OCR engine (TESSERACT_PATH) not configured or installed. Visual text overlays and typography are not assessed.',
+        executionDurationMs: 0
+      };
+    }
+
+    try {
+      const { stdout } = await execFileAsync(executable, [imagePath, 'stdout', '--oem', '1'], { timeout: 20000 });
+      const elapsed = Date.now() - startTime;
+      const text = (stdout || '').trim();
+
+      if (text.length === 0) {
+        return {
+          status: 'NO_SIGNAL_DETECTED',
+          extractedText: '',
+          textDensityRatio: 0,
+          confidence: 0.90,
+          limitations: 'OCR ran successfully; no legible text detected in image.',
+          executionDurationMs: elapsed
+        };
+      }
+
+      // Estimate text density ratio relative to thumbnail canvas (characters per 1000px resolution unit)
+      const canvasUnits = (width * height) / 10000;
+      const textDensity = parseFloat(Math.min(1.0, text.length / Math.max(10, canvasUnits)).toFixed(2));
+
+      return {
+        status: 'DETECTED',
+        extractedText: text,
+        textDensityRatio: textDensity,
+        confidence: 0.88,
+        limitations: 'Text extracted via local OCR engine; low contrast or stylized fonts may affect character accuracy.',
+        executionDurationMs: elapsed
+      };
+    } catch (err: any) {
+      return {
+        status: 'ANALYSIS_UNAVAILABLE',
+        extractedText: null,
+        textDensityRatio: null,
+        confidence: 0,
+        failureReason: `OCR extraction failed: ${err?.message || err}`,
+        limitations: 'Thumbnail OCR execution failed.',
+        executionDurationMs: Date.now() - startTime
+      };
+    }
+  }
+}
+
 export class ThumbnailInspector {
+  private ocrAdapter = new ThumbnailOcrAdapter();
+
   /**
    * Analyzes an uploaded thumbnail image for dimensions, aspect ratio, visual properties,
-   * and potential pre-publish compliance flags.
+   * luminance, and optional OCR text extraction.
    */
   public async inspect(imagePath: string, originalFilename: string): Promise<ThumbnailMetadata> {
+    const startTime = Date.now();
+
     if (!fs.existsSync(imagePath)) {
       throw new ThumbnailInspectionError('Thumbnail image file does not exist on disk.');
     }
@@ -61,12 +159,17 @@ export class ThumbnailInspector {
       // Extract basic luminance sample via ffmpeg signalstats filter or deterministic probe
       const meanLuminance = await this.extractLuminance(imagePath);
 
-      // Evidence integrity: Visual text overlays, OCR, and graphic clickbait cues (arrows/circles)
-      // cannot be honestly inferred from luminance thresholds or filename strings alone.
-      // Explicitly represent visual content analysis as NOT_ASSESSED.
-      const hasHighContrastText: boolean | null = null;
+      // Run optional local OCR analysis
+      const ocrResult = await this.ocrAdapter.extractText(imagePath, width, height);
+
+      const hasHighContrastText: boolean | null = ocrResult.status === 'DETECTED' 
+        ? true 
+        : (ocrResult.status === 'NO_SIGNAL_DETECTED' ? false : null);
+
       const hasSensationalElements: boolean | null = null;
-      const visualAnalysisStatus = 'NOT_ASSESSED' as const;
+      const visualAnalysisStatus = ocrResult.status === 'DETECTED'
+        ? 'REVIEW_RECOMMENDED'
+        : 'NOT_ASSESSED';
 
       const notes: string[] = [];
       if (!is16by9) {
@@ -78,7 +181,41 @@ export class ThumbnailInspector {
       if (width < 640) {
         notes.push('Resolution is below 640px wide. May appear blurry on high-DPI desktop feeds.');
       }
-      notes.push('Visual text, graphic overlays, and sensational cues are not assessed without visual AI models.');
+
+      if (ocrResult.status === 'DETECTED' && ocrResult.extractedText) {
+        notes.push(`Text detected: "${ocrResult.extractedText.substring(0, 60)}${ocrResult.extractedText.length > 60 ? '...' : ''}". Ensure thumbnail text accurately reflects video content.`);
+      } else if (ocrResult.status === 'NOT_ASSESSED') {
+        notes.push('Visual text, graphic overlays, and sensational cues are not assessed without visual AI models.');
+      }
+
+      const totalMs = Date.now() - startTime;
+      const detectors: Record<string, DetectorReport> = {
+        thumbnail_geometry: {
+          detectorName: 'ffprobe_stream_geometry',
+          version: '1.0.0',
+          status: 'DETECTED',
+          executionDurationMs: totalMs,
+          confidence: 0.99,
+          limitations: 'Measures pixel width, height, and container format from decoded image stream header.'
+        },
+        thumbnail_luminance: {
+          detectorName: 'ffmpeg_signalstats_yavg',
+          version: '1.0.0',
+          status: meanLuminance !== null ? 'DETECTED' : 'ANALYSIS_UNAVAILABLE',
+          executionDurationMs: totalMs,
+          confidence: meanLuminance !== null ? 0.95 : 0,
+          limitations: 'Calculates mean luminance (0-255 YAVG) via FFmpeg signalstats filter.'
+        },
+        thumbnail_ocr: {
+          detectorName: 'local_ocr_adapter',
+          version: '1.0.0',
+          status: ocrResult.status,
+          executionDurationMs: ocrResult.executionDurationMs,
+          confidence: ocrResult.confidence,
+          limitations: ocrResult.limitations,
+          failureReason: ocrResult.failureReason
+        }
+      };
 
       return {
         filename: originalFilename,
@@ -92,7 +229,11 @@ export class ThumbnailInspector {
         hasHighContrastText,
         hasSensationalElements,
         visualAnalysisStatus,
-        notes: notes.join(' ')
+        ocrAnalysisStatus: ocrResult.status,
+        extractedText: ocrResult.extractedText,
+        textDensityRatio: ocrResult.textDensityRatio,
+        notes: notes.join(' '),
+        detectors
       };
     } catch (err: any) {
       if (err instanceof ThumbnailInspectionError) throw err;

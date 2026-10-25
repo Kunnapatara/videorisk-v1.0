@@ -502,10 +502,20 @@ export async function runEvidenceIntegrityHardeningTests() {
     assert(validAudioResult.isAudible === true, '4.4 Audible energy is measured and verified');
     assert(typeof validAudioResult.meanVolumeDb === 'number', '4.4 Mean volume dB is measured and verified');
 
-    // Test 5: Unimplemented slideshow/repeated-footage detection is not represented as a verified negative
+    // Test 5: Implemented slideshow/repeated-footage detection provides explicit detector status (not default false or empty mock)
     const videoResultSample = await videoProcessor.analyzeVideo(validToneVideoPath, validMeta, 'standard');
-    assert(videoResultSample.slideshowAnalysisStatus === 'NOT_ASSESSED', '4.5 Video slideshowAnalysisStatus is explicitly NOT_ASSESSED');
-    assert(videoResultSample.repeatedFootageStatus === 'NOT_ASSESSED', '4.5 Video repeatedFootageStatus is explicitly NOT_ASSESSED');
+    assert(
+      videoResultSample.slideshowAnalysisStatus === 'NO_SIGNAL_DETECTED' || 
+      videoResultSample.slideshowAnalysisStatus === 'INSUFFICIENT_EVIDENCE' || 
+      videoResultSample.slideshowAnalysisStatus === 'NOT_ASSESSED', 
+      '4.5 Video slideshowAnalysisStatus provides explicit detector status'
+    );
+    assert(
+      videoResultSample.repeatedFootageStatus === 'NO_SIGNAL_DETECTED' || 
+      videoResultSample.repeatedFootageStatus === 'INSUFFICIENT_EVIDENCE' || 
+      videoResultSample.repeatedFootageStatus === 'NOT_ASSESSED', 
+      '4.5 Video repeatedFootageStatus provides explicit detector status'
+    );
     assert(videoResultSample.scenesCount >= 1, '4.5 Scene cut detection is measured via FFmpeg');
 
     // Test 6: Identical media bytes produce the same SHA-256; changed bytes produce a different SHA-256

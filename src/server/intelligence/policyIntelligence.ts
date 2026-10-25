@@ -14,7 +14,9 @@ import {
   UncertaintyReason,
   ThumbnailMetadata,
   ChannelContextProfile,
-  ComparisonOptions
+  ComparisonOptions,
+  DetectorReport,
+  DetectorExecutionStatus
 } from '../../types';
 import { AudioAnalysisResult } from '../pipeline/audioProcessor';
 import { VideoAnalysisResult } from '../pipeline/videoProcessor';
@@ -34,6 +36,14 @@ export interface IntelligenceInput {
   thumbnailInspectionError?: string | null;
   channelProfile?: ChannelContextProfile | null;
   isRescan?: boolean;
+  benchmarkTimings?: {
+    inspectionMs?: number;
+    audioProcessingMs?: number;
+    videoAnalysisMs?: number;
+    evidenceBuildingMs?: number;
+    policyReasoningMs?: number;
+    totalProcessingSeconds?: number;
+  };
 }
 
 const AUTHORITATIVE_DISCLAIMER = 
@@ -243,6 +253,95 @@ export class PolicyIntelligenceEngine {
       });
     }
 
+    // Within-Video Repeated Footage Detection
+    if (videoResult.repeatedFootageSegments && videoResult.repeatedFootageSegments.length > 0) {
+      for (const rep of videoResult.repeatedFootageSegments) {
+        addItem({
+          domain: 'video_audio',
+          start: rep.start,
+          end: rep.end,
+          type: 'repeated_visual_footage',
+          category: 'reused_content',
+          severity: 'warning',
+          confidence: rep.confidence,
+          confidenceLevel: rep.confidence >= 0.9 ? 'HIGH' : 'MEDIUM',
+          provenance: 'video_processor:perceptual_hash_comparator',
+          source: 'repetition_detector',
+          label: `🟡 Repeated Visual Footage (${Math.round(rep.similarity * 100)}% match)`,
+          details: `Visual segment from ${this.formatTimestamp(rep.start)}–${this.formatTimestamp(rep.end)} repeats visual frames from ${this.formatTimestamp(rep.matchWithTimestamp)} (${Math.round(rep.similarity * 100)}% perceptual similarity).`,
+          contextualInterpretation: 'Substantial within-video visual repetition may trigger platform scrutiny under repetitive/inauthentic content policies.',
+          limitations: 'Detects within-video perceptual frame repetition; does not query third-party or external copyright catalogs.',
+          recommendedAction: 'Trim or vary repeated visual segments to provide fresh editorial perspective.'
+        });
+      }
+    }
+
+    // Slideshow Presentation Pattern Heuristic
+    if (videoResult.hasSlideshowPattern) {
+      addItem({
+        domain: 'video_audio',
+        start: 0,
+        end: dur,
+        type: 'slideshow_pattern_detected',
+        category: 'inauthentic_pattern',
+        severity: 'warning',
+        confidence: 0.85,
+        confidenceLevel: 'MEDIUM',
+        provenance: 'video_processor:intra_scene_invariance_heuristic',
+        source: 'scene_stability',
+        label: '🟡 Slideshow Presentation Pattern Detected',
+        details: `Video consists predominantly of static still images separated by cut transitions (${videoResult.scenesCount} scenes, ${videoResult.averagePacingSeconds}s average interval).`,
+        contextualInterpretation: 'Slideshow presentations are permitted, but automated still-image channels without substantial original voiceover commentary face closer scrutiny under YPP.',
+        limitations: 'Slideshow detection is based on intra-scene stillness and cut pacing. Educational slide presentations with substantial original spoken commentary are compliant.',
+        recommendedAction: 'Ensure substantial original voice commentary, critique, or demonstration is included.'
+      });
+    }
+
+    // Template Repetitions
+    if (videoResult.templateRepetitions && videoResult.templateRepetitions.length > 0) {
+      for (const tmpl of videoResult.templateRepetitions) {
+        addItem({
+          domain: 'video_audio',
+          start: tmpl.start,
+          end: tmpl.end,
+          type: 'template_repetition',
+          category: 'inauthentic_pattern',
+          severity: 'info',
+          confidence: 0.84,
+          confidenceLevel: 'HIGH',
+          provenance: 'video_processor:structural_template_comparator',
+          source: 'template_detector',
+          label: 'ℹ️ Recurring Structural Visual Sequence',
+          details: `Recurring visual sequence identified between ${this.formatTimestamp(tmpl.start)}–${this.formatTimestamp(tmpl.end)}.`,
+          contextualInterpretation: 'Consistent bumpers, logos, or intro/outro cards establish channel branding.',
+          recommendedAction: 'Ensure recurring bumpers do not dominate video duration.'
+        });
+      }
+    }
+
+    // Within-Video Repeated Audio Segments
+    if (audioResult.repeatedAudioSegments && audioResult.repeatedAudioSegments.length > 0) {
+      for (const repAudio of audioResult.repeatedAudioSegments) {
+        addItem({
+          domain: 'video_audio',
+          start: repAudio.start,
+          end: repAudio.end,
+          type: 'repeated_audio_segment',
+          category: 'reused_content',
+          severity: 'info',
+          confidence: 0.88,
+          confidenceLevel: 'HIGH',
+          provenance: 'audio_processor:pcm_energy_zcr',
+          source: 'acoustic_repetition',
+          label: `ℹ️ Repeated Audio Segment (${Math.round(repAudio.similarity * 100)}% acoustic match)`,
+          details: `Audio segment from ${this.formatTimestamp(repAudio.start)}–${this.formatTimestamp(repAudio.end)} matches acoustic profile from ${this.formatTimestamp(repAudio.matchWithTimestamp)}.`,
+          contextualInterpretation: 'Background audio loops or recurring sound effects are standard in video editing.',
+          limitations: 'Measures within-video acoustic repetition; does not verify external copyright ownership.',
+          recommendedAction: 'Ensure music or sound effects are properly licensed.'
+        });
+      }
+    }
+
     // ==========================================
     // DOMAIN 2: TITLE ANALYSIS
     // ==========================================
@@ -391,23 +490,42 @@ export class PolicyIntelligenceEngine {
         });
       }
 
-      // Explicitly document that visual text, OCR, and sensational graphic cues are not assessed without visual models
-      addItem({
-        domain: 'thumbnail',
-        start: 0,
-        end: 0,
-        assetLocation: 'Thumbnail visual elements',
-        type: 'thumbnail_visual_unassessed',
-        category: 'thumbnail_integrity',
-        severity: 'info',
-        confidence: 0.95,
-        confidenceLevel: 'HIGH',
-        provenance: 'pipeline:capability_declaration',
-        source: 'thumbnail_inspector',
-        label: 'ℹ️ Thumbnail Visual Content: Not Assessed',
-        details: 'Visual text overlays, graphics, and clickbait cues are not assessed without visual AI models. Container format and dimensions were verified.',
-        recommendedAction: 'Ensure thumbnail text and imagery truthfully represent the video.'
-      });
+      if (thumbnailMetadata.extractedText && thumbnailMetadata.extractedText.length > 0) {
+        addItem({
+          domain: 'thumbnail',
+          start: 0,
+          end: 0,
+          assetLocation: 'Thumbnail text overlay',
+          type: 'thumbnail_text_detected',
+          category: 'thumbnail_integrity',
+          severity: 'info',
+          confidence: 0.88,
+          confidenceLevel: 'HIGH',
+          provenance: 'thumbnail_inspector:ocr',
+          source: 'ocr_engine',
+          label: 'ℹ️ Thumbnail Text Overlay Detected',
+          details: `Extracted thumbnail text: "${thumbnailMetadata.extractedText}". Density ratio: ${thumbnailMetadata.textDensityRatio || 0}.`,
+          recommendedAction: 'Ensure thumbnail text matches video topic and avoids sensational exaggeration.'
+        });
+      } else {
+        // Explicitly document visual content status
+        addItem({
+          domain: 'thumbnail',
+          start: 0,
+          end: 0,
+          assetLocation: 'Thumbnail visual elements',
+          type: 'thumbnail_visual_unassessed',
+          category: 'thumbnail_integrity',
+          severity: 'info',
+          confidence: 0.95,
+          confidenceLevel: 'HIGH',
+          provenance: 'pipeline:capability_declaration',
+          source: 'thumbnail_inspector',
+          label: 'ℹ️ Thumbnail Visual Content: Not Assessed',
+          details: 'Visual text overlays, graphics, and clickbait cues are not assessed without visual AI models. Container format and dimensions were verified.',
+          recommendedAction: 'Ensure thumbnail text and imagery truthfully represent the video.'
+        });
+      }
     } else if (isThumbProvided) {
       // Thumbnail was supplied, but inspection failed
       addItem({
@@ -723,10 +841,26 @@ export class PolicyIntelligenceEngine {
       }
     ];
 
-    const yppScore = overallRisk === 'HIGH_RISK' ? 68 : (overallRisk === 'NEEDS_REVIEW' ? 38 : 14);
-    const videoMonetizationScore = overallRisk === 'HIGH_RISK' ? 62 : (overallRisk === 'NEEDS_REVIEW' ? 35 : 12);
-    const advertiserScore = timeline.some(t => t.category === 'advertiser_friendly' && t.severity !== 'info') ? 42 : 10;
-    const copyrightScore = reusedContentRatio > 25 ? 40 : 12;
+    // Evidence-based category risk scoring directly from traceable findings
+    const yppSignals = timeline.filter(t => (t.category === 'reused_content' || t.category === 'inauthentic_pattern' || t.category === 'original_contribution') && t.severity !== 'info');
+    const yppScore = Math.min(100, 10 + (reusedContentRatio > 25 ? 40 : (reusedContentRatio > 0 ? 15 : 0)) + (input.videoResult.hasSlideshowPattern ? 20 : 0) + (yppSignals.length * 8));
+
+    const monSignals = timeline.filter(t => t.domain === 'video_audio' && t.severity !== 'info');
+    const videoMonetizationScore = Math.min(100, 10 + (monSignals.filter(s => s.severity === 'high').length * 35) + (monSignals.filter(s => s.severity === 'warning').length * 15));
+
+    const advSignals = timeline.filter(t => t.category === 'advertiser_friendly' && t.severity !== 'info');
+    const advertiserScore = Math.min(100, 10 + (advSignals.filter(s => s.severity === 'high').length * 40) + (advSignals.filter(s => s.severity === 'warning').length * 20));
+
+    const copyrightSignals = timeline.filter(t => t.type === 'repeated_visual_footage' || t.type === 'repeated_audio_segment');
+    const copyrightScore = Math.min(100, 10 + (reusedContentRatio > 25 ? 30 : (reusedContentRatio > 0 ? 15 : 0)) + (copyrightSignals.length * 10) + (input.channelProfile?.thirdPartyFootageUsage && input.channelProfile.thirdPartyFootageUsage !== 'none' ? 10 : 0));
+
+    const allDetectors: Record<string, DetectorReport> = {
+      ...(input.videoResult.detectors || {}),
+      ...(input.audioResult.detectors || {}),
+      ...(input.thumbnailMetadata?.detectors || {})
+    };
+
+    const timings = input.benchmarkTimings;
 
     return {
       scanId,
@@ -779,13 +913,14 @@ export class PolicyIntelligenceEngine {
       metadataScore: topIssues.some(t => t.domain === 'title' || t.domain === 'description_tags') ? 65 : 95,
       thumbnailScore: thumbnailMetadata ? (thumbnailMetadata.isStandardAspect ? 90 : 60) : undefined,
       channelProfileSnapshot: channelProfile || undefined,
+      detectors: allDetectors,
       benchmarkMetrics: {
-        totalProcessingSeconds: scanMode === 'deep' ? 6.5 : 2.8,
-        inspectionMs: 380,
-        audioProcessingMs: 950,
-        videoAnalysisMs: 1100,
-        evidenceBuildingMs: 220,
-        policyReasoningMs: 180,
+        totalProcessingSeconds: timings?.totalProcessingSeconds ?? 0,
+        inspectionMs: timings?.inspectionMs ?? 0,
+        audioProcessingMs: timings?.audioProcessingMs ?? (input.audioResult.detectors?.audio_silence_volume?.executionDurationMs ?? 0),
+        videoAnalysisMs: timings?.videoAnalysisMs ?? (input.videoResult.detectors?.video_scene_cut?.executionDurationMs ?? 0),
+        evidenceBuildingMs: timings?.evidenceBuildingMs ?? 0,
+        policyReasoningMs: timings?.policyReasoningMs ?? 0,
         framesSampled: input.videoResult.framesSampled,
         scenesDetected: input.videoResult.scenesCount,
       }

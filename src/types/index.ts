@@ -39,6 +39,26 @@ export type DomainAssessmentStatus =
   | 'ANALYSIS_UNAVAILABLE'
   | 'NOT_PROVIDED';
 
+export type DetectorExecutionStatus = 
+  | 'DETECTED'
+  | 'NO_SIGNAL_DETECTED'
+  | 'INSUFFICIENT_EVIDENCE'
+  | 'NOT_ASSESSED'
+  | 'ANALYSIS_UNAVAILABLE'
+  | 'NOT_PROVIDED';
+
+export interface DetectorReport {
+  detectorName: string;
+  version: string;
+  status: DetectorExecutionStatus;
+  executionDurationMs: number;
+  evidenceReferences?: string[];
+  confidence?: number;
+  limitations?: string;
+  failureReason?: string;
+  details?: Record<string, any>;
+}
+
 export type EvidenceStatus = 'VERIFIED' | 'OBSERVED' | 'INSUFFICIENT_EVIDENCE' | 'NOT_ASSESSED';
 
 export type ConfidenceLevel = 'HIGH' | 'MEDIUM' | 'LOW' | 'UNKNOWN';
@@ -172,7 +192,11 @@ export interface ThumbnailMetadata {
   hasHighContrastText?: boolean | null;
   hasSensationalElements?: boolean | null;
   visualAnalysisStatus?: DomainAssessmentStatus;
+  ocrAnalysisStatus?: DetectorExecutionStatus | DomainAssessmentStatus;
+  extractedText?: string | null;
+  textDensityRatio?: number | null;
   notes?: string;
+  detectors?: Record<string, DetectorReport>;
 }
 
 export interface ChannelContextProfile {
@@ -225,6 +249,7 @@ export interface RiskReport {
   metadataScore: number; // 0 - 100%
   thumbnailScore?: number; // 0 - 100%
   channelProfileSnapshot?: ChannelContextProfile;
+  detectors?: Record<string, DetectorReport>;
   benchmarkMetrics: {
     totalProcessingSeconds: number;
     inspectionMs: number;

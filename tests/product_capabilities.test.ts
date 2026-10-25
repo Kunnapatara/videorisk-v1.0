@@ -3,8 +3,8 @@ import { promisify } from 'util';
 import path from 'path';
 import fs from 'fs';
 import { mediaInspector } from '../src/server/pipeline/mediaInspector';
-import { thumbnailInspector, ThumbnailInspectionError } from '../src/server/pipeline/thumbnailInspector';
-import { audioProcessor, AudioProcessingError } from '../src/server/pipeline/audioProcessor';
+import { thumbnailInspector, ThumbnailInspectionError, ThumbnailOcrAdapter } from '../src/server/pipeline/thumbnailInspector';
+import { audioProcessor, AudioProcessingError, SpeechTranscriptionAdapter } from '../src/server/pipeline/audioProcessor';
 import { videoProcessor, VideoProcessingError } from '../src/server/pipeline/videoProcessor';
 import { policyIntelligenceEngine } from '../src/server/intelligence/policyIntelligence';
 import { contextAnalyzer } from '../src/server/intelligence/contextAnalyzer';
@@ -436,6 +436,226 @@ export async function runProductCapabilitiesTests() {
     assert(silentItem?.severity === 'info', '6. Absence of audio is not marked as high severity policy violation');
     assert(reportSilent.domainReports.video_audio.limitations.includes('does not verify speech content'), '6. Limitations explicitly distinguish measurable signals from unverified conclusions');
     assert(reportSilent.domainReports.video_audio.limitations.includes('Content ID'), '6. Limitations explicitly declare VideoRisk does not query private Content ID databases');
+
+    // ---------------------------------------------------------
+    // 8. ADVANCED MEDIA INTELLIGENCE CAPABILITIES VERIFICATION
+    // ---------------------------------------------------------
+    console.log('\n[8. Advanced Media Intelligence Capabilities]');
+
+    // 8.1 Within-video repeated footage detection
+    const repeatedVideoPath = path.join(testDir, 'synth_repeated_footage.mp4');
+    if (!fs.existsSync(repeatedVideoPath)) {
+      // 6 seconds: 0-2s red (Scene 1), 2-4s blue (Scene 2), 4-6s red (Scene 1 repeated)
+      await execFileAsync('ffmpeg', [
+        '-y',
+        '-f', 'lavfi', '-i', 'color=c=red:s=320x240:d=2[v1];color=c=blue:s=320x240:d=2[v2];color=c=red:s=320x240:d=2[v3];[v1][v2][v3]concat=n=3:v=1',
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+        repeatedVideoPath
+      ], { timeout: 25000 });
+    }
+
+    const metaRepeated = await mediaInspector.inspect(repeatedVideoPath, 'synth_repeated_footage.mp4');
+    const videoResRepeated = await videoProcessor.analyzeVideo(repeatedVideoPath, metaRepeated, 'standard');
+
+    assert(videoResRepeated.repeatedFootageSegments.length >= 1, '8.1 Within-video repeated footage detected from perceptual frame comparison');
+    assert(videoResRepeated.repeatedFootageStatus === 'DETECTED', '8.1 Repeated footage status is explicitly DETECTED');
+    const firstRep = videoResRepeated.repeatedFootageSegments[0];
+    assert(firstRep.similarity >= 0.95, '8.1 Exact repeated visual segment has high similarity (>= 95%)');
+    assert(firstRep.matchWithTimestamp <= 2.0 && firstRep.start >= 3.0, '8.1 Repeated segment maps second occurrence to first scene timestamp');
+
+    const timelineRepeated = policyIntelligenceEngine.generateEvidenceTimeline({
+      scanId: 'scan_rep_check',
+      metadata: metaRepeated,
+      scanMode: 'standard',
+      audioResult: audioResSynth,
+      videoResult: videoResRepeated,
+      videoTitle: 'Repeated Footage Demo',
+      channelProfile: null
+    });
+    assert(
+      timelineRepeated.some(t => t.type === 'repeated_visual_footage' && t.category === 'reused_content'),
+      '8.1 Timeline includes verified repeated_visual_footage evidence item'
+    );
+
+    const reportRepeated = policyIntelligenceEngine.buildReport({
+      scanId: 'scan_rep_check',
+      metadata: metaRepeated,
+      scanMode: 'standard',
+      audioResult: audioResSynth,
+      videoResult: videoResRepeated,
+      videoTitle: 'Repeated Footage Demo',
+      channelProfile: null
+    }, timelineRepeated);
+    assert(reportRepeated.reusedContentRatio > 0, '8.1 Report reusedContentRatio is measured from actual repeated footage duration');
+    await videoProcessor.cleanupFrames(videoResRepeated.tempFramesDir);
+
+    // 8.2 Distinct scenes without repetition (NO_SIGNAL_DETECTED)
+    const distinctVideoPath = path.join(testDir, 'synth_distinct_scenes.mp4');
+    if (!fs.existsSync(distinctVideoPath)) {
+      // 6 seconds: 0-2s red, 2-4s green, 4-6s blue (3 distinct scenes, zero repeats)
+      await execFileAsync('ffmpeg', [
+        '-y',
+        '-f', 'lavfi', '-i', 'color=c=red:s=320x240:d=2[v1];color=c=green:s=320x240:d=2[v2];color=c=blue:s=320x240:d=2[v3];[v1][v2][v3]concat=n=3:v=1',
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+        distinctVideoPath
+      ], { timeout: 25000 });
+    }
+
+    const metaDistinct = await mediaInspector.inspect(distinctVideoPath, 'synth_distinct_scenes.mp4');
+    const videoResDistinct = await videoProcessor.analyzeVideo(distinctVideoPath, metaDistinct, 'standard');
+    assert(videoResDistinct.repeatedFootageSegments.length === 0, '8.2 Distinct scenes video detects 0 repeated segments');
+    assert(videoResDistinct.repeatedFootageStatus === 'NO_SIGNAL_DETECTED', '8.2 Distinct scenes video sets repeatedFootageStatus to NO_SIGNAL_DETECTED');
+    await videoProcessor.cleanupFrames(videoResDistinct.tempFramesDir);
+
+    // 8.3 Slideshow Presentation Pattern Heuristic
+    const slideshowVideoPath = path.join(testDir, 'synth_slideshow.mp4');
+    if (!fs.existsSync(slideshowVideoPath)) {
+      // 10 seconds: 4 distinct slide colors, each static for 2.5s with cuts
+      await execFileAsync('ffmpeg', [
+        '-y',
+        '-f', 'lavfi', '-i', 'color=c=red:s=320x240:d=2.5[s1];color=c=green:s=320x240:d=2.5[s2];color=c=blue:s=320x240:d=2.5[s3];color=c=yellow:s=320x240:d=2.5[s4];[s1][s2][s3][s4]concat=n=4:v=1',
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+        slideshowVideoPath
+      ], { timeout: 25000 });
+    }
+
+    const metaSlideshow = await mediaInspector.inspect(slideshowVideoPath, 'synth_slideshow.mp4');
+    const videoResSlideshow = await videoProcessor.analyzeVideo(slideshowVideoPath, metaSlideshow, 'deep');
+    assert(videoResSlideshow.scenesCount >= 3, '8.3 Slideshow video detects cut transitions between slides');
+    assert(videoResSlideshow.hasSlideshowPattern === true, '8.3 Slideshow video triggers hasSlideshowPattern = true based on static intra-scene frames');
+    assert(videoResSlideshow.slideshowAnalysisStatus === 'DETECTED', '8.3 Slideshow status is explicitly DETECTED');
+
+    const timelineSlideshow = policyIntelligenceEngine.generateEvidenceTimeline({
+      scanId: 'scan_slide_check',
+      metadata: metaSlideshow,
+      scanMode: 'deep',
+      audioResult: audioResSynth,
+      videoResult: videoResSlideshow,
+      videoTitle: 'Photo Slideshow Presentation',
+      channelProfile: null
+    });
+    assert(
+      timelineSlideshow.some(t => t.type === 'slideshow_pattern_detected'),
+      '8.3 Timeline records slideshow_pattern_detected evidence item'
+    );
+    await videoProcessor.cleanupFrames(videoResSlideshow.tempFramesDir);
+
+    // 8.4 Within-video repeated audio detection
+    const repeatedAudioVideoPath = path.join(testDir, 'synth_repeated_audio.mp4');
+    if (!fs.existsSync(repeatedAudioVideoPath)) {
+      // 6 seconds: 0-2s 1000Hz, 2-4s 440Hz, 4-6s 1000Hz repeated
+      await execFileAsync('ffmpeg', [
+        '-y',
+        '-f', 'lavfi', '-i', 'color=c=black:s=320x240:d=6',
+        '-f', 'lavfi', '-i', 'sine=frequency=1000:duration=2[a1];sine=frequency=440:duration=2[a2];sine=frequency=1000:duration=2[a3];[a1][a2][a3]concat=n=3:v=0:a=1',
+        '-c:v', 'libx264', '-c:a', 'aac',
+        repeatedAudioVideoPath
+      ], { timeout: 25000 });
+    }
+
+    const metaRepAudio = await mediaInspector.inspect(repeatedAudioVideoPath, 'synth_repeated_audio.mp4');
+    const audioResRep = await audioProcessor.analyzeAudio(repeatedAudioVideoPath, metaRepAudio);
+    assert(Boolean(audioResRep.repeatedAudioSegments && audioResRep.repeatedAudioSegments.length >= 1), '8.4 Within-video repeated audio segments detected');
+    assert(audioResRep.repeatedAudioStatus === 'DETECTED', '8.4 Repeated audio status is explicitly DETECTED');
+
+    // 8.5 Speech Transcription Adapter
+    const sttAdapter = new SpeechTranscriptionAdapter();
+    const unconfiguredStt = await sttAdapter.transcribe(validVideoPath, 2);
+    assert(unconfiguredStt.status === 'NOT_ASSESSED', '8.5 Unconfigured STT returns NOT_ASSESSED');
+    assert(unconfiguredStt.limitations.includes('WHISPER_PATH'), '8.5 Unconfigured STT explicitly documents missing environment setup');
+
+    process.env.WHISPER_PATH = '/path/to/nonexistent/whisper_binary';
+    const missingStt = await sttAdapter.transcribe(validVideoPath, 2);
+    assert(missingStt.status === 'ANALYSIS_UNAVAILABLE', '8.5 Invalid STT executable path returns ANALYSIS_UNAVAILABLE');
+    assert(Boolean(missingStt.failureReason), '8.5 Missing STT executable documents failure reason');
+    delete process.env.WHISPER_PATH;
+
+    // 8.6 Thumbnail OCR Adapter
+    const ocrAdapter = new ThumbnailOcrAdapter();
+    const unconfiguredOcr = await ocrAdapter.extractText(validThumbPath, 1280, 720);
+    assert(unconfiguredOcr.status === 'NOT_ASSESSED', '8.6 Unconfigured OCR returns NOT_ASSESSED');
+    assert(unconfiguredOcr.limitations.includes('TESSERACT_PATH'), '8.6 Unconfigured OCR explicitly documents missing engine');
+
+    process.env.TESSERACT_PATH = '/path/to/nonexistent/tesseract_binary';
+    const missingOcr = await ocrAdapter.extractText(validThumbPath, 1280, 720);
+    assert(missingOcr.status === 'ANALYSIS_UNAVAILABLE', '8.6 Invalid OCR path returns ANALYSIS_UNAVAILABLE');
+    delete process.env.TESSERACT_PATH;
+
+    // 8.7 Re-scan Comparison with Known Video Changes
+    // Scenario A: Issue RESOLVED (Original has repeated footage, revised replaces it with distinct scenes)
+    const timelineDistinct = policyIntelligenceEngine.generateEvidenceTimeline({
+      scanId: 'scan_revised_clean',
+      metadata: metaDistinct,
+      scanMode: 'standard',
+      audioResult: audioResSynth,
+      videoResult: videoResDistinct,
+      videoTitle: 'Revised Clean Video',
+      channelProfile: null
+    });
+    const reportDistinct = policyIntelligenceEngine.buildReport({
+      scanId: 'scan_revised_clean',
+      metadata: metaDistinct,
+      scanMode: 'standard',
+      audioResult: audioResSynth,
+      videoResult: videoResDistinct,
+      videoTitle: 'Revised Clean Video',
+      channelProfile: null
+    }, timelineDistinct);
+
+    const compResolved = policyIntelligenceEngine.generateComparison(reportRepeated, reportDistinct);
+    assert(compResolved.resolvedIssues.length >= 1, '8.7 Re-scan comparison identifies resolved issues with evidence');
+    assert(
+      compResolved.resolvedIssues.some(i => i.includes('Repeated Visual Footage')),
+      '8.7 Repeated footage issue is marked RESOLVED when revised video contains distinct scenes'
+    );
+    assert(compResolved.revisedRatios.reusedContent < compResolved.originalRatios.reusedContent, '8.7 Reused content ratio decreases in revised re-scan');
+
+    // Scenario B: Issue STILL PRESENT (Revised video also contains repeated footage)
+    const compPersisting = policyIntelligenceEngine.generateComparison(reportRepeated, reportRepeated);
+    assert(
+      compPersisting.remainingIssues.some(i => i.includes('Repeated Visual Footage')),
+      '8.7 Repeated footage issue is marked as remaining/persisting when still present in revised video'
+    );
+
+    // Scenario C: NEW issue detected in revised video
+    const timelineWithNewIssue = policyIntelligenceEngine.generateEvidenceTimeline({
+      scanId: 'scan_with_new_issue',
+      metadata: metaDistinct,
+      scanMode: 'standard',
+      audioResult: audioResSynth,
+      videoResult: videoResDistinct,
+      videoTitle: '100% CURE GUARANTEED - INSANE SECRETS',
+      videoDescription: 'Promo code BUYNOW without disclosure',
+      channelProfile: null
+    });
+    const reportWithNewIssue = policyIntelligenceEngine.buildReport({
+      scanId: 'scan_with_new_issue',
+      metadata: metaDistinct,
+      scanMode: 'standard',
+      audioResult: audioResSynth,
+      videoResult: videoResDistinct,
+      videoTitle: '100% CURE GUARANTEED - INSANE SECRETS',
+      videoDescription: 'Promo code BUYNOW without disclosure',
+      channelProfile: null
+    }, timelineWithNewIssue);
+
+    const compNewIssue = policyIntelligenceEngine.generateComparison(reportDistinct, reportWithNewIssue);
+    assert(Boolean(compNewIssue.newIssues && compNewIssue.newIssues.length >= 1), '8.7 Newly introduced policy findings are marked as NEW issues');
+
+    // Scenario D: NOT VERIFIED when detector analysis was unavailable or skipped
+    const compUnverified = policyIntelligenceEngine.generateComparison(reportRepeated, reportDistinct, {
+      skippedDomains: ['video_audio']
+    });
+    assert(
+      Boolean(compUnverified.notVerifiedIssues && compUnverified.notVerifiedIssues.length >= 1),
+      '8.7 Issue resolution is marked NOT VERIFIED when the detector domain was skipped'
+    );
+
+    // 8.8 Evidence-Based Risk Scoring & Real Benchmark Metrics
+    assert(typeof reportRepeated.riskCategories.yppMonetization.score === 'number', '8.8 YPP category score is a numeric value');
+    assert(typeof reportRepeated.riskCategories.copyrightSignals.score === 'number', '8.8 Copyright signals score is a numeric value');
+    assert(Boolean(reportRepeated.detectors && Object.keys(reportRepeated.detectors).length >= 2), '8.8 Report contains structured detector execution metadata');
+    assert(typeof reportRepeated.benchmarkMetrics.totalProcessingSeconds === 'number', '8.8 Report benchmarkMetrics totalProcessingSeconds is measured');
 
     console.log(`\n======================================================`);
     console.log(`TEST SUITE 2 COMPLETE: ${passed}/${total} assertions passed!`);

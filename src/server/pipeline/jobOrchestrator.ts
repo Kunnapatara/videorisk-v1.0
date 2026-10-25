@@ -405,18 +405,15 @@ export class JobOrchestrator {
         thumbnailInspectionError,
         channelProfile,
         isRescan: scan.isRescan,
+        benchmarkTimings: {
+          totalProcessingSeconds: parseFloat(((Date.now() - startTime) / 1000).toFixed(2)),
+          inspectionMs,
+          audioProcessingMs: audioMs,
+          videoAnalysisMs: videoMs,
+          evidenceBuildingMs: evidenceMs,
+          policyReasoningMs: Date.now() - policyStart,
+        }
       }, timeline);
-
-      report.benchmarkMetrics = {
-        totalProcessingSeconds: parseFloat(((Date.now() - startTime) / 1000).toFixed(2)),
-        inspectionMs,
-        audioProcessingMs: audioMs,
-        videoAnalysisMs: videoMs,
-        evidenceBuildingMs: evidenceMs,
-        policyReasoningMs: Date.now() - policyStart,
-        framesSampled: videoResult.framesSampled,
-        scenesDetected: videoResult.scenesCount,
-      };
 
       checkLease();
       await this.storageRepo.scans.saveReport(scanId, report, leaseToken);
