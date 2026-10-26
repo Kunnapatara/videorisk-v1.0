@@ -21,7 +21,7 @@ export interface AudioAnalysisResult {
   hasVoiceover: boolean;
   voiceoverRatio: number; // 0 to 1
   silenceRatio: number;
-  hasMusicDetected: boolean;
+  hasMusicDetected: boolean | null; // null when unassessed, unavailable, or insufficient evidence
   meanVolumeDb?: number;
   isAudible?: boolean;
   advertiserSpeechFlags: Array<{ word: string; timestamp: number; category: string }>;
@@ -202,8 +202,194 @@ export class SpeechTranscriptionAdapter {
   }
 }
 
+export interface LocalMusicClassificationResult {
+  status: DetectorExecutionStatus;
+  hasMusic: boolean | null;
+  confidence?: number;
+  segments?: Array<{ start: number; end: number; confidence?: number }>;
+  failureReason?: string;
+  limitations: string;
+  executionDurationMs: number;
+}
+
+/**
+ * Adapter for optional local Music Classification.
+ * Checks dependency availability (MUSIC_CLASSIFIER_PATH).
+ * Never assumes unassessed audio is music-free; distinguishes NOT_ASSESSED,
+ * ANALYSIS_UNAVAILABLE, INSUFFICIENT_EVIDENCE, DETECTED, and NO_SIGNAL_DETECTED.
+ */
+export class MusicClassificationAdapter {
+  public async classify(videoPath: string, durationSeconds: number): Promise<LocalMusicClassificationResult> {
+    const startTime = Date.now();
+    const classifierPath = process.env.MUSIC_CLASSIFIER_PATH;
+
+    if (!classifierPath) {
+      return {
+        status: 'NOT_ASSESSED',
+        hasMusic: null,
+        limitations: 'Music detection and classification model (MUSIC_CLASSIFIER_PATH) not configured in local environment; music presence is unverified.',
+        executionDurationMs: 0
+      };
+    }
+
+    if (!fs.existsSync(classifierPath)) {
+      return {
+        status: 'ANALYSIS_UNAVAILABLE',
+        hasMusic: null,
+        failureReason: `Configured music classifier executable not found at ${classifierPath}`,
+        limitations: 'Music classifier path was configured but executable is missing on disk.',
+        executionDurationMs: Date.now() - startTime
+      };
+    }
+
+    try {
+      const { stdout } = await execFileAsync(classifierPath, [videoPath, '--format', 'json'], { timeout: 60000 });
+      const elapsed = Date.now() - startTime;
+      const rawOutput = (stdout || '').trim();
+
+      if (!rawOutput) {
+        return {
+          status: 'NO_SIGNAL_DETECTED',
+          hasMusic: false,
+          segments: [],
+          limitations: 'Music classifier completed with empty output; no musical signals detected.',
+          executionDurationMs: elapsed
+        };
+      }
+
+      let parsed: any;
+      try {
+        parsed = JSON.parse(rawOutput);
+      } catch {
+        return {
+          status: 'ANALYSIS_UNAVAILABLE',
+          hasMusic: null,
+          failureReason: 'Malformed JSON output from music classifier executable',
+          limitations: 'Music classifier returned non-JSON output.',
+          executionDurationMs: elapsed
+        };
+      }
+
+      const hasMusic = Boolean(parsed.hasMusic);
+      const confidence = typeof parsed.confidence === 'number' && Number.isFinite(parsed.confidence)
+        ? Math.max(0, Math.min(1, parsed.confidence))
+        : 0.85;
+
+      const segments = Array.isArray(parsed.segments)
+        ? parsed.segments
+            .filter((s: any) => Number.isFinite(s.start) && Number.isFinite(s.end) && s.start >= 0 && s.end > s.start && s.start < durationSeconds)
+            .map((s: any) => ({
+              start: parseFloat(s.start.toFixed(2)),
+              end: Math.min(durationSeconds, parseFloat(s.end.toFixed(2))),
+              confidence: s.confidence
+            }))
+        : [];
+
+      return {
+        status: hasMusic ? 'DETECTED' : 'NO_SIGNAL_DETECTED',
+        hasMusic,
+        confidence,
+        segments,
+        limitations: 'Classified via local music classifier model. Does not query external copyright registries or YouTube Content ID.',
+        executionDurationMs: elapsed
+      };
+    } catch (err: any) {
+      return {
+        status: 'ANALYSIS_UNAVAILABLE',
+        hasMusic: null,
+        failureReason: `Local music classifier process execution failed: ${err?.message || err}`,
+        limitations: 'Music classification failed during execution.',
+        executionDurationMs: Date.now() - startTime
+      };
+    }
+  }
+}
+
+/**
+ * Radix-2 Cooley-Tukey In-Place Fast Fourier Transform for spectral audio analysis.
+ */
+function computeFFT(real: Float64Array, imag: Float64Array): void {
+  const n = real.length;
+  for (let i = 0, j = 0; i < n; i++) {
+    if (j > i) {
+      const tr = real[i]; real[i] = real[j]; real[j] = tr;
+      const ti = imag[i]; imag[i] = imag[j]; imag[j] = ti;
+    }
+    let m = n >> 1;
+    while (m >= 1 && j >= m) { j -= m; m >>= 1; }
+    j += m;
+  }
+  for (let s = 2; s <= n; s <<= 1) {
+    const half = s >> 1;
+    const wStep = -2 * Math.PI / s;
+    for (let i = 0; i < n; i += s) {
+      for (let j = 0; j < half; j++) {
+        const theta = j * wStep;
+        const c = Math.cos(theta), sn = Math.sin(theta);
+        const vR = real[i + j + half] * c - imag[i + j + half] * sn;
+        const vI = real[i + j + half] * sn + imag[i + j + half] * c;
+        real[i + j + half] = real[i + j] - vR;
+        imag[i + j + half] = imag[i + j] - vI;
+        real[i + j] += vR;
+        imag[i + j] += vI;
+      }
+    }
+  }
+}
+
+/**
+ * 16 logarithmically/perceptually-spaced frequency subbands from 0 to 4000 Hz for 8kHz audio.
+ */
+const SPECTRAL_BANDS_8KHZ: Array<[number, number]> = [
+  [0, 200], [200, 400], [400, 600], [600, 800],
+  [800, 1000], [1000, 1250], [1250, 1500], [1500, 1750],
+  [1750, 2000], [2000, 2300], [2300, 2600], [2600, 2900],
+  [2900, 3200], [3200, 3500], [3500, 3800], [3800, 4000]
+];
+
+/**
+ * Computes a normalized 16-band spectral energy profile for a window of 8000Hz PCM samples.
+ */
+function extractSubbandSpectralProfile(pcmBuffer: Buffer, startByte: number, lengthBytes: number): Float64Array {
+  const profile = new Float64Array(SPECTRAL_BANDS_8KHZ.length);
+  const totalSamples = Math.floor(lengthBytes / 2);
+  const winSize = 512;
+  const numWins = Math.floor(totalSamples / winSize);
+  if (numWins <= 0) return profile;
+
+  const binWidth = 8000 / winSize;
+  const real = new Float64Array(winSize);
+  const imag = new Float64Array(winSize);
+
+  for (let w = 0; w < numWins; w++) {
+    const winOffset = startByte + w * winSize * 2;
+    for (let i = 0; i < winSize; i++) {
+      // Periodic Hann window
+      const h = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (winSize - 1)));
+      real[i] = pcmBuffer.readInt16LE(winOffset + i * 2) * h;
+      imag[i] = 0;
+    }
+    computeFFT(real, imag);
+    for (let b = 0; b < SPECTRAL_BANDS_8KHZ.length; b++) {
+      const [fLow, fHigh] = SPECTRAL_BANDS_8KHZ[b];
+      const startBin = Math.max(1, Math.floor(fLow / binWidth));
+      const endBin = Math.min(winSize / 2 - 1, Math.ceil(fHigh / binWidth));
+      for (let k = startBin; k <= endBin; k++) {
+        profile[b] += (real[k] * real[k] + imag[k] * imag[k]);
+      }
+    }
+  }
+
+  let sumSq = 0;
+  for (let b = 0; b < profile.length; b++) sumSq += profile[b] * profile[b];
+  const norm = Math.sqrt(sumSq) || 1;
+  for (let b = 0; b < profile.length; b++) profile[b] /= norm;
+  return profile;
+}
+
 export class AudioProcessor {
   private transcriptionAdapter = new SpeechTranscriptionAdapter();
+  private musicAdapter = new MusicClassificationAdapter();
 
   /**
    * Processes audio stream using:
@@ -231,7 +417,7 @@ export class AudioProcessor {
         hasVoiceover: false,
         voiceoverRatio: 0,
         silenceRatio: 1,
-        hasMusicDetected: false,
+        hasMusicDetected: null,
         meanVolumeDb: undefined,
         isAudible: false,
         advertiserSpeechFlags: [],
@@ -257,9 +443,16 @@ export class AudioProcessor {
             executionDurationMs: 0,
             limitations: 'No audio stream detected in container.'
           },
-          audio_repeated_segments: {
-            detectorName: 'within_video_audio_fingerprint',
+          audio_music_detection: {
+            detectorName: 'music_classification_analyzer',
             version: '1.0.0',
+            status: 'NOT_PROVIDED',
+            executionDurationMs: 0,
+            limitations: 'No audio stream detected in container.'
+          },
+          audio_repeated_segments: {
+            detectorName: 'subband_spectral_audio_fingerprint',
+            version: '1.1.0',
             status: 'NOT_PROVIDED',
             executionDurationMs: 0,
             limitations: 'No audio stream detected in container.'
@@ -353,11 +546,12 @@ export class AudioProcessor {
       const bytesPerSec = 16000;
       const totalAudioSeconds = Math.floor(pcmBuffer.length / bytesPerSec);
       
-      // Calculate 1-second acoustic chunk signatures: RMS energy and Zero-Crossing Rate
+      // Calculate 1-second acoustic chunk signatures: RMS energy, Zero-Crossing Rate, and 16-band spectral profile
       interface AudioChunkSignature {
         sec: number;
         rms: number;
         zcr: number;
+        spectralProfile: Float64Array;
       }
 
       const chunkSignatures: AudioChunkSignature[] = [];
@@ -377,7 +571,8 @@ export class AudioProcessor {
         }
 
         const rms = Math.sqrt(sumSq / 8000);
-        chunkSignatures.push({ sec, rms, zcr });
+        const spectralProfile = extractSubbandSpectralProfile(pcmBuffer, startOffset, bytesPerSec);
+        chunkSignatures.push({ sec, rms, zcr, spectralProfile });
       }
 
       // 1. Acoustic Speech Modulation Detection
@@ -404,9 +599,9 @@ export class AudioProcessor {
       }
 
       // 2. Within-Video Repeated Audio Detection
-      // Identifies non-adjacent audio segments with matching acoustic signatures
+      // Identifies non-adjacent audio segments with matching acoustic signatures and 16-band spectral profiles
       const repeatedAudioSegments: AudioAnalysisResult['repeatedAudioSegments'] = [];
-      const minAudioGap = 3; // at least 3 seconds separation
+      const minAudioGap = 2; // at least 2 seconds separation
 
       for (let i = 0; i < chunkSignatures.length; i++) {
         const c1 = chunkSignatures[i];
@@ -416,30 +611,47 @@ export class AudioProcessor {
           const c2 = chunkSignatures[j];
           if (c2.rms < 150) continue;
 
-          // Acoustic correlation between 1-second chunks:
-          // Check matching RMS energy within 8% and ZCR within 10%
+          // Acoustic & spectral correlation between 1-second chunks:
+          let spectralSim = 0;
+          for (let b = 0; b < 16; b++) {
+            spectralSim += c1.spectralProfile[b] * c2.spectralProfile[b];
+          }
+
           const rmsDelta = Math.abs(c1.rms - c2.rms) / Math.max(c1.rms, c2.rms);
           const zcrDelta = Math.abs(c1.zcr - c2.zcr) / Math.max(1, Math.max(c1.zcr, c2.zcr));
 
-          if (rmsDelta <= 0.08 && zcrDelta <= 0.10) {
-            const similarity = parseFloat(Math.max(0, 1 - ((rmsDelta + zcrDelta) / 2)).toFixed(3));
-            repeatedAudioSegments.push({
-              start: c1.sec,
-              end: c1.sec + 1,
-              matchWithTimestamp: c2.sec,
-              similarity
-            });
-            break; // Record one match per source segment to avoid explosion
+          // Robust match criteria:
+          // 1. Spectral subband correlation >= 0.88
+          // 2. RMS energy amplitude delta <= 25%
+          // 3. Zero-crossing rate delta <= 20%
+          if (spectralSim >= 0.88 && rmsDelta <= 0.25 && zcrDelta <= 0.20) {
+            const compositeSimilarity = parseFloat((0.60 * spectralSim + 0.25 * Math.max(0, 1 - rmsDelta) + 0.15 * Math.max(0, 1 - zcrDelta)).toFixed(3));
+            const startSec = parseFloat(c1.sec.toFixed(2));
+            const endSec = parseFloat(Math.min(c1.sec + 1, dur).toFixed(2));
+            const matchTimestamp = parseFloat(c2.sec.toFixed(2));
+
+            if (startSec < endSec && endSec <= dur && matchTimestamp <= dur) {
+              repeatedAudioSegments.push({
+                start: startSec,
+                end: endSec,
+                matchWithTimestamp: matchTimestamp,
+                similarity: compositeSimilarity
+              });
+              break; // Record one match per source segment to avoid combinatorial explosion
+            }
           }
         }
       }
 
-      let repeatedAudioStatus: DetectorExecutionStatus = totalAudioSeconds < 3 
+      let repeatedAudioStatus: DetectorExecutionStatus = totalAudioSeconds < 2 
         ? 'INSUFFICIENT_EVIDENCE'
         : (repeatedAudioSegments.length > 0 ? 'DETECTED' : 'NO_SIGNAL_DETECTED');
 
       // 3. Optional Local Speech Transcription
       const sttResult = await this.transcriptionAdapter.transcribe(videoPath, dur);
+
+      // 4. Optional Local Music Classification
+      const musicResult = await this.musicAdapter.classify(videoPath, dur);
 
       // Active intervals contain acoustic energy (music, speech, sfx, or ambient)
       if (isAudible) {
@@ -500,17 +712,19 @@ export class AudioProcessor {
         audio_music_detection: {
           detectorName: 'music_classification_analyzer',
           version: '1.0.0',
-          status: 'NOT_ASSESSED',
-          executionDurationMs: 0,
-          limitations: 'Music detection and classification model not configured or evaluated in local environment; music presence is unverified.'
+          status: musicResult.status,
+          executionDurationMs: musicResult.executionDurationMs,
+          confidence: musicResult.confidence,
+          limitations: musicResult.limitations,
+          failureReason: musicResult.failureReason
         },
         audio_repeated_segments: {
-          detectorName: 'within_video_audio_fingerprint',
-          version: '1.0.0',
+          detectorName: 'subband_spectral_audio_fingerprint',
+          version: '1.1.0',
           status: repeatedAudioStatus,
           executionDurationMs: totalMs,
           confidence: repeatedAudioSegments.length > 0 ? 0.90 : 0.92,
-          limitations: 'Detects within-video acoustic repetition across non-adjacent segments; does not match external copyrighted audio catalogs.'
+          limitations: 'Detects within-video acoustic repetition across non-adjacent segments using 16-band spectral energy correlation; does not match external copyrighted audio catalogs or YouTube Content ID.'
         }
       };
 
@@ -518,7 +732,7 @@ export class AudioProcessor {
         hasVoiceover,
         voiceoverRatio,
         silenceRatio: parseFloat(silenceRatio.toFixed(2)),
-        hasMusicDetected: false,
+        hasMusicDetected: musicResult.hasMusic,
         meanVolumeDb: meanVol,
         isAudible,
         advertiserSpeechFlags: [],
@@ -528,7 +742,7 @@ export class AudioProcessor {
           ? `Audio stream inspected. Acoustic energy present across ${Math.round(activeRatio * 100)}% of the timeline (mean volume ${meanVol} dB). ${sttResult.status === 'DETECTED' ? 'Speech transcription completed via local STT.' : 'Speech and voice narration are unverified without transcript analysis.'}`
           : 'Low volume or quiet audio track.',
         speechAnalysisStatus: sttResult.status,
-        musicAnalysisStatus: 'NOT_ASSESSED',
+        musicAnalysisStatus: musicResult.status,
         speechDetectionStatus,
         transcriptionStatus: sttResult.status,
         repeatedAudioStatus,

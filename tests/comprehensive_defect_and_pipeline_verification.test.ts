@@ -206,7 +206,7 @@ export async function runComprehensiveDefectAndPipelineTests() {
     assert(silenceAudioResult.silenceRatio >= 0.90, '3.1 Silence ratio is >= 90% for digital silence');
     assert(silenceAudioResult.isAudible === false, '3.1 isAudible is false for digital silence');
     assert(silenceAudioResult.musicAnalysisStatus === 'NOT_ASSESSED', '3.1 musicAnalysisStatus is explicitly NOT_ASSESSED');
-    assert(silenceAudioResult.hasMusicDetected === false, '3.1 hasMusicDetected is false');
+    assert(silenceAudioResult.hasMusicDetected === null, '3.1 hasMusicDetected is null when musicAnalysisStatus is NOT_ASSESSED');
     assert(silenceAudioResult.detectors?.audio_music_detection?.status === 'NOT_ASSESSED', '3.1 Music detector explicitly records NOT_ASSESSED');
 
     // 3.2 Audible acoustic energy with variable modulation
@@ -225,7 +225,42 @@ export async function runComprehensiveDefectAndPipelineTests() {
     assert(modulatedAudioResult.isAudible === true, '3.2 Audible sound detected');
     assert(modulatedAudioResult.silenceRatio <= 0.20, '3.2 Low silence ratio on continuous tone sequence');
     assert(modulatedAudioResult.musicAnalysisStatus === 'NOT_ASSESSED', '3.2 musicAnalysisStatus remains NOT_ASSESSED without music classifier model');
+    assert(modulatedAudioResult.hasMusicDetected === null, '3.2 hasMusicDetected is null when music classifier is not run');
     assert(modulatedAudioResult.detectors?.audio_speech_activity?.detectorName === 'acoustic_energy_modulation', '3.2 Acoustic detector accurately named');
+
+    // 3.3 Music Classification Adapter Semantics (Unconfigured, Missing, Execution)
+    const { MusicClassificationAdapter } = await import('../src/server/pipeline/audioProcessor');
+    const musicAdapter = new MusicClassificationAdapter();
+    const unconfiguredMusic = await musicAdapter.classify(silenceVideoPath, 4);
+    assert(unconfiguredMusic.status === 'NOT_ASSESSED', '3.3 Unconfigured music classifier returns NOT_ASSESSED');
+    assert(unconfiguredMusic.hasMusic === null, '3.3 Unconfigured music classifier returns hasMusic: null');
+
+    process.env.MUSIC_CLASSIFIER_PATH = '/path/to/nonexistent/music_classifier_binary';
+    const missingMusic = await musicAdapter.classify(silenceVideoPath, 4);
+    assert(missingMusic.status === 'ANALYSIS_UNAVAILABLE', '3.3 Missing classifier executable returns ANALYSIS_UNAVAILABLE');
+    assert(missingMusic.hasMusic === null, '3.3 Missing classifier returns hasMusic: null');
+    assert(Boolean(missingMusic.failureReason), '3.3 Missing classifier records failureReason');
+
+    // Mock executable returning detected music JSON
+    const mockMusicScript = path.resolve(testDir, 'mock_music_classifier.sh');
+    fs.writeFileSync(mockMusicScript, '#!/bin/sh\necho \'{"hasMusic": true, "confidence": 0.92, "segments": [{"start": 0, "end": 4, "confidence": 0.92}]}\'\n');
+    fs.chmodSync(mockMusicScript, 0o755);
+    process.env.MUSIC_CLASSIFIER_PATH = mockMusicScript;
+
+    const detectedMusic = await musicAdapter.classify(silenceVideoPath, 4);
+    assert(detectedMusic.status === 'DETECTED', '3.3 Executed classifier returns DETECTED');
+    assert(detectedMusic.hasMusic === true, '3.3 Executed classifier returns hasMusic: true');
+    assert(detectedMusic.confidence === 0.92, '3.3 Confidence recorded from executed classifier');
+    delete process.env.MUSIC_CLASSIFIER_PATH;
+
+    // 3.4 No-Audio-Stream Case Distinguishes Stream Absence from Assessed Negative
+    const noAudioResult = await audioProcessor.analyzeAudio(silenceVideoPath, {
+      ...silenceAudioMeta,
+      hasAudio: false
+    });
+    assert(noAudioResult.hasMusicDetected === null, '3.4 No-audio stream sets hasMusicDetected to null');
+    assert(noAudioResult.musicAnalysisStatus === 'NOT_PROVIDED', '3.4 No-audio stream sets musicAnalysisStatus to NOT_PROVIDED');
+    assert(noAudioResult.detectors?.audio_music_detection?.status === 'NOT_PROVIDED', '3.4 Music detector status is NOT_PROVIDED for no-audio container');
 
     // =========================================================================
     // 4. STT EXECUTION & TIMESTAMP INTEGRITY (SECTION 5)

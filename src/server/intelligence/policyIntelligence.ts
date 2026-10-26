@@ -685,7 +685,17 @@ export class PolicyIntelligenceEngine {
           : 'No audio stream detected in video container. Visual-only analysis performed.',
         findingsCount: timeline.filter(t => t.domain === 'video_audio' && t.severity !== 'info').length,
         confidence: 'MEDIUM',
-        limitations: 'Silence and scene cut detection measure acoustic volume and visual transitions; VideoRisk does not verify speech content or query YouTube Content ID / copyright databases.'
+        limitations: 'Silence and scene cut detection measure acoustic volume and visual transitions; VideoRisk does not verify speech content or query YouTube Content ID / copyright databases.',
+        details: {
+          hasAudio: metadata.hasAudio,
+          hasMusicDetected: input.audioResult.hasMusicDetected,
+          musicAnalysisStatus: input.audioResult.musicAnalysisStatus,
+          speechAnalysisStatus: input.audioResult.speechAnalysisStatus,
+          repeatedAudioStatus: input.audioResult.repeatedAudioStatus,
+          silenceRatio: input.audioResult.silenceRatio,
+          scenesCount: input.videoResult.scenesCount,
+          averagePacingSeconds: input.videoResult.averagePacingSeconds,
+        }
       },
       title: {
         domain: 'title',

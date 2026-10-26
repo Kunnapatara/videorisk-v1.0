@@ -39,6 +39,7 @@ async function main() {
     const { runScanDeletionAndMediaCleanupTests } = await import('./scan_deletion_and_media_cleanup.test');
     const { runRateLimitingAndAbuseProtectionTests } = await import('./rate_limiting_and_abuse_protection.test');
     const { runComprehensiveDefectAndPipelineTests } = await import('./comprehensive_defect_and_pipeline_verification.test');
+    const { runVisualDuplicateBenchmark } = await import('./visual_duplicate_benchmark.test');
 
     // Narrowly scoped cleanup of test-specific rate limits (never deletes real/unrelated records)
     await storage.rateLimits.clearRateLimits?.();
@@ -81,6 +82,9 @@ async function main() {
 
     // Run Suite 13: Comprehensive Defect & Pipeline Verification
     await runComprehensiveDefectAndPipelineTests();
+
+    // Run Suite 14: Visual Duplicate & Slideshow Benchmark
+    await runVisualDuplicateBenchmark();
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log(`\n🎉 ALL AUTOMATED VERIFICATION SUITES COMPLETED SUCCESSFULLY in ${elapsed}s!`);

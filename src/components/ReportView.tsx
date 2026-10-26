@@ -472,6 +472,12 @@ export const ReportView: React.FC<ReportViewProps> = ({
                   <span>Visual text overlays, OCR, and graphic clickbait cues were not evaluated. Only container format, dimensions, size, and aspect ratio were verified.</span>
                 </div>
               )}
+              {dom.domain === 'video_audio' && dom.details?.musicAnalysisStatus === 'NOT_ASSESSED' && (
+                <div className="p-2.5 bg-amber-50/70 rounded-xl text-[11px] text-amber-900 border border-amber-200/70">
+                  <span className="font-bold block mb-0.5">Music & Audio Classification: Not Assessed</span>
+                  <span>Acoustic sound energy was measured, but automated music classification and Content ID reference catalog matching were not performed. Music presence is unverified.</span>
+                </div>
+              )}
               <div className="p-3 bg-stone-50 rounded-xl text-[11px] text-stone-500 border border-stone-100">
                 <span className="font-bold text-stone-700 block mb-0.5">Known Analyzer Boundary:</span>
                 <span>{dom.limitations}</span>
@@ -544,6 +550,47 @@ export const ReportView: React.FC<ReportViewProps> = ({
               <strong className="text-sm text-stone-900">{report.benchmarkMetrics.audioProcessingMs}ms</strong>
             </div>
           </div>
+
+          {/* DETECTOR EXECUTION PROVENANCE & TRANSPARENCY */}
+          {report.detectors && Object.keys(report.detectors).length > 0 && (
+            <div className="space-y-3 pt-2">
+              <h4 className="font-bold text-sm text-stone-900">Detector Execution Provenance</h4>
+              <div className="overflow-x-auto border border-stone-200 rounded-xl">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-stone-50 border-b border-stone-200 text-stone-600 font-semibold">
+                    <tr>
+                      <th className="py-2.5 px-3">Detector Module</th>
+                      <th className="py-2.5 px-3">Status</th>
+                      <th className="py-2.5 px-3">Version</th>
+                      <th className="py-2.5 px-3">Duration</th>
+                      <th className="py-2.5 px-3">Limitations & Boundaries</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-stone-100 text-stone-700">
+                    {Object.entries(report.detectors).map(([key, det]) => (
+                      <tr key={key} className="hover:bg-stone-50/50">
+                        <td className="py-2 px-3 font-mono text-[11px] font-bold text-stone-900">{det.detectorName}</td>
+                        <td className="py-2 px-3">
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                            det.status === 'DETECTED' ? 'bg-emerald-100 text-emerald-800' :
+                            det.status === 'NO_SIGNAL_DETECTED' ? 'bg-blue-100 text-blue-800' :
+                            det.status === 'NOT_ASSESSED' ? 'bg-amber-100 text-amber-800' :
+                            det.status === 'NOT_PROVIDED' ? 'bg-stone-100 text-stone-600' :
+                            'bg-rose-100 text-rose-800'
+                          }`}>
+                            {det.status}
+                          </span>
+                        </td>
+                        <td className="py-2 px-3 text-[11px] text-stone-500">v{det.version}</td>
+                        <td className="py-2 px-3 text-[11px] text-stone-600">{det.executionDurationMs}ms</td>
+                        <td className="py-2 px-3 text-[11px] text-stone-500 max-w-xs">{det.limitations || '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
 
           <div className="p-4 bg-stone-50 rounded-xl border border-stone-200 text-xs text-stone-600 space-y-2">
             <span className="font-bold text-stone-900 block">Explicit Known Platform Limitations:</span>
