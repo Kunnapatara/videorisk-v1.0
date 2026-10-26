@@ -91,10 +91,11 @@ export class SpeechTranscriptionAdapter {
 
       if (!rawOutput) {
         return {
-          status: 'NO_SIGNAL_DETECTED',
+          status: 'INSUFFICIENT_EVIDENCE',
           transcriptText: '',
           segments: [],
-          limitations: 'STT executable completed with empty output; no speech detected.',
+          failureReason: 'STT executable completed with empty output',
+          limitations: 'STT executable produced empty output; cannot verify presence or absence of speech without transcript data.',
           executionDurationMs: elapsed
         };
       }
@@ -122,10 +123,30 @@ export class SpeechTranscriptionAdapter {
         // Plain text transcript output without timestamps
         // CRITICAL: NEVER fabricate a full-duration segment [0, durationSeconds] from plain text
         return {
-          status: rawOutput.length > 0 ? 'DETECTED' : 'NO_SIGNAL_DETECTED',
+          status: rawOutput.length > 0 ? 'DETECTED' : 'INSUFFICIENT_EVIDENCE',
           transcriptText: rawOutput,
           segments: [], // Segments MUST remain empty when timestamps are absent
           limitations: 'Plain text transcript returned without segment timestamps; segment-level timestamps are unavailable and were not fabricated.',
+          executionDurationMs: elapsed
+        };
+      }
+
+      // Check if parsed is an object
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return {
+          status: 'ANALYSIS_UNAVAILABLE',
+          failureReason: 'STT executable returned invalid JSON structure (expected JSON object)',
+          limitations: 'STT JSON output did not contain an object payload.',
+          executionDurationMs: elapsed
+        };
+      }
+
+      // Verify that at least text string or segments array is present
+      if (typeof parsed.text !== 'string' && !Array.isArray(parsed.segments)) {
+        return {
+          status: 'ANALYSIS_UNAVAILABLE',
+          failureReason: 'STT JSON output missing both text and segments fields',
+          limitations: 'STT executable output did not contain usable text or segments fields.',
           executionDurationMs: elapsed
         };
       }
@@ -175,10 +196,13 @@ export class SpeechTranscriptionAdapter {
       }
 
       let status: DetectorExecutionStatus;
+      let failureReason: string | undefined;
+
       if (validSegments.length > 0 || transcriptText.length > 0) {
         status = 'DETECTED';
       } else if (rawSegments.length > 0 && validSegments.length === 0) {
         status = 'INSUFFICIENT_EVIDENCE';
+        failureReason = 'All reported segment timestamps were invalid or out of bounds.';
         limitationNotes += ' All reported segment timestamps were invalid or out of bounds.';
       } else {
         status = 'NO_SIGNAL_DETECTED';
@@ -188,6 +212,7 @@ export class SpeechTranscriptionAdapter {
         status,
         transcriptText,
         segments: validSegments,
+        ...(failureReason ? { failureReason } : {}),
         limitations: limitationNotes,
         executionDurationMs: elapsed
       };
@@ -249,10 +274,10 @@ export class MusicClassificationAdapter {
 
       if (!rawOutput) {
         return {
-          status: 'NO_SIGNAL_DETECTED',
-          hasMusic: false,
-          segments: [],
-          limitations: 'Music classifier completed with empty output; no musical signals detected.',
+          status: 'INSUFFICIENT_EVIDENCE',
+          hasMusic: null,
+          failureReason: 'Music classifier completed with empty output',
+          limitations: 'Music classifier completed with empty output; cannot confirm presence or absence of music.',
           executionDurationMs: elapsed
         };
       }
@@ -270,25 +295,45 @@ export class MusicClassificationAdapter {
         };
       }
 
-      const hasMusic = Boolean(parsed.hasMusic);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return {
+          status: 'ANALYSIS_UNAVAILABLE',
+          hasMusic: null,
+          failureReason: 'Music classifier output must be a JSON object',
+          limitations: 'Music classifier returned non-object JSON structure.',
+          executionDurationMs: elapsed
+        };
+      }
+
+      if (typeof parsed.hasMusic !== 'boolean') {
+        return {
+          status: 'ANALYSIS_UNAVAILABLE',
+          hasMusic: null,
+          failureReason: 'Malformed or missing hasMusic boolean field in classifier output',
+          limitations: 'Music classifier output did not contain a valid boolean hasMusic property.',
+          executionDurationMs: elapsed
+        };
+      }
+
+      const hasMusic: boolean = parsed.hasMusic;
       const confidence = typeof parsed.confidence === 'number' && Number.isFinite(parsed.confidence)
         ? Math.max(0, Math.min(1, parsed.confidence))
-        : 0.85;
+        : undefined;
 
       const segments = Array.isArray(parsed.segments)
         ? parsed.segments
-            .filter((s: any) => Number.isFinite(s.start) && Number.isFinite(s.end) && s.start >= 0 && s.end > s.start && s.start < durationSeconds)
+            .filter((s: any) => Number.isFinite(s?.start) && Number.isFinite(s?.end) && s.start >= 0 && s.end > s.start && s.start < durationSeconds)
             .map((s: any) => ({
               start: parseFloat(s.start.toFixed(2)),
               end: Math.min(durationSeconds, parseFloat(s.end.toFixed(2))),
-              confidence: s.confidence
+              confidence: typeof s?.confidence === 'number' && Number.isFinite(s.confidence) ? Math.max(0, Math.min(1, s.confidence)) : undefined
             }))
         : [];
 
       return {
         status: hasMusic ? 'DETECTED' : 'NO_SIGNAL_DETECTED',
         hasMusic,
-        confidence,
+        ...(confidence !== undefined ? { confidence } : {}),
         segments,
         limitations: 'Classified via local music classifier model. Does not query external copyright registries or YouTube Content ID.',
         executionDurationMs: elapsed

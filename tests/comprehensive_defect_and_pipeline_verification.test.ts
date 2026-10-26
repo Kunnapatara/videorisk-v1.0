@@ -228,29 +228,119 @@ export async function runComprehensiveDefectAndPipelineTests() {
     assert(modulatedAudioResult.hasMusicDetected === null, '3.2 hasMusicDetected is null when music classifier is not run');
     assert(modulatedAudioResult.detectors?.audio_speech_activity?.detectorName === 'acoustic_energy_modulation', '3.2 Acoustic detector accurately named');
 
-    // 3.3 Music Classification Adapter Semantics (Unconfigured, Missing, Execution)
+    // 3.3 Music Classification Adapter Semantics & Output Validation
     const { MusicClassificationAdapter } = await import('../src/server/pipeline/audioProcessor');
     const musicAdapter = new MusicClassificationAdapter();
-    const unconfiguredMusic = await musicAdapter.classify(silenceVideoPath, 4);
-    assert(unconfiguredMusic.status === 'NOT_ASSESSED', '3.3 Unconfigured music classifier returns NOT_ASSESSED');
-    assert(unconfiguredMusic.hasMusic === null, '3.3 Unconfigured music classifier returns hasMusic: null');
 
+    // 3.3.1 Unconfigured
+    const unconfiguredMusic = await musicAdapter.classify(silenceVideoPath, 4);
+    assert(unconfiguredMusic.status === 'NOT_ASSESSED', '3.3.1 Unconfigured music classifier returns NOT_ASSESSED');
+    assert(unconfiguredMusic.hasMusic === null, '3.3.1 Unconfigured music classifier returns hasMusic: null');
+
+    // 3.3.2 Missing executable
     process.env.MUSIC_CLASSIFIER_PATH = '/path/to/nonexistent/music_classifier_binary';
     const missingMusic = await musicAdapter.classify(silenceVideoPath, 4);
-    assert(missingMusic.status === 'ANALYSIS_UNAVAILABLE', '3.3 Missing classifier executable returns ANALYSIS_UNAVAILABLE');
-    assert(missingMusic.hasMusic === null, '3.3 Missing classifier returns hasMusic: null');
-    assert(Boolean(missingMusic.failureReason), '3.3 Missing classifier records failureReason');
+    assert(missingMusic.status === 'ANALYSIS_UNAVAILABLE', '3.3.2 Missing classifier executable returns ANALYSIS_UNAVAILABLE');
+    assert(missingMusic.hasMusic === null, '3.3.2 Missing classifier returns hasMusic: null');
+    assert(Boolean(missingMusic.failureReason), '3.3.2 Missing classifier records failureReason');
 
-    // Mock executable returning detected music JSON
-    const mockMusicScript = path.resolve(testDir, 'mock_music_classifier.sh');
-    fs.writeFileSync(mockMusicScript, '#!/bin/sh\necho \'{"hasMusic": true, "confidence": 0.92, "segments": [{"start": 0, "end": 4, "confidence": 0.92}]}\'\n');
-    fs.chmodSync(mockMusicScript, 0o755);
-    process.env.MUSIC_CLASSIFIER_PATH = mockMusicScript;
-
+    // 3.3.3 Valid positive detection with confidence
+    const mockMusicPosScript = path.resolve(testDir, 'mock_music_pos.sh');
+    fs.writeFileSync(mockMusicPosScript, '#!/bin/sh\necho \'{"hasMusic": true, "confidence": 0.92, "segments": [{"start": 0, "end": 4, "confidence": 0.92}]}\'\n');
+    fs.chmodSync(mockMusicPosScript, 0o755);
+    process.env.MUSIC_CLASSIFIER_PATH = mockMusicPosScript;
     const detectedMusic = await musicAdapter.classify(silenceVideoPath, 4);
-    assert(detectedMusic.status === 'DETECTED', '3.3 Executed classifier returns DETECTED');
-    assert(detectedMusic.hasMusic === true, '3.3 Executed classifier returns hasMusic: true');
-    assert(detectedMusic.confidence === 0.92, '3.3 Confidence recorded from executed classifier');
+    assert(detectedMusic.status === 'DETECTED', '3.3.3 Executed classifier returns DETECTED for hasMusic: true');
+    assert(detectedMusic.hasMusic === true, '3.3.3 Executed classifier returns hasMusic: true');
+    assert(detectedMusic.confidence === 0.92, '3.3.3 Confidence preserved from executed classifier');
+
+    // 3.3.4 Valid negative detection (confirmed false)
+    const mockMusicNegScript = path.resolve(testDir, 'mock_music_neg.sh');
+    fs.writeFileSync(mockMusicNegScript, '#!/bin/sh\necho \'{"hasMusic": false, "confidence": 0.88, "segments": []}\'\n');
+    fs.chmodSync(mockMusicNegScript, 0o755);
+    process.env.MUSIC_CLASSIFIER_PATH = mockMusicNegScript;
+    const negativeMusic = await musicAdapter.classify(silenceVideoPath, 4);
+    assert(negativeMusic.status === 'NO_SIGNAL_DETECTED', '3.3.4 Confirmed negative hasMusic: false returns NO_SIGNAL_DETECTED');
+    assert(negativeMusic.hasMusic === false, '3.3.4 Confirmed negative hasMusic: false returns hasMusic: false');
+    assert(negativeMusic.confidence === 0.88, '3.3.4 Confidence preserved on negative detection');
+
+    // 3.3.5 Empty stdout fails closed (must NOT report NO_SIGNAL_DETECTED or hasMusic: false)
+    const mockMusicEmptyScript = path.resolve(testDir, 'mock_music_empty.sh');
+    fs.writeFileSync(mockMusicEmptyScript, '#!/bin/sh\nexit 0\n');
+    fs.chmodSync(mockMusicEmptyScript, 0o755);
+    process.env.MUSIC_CLASSIFIER_PATH = mockMusicEmptyScript;
+    const emptyMusic = await musicAdapter.classify(silenceVideoPath, 4);
+    assert(emptyMusic.status === 'INSUFFICIENT_EVIDENCE', '3.3.5 Empty stdout from classifier returns INSUFFICIENT_EVIDENCE');
+    assert(emptyMusic.hasMusic === null, '3.3.5 Empty stdout returns hasMusic: null (not false)');
+    assert(Boolean(emptyMusic.failureReason), '3.3.5 Empty stdout records failureReason');
+
+    // 3.3.6 Malformed JSON fails closed
+    const mockMusicMalformedScript = path.resolve(testDir, 'mock_music_malformed.sh');
+    fs.writeFileSync(mockMusicMalformedScript, '#!/bin/sh\necho "invalid json corrupt"\n');
+    fs.chmodSync(mockMusicMalformedScript, 0o755);
+    process.env.MUSIC_CLASSIFIER_PATH = mockMusicMalformedScript;
+    const malformedMusic = await musicAdapter.classify(silenceVideoPath, 4);
+    assert(malformedMusic.status === 'ANALYSIS_UNAVAILABLE', '3.3.6 Malformed JSON returns ANALYSIS_UNAVAILABLE');
+    assert(malformedMusic.hasMusic === null, '3.3.6 Malformed JSON returns hasMusic: null');
+    assert(Boolean(malformedMusic.failureReason), '3.3.6 Malformed JSON records failureReason');
+
+    // 3.3.7 Missing hasMusic field fails closed (must NOT coerce undefined to false)
+    const mockMusicMissingFieldScript = path.resolve(testDir, 'mock_music_missing_field.sh');
+    fs.writeFileSync(mockMusicMissingFieldScript, '#!/bin/sh\necho \'{"confidence": 0.9, "tempo": 120}\'\n');
+    fs.chmodSync(mockMusicMissingFieldScript, 0o755);
+    process.env.MUSIC_CLASSIFIER_PATH = mockMusicMissingFieldScript;
+    const missingFieldMusic = await musicAdapter.classify(silenceVideoPath, 4);
+    assert(missingFieldMusic.status === 'ANALYSIS_UNAVAILABLE', '3.3.7 Missing hasMusic property returns ANALYSIS_UNAVAILABLE');
+    assert(missingFieldMusic.hasMusic === null, '3.3.7 Missing hasMusic returns hasMusic: null');
+    assert(missingFieldMusic.failureReason?.includes('hasMusic'), '3.3.7 Missing hasMusic records explanatory failureReason');
+
+    // 3.3.8 Null hasMusic field fails closed (must NOT coerce null to false)
+    const mockMusicNullFieldScript = path.resolve(testDir, 'mock_music_null_field.sh');
+    fs.writeFileSync(mockMusicNullFieldScript, '#!/bin/sh\necho \'{"hasMusic": null, "confidence": 0.5}\'\n');
+    fs.chmodSync(mockMusicNullFieldScript, 0o755);
+    process.env.MUSIC_CLASSIFIER_PATH = mockMusicNullFieldScript;
+    const nullFieldMusic = await musicAdapter.classify(silenceVideoPath, 4);
+    assert(nullFieldMusic.status === 'ANALYSIS_UNAVAILABLE', '3.3.8 Null hasMusic property returns ANALYSIS_UNAVAILABLE');
+    assert(nullFieldMusic.hasMusic === null, '3.3.8 Null hasMusic returns hasMusic: null');
+    assert(nullFieldMusic.failureReason?.includes('hasMusic'), '3.3.8 Null hasMusic records explanatory failureReason');
+
+    // 3.3.9 String hasMusic field fails closed (must NOT coerce string "false" or "true")
+    const mockMusicStringFieldScript = path.resolve(testDir, 'mock_music_string_field.sh');
+    fs.writeFileSync(mockMusicStringFieldScript, '#!/bin/sh\necho \'{"hasMusic": "false"}\'\n');
+    fs.chmodSync(mockMusicStringFieldScript, 0o755);
+    process.env.MUSIC_CLASSIFIER_PATH = mockMusicStringFieldScript;
+    const stringFieldMusic = await musicAdapter.classify(silenceVideoPath, 4);
+    assert(stringFieldMusic.status === 'ANALYSIS_UNAVAILABLE', '3.3.9 String hasMusic property returns ANALYSIS_UNAVAILABLE');
+    assert(stringFieldMusic.hasMusic === null, '3.3.9 String hasMusic returns hasMusic: null');
+
+    // 3.3.10 Number hasMusic field fails closed (must NOT coerce number 0 or 1)
+    const mockMusicNumberFieldScript = path.resolve(testDir, 'mock_music_number_field.sh');
+    fs.writeFileSync(mockMusicNumberFieldScript, '#!/bin/sh\necho \'{"hasMusic": 0}\'\n');
+    fs.chmodSync(mockMusicNumberFieldScript, 0o755);
+    process.env.MUSIC_CLASSIFIER_PATH = mockMusicNumberFieldScript;
+    const numberFieldMusic = await musicAdapter.classify(silenceVideoPath, 4);
+    assert(numberFieldMusic.status === 'ANALYSIS_UNAVAILABLE', '3.3.10 Number hasMusic property returns ANALYSIS_UNAVAILABLE');
+    assert(numberFieldMusic.hasMusic === null, '3.3.10 Number hasMusic returns hasMusic: null');
+
+    // 3.3.11 Missing confidence does NOT fabricate 0.85
+    const mockMusicNoConfScript = path.resolve(testDir, 'mock_music_no_conf.sh');
+    fs.writeFileSync(mockMusicNoConfScript, '#!/bin/sh\necho \'{"hasMusic": true}\'\n');
+    fs.chmodSync(mockMusicNoConfScript, 0o755);
+    process.env.MUSIC_CLASSIFIER_PATH = mockMusicNoConfScript;
+    const noConfMusic = await musicAdapter.classify(silenceVideoPath, 4);
+    assert(noConfMusic.status === 'DETECTED', '3.3.11 Status is DETECTED with hasMusic: true');
+    assert(noConfMusic.confidence === undefined, '3.3.11 Missing confidence remains undefined (no fabricated 0.85)');
+
+    // 3.3.12 Process error exit code fails closed
+    const mockMusicErrorScript = path.resolve(testDir, 'mock_music_error.sh');
+    fs.writeFileSync(mockMusicErrorScript, '#!/bin/sh\necho "Internal model error" >&2\nexit 1\n');
+    fs.chmodSync(mockMusicErrorScript, 0o755);
+    process.env.MUSIC_CLASSIFIER_PATH = mockMusicErrorScript;
+    const errorMusic = await musicAdapter.classify(silenceVideoPath, 4);
+    assert(errorMusic.status === 'ANALYSIS_UNAVAILABLE', '3.3.12 Process error returns ANALYSIS_UNAVAILABLE');
+    assert(errorMusic.hasMusic === null, '3.3.12 Process error returns hasMusic: null');
+    assert(Boolean(errorMusic.failureReason), '3.3.12 Process error records failureReason');
+
     delete process.env.MUSIC_CLASSIFIER_PATH;
 
     // 3.4 No-Audio-Stream Case Distinguishes Stream Absence from Assessed Negative
@@ -348,7 +438,7 @@ export async function runComprehensiveDefectAndPipelineTests() {
       process.env.WHISPER_PATH = prevStt;
     }
 
-    // 4.5 Empty output
+    // 4.5 Empty output fails closed to INSUFFICIENT_EVIDENCE (must NOT report NO_SIGNAL_DETECTED)
     const mockEmptyScript = path.resolve(testDir, 'mock_stt_empty.sh');
     fs.writeFileSync(mockEmptyScript, '#!/bin/sh\nexit 0\n');
     fs.chmodSync(mockEmptyScript, 0o755);
@@ -356,8 +446,9 @@ export async function runComprehensiveDefectAndPipelineTests() {
     process.env.WHISPER_PATH = mockEmptyScript;
     try {
       const emptyResult = await sttAdapter.transcribe(silenceVideoPath, 10.0);
-      assert(emptyResult.status === 'NO_SIGNAL_DETECTED', '4.5 Empty STT output reports NO_SIGNAL_DETECTED');
+      assert(emptyResult.status === 'INSUFFICIENT_EVIDENCE', '4.5 Empty STT output reports INSUFFICIENT_EVIDENCE');
       assert(emptyResult.segments?.length === 0, '4.5 Empty segments array');
+      assert(Boolean(emptyResult.failureReason), '4.5 Empty STT output records failureReason');
     } finally {
       process.env.WHISPER_PATH = prevStt;
     }
@@ -368,6 +459,58 @@ export async function runComprehensiveDefectAndPipelineTests() {
       const missingBinResult = await sttAdapter.transcribe(silenceVideoPath, 10.0);
       assert(missingBinResult.status === 'ANALYSIS_UNAVAILABLE', '4.6 Missing STT binary reports ANALYSIS_UNAVAILABLE');
       assert(missingBinResult.failureReason?.includes('not found'), '4.6 Explicit failure reason for missing executable');
+    } finally {
+      process.env.WHISPER_PATH = prevStt;
+    }
+
+    // 4.7 Missing both text and segments fields in JSON fails closed
+    const mockMissingFieldsScript = path.resolve(testDir, 'mock_stt_missing_fields.sh');
+    fs.writeFileSync(mockMissingFieldsScript, '#!/bin/sh\necho \'{"status": "ok", "duration": 10}\'\n');
+    fs.chmodSync(mockMissingFieldsScript, 0o755);
+    process.env.WHISPER_PATH = mockMissingFieldsScript;
+    try {
+      const missingFieldsResult = await sttAdapter.transcribe(silenceVideoPath, 10.0);
+      assert(missingFieldsResult.status === 'ANALYSIS_UNAVAILABLE', '4.7 JSON missing text & segments reports ANALYSIS_UNAVAILABLE');
+      assert(Boolean(missingFieldsResult.failureReason), '4.7 Missing text & segments records failureReason');
+    } finally {
+      process.env.WHISPER_PATH = prevStt;
+    }
+
+    // 4.8 Explicit confirmed negative detection {"text": "", "segments": []}
+    const mockExplicitNegativeScript = path.resolve(testDir, 'mock_stt_explicit_negative.sh');
+    fs.writeFileSync(mockExplicitNegativeScript, '#!/bin/sh\necho \'{"text": "", "segments": []}\'\n');
+    fs.chmodSync(mockExplicitNegativeScript, 0o755);
+    process.env.WHISPER_PATH = mockExplicitNegativeScript;
+    try {
+      const negResult = await sttAdapter.transcribe(silenceVideoPath, 10.0);
+      assert(negResult.status === 'NO_SIGNAL_DETECTED', '4.8 Explicit empty text and segments reports NO_SIGNAL_DETECTED');
+      assert(negResult.segments?.length === 0, '4.8 Negative result has empty segments');
+    } finally {
+      process.env.WHISPER_PATH = prevStt;
+    }
+
+    // 4.9 Process error non-zero exit code fails closed
+    const mockSttErrorScript = path.resolve(testDir, 'mock_stt_error.sh');
+    fs.writeFileSync(mockSttErrorScript, '#!/bin/sh\necho "STT engine crashed" >&2\nexit 1\n');
+    fs.chmodSync(mockSttErrorScript, 0o755);
+    process.env.WHISPER_PATH = mockSttErrorScript;
+    try {
+      const errorResult = await sttAdapter.transcribe(silenceVideoPath, 10.0);
+      assert(errorResult.status === 'ANALYSIS_UNAVAILABLE', '4.9 Process error reports ANALYSIS_UNAVAILABLE');
+      assert(Boolean(errorResult.failureReason), '4.9 Process error records failureReason');
+    } finally {
+      process.env.WHISPER_PATH = prevStt;
+    }
+
+    // 4.10 All segment timestamps invalid with no transcript text
+    const mockAllInvalidTsScript = path.resolve(testDir, 'mock_stt_all_invalid_ts.sh');
+    fs.writeFileSync(mockAllInvalidTsScript, '#!/bin/sh\necho \'{"text": "", "segments": [{"start": -10, "end": -5, "text": "bad"}]}\'\n');
+    fs.chmodSync(mockAllInvalidTsScript, 0o755);
+    process.env.WHISPER_PATH = mockAllInvalidTsScript;
+    try {
+      const allInvalidResult = await sttAdapter.transcribe(silenceVideoPath, 10.0);
+      assert(allInvalidResult.status === 'INSUFFICIENT_EVIDENCE', '4.10 All invalid timestamps with no text reports INSUFFICIENT_EVIDENCE');
+      assert(Boolean(allInvalidResult.failureReason), '4.10 All invalid timestamps records failureReason');
     } finally {
       process.env.WHISPER_PATH = prevStt;
     }
