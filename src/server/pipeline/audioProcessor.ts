@@ -1,6 +1,9 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import crypto from 'crypto';
 import { 
   MediaMetadata, 
   DomainAssessmentStatus, 
@@ -432,9 +435,373 @@ function extractSubbandSpectralProfile(pcmBuffer: Buffer, startByte: number, len
   return profile;
 }
 
+export interface AudioChunkSignature {
+  sec: number;             // Start timestamp in seconds
+  duration: number;        // Duration in seconds (1.0 or >= 0.5 for trailing partial chunk)
+  rms: number;             // Root-Mean-Square energy amplitude
+  zcr: number;             // Normalized Zero-Crossing Rate per second
+  spectralProfile: Float64Array; // 16-band normalized energy profile
+}
+
+export interface PcmExtractionResult {
+  status: 'SUCCESS' | 'INSUFFICIENT_EVIDENCE' | 'ANALYSIS_UNAVAILABLE';
+  totalAudioSeconds: number;
+  chunkSignatures: AudioChunkSignature[];
+  failureReason?: string;
+  limitations?: string;
+}
+
+/**
+ * Merges contiguous matching repeated audio intervals while strictly preventing
+ * false merging of disjoint intervals or differing repetition offsets.
+ */
+export function mergeContiguousAudioSegments(
+  rawMatches: Array<{
+    start: number;
+    end: number;
+    matchWithTimestamp: number;
+    matchEndTimestamp?: number;
+    similarity: number;
+  }>
+): Array<{
+  start: number;
+  end: number;
+  matchWithTimestamp: number;
+  similarity: number;
+}> {
+  if (rawMatches.length === 0) return [];
+
+  // Sort by start timestamp ascending
+  const sorted = [...rawMatches].sort((a, b) => a.start - b.start);
+  const merged: Array<{
+    start: number;
+    end: number;
+    matchWithTimestamp: number;
+    similarity: number;
+    _count: number;
+    _totalSim: number;
+  }> = [];
+
+  for (const m of sorted) {
+    if (merged.length === 0) {
+      merged.push({
+        start: m.start,
+        end: m.end,
+        matchWithTimestamp: m.matchWithTimestamp,
+        similarity: m.similarity,
+        _count: 1,
+        _totalSim: m.similarity
+      });
+      continue;
+    }
+
+    const prev = merged[merged.length - 1];
+    // Check contiguous adjacency:
+    // prev.end matches m.start (within 0.05s tolerance for floating point rounding)
+    // AND match offset (target - source) is consistent within 0.05s
+    const isAdjacent = Math.abs(prev.end - m.start) <= 0.05;
+    const prevOffset = prev.matchWithTimestamp - prev.start;
+    const currOffset = m.matchWithTimestamp - m.start;
+    const isConsistentMatchOffset = Math.abs(prevOffset - currOffset) <= 0.05;
+
+    if (isAdjacent && isConsistentMatchOffset) {
+      // Merge into prev interval
+      prev.end = m.end;
+      prev._count += 1;
+      prev._totalSim += m.similarity;
+      prev.similarity = parseFloat((prev._totalSim / prev._count).toFixed(3));
+    } else {
+      // Disjoint or different match interval - keep separate to prevent false merging
+      merged.push({
+        start: m.start,
+        end: m.end,
+        matchWithTimestamp: m.matchWithTimestamp,
+        similarity: m.similarity,
+        _count: 1,
+        _totalSim: m.similarity
+      });
+    }
+  }
+
+  return merged.map(({ start, end, matchWithTimestamp, similarity }) => ({
+    start: parseFloat(start.toFixed(2)),
+    end: parseFloat(end.toFixed(2)),
+    matchWithTimestamp: parseFloat(matchWithTimestamp.toFixed(2)),
+    similarity
+  }));
+}
+
+/**
+ * Within-Video Repeated Audio Detection using real media timestamp gaps.
+ * Detects non-adjacent audio segments with matching acoustic signatures and 16-band spectral profiles.
+ */
+export function detectRepeatedAudio(
+  chunkSignatures: AudioChunkSignature[],
+  durationSeconds: number,
+  minAudioGapSeconds: number = 2.0
+): Array<{
+  start: number;
+  end: number;
+  matchWithTimestamp: number;
+  similarity: number;
+}> {
+  const rawMatches: Array<{
+    start: number;
+    end: number;
+    matchWithTimestamp: number;
+    matchEndTimestamp: number;
+    similarity: number;
+  }> = [];
+
+  for (let i = 0; i < chunkSignatures.length; i++) {
+    const c1 = chunkSignatures[i];
+    if (c1.rms < 150) continue; // Skip near-silent intervals
+
+    for (let j = i + 1; j < chunkSignatures.length; j++) {
+      const c2 = chunkSignatures[j];
+      if (c2.rms < 150) continue;
+
+      // Real media gap calculation:
+      // Interval 1: [c1.sec, c1.sec + c1.duration]
+      // Interval 2: [c2.sec, c2.sec + c2.duration]
+      // Real time gap is the duration of intervening audio/silence:
+      const c1End = c1.sec + c1.duration;
+      const c2Start = c2.sec;
+      const realGap = parseFloat((c2Start - c1End).toFixed(3));
+
+      // Enforce configured minimum gap in real time units (seconds)
+      if (realGap < minAudioGapSeconds) {
+        continue;
+      }
+
+      // Acoustic & spectral correlation between chunks:
+      let spectralSim = 0;
+      for (let b = 0; b < 16; b++) {
+        spectralSim += c1.spectralProfile[b] * c2.spectralProfile[b];
+      }
+
+      const rmsDelta = Math.abs(c1.rms - c2.rms) / Math.max(c1.rms, c2.rms);
+      const zcrDelta = Math.abs(c1.zcr - c2.zcr) / Math.max(1, Math.max(c1.zcr, c2.zcr));
+
+      // Robust match criteria:
+      // 1. Spectral subband correlation >= 0.88
+      // 2. RMS energy amplitude delta <= 25%
+      // 3. Zero-crossing rate delta <= 20%
+      if (spectralSim >= 0.88 && rmsDelta <= 0.25 && zcrDelta <= 0.20) {
+        const compositeSimilarity = parseFloat((0.60 * spectralSim + 0.25 * Math.max(0, 1 - rmsDelta) + 0.15 * Math.max(0, 1 - zcrDelta)).toFixed(3));
+        const startSec = parseFloat(c1.sec.toFixed(2));
+        const endSec = parseFloat(Math.min(c1.sec + c1.duration, durationSeconds).toFixed(2));
+        const matchTimestamp = parseFloat(c2.sec.toFixed(2));
+        const matchEndTimestamp = parseFloat(Math.min(c2.sec + c2.duration, durationSeconds).toFixed(2));
+
+        if (startSec < endSec && endSec <= durationSeconds && matchTimestamp <= durationSeconds) {
+          rawMatches.push({
+            start: startSec,
+            end: endSec,
+            matchWithTimestamp: matchTimestamp,
+            matchEndTimestamp,
+            similarity: compositeSimilarity
+          });
+          break; // Record one match per source segment to avoid combinatorial explosion
+        }
+      }
+    }
+  }
+
+  // Merge contiguous repeated intervals
+  return mergeContiguousAudioSegments(rawMatches);
+}
+
 export class AudioProcessor {
   private transcriptionAdapter = new SpeechTranscriptionAdapter();
   private musicAdapter = new MusicClassificationAdapter();
+
+  /**
+   * Bounded extraction of raw 8kHz mono 16-bit PCM audio stream into 1-second and trailing
+   * partial chunk signatures using bounded temporary storage and streaming file reads.
+   * Guarantees memory consumption is bounded to a single chunk buffer (16KB) regardless of audio duration.
+   */
+  public async extractPcmAudio(
+    videoPath: string,
+    durationSeconds: number,
+    options?: { timeoutMs?: number; ffmpegBinary?: string }
+  ): Promise<PcmExtractionResult> {
+    if (!fs.existsSync(videoPath)) {
+      return {
+        status: 'ANALYSIS_UNAVAILABLE',
+        totalAudioSeconds: 0,
+        chunkSignatures: [],
+        failureReason: `Video media file not found at ${path.basename(videoPath)}`,
+        limitations: 'Media file does not exist on disk.'
+      };
+    }
+
+    const ffmpegBin = options?.ffmpegBinary || 'ffmpeg';
+    const timeoutMs = options?.timeoutMs || 45000;
+    const tempPcmPath = path.resolve(os.tmpdir(), `vr_pcm_${Date.now()}_${crypto.randomBytes(6).toString('hex')}.raw`);
+
+    try {
+      try {
+        await execFileAsync(ffmpegBin, [
+          '-y',
+          '-i', videoPath,
+          '-vn',
+          '-ac', '1',
+          '-ar', '8000',
+          '-f', 's16le',
+          tempPcmPath
+        ], { timeout: timeoutMs });
+      } catch (procErr: any) {
+        const isTimeout = procErr?.killed || procErr?.signal === 'SIGTERM' || procErr?.message?.includes('timed out');
+        const isMissingBin = procErr?.code === 'ENOENT';
+        const rawMsg = procErr?.message || String(procErr);
+        const sanitizedMsg = rawMsg.replace(new RegExp(tempPcmPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[temp_pcm]');
+
+        const reason = isMissingBin
+          ? 'FFmpeg executable not found or inaccessible for PCM extraction'
+          : isTimeout
+            ? `PCM audio extraction timed out after ${timeoutMs}ms`
+            : `FFmpeg PCM audio extraction process failed: ${sanitizedMsg}`;
+
+        return {
+          status: 'ANALYSIS_UNAVAILABLE',
+          totalAudioSeconds: 0,
+          chunkSignatures: [],
+          failureReason: reason,
+          limitations: 'PCM extraction failed during local FFmpeg execution.'
+        };
+      }
+
+      if (!fs.existsSync(tempPcmPath)) {
+        return {
+          status: 'ANALYSIS_UNAVAILABLE',
+          totalAudioSeconds: 0,
+          chunkSignatures: [],
+          failureReason: 'FFmpeg process completed but PCM output file was not created',
+          limitations: 'PCM output file missing after extraction.'
+        };
+      }
+
+      const stats = fs.statSync(tempPcmPath);
+      const totalBytes = stats.size;
+
+      if (totalBytes === 0) {
+        return {
+          status: 'INSUFFICIENT_EVIDENCE',
+          totalAudioSeconds: 0,
+          chunkSignatures: [],
+          failureReason: 'Extracted PCM audio output is empty (0 bytes)',
+          limitations: 'Audio stream yielded zero bytes of PCM data.'
+        };
+      }
+
+      const bytesPerSec = 16000;
+      const totalAudioSeconds = parseFloat((totalBytes / bytesPerSec).toFixed(3));
+
+      // Bounded buffer streaming: read 1-second chunks (16,000 bytes) one at a time
+      const fd = fs.openSync(tempPcmPath, 'r');
+      const chunkSignatures: AudioChunkSignature[] = [];
+
+      try {
+        const chunkBuf = Buffer.alloc(bytesPerSec);
+        let offset = 0;
+        let sec = 0;
+
+        while (offset + bytesPerSec <= totalBytes) {
+          const bytesRead = fs.readSync(fd, chunkBuf, 0, bytesPerSec, offset);
+          if (bytesRead < bytesPerSec) break;
+
+          let sumSq = 0;
+          let zcr = 0;
+          let prevVal = chunkBuf.readInt16LE(0);
+
+          for (let i = 1; i < 8000; i++) {
+            const val = chunkBuf.readInt16LE(i * 2);
+            sumSq += val * val;
+            if ((val >= 0 && prevVal < 0) || (val < 0 && prevVal >= 0)) {
+              zcr++;
+            }
+            prevVal = val;
+          }
+
+          const rms = Math.sqrt(sumSq / 8000);
+          const spectralProfile = extractSubbandSpectralProfile(chunkBuf, 0, bytesPerSec);
+          chunkSignatures.push({
+            sec,
+            duration: 1.0,
+            rms,
+            zcr,
+            spectralProfile
+          });
+
+          offset += bytesPerSec;
+          sec += 1;
+        }
+
+        // Handle trailing partial audio chunk if >= 0.5s (8,000 bytes = 4,000 samples)
+        const remainderBytes = totalBytes - offset;
+        const remainderSec = parseFloat((remainderBytes / bytesPerSec).toFixed(3));
+
+        if (remainderSec >= 0.5) {
+          const remainderBuf = Buffer.alloc(remainderBytes);
+          fs.readSync(fd, remainderBuf, 0, remainderBytes, offset);
+          const numSamples = Math.floor(remainderBytes / 2);
+
+          let sumSq = 0;
+          let rawZcr = 0;
+          let prevVal = remainderBuf.readInt16LE(0);
+
+          for (let i = 1; i < numSamples; i++) {
+            const val = remainderBuf.readInt16LE(i * 2);
+            sumSq += val * val;
+            if ((val >= 0 && prevVal < 0) || (val < 0 && prevVal >= 0)) {
+              rawZcr++;
+            }
+            prevVal = val;
+          }
+
+          const rms = Math.sqrt(sumSq / numSamples);
+          const zcr = (rawZcr / numSamples) * 8000; // Normalized to 1-second rate
+          const spectralProfile = extractSubbandSpectralProfile(remainderBuf, 0, remainderBytes);
+
+          chunkSignatures.push({
+            sec,
+            duration: remainderSec,
+            rms,
+            zcr,
+            spectralProfile
+          });
+        }
+      } finally {
+        fs.closeSync(fd);
+      }
+
+      if (totalAudioSeconds < 2.0) {
+        return {
+          status: 'INSUFFICIENT_EVIDENCE',
+          totalAudioSeconds,
+          chunkSignatures,
+          failureReason: 'Audio stream duration is under 2.0 seconds; insufficient timeline for repetition comparison.',
+          limitations: 'Less than 2.0 seconds of audio data extracted; cannot perform non-adjacent repetition analysis.'
+        };
+      }
+
+      return {
+        status: 'SUCCESS',
+        totalAudioSeconds,
+        chunkSignatures,
+        limitations: 'Raw PCM audio successfully extracted and signature profiles computed.'
+      };
+    } finally {
+      try {
+        if (fs.existsSync(tempPcmPath)) {
+          fs.unlinkSync(tempPcmPath);
+        }
+      } catch {
+        // Safe disposal
+      }
+    }
+  }
 
   /**
    * Processes audio stream using:
@@ -571,59 +938,20 @@ export class AudioProcessor {
       const isAudible = meanVol > -50;
 
       // Extract raw PCM audio chunk samples for acoustic signal processing & repetition detection
-      // 8000Hz mono 16-bit PCM: 16,000 bytes per second
-      let pcmBuffer: Buffer = Buffer.alloc(0);
-      try {
-        const pcmRes = await execFileAsync('ffmpeg', [
-          '-y',
-          '-i', videoPath,
-          '-vn',
-          '-ac', '1',
-          '-ar', '8000',
-          '-f', 's16le',
-          '-'
-        ], { encoding: 'buffer', maxBuffer: 15 * 1024 * 1024, timeout: 30000 });
-        pcmBuffer = pcmRes.stdout as unknown as Buffer;
-      } catch {
-        // Non-fatal for PCM sampling, fall back gracefully
-      }
-
-      const bytesPerSec = 16000;
-      const totalAudioSeconds = Math.floor(pcmBuffer.length / bytesPerSec);
-      
-      // Calculate 1-second acoustic chunk signatures: RMS energy, Zero-Crossing Rate, and 16-band spectral profile
-      interface AudioChunkSignature {
-        sec: number;
-        rms: number;
-        zcr: number;
-        spectralProfile: Float64Array;
-      }
-
-      const chunkSignatures: AudioChunkSignature[] = [];
-      for (let sec = 0; sec < totalAudioSeconds; sec++) {
-        const startOffset = sec * bytesPerSec;
-        let sumSq = 0;
-        let zcr = 0;
-        let prevVal = pcmBuffer.readInt16LE(startOffset);
-
-        for (let i = 1; i < 8000; i++) {
-          const val = pcmBuffer.readInt16LE(startOffset + i * 2);
-          sumSq += val * val;
-          if ((val >= 0 && prevVal < 0) || (val < 0 && prevVal >= 0)) {
-            zcr++;
-          }
-          prevVal = val;
-        }
-
-        const rms = Math.sqrt(sumSq / 8000);
-        const spectralProfile = extractSubbandSpectralProfile(pcmBuffer, startOffset, bytesPerSec);
-        chunkSignatures.push({ sec, rms, zcr, spectralProfile });
-      }
+      // 8000Hz mono 16-bit PCM: 16,000 bytes per second with bounded memory streaming
+      const pcmExtraction = await this.extractPcmAudio(videoPath, dur);
+      const chunkSignatures = pcmExtraction.chunkSignatures;
+      const totalAudioSeconds = pcmExtraction.totalAudioSeconds;
 
       // 1. Acoustic Speech Modulation Detection
       // Speech has high temporal modulation in energy envelope and significant ZCR variability between phonemes
       let speechDetectionStatus: DetectorExecutionStatus = 'NO_SIGNAL_DETECTED';
-      if (!isAudible || totalAudioSeconds < 1) {
+      let speechFailureReason: string | undefined;
+
+      if (pcmExtraction.status === 'ANALYSIS_UNAVAILABLE') {
+        speechDetectionStatus = 'ANALYSIS_UNAVAILABLE';
+        speechFailureReason = pcmExtraction.failureReason;
+      } else if (!isAudible || totalAudioSeconds < 1) {
         speechDetectionStatus = isAudible ? 'INSUFFICIENT_EVIDENCE' : 'NO_SIGNAL_DETECTED';
       } else {
         const rmsValues = chunkSignatures.map(c => c.rms).filter(r => r > 100);
@@ -645,52 +973,20 @@ export class AudioProcessor {
 
       // 2. Within-Video Repeated Audio Detection
       // Identifies non-adjacent audio segments with matching acoustic signatures and 16-band spectral profiles
-      const repeatedAudioSegments: AudioAnalysisResult['repeatedAudioSegments'] = [];
-      const minAudioGap = 2; // at least 2 seconds separation
+      let repeatedAudioSegments: NonNullable<AudioAnalysisResult['repeatedAudioSegments']> = [];
+      let repeatedAudioStatus: DetectorExecutionStatus;
+      let repeatedAudioFailureReason: string | undefined;
 
-      for (let i = 0; i < chunkSignatures.length; i++) {
-        const c1 = chunkSignatures[i];
-        if (c1.rms < 150) continue; // Skip near-silent intervals
-
-        for (let j = i + minAudioGap; j < chunkSignatures.length; j++) {
-          const c2 = chunkSignatures[j];
-          if (c2.rms < 150) continue;
-
-          // Acoustic & spectral correlation between 1-second chunks:
-          let spectralSim = 0;
-          for (let b = 0; b < 16; b++) {
-            spectralSim += c1.spectralProfile[b] * c2.spectralProfile[b];
-          }
-
-          const rmsDelta = Math.abs(c1.rms - c2.rms) / Math.max(c1.rms, c2.rms);
-          const zcrDelta = Math.abs(c1.zcr - c2.zcr) / Math.max(1, Math.max(c1.zcr, c2.zcr));
-
-          // Robust match criteria:
-          // 1. Spectral subband correlation >= 0.88
-          // 2. RMS energy amplitude delta <= 25%
-          // 3. Zero-crossing rate delta <= 20%
-          if (spectralSim >= 0.88 && rmsDelta <= 0.25 && zcrDelta <= 0.20) {
-            const compositeSimilarity = parseFloat((0.60 * spectralSim + 0.25 * Math.max(0, 1 - rmsDelta) + 0.15 * Math.max(0, 1 - zcrDelta)).toFixed(3));
-            const startSec = parseFloat(c1.sec.toFixed(2));
-            const endSec = parseFloat(Math.min(c1.sec + 1, dur).toFixed(2));
-            const matchTimestamp = parseFloat(c2.sec.toFixed(2));
-
-            if (startSec < endSec && endSec <= dur && matchTimestamp <= dur) {
-              repeatedAudioSegments.push({
-                start: startSec,
-                end: endSec,
-                matchWithTimestamp: matchTimestamp,
-                similarity: compositeSimilarity
-              });
-              break; // Record one match per source segment to avoid combinatorial explosion
-            }
-          }
-        }
+      if (pcmExtraction.status === 'ANALYSIS_UNAVAILABLE') {
+        repeatedAudioStatus = 'ANALYSIS_UNAVAILABLE';
+        repeatedAudioFailureReason = pcmExtraction.failureReason;
+      } else if (pcmExtraction.status === 'INSUFFICIENT_EVIDENCE' || totalAudioSeconds < 2.0) {
+        repeatedAudioStatus = 'INSUFFICIENT_EVIDENCE';
+        repeatedAudioFailureReason = pcmExtraction.failureReason || 'Audio stream duration is under 2.0 seconds; insufficient timeline for repetition comparison.';
+      } else {
+        repeatedAudioSegments = detectRepeatedAudio(chunkSignatures, dur, 2.0);
+        repeatedAudioStatus = repeatedAudioSegments.length > 0 ? 'DETECTED' : 'NO_SIGNAL_DETECTED';
       }
-
-      let repeatedAudioStatus: DetectorExecutionStatus = totalAudioSeconds < 2 
-        ? 'INSUFFICIENT_EVIDENCE'
-        : (repeatedAudioSegments.length > 0 ? 'DETECTED' : 'NO_SIGNAL_DETECTED');
 
       // 3. Optional Local Speech Transcription
       const sttResult = await this.transcriptionAdapter.transcribe(videoPath, dur);
@@ -743,7 +1039,8 @@ export class AudioProcessor {
           version: '1.0.0',
           status: speechDetectionStatus,
           executionDurationMs: totalMs,
-          confidence: 0.85,
+          confidence: speechDetectionStatus === 'ANALYSIS_UNAVAILABLE' ? undefined : 0.85,
+          failureReason: speechFailureReason,
           limitations: 'Acoustic activity heuristic based on energy envelope modulation; does not produce verified speech semantics or textual transcripts.'
         },
         audio_transcription: {
@@ -768,7 +1065,8 @@ export class AudioProcessor {
           version: '1.1.0',
           status: repeatedAudioStatus,
           executionDurationMs: totalMs,
-          confidence: repeatedAudioSegments.length > 0 ? 0.90 : 0.92,
+          confidence: repeatedAudioStatus === 'ANALYSIS_UNAVAILABLE' ? undefined : (repeatedAudioSegments.length > 0 ? 0.90 : 0.92),
+          failureReason: repeatedAudioFailureReason,
           limitations: 'Detects within-video acoustic repetition across non-adjacent segments using 16-band spectral energy correlation; does not match external copyrighted audio catalogs or YouTube Content ID.'
         }
       };

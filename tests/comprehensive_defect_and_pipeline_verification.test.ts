@@ -7,7 +7,13 @@ import { promisify } from 'util';
 import express from 'express';
 import http from 'http';
 import { videoProcessor } from '../src/server/pipeline/videoProcessor';
-import { audioProcessor, SpeechTranscriptionAdapter } from '../src/server/pipeline/audioProcessor';
+import { 
+  audioProcessor, 
+  SpeechTranscriptionAdapter,
+  detectRepeatedAudio,
+  mergeContiguousAudioSegments,
+  AudioChunkSignature 
+} from '../src/server/pipeline/audioProcessor';
 import { thumbnailInspector } from '../src/server/pipeline/thumbnailInspector';
 import { mediaInspector } from '../src/server/pipeline/mediaInspector';
 import { policyIntelligenceEngine } from '../src/server/intelligence/policyIntelligence';
@@ -351,6 +357,179 @@ export async function runComprehensiveDefectAndPipelineTests() {
     assert(noAudioResult.hasMusicDetected === null, '3.4 No-audio stream sets hasMusicDetected to null');
     assert(noAudioResult.musicAnalysisStatus === 'NOT_PROVIDED', '3.4 No-audio stream sets musicAnalysisStatus to NOT_PROVIDED');
     assert(noAudioResult.detectors?.audio_music_detection?.status === 'NOT_PROVIDED', '3.4 Music detector status is NOT_PROVIDED for no-audio container');
+
+    // =========================================================================
+    // 3.5 AUDIO PCM EXTRACTION RELIABILITY & BUFFER SAFETY (TASK 3)
+    // =========================================================================
+    console.log('\n[3.5 Audio PCM Extraction Reliability & Buffer Safety]');
+
+    // 3.5.1 Successful extraction of valid PCM from genuine media
+    const pcmSuccessRes = await audioProcessor.extractPcmAudio(modulatedAudioVideoPath, 4);
+    assert(pcmSuccessRes.status === 'SUCCESS', '3.5.1 Valid media produces SUCCESS extraction status');
+    assert(pcmSuccessRes.totalAudioSeconds >= 3.8 && pcmSuccessRes.totalAudioSeconds <= 4.2, '3.5.1 Total audio duration measured accurately (~4s)');
+    assert(pcmSuccessRes.chunkSignatures.length >= 4, '3.5.1 Extracted at least 4 chunk signatures for 4s audio');
+    assert(pcmSuccessRes.chunkSignatures[0].rms > 0, '3.5.1 Non-zero RMS energy calculated for audio chunk');
+    assert(pcmSuccessRes.chunkSignatures[0].spectralProfile.length === 16, '3.5.1 16-band normalized subband profile generated');
+
+    // 3.5.2 Missing FFmpeg executable fails closed with ANALYSIS_UNAVAILABLE
+    const missingFfmpegRes = await audioProcessor.extractPcmAudio(modulatedAudioVideoPath, 4, {
+      ffmpegBinary: '/path/to/nonexistent/ffmpeg_binary_xyz'
+    });
+    assert(missingFfmpegRes.status === 'ANALYSIS_UNAVAILABLE', '3.5.2 Missing FFmpeg binary returns ANALYSIS_UNAVAILABLE');
+    assert(missingFfmpegRes.totalAudioSeconds === 0, '3.5.2 Missing FFmpeg binary yields 0 audio seconds');
+    assert(missingFfmpegRes.failureReason?.includes('not found') || missingFfmpegRes.failureReason?.includes('inaccessible'), '3.5.2 Failure reason documents missing executable');
+
+    // 3.5.3 Non-zero FFmpeg exit status fails closed with ANALYSIS_UNAVAILABLE
+    const mockFfmpegErrorScript = path.resolve(testDir, 'mock_ffmpeg_error.sh');
+    fs.writeFileSync(mockFfmpegErrorScript, '#!/bin/sh\necho "Decoder error: invalid bitstream" >&2\nexit 1\n');
+    fs.chmodSync(mockFfmpegErrorScript, 0o755);
+    const errorFfmpegRes = await audioProcessor.extractPcmAudio(modulatedAudioVideoPath, 4, {
+      ffmpegBinary: mockFfmpegErrorScript
+    });
+    assert(errorFfmpegRes.status === 'ANALYSIS_UNAVAILABLE', '3.5.3 Non-zero exit code returns ANALYSIS_UNAVAILABLE');
+    assert(errorFfmpegRes.totalAudioSeconds === 0, '3.5.3 Error process yields 0 audio seconds');
+    assert(Boolean(errorFfmpegRes.failureReason), '3.5.3 Process failure records diagnostic failureReason');
+
+    // 3.5.4 Extraction timeout fails closed with ANALYSIS_UNAVAILABLE
+    const mockFfmpegHangScript = path.resolve(testDir, 'mock_ffmpeg_hang.sh');
+    fs.writeFileSync(mockFfmpegHangScript, '#!/bin/sh\nsleep 5\nexit 0\n');
+    fs.chmodSync(mockFfmpegHangScript, 0o755);
+    const timeoutFfmpegRes = await audioProcessor.extractPcmAudio(modulatedAudioVideoPath, 4, {
+      ffmpegBinary: mockFfmpegHangScript,
+      timeoutMs: 150
+    });
+    assert(timeoutFfmpegRes.status === 'ANALYSIS_UNAVAILABLE', '3.5.4 Process timeout returns ANALYSIS_UNAVAILABLE');
+    assert(timeoutFfmpegRes.failureReason?.includes('timed out'), '3.5.4 Timeout recorded in failureReason');
+
+    // 3.5.5 Empty PCM output (0 bytes) returns INSUFFICIENT_EVIDENCE
+    const mockFfmpegEmptyScript = path.resolve(testDir, 'mock_ffmpeg_empty.sh');
+    fs.writeFileSync(mockFfmpegEmptyScript, '#!/bin/sh\neval "out=\\${$#}"\ntouch "$out"\nexit 0\n');
+    fs.chmodSync(mockFfmpegEmptyScript, 0o755);
+    const emptyPcmRes = await audioProcessor.extractPcmAudio(modulatedAudioVideoPath, 4, {
+      ffmpegBinary: mockFfmpegEmptyScript
+    });
+    assert(emptyPcmRes.status === 'INSUFFICIENT_EVIDENCE', '3.5.5 Empty PCM output returns INSUFFICIENT_EVIDENCE');
+    assert(emptyPcmRes.totalAudioSeconds === 0, '3.5.5 Empty output yields 0 seconds');
+    assert(emptyPcmRes.failureReason?.includes('empty'), '3.5.5 Failure reason documents empty PCM output');
+
+    // 3.5.6 Insufficient usable PCM (< 2.0s) returns INSUFFICIENT_EVIDENCE
+    const shortAudioVideoPath = path.resolve(testDir, 'short_1s_audio.mp4');
+    await execFileAsync('ffmpeg', [
+      '-y',
+      '-f', 'lavfi', '-i', 'color=c=black:size=320x240:duration=1:rate=10',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1',
+      '-t', '1',
+      '-c:v', 'libx264', '-c:a', 'aac',
+      shortAudioVideoPath
+    ]);
+    const shortPcmRes = await audioProcessor.extractPcmAudio(shortAudioVideoPath, 1.0);
+    assert(shortPcmRes.status === 'INSUFFICIENT_EVIDENCE', '3.5.6 Audio under 2s returns INSUFFICIENT_EVIDENCE');
+    assert(shortPcmRes.totalAudioSeconds < 2.0, '3.5.6 Duration is under 2.0s');
+    assert(shortPcmRes.failureReason?.includes('under 2.0 seconds'), '3.5.6 Failure reason states duration under 2 seconds');
+
+    // 3.5.7 Long audio exceeding previous single-buffer limit (15MB stdout maxBuffer)
+    const mockFfmpegLongScript = path.resolve(testDir, 'mock_ffmpeg_long.sh');
+    fs.writeFileSync(mockFfmpegLongScript, '#!/bin/sh\neval "out=\\${$#}"\nhead -c 16384000 /dev/zero > "$out"\nexit 0\n');
+    fs.chmodSync(mockFfmpegLongScript, 0o755);
+    const longPcmRes = await audioProcessor.extractPcmAudio(modulatedAudioVideoPath, 1024, {
+      ffmpegBinary: mockFfmpegLongScript
+    });
+    assert(longPcmRes.status === 'SUCCESS', '3.5.7 Long audio exceeding 15MB processes successfully without maxBuffer overflow');
+    assert(longPcmRes.totalAudioSeconds >= 1024, '3.5.7 Extracted all 1024 seconds of 16MB PCM audio stream');
+    assert(longPcmRes.chunkSignatures.length >= 1024, '3.5.7 Produced full chunk signatures for large audio file');
+
+    // 3.5.8 Final partial chunk is preserved when meeting duration requirement (4.7s video -> 0.7s partial chunk)
+    const partialAudioVideoPath = path.resolve(testDir, 'partial_4_7s_audio.mp4');
+    await execFileAsync('ffmpeg', [
+      '-y',
+      '-f', 'lavfi', '-i', 'color=c=black:size=320x240:duration=4.7:rate=10',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:duration=4.7',
+      '-t', '4.7',
+      '-c:v', 'libx264', '-c:a', 'aac',
+      partialAudioVideoPath
+    ]);
+    const partialPcmRes = await audioProcessor.extractPcmAudio(partialAudioVideoPath, 4.7);
+    assert(partialPcmRes.status === 'SUCCESS', '3.5.8 Fractional media extraction succeeds');
+    assert(partialPcmRes.chunkSignatures.length === 5, '3.5.8 Exactly 5 chunks preserved (4 full + 1 trailing partial chunk)');
+    const lastChunk = partialPcmRes.chunkSignatures[4];
+    assert(lastChunk.sec === 4, '3.5.8 Trailing chunk starts at second 4');
+    assert(lastChunk.duration >= 0.65 && lastChunk.duration <= 0.75, '3.5.8 Trailing chunk preserves fractional 0.7s duration');
+    assert(lastChunk.rms > 0, '3.5.8 Partial chunk computes valid RMS energy');
+
+    // 3.5.9 Temporary resources are strictly cleaned up on success and failure
+    const tmpFiles = fs.readdirSync(os.tmpdir()).filter(f => f.startsWith('vr_pcm_'));
+    assert(tmpFiles.length === 0, '3.5.9 Zero orphaned vr_pcm_ temporary files remain on disk');
+
+    // =========================================================================
+    // 3.6 AUDIO INTERVAL BOUNDARIES & MINIMUM-GAP CORRECTNESS (TASK 3)
+    // =========================================================================
+    console.log('\n[3.6 Audio Interval Boundaries & Minimum-Gap Correctness]');
+
+    // Create synthetic identical subband spectral profile vector (unit normalized)
+    const testSpectralProfile = new Float64Array(16);
+    testSpectralProfile[3] = 0.6;
+    testSpectralProfile[4] = 0.8; // sumSq = 0.36 + 0.64 = 1.0
+
+    const makeChunk = (sec: number, duration: number = 1.0): AudioChunkSignature => ({
+      sec,
+      duration,
+      rms: 1000,
+      zcr: 50,
+      spectralProfile: new Float64Array(testSpectralProfile)
+    });
+
+    // 3.6.1 Duplicate intervals separated by less than minimum gap (< 2.0s real time) are REJECTED
+    // Chunk 1: [0.0, 1.0], Chunk 2: [2.0, 3.0] -> Gap is 2.0 - 1.0 = 1.0s (< 2.0s min gap)
+    const gapUnderMinMatches = detectRepeatedAudio([makeChunk(0.0), makeChunk(2.0)], 10.0, 2.0);
+    assert(gapUnderMinMatches.length === 0, '3.6.1 Real gap of 1.0s (< 2.0s min gap) is strictly rejected (no false positive from chunk index diff)');
+
+    // 3.6.2 Duplicate intervals separated by exactly minimum gap (== 2.0s real time) are ACCEPTED
+    // Chunk 1: [0.0, 1.0], Chunk 2: [3.0, 4.0] -> Gap is 3.0 - 1.0 = 2.0s (== 2.0s min gap)
+    const gapExactMinMatches = detectRepeatedAudio([makeChunk(0.0), makeChunk(3.0)], 10.0, 2.0);
+    assert(gapExactMinMatches.length === 1, '3.6.2 Real gap of exactly 2.0s is correctly accepted as duplicate');
+    assert(gapExactMinMatches[0].start === 0.0, '3.6.2 Exact gap match start is 0.0s');
+    assert(gapExactMinMatches[0].end === 1.0, '3.6.2 Exact gap match end is 1.0s');
+    assert(gapExactMinMatches[0].matchWithTimestamp === 3.0, '3.6.2 Exact gap target timestamp is 3.0s');
+
+    // 3.6.3 Duplicate intervals separated by more than minimum gap (> 2.0s real time) are ACCEPTED
+    // Chunk 1: [0.0, 1.0], Chunk 2: [4.0, 5.0] -> Gap is 4.0 - 1.0 = 3.0s (> 2.0s min gap)
+    const gapOverMinMatches = detectRepeatedAudio([makeChunk(0.0), makeChunk(4.0)], 10.0, 2.0);
+    assert(gapOverMinMatches.length === 1, '3.6.3 Real gap of 3.0s (> 2.0s min gap) is correctly detected');
+    assert(gapOverMinMatches[0].start === 0.0 && gapOverMinMatches[0].end === 1.0 && gapOverMinMatches[0].matchWithTimestamp === 4.0, '3.6.3 Timestamps preserved for > 2s gap');
+
+    // 3.6.4 Adjacent intervals (gap == 0.0s) and overlapping intervals (gap < 0.0s) are REJECTED
+    const adjacentMatches = detectRepeatedAudio([makeChunk(0.0), makeChunk(1.0)], 10.0, 2.0);
+    assert(adjacentMatches.length === 0, '3.6.4 Adjacent chunks [0,1] and [1,2] (gap 0s) are strictly rejected');
+    const overlapMatches = detectRepeatedAudio([makeChunk(0.0), makeChunk(0.5)], 10.0, 2.0);
+    assert(overlapMatches.length === 0, '3.6.4 Overlapping chunks (gap < 0s) are strictly rejected');
+
+    // 3.6.5 Duplicate occurrence in the final partial chunk
+    // Chunk 1: [0.0, 1.0], Partial Chunk 2: [4.0, 4.7] -> Gap is 4.0 - 1.0 = 3.0s
+    const partialMatch = detectRepeatedAudio([makeChunk(0.0, 1.0), makeChunk(4.0, 0.7)], 4.7, 2.0);
+    assert(partialMatch.length === 1, '3.6.5 Duplicate occurrence in final partial chunk is detected');
+    assert(partialMatch[0].matchWithTimestamp === 4.0, '3.6.5 Target timestamp matches start of partial chunk');
+
+    // 3.6.6 Correct timestamps for chunk boundaries and half-open convention
+    assert(gapExactMinMatches[0].start < gapExactMinMatches[0].end, '3.6.6 Half-open interval convention: start < end');
+    assert(Number.isFinite(gapExactMinMatches[0].similarity) && gapExactMinMatches[0].similarity > 0.8, '3.6.6 High similarity score for identical spectral profiles');
+
+    // 3.6.7 Fractional-duration, rounding tolerance, and contiguous segment merging
+    const rawContiguous = [
+      { start: 0.0, end: 1.0, matchWithTimestamp: 4.0, similarity: 0.95 },
+      { start: 1.0, end: 2.0, matchWithTimestamp: 5.0, similarity: 0.95 }
+    ];
+    const mergedContiguous = mergeContiguousAudioSegments(rawContiguous);
+    assert(mergedContiguous.length === 1, '3.6.7 Contiguous matching chunks cleanly merged into 1 continuous interval');
+    assert(mergedContiguous[0].start === 0.0 && mergedContiguous[0].end === 2.0, '3.6.7 Merged interval covers 0.0–2.0s');
+    assert(mergedContiguous[0].matchWithTimestamp === 4.0, '3.6.7 Merged match target starts at 4.0s');
+
+    // Disjoint intervals are NOT falsely merged
+    const rawDisjoint = [
+      { start: 0.0, end: 1.0, matchWithTimestamp: 4.0, similarity: 0.95 },
+      { start: 3.0, end: 4.0, matchWithTimestamp: 7.0, similarity: 0.95 }
+    ];
+    const mergedDisjoint = mergeContiguousAudioSegments(rawDisjoint);
+    assert(mergedDisjoint.length === 2, '3.6.7 Disjoint intervals are NOT falsely merged');
 
     // =========================================================================
     // 4. STT EXECUTION & TIMESTAMP INTEGRITY (SECTION 5)
