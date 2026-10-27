@@ -435,6 +435,50 @@ function extractSubbandSpectralProfile(pcmBuffer: Buffer, startByte: number, len
   return profile;
 }
 
+/**
+ * Verifiable processing bounds for audio pipeline extraction and repetition analysis.
+ *
+ * SIZING RATIONALE:
+ * - maxAudioChunks (1800): Corresponds to 30 minutes of 1-second chunks (approx. 360 KB heap memory for signatures).
+ *   Derived from existing pipeline tests requiring verification of 1024-second streams without buffer overflow.
+ * - maxCandidatePairs (50,000): Upper bound on candidate pairs evaluated after silence/gap filtering.
+ * - maxPairComparisons (30,000): Hard execution cap on pairwise spectral/acoustic calculations.
+ *
+ * NOTE: These are engineering safety limits designed to prevent runaway nested-loop execution.
+ * They are NOT claimed to be globally optimal runtime bounds for all production topologies.
+ */
+export interface AudioAnalysisBounds {
+  /** Maximum audio chunks extracted and retained in memory. */
+  maxAudioChunks: number;
+  /** Maximum candidate pairs considered (after silence and minimum gap filters). */
+  maxCandidatePairs: number;
+  /** Maximum acoustic pairwise comparisons actually executed (spectral/RMS/ZCR correlation). */
+  maxPairComparisons: number;
+}
+
+export const DEFAULT_AUDIO_ANALYSIS_BOUNDS: AudioAnalysisBounds = Object.freeze({
+  maxAudioChunks: 1800,
+  maxCandidatePairs: 50000,
+  maxPairComparisons: 30000
+});
+
+export interface RepeatedAudioMatch {
+  start: number;
+  end: number;
+  matchWithTimestamp: number;
+  matchEndTimestamp?: number;
+  similarity: number;
+}
+
+export interface RepeatedAudioAnalysisDetails {
+  candidatePairsConsidered: number;
+  pairComparisonsPerformed: number;
+  budgetExceeded: boolean;
+  limitReached?: 'CHUNK_LIMIT' | 'CANDIDATE_PAIR_LIMIT' | 'PAIR_COMPARISON_LIMIT';
+  chunksEvaluated: number;
+  totalChunks: number;
+}
+
 export interface AudioChunkSignature {
   sec: number;             // Start timestamp in seconds
   duration: number;        // Duration in seconds (1.0 or >= 0.5 for trailing partial chunk)
@@ -449,6 +493,9 @@ export interface PcmExtractionResult {
   chunkSignatures: AudioChunkSignature[];
   failureReason?: string;
   limitations?: string;
+  isTruncated?: boolean;
+  chunksLimitExceeded?: boolean;
+  totalChunksExtracted?: number;
 }
 
 /**
@@ -532,19 +579,47 @@ export function mergeContiguousAudioSegments(
 }
 
 /**
- * Within-Video Repeated Audio Detection using real media timestamp gaps.
- * Detects non-adjacent audio segments with matching acoustic signatures and 16-band spectral profiles.
+ * Within-Video Repeated Audio Detection with verifiable processing bounds and detailed telemetry.
+ *
+ * SCORE SEMANTICS & DEFINITIONS:
+ * A. Heuristic Weights (0.60, 0.25, 0.15):
+ *    - Linear weighting factors used to combine 16-band spectral subband cosine correlation (0.60),
+ *      RMS energy amplitude delta (0.25), and Zero-Crossing Rate delta (0.15).
+ *    - These are deterministic engineering weights, NOT probabilities and NOT confidence ratings.
+ * B. Similarity Scores (compositeSimilarity):
+ *    - A deterministic value in [0, 1] measuring acoustic waveform & spectral profile resemblance.
+ *    - Similarity measures how closely two audio chunks sound alike. It does NOT represent statistical
+ *      confidence or legal copyright identity.
+ * C. Confidence:
+ *    - Maintained in DetectorReport / EvidenceItem to express detector assessment confidence.
+ *    - Never conflated with similarity score. When execution is truncated by processing bounds,
+ *      confidence is NOT claimed as high.
  */
-export function detectRepeatedAudio(
+export function detectRepeatedAudioDetailed(
   chunkSignatures: AudioChunkSignature[],
   durationSeconds: number,
-  minAudioGapSeconds: number = 2.0
-): Array<{
-  start: number;
-  end: number;
-  matchWithTimestamp: number;
-  similarity: number;
-}> {
+  minAudioGapSeconds: number = 2.0,
+  options?: { bounds?: Partial<AudioAnalysisBounds> }
+): {
+  matches: RepeatedAudioMatch[];
+  details: RepeatedAudioAnalysisDetails;
+} {
+  const bounds: AudioAnalysisBounds = {
+    maxAudioChunks: options?.bounds?.maxAudioChunks ?? DEFAULT_AUDIO_ANALYSIS_BOUNDS.maxAudioChunks,
+    maxCandidatePairs: options?.bounds?.maxCandidatePairs ?? DEFAULT_AUDIO_ANALYSIS_BOUNDS.maxCandidatePairs,
+    maxPairComparisons: options?.bounds?.maxPairComparisons ?? DEFAULT_AUDIO_ANALYSIS_BOUNDS.maxPairComparisons
+  };
+
+  const totalChunks = chunkSignatures.length;
+  const chunksToEvaluate = totalChunks > bounds.maxAudioChunks
+    ? chunkSignatures.slice(0, bounds.maxAudioChunks)
+    : chunkSignatures;
+
+  let candidatePairsConsidered = 0;
+  let pairComparisonsPerformed = 0;
+  let budgetExceeded = totalChunks > bounds.maxAudioChunks;
+  let limitReached: RepeatedAudioAnalysisDetails['limitReached'] = budgetExceeded ? 'CHUNK_LIMIT' : undefined;
+
   const rawMatches: Array<{
     start: number;
     end: number;
@@ -553,18 +628,24 @@ export function detectRepeatedAudio(
     similarity: number;
   }> = [];
 
-  for (let i = 0; i < chunkSignatures.length; i++) {
-    const c1 = chunkSignatures[i];
+  outerLoop: for (let i = 0; i < chunksToEvaluate.length; i++) {
+    const c1 = chunksToEvaluate[i];
     if (c1.rms < 150) continue; // Skip near-silent intervals
 
-    for (let j = i + 1; j < chunkSignatures.length; j++) {
-      const c2 = chunkSignatures[j];
+    for (let j = i + 1; j < chunksToEvaluate.length; j++) {
+      // Check candidate pair budget before computing gap
+      if (candidatePairsConsidered >= bounds.maxCandidatePairs) {
+        budgetExceeded = true;
+        limitReached = limitReached || 'CANDIDATE_PAIR_LIMIT';
+        break outerLoop;
+      }
+
+      const c2 = chunksToEvaluate[j];
       if (c2.rms < 150) continue;
 
       // Real media gap calculation:
       // Interval 1: [c1.sec, c1.sec + c1.duration]
       // Interval 2: [c2.sec, c2.sec + c2.duration]
-      // Real time gap is the duration of intervening audio/silence:
       const c1End = c1.sec + c1.duration;
       const c2Start = c2.sec;
       const realGap = parseFloat((c2Start - c1End).toFixed(3));
@@ -574,7 +655,19 @@ export function detectRepeatedAudio(
         continue;
       }
 
-      // Acoustic & spectral correlation between chunks:
+      // Candidate pair passed silence and minimum gap filters
+      candidatePairsConsidered++;
+
+      // Check pair comparison budget before expensive spectral and acoustic calculation
+      if (pairComparisonsPerformed >= bounds.maxPairComparisons) {
+        budgetExceeded = true;
+        limitReached = limitReached || 'PAIR_COMPARISON_LIMIT';
+        break outerLoop;
+      }
+
+      // Execute actual acoustic & spectral comparison between candidate chunks
+      pairComparisonsPerformed++;
+
       let spectralSim = 0;
       for (let b = 0; b < 16; b++) {
         spectralSim += c1.spectralProfile[b] * c2.spectralProfile[b];
@@ -583,11 +676,12 @@ export function detectRepeatedAudio(
       const rmsDelta = Math.abs(c1.rms - c2.rms) / Math.max(c1.rms, c2.rms);
       const zcrDelta = Math.abs(c1.zcr - c2.zcr) / Math.max(1, Math.max(c1.zcr, c2.zcr));
 
-      // Robust match criteria:
+      // Match criteria:
       // 1. Spectral subband correlation >= 0.88
       // 2. RMS energy amplitude delta <= 25%
       // 3. Zero-crossing rate delta <= 20%
       if (spectralSim >= 0.88 && rmsDelta <= 0.25 && zcrDelta <= 0.20) {
+        // Heuristic weights: 0.60 spectral + 0.25 RMS + 0.15 ZCR -> deterministic composite similarity
         const compositeSimilarity = parseFloat((0.60 * spectralSim + 0.25 * Math.max(0, 1 - rmsDelta) + 0.15 * Math.max(0, 1 - zcrDelta)).toFixed(3));
         const startSec = parseFloat(c1.sec.toFixed(2));
         const endSec = parseFloat(Math.min(c1.sec + c1.duration, durationSeconds).toFixed(2));
@@ -608,8 +702,46 @@ export function detectRepeatedAudio(
     }
   }
 
-  // Merge contiguous repeated intervals
-  return mergeContiguousAudioSegments(rawMatches);
+  const mergedMatches = mergeContiguousAudioSegments(rawMatches);
+
+  return {
+    matches: mergedMatches,
+    details: {
+      candidatePairsConsidered,
+      pairComparisonsPerformed,
+      budgetExceeded,
+      limitReached,
+      chunksEvaluated: chunksToEvaluate.length,
+      totalChunks
+    }
+  };
+}
+
+/**
+ * Within-Video Repeated Audio Detection using real media timestamp gaps.
+ * Detects non-adjacent audio segments with matching acoustic signatures and 16-band spectral profiles.
+ * Preserves backward compatibility by returning an array while attaching telemetry details.
+ */
+export function detectRepeatedAudio(
+  chunkSignatures: AudioChunkSignature[],
+  durationSeconds: number,
+  minAudioGapSeconds: number = 2.0,
+  options?: { bounds?: Partial<AudioAnalysisBounds> }
+): Array<{
+  start: number;
+  end: number;
+  matchWithTimestamp: number;
+  similarity: number;
+}> & { details?: RepeatedAudioAnalysisDetails } {
+  const result = detectRepeatedAudioDetailed(chunkSignatures, durationSeconds, minAudioGapSeconds, options);
+  const arr = result.matches as Array<{
+    start: number;
+    end: number;
+    matchWithTimestamp: number;
+    similarity: number;
+  }> & { details?: RepeatedAudioAnalysisDetails };
+  arr.details = result.details;
+  return arr;
 }
 
 export class AudioProcessor {
@@ -619,12 +751,27 @@ export class AudioProcessor {
   /**
    * Bounded extraction of raw 8kHz mono 16-bit PCM audio stream into 1-second and trailing
    * partial chunk signatures using bounded temporary storage and streaming file reads.
-   * Guarantees memory consumption is bounded to a single chunk buffer (16KB) regardless of audio duration.
+   *
+   * MEMORY ARCHITECTURE & WORKLOAD BOUNDS:
+   * 1. File I/O Read Buffer:
+   *    - Bounded to a single chunk buffer of 16,000 bytes (16 KB) for sequential streaming reads.
+   *    - The entire raw PCM file is never loaded into a single Node.js Buffer at once.
+   * 2. In-Memory Signature Storage:
+   *    - Memory consumption is NOT O(1) across the entire pipeline.
+   *    - Each extracted chunk allocates an AudioChunkSignature object (~200 bytes, including Float64Array(16)).
+   *    - Accumulation is explicitly capped at maxAudioChunks (default: 600 chunks, ~120 KB heap memory).
+   *    - Once maxAudioChunks is reached, chunk extraction halts to strictly enforce memory and compute bounds.
+   * 3. Pairwise Comparison Workload:
+   *    - All-pairs comparison across N chunks is O(N^2) in the worst case (N*(N-1)/2 pairs).
+   *    - Workload is explicitly bounded by maxCandidatePairs (default: 50,000) and maxPairComparisons (default: 30,000).
+   * 4. Unmeasured Memory Usage:
+   *    - External FFmpeg sub-process heap and OS disk I/O caching during PCM extraction are managed by the OS kernel
+   *      and process execution timeout, not JavaScript V8 heap bounds.
    */
   public async extractPcmAudio(
     videoPath: string,
     durationSeconds: number,
-    options?: { timeoutMs?: number; ffmpegBinary?: string }
+    options?: { timeoutMs?: number; ffmpegBinary?: string; bounds?: Partial<AudioAnalysisBounds> }
   ): Promise<PcmExtractionResult> {
     if (!fs.existsSync(videoPath)) {
       return {
@@ -697,10 +844,12 @@ export class AudioProcessor {
 
       const bytesPerSec = 16000;
       const totalAudioSeconds = parseFloat((totalBytes / bytesPerSec).toFixed(3));
+      const maxChunks = options?.bounds?.maxAudioChunks ?? DEFAULT_AUDIO_ANALYSIS_BOUNDS.maxAudioChunks;
 
       // Bounded buffer streaming: read 1-second chunks (16,000 bytes) one at a time
       const fd = fs.openSync(tempPcmPath, 'r');
       const chunkSignatures: AudioChunkSignature[] = [];
+      let chunksLimitExceeded = false;
 
       try {
         const chunkBuf = Buffer.alloc(bytesPerSec);
@@ -708,6 +857,12 @@ export class AudioProcessor {
         let sec = 0;
 
         while (offset + bytesPerSec <= totalBytes) {
+          // Pre-allocation bounds check: prevent unbounded memory accumulation
+          if (sec >= maxChunks) {
+            chunksLimitExceeded = true;
+            break;
+          }
+
           const bytesRead = fs.readSync(fd, chunkBuf, 0, bytesPerSec, offset);
           if (bytesRead < bytesPerSec) break;
 
@@ -738,11 +893,11 @@ export class AudioProcessor {
           sec += 1;
         }
 
-        // Handle trailing partial audio chunk if >= 0.5s (8,000 bytes = 4,000 samples)
+        // Handle trailing partial audio chunk if >= 0.5s and within maxChunks budget
         const remainderBytes = totalBytes - offset;
         const remainderSec = parseFloat((remainderBytes / bytesPerSec).toFixed(3));
 
-        if (remainderSec >= 0.5) {
+        if (!chunksLimitExceeded && sec < maxChunks && remainderSec >= 0.5) {
           const remainderBuf = Buffer.alloc(remainderBytes);
           fs.readSync(fd, remainderBuf, 0, remainderBytes, offset);
           const numSamples = Math.floor(remainderBytes / 2);
@@ -786,11 +941,18 @@ export class AudioProcessor {
         };
       }
 
+      const limitationsText = chunksLimitExceeded
+        ? `Raw PCM audio extracted with bounded chunk limit (${chunkSignatures.length} chunks extracted of ${Math.ceil(totalAudioSeconds)} total seconds; trailing audio unextracted).`
+        : 'Raw PCM audio successfully extracted and signature profiles computed.';
+
       return {
         status: 'SUCCESS',
         totalAudioSeconds,
         chunkSignatures,
-        limitations: 'Raw PCM audio successfully extracted and signature profiles computed.'
+        isTruncated: chunksLimitExceeded,
+        chunksLimitExceeded,
+        totalChunksExtracted: chunkSignatures.length,
+        limitations: limitationsText
       };
     } finally {
       try {
@@ -810,7 +972,11 @@ export class AudioProcessor {
    * 3. Within-video non-adjacent repeated audio segment detection
    * 4. Optional local speech-to-text adapter
    */
-  public async analyzeAudio(videoPath: string, metadataOrDuration: MediaMetadata | number): Promise<AudioAnalysisResult> {
+  public async analyzeAudio(
+    videoPath: string,
+    metadataOrDuration: MediaMetadata | number,
+    options?: { bounds?: Partial<AudioAnalysisBounds> }
+  ): Promise<AudioAnalysisResult> {
     const startTime = Date.now();
 
     if (!fs.existsSync(videoPath)) {
@@ -938,8 +1104,8 @@ export class AudioProcessor {
       const isAudible = meanVol > -50;
 
       // Extract raw PCM audio chunk samples for acoustic signal processing & repetition detection
-      // 8000Hz mono 16-bit PCM: 16,000 bytes per second with bounded memory streaming
-      const pcmExtraction = await this.extractPcmAudio(videoPath, dur);
+      // 8000Hz mono 16-bit PCM: 16,000 bytes per second sequential streaming with bounded signature storage
+      const pcmExtraction = await this.extractPcmAudio(videoPath, dur, { bounds: options?.bounds });
       const chunkSignatures = pcmExtraction.chunkSignatures;
       const totalAudioSeconds = pcmExtraction.totalAudioSeconds;
 
@@ -976,6 +1142,14 @@ export class AudioProcessor {
       let repeatedAudioSegments: NonNullable<AudioAnalysisResult['repeatedAudioSegments']> = [];
       let repeatedAudioStatus: DetectorExecutionStatus;
       let repeatedAudioFailureReason: string | undefined;
+      let repeatedAudioLimitations = 'Detects within-video acoustic repetition across non-adjacent segments using 16-band spectral energy correlation; does not match external copyrighted audio catalogs or YouTube Content ID.';
+      let repDetails: RepeatedAudioAnalysisDetails = {
+        candidatePairsConsidered: 0,
+        pairComparisonsPerformed: 0,
+        budgetExceeded: false,
+        chunksEvaluated: chunkSignatures.length,
+        totalChunks: chunkSignatures.length
+      };
 
       if (pcmExtraction.status === 'ANALYSIS_UNAVAILABLE') {
         repeatedAudioStatus = 'ANALYSIS_UNAVAILABLE';
@@ -984,8 +1158,33 @@ export class AudioProcessor {
         repeatedAudioStatus = 'INSUFFICIENT_EVIDENCE';
         repeatedAudioFailureReason = pcmExtraction.failureReason || 'Audio stream duration is under 2.0 seconds; insufficient timeline for repetition comparison.';
       } else {
-        repeatedAudioSegments = detectRepeatedAudio(chunkSignatures, dur, 2.0);
-        repeatedAudioStatus = repeatedAudioSegments.length > 0 ? 'DETECTED' : 'NO_SIGNAL_DETECTED';
+        const repResult = detectRepeatedAudioDetailed(chunkSignatures, dur, 2.0, { bounds: options?.bounds });
+        repeatedAudioSegments = repResult.matches;
+        repDetails = repResult.details;
+
+        const isBudgetExceeded = repDetails.budgetExceeded || (pcmExtraction.chunksLimitExceeded === true);
+
+        if (isBudgetExceeded) {
+          const budgetCause = repDetails.limitReached === 'CANDIDATE_PAIR_LIMIT'
+            ? `maximum candidate pairs (${repDetails.candidatePairsConsidered}) evaluated`
+            : repDetails.limitReached === 'PAIR_COMPARISON_LIMIT'
+              ? `maximum pair comparisons (${repDetails.pairComparisonsPerformed}) reached`
+              : `audio duration exceeded maximum chunk signature limit (${chunkSignatures.length} chunks extracted)`;
+
+          const budgetNotice = `Analysis budget reached: ${budgetCause} before completing full timeline repetition analysis.`;
+          repeatedAudioLimitations += ` Incomplete coverage notice: ${budgetNotice}`;
+
+          if (repeatedAudioSegments.length > 0) {
+            // Reused audio segments detected before budget exhaustion are strictly preserved
+            repeatedAudioStatus = 'DETECTED';
+          } else {
+            // Incomplete inspection with zero matches must NOT claim clean negative detection
+            repeatedAudioStatus = 'INSUFFICIENT_EVIDENCE';
+            repeatedAudioFailureReason = budgetNotice;
+          }
+        } else {
+          repeatedAudioStatus = repeatedAudioSegments.length > 0 ? 'DETECTED' : 'NO_SIGNAL_DETECTED';
+        }
       }
 
       // 3. Optional Local Speech Transcription
@@ -1041,7 +1240,7 @@ export class AudioProcessor {
           executionDurationMs: totalMs,
           confidence: speechDetectionStatus === 'ANALYSIS_UNAVAILABLE' ? undefined : 0.85,
           failureReason: speechFailureReason,
-          limitations: 'Acoustic activity heuristic based on energy envelope modulation; does not produce verified speech semantics or textual transcripts.'
+          limitations: 'Acoustic activity heuristic based on energy envelope modulation; does not produce verified speech semantics or textual transcripts. Confidence score is a heuristic execution rating, not a calibrated statistical probability.'
         },
         audio_transcription: {
           detectorName: 'local_speech_to_text_adapter',
@@ -1065,9 +1264,17 @@ export class AudioProcessor {
           version: '1.1.0',
           status: repeatedAudioStatus,
           executionDurationMs: totalMs,
-          confidence: repeatedAudioStatus === 'ANALYSIS_UNAVAILABLE' ? undefined : (repeatedAudioSegments.length > 0 ? 0.90 : 0.92),
+          confidence: (repeatedAudioStatus === 'ANALYSIS_UNAVAILABLE' || repDetails.budgetExceeded) ? undefined : (repeatedAudioSegments.length > 0 ? 0.90 : 0.92),
           failureReason: repeatedAudioFailureReason,
-          limitations: 'Detects within-video acoustic repetition across non-adjacent segments using 16-band spectral energy correlation; does not match external copyrighted audio catalogs or YouTube Content ID.'
+          limitations: repeatedAudioLimitations,
+          details: {
+            candidatePairsConsidered: repDetails.candidatePairsConsidered,
+            pairComparisonsPerformed: repDetails.pairComparisonsPerformed,
+            budgetExceeded: repDetails.budgetExceeded,
+            limitReached: repDetails.limitReached,
+            chunksEvaluated: repDetails.chunksEvaluated,
+            totalChunks: repDetails.totalChunks
+          }
         }
       };
 

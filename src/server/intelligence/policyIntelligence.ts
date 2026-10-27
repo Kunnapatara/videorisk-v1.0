@@ -334,7 +334,7 @@ export class PolicyIntelligenceEngine {
           provenance: 'audio_processor:pcm_energy_zcr',
           source: 'acoustic_repetition',
           label: `ℹ️ Repeated Audio Segment (${Math.round(repAudio.similarity * 100)}% acoustic match)`,
-          details: `Audio segment from ${this.formatTimestamp(repAudio.start)}–${this.formatTimestamp(repAudio.end)} matches acoustic profile from ${this.formatTimestamp(repAudio.matchWithTimestamp)}.`,
+          details: `Audio segment from ${this.formatTimestamp(repAudio.start)}–${this.formatTimestamp(repAudio.end)} matches acoustic profile from ${this.formatTimestamp(repAudio.matchWithTimestamp)} (${Math.round(repAudio.similarity * 100)}% acoustic similarity score).`,
           contextualInterpretation: 'Background audio loops or recurring sound effects are standard in video editing.',
           limitations: 'Measures within-video acoustic repetition; does not verify external copyright ownership.',
           recommendedAction: 'Ensure music or sound effects are properly licensed.'
@@ -677,6 +677,7 @@ export class PolicyIntelligenceEngine {
       if (
         repeatAudioStatus === 'ANALYSIS_UNAVAILABLE' ||
         repeatAudioDetector?.status === 'ANALYSIS_UNAVAILABLE' ||
+        (repeatAudioDetector?.details?.budgetExceeded && repeatAudioStatus !== 'DETECTED') ||
         (repeatAudioDetector?.failureReason && repeatAudioStatus !== 'DETECTED' && repeatAudioStatus !== 'NO_SIGNAL_DETECTED')
       ) {
         incomplete.push('audio_repeated_segments');

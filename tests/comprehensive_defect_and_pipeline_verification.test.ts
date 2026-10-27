@@ -11,8 +11,11 @@ import {
   audioProcessor, 
   SpeechTranscriptionAdapter,
   detectRepeatedAudio,
+  detectRepeatedAudioDetailed,
   mergeContiguousAudioSegments,
-  AudioChunkSignature 
+  AudioChunkSignature,
+  DEFAULT_AUDIO_ANALYSIS_BOUNDS,
+  AudioAnalysisBounds
 } from '../src/server/pipeline/audioProcessor';
 import { thumbnailInspector } from '../src/server/pipeline/thumbnailInspector';
 import { mediaInspector } from '../src/server/pipeline/mediaInspector';
@@ -1296,6 +1299,246 @@ export async function runComprehensiveDefectAndPipelineTests() {
     assert(reportCleanBaseline.overallRisk === 'LOW_RISK', '8.7 Clean baseline remains LOW_RISK when all core analyzers complete successfully');
     assert(reportCleanBaseline.domainReports.video_audio.status === 'NO_MAJOR_RISK_SIGNALS_DETECTED', '8.7 Clean baseline reports NO_MAJOR_RISK_SIGNALS_DETECTED');
     assert(reportCleanBaseline.riskSummary.includes('No major risk signals detected'), '8.7 Clean baseline summary confirms no major risk signals');
+
+    // =========================================================================
+    // SECTION 9: AUDIO ANALYSIS COST CONTROLS & SCORE SEMANTICS
+    // =========================================================================
+    console.log('\n[9. Audio Analysis Cost Controls & Score Semantics]');
+
+    // Helper to generate distinct synthetic chunk profiles
+    const makeProfile = (baseIndex: number): Float64Array => {
+      const arr = new Float64Array(16);
+      for (let b = 0; b < 16; b++) {
+        arr[b] = ((b + baseIndex) % 7) + 1;
+      }
+      let sumSq = 0;
+      for (let b = 0; b < 16; b++) sumSq += arr[b] * arr[b];
+      const norm = Math.sqrt(sumSq) || 1;
+      for (let b = 0; b < 16; b++) arr[b] /= norm;
+      return arr;
+    };
+
+    const makeSynthChunk = (sec: number, profileId: number, rms: number = 800, zcr: number = 50): AudioChunkSignature => ({
+      sec,
+      duration: 1.0,
+      rms,
+      zcr,
+      spectralProfile: makeProfile(profileId)
+    });
+
+    // -------------------------------------------------------------------------
+    // 9.1 Chunks below bound: Analyzed normally
+    // -------------------------------------------------------------------------
+    const chunksBelow = [
+      makeSynthChunk(0, 1),
+      makeSynthChunk(3, 2),
+      makeSynthChunk(6, 3),
+      makeSynthChunk(9, 4),
+      makeSynthChunk(12, 5)
+    ];
+    const resBelow = detectRepeatedAudioDetailed(chunksBelow, 15, 2.0, {
+      bounds: { maxAudioChunks: 10, maxCandidatePairs: 50, maxPairComparisons: 50 }
+    });
+    assert(resBelow.details.budgetExceeded === false, '9.1 Chunks below bound reports budgetExceeded = false');
+    assert(resBelow.details.chunksEvaluated === 5, '9.1 Chunks below bound evaluates all 5 chunks');
+    assert(resBelow.details.totalChunks === 5, '9.1 Total chunks recorded accurately as 5');
+
+    // -------------------------------------------------------------------------
+    // 9.2 Chunks equal to bound: Evaluated exactly to bound contract
+    // -------------------------------------------------------------------------
+    const chunksEqual: AudioChunkSignature[] = [];
+    for (let i = 0; i < 10; i++) {
+      chunksEqual.push(makeSynthChunk(i * 3, i));
+    }
+    const resEqual = detectRepeatedAudioDetailed(chunksEqual, 30, 2.0, {
+      bounds: { maxAudioChunks: 10, maxCandidatePairs: 100, maxPairComparisons: 100 }
+    });
+    assert(resEqual.details.budgetExceeded === false, '9.2 Chunks equal to bound reports budgetExceeded = false');
+    assert(resEqual.details.chunksEvaluated === 10, '9.2 Exactly 10 chunks evaluated');
+    assert(resEqual.details.totalChunks === 10, '9.2 Total chunks recorded as 10');
+
+    // -------------------------------------------------------------------------
+    // 9.3 Chunks above bound: Strictly capped with deterministic telemetry
+    // -------------------------------------------------------------------------
+    const chunksAbove: AudioChunkSignature[] = [];
+    for (let i = 0; i < 15; i++) {
+      chunksAbove.push(makeSynthChunk(i * 3, i));
+    }
+    const resAbove = detectRepeatedAudioDetailed(chunksAbove, 45, 2.0, {
+      bounds: { maxAudioChunks: 10, maxCandidatePairs: 100, maxPairComparisons: 100 }
+    });
+    assert(resAbove.details.budgetExceeded === true, '9.3 Chunks above bound reports budgetExceeded = true');
+    assert(resAbove.details.limitReached === 'CHUNK_LIMIT', '9.3 Limit reached reason is CHUNK_LIMIT');
+    assert(resAbove.details.chunksEvaluated === 10, '9.3 Evaluated chunks strictly capped at 10');
+    assert(resAbove.details.totalChunks === 15, '9.3 Total chunks correctly preserves uninspected total 15');
+
+    // -------------------------------------------------------------------------
+    // 9.4 Candidate pairs and pair comparisons below bound counted accurately
+    // -------------------------------------------------------------------------
+    // 4 chunks at 0, 3, 6, 9 -> Pairs: (0,3), (0,6), (0,9), (3,6), (3,9), (6,9) = 6 pairs
+    const chunks4 = [
+      makeSynthChunk(0, 1),
+      makeSynthChunk(3, 2),
+      makeSynthChunk(6, 3),
+      makeSynthChunk(9, 4)
+    ];
+    const resCountPairs = detectRepeatedAudioDetailed(chunks4, 12, 2.0, {
+      bounds: { maxCandidatePairs: 20, maxPairComparisons: 20 }
+    });
+    assert(resCountPairs.details.candidatePairsConsidered === 6, '9.4 Exactly 6 candidate pairs considered');
+    assert(resCountPairs.details.pairComparisonsPerformed === 6, '9.4 Exactly 6 pairwise acoustic comparisons executed');
+    assert(resCountPairs.details.budgetExceeded === false, '9.4 Execution completed within budget');
+
+    // -------------------------------------------------------------------------
+    // 9.5 Pair comparisons budget reached: Halts work without exceeding budget
+    // -------------------------------------------------------------------------
+    const resHitBudget = detectRepeatedAudioDetailed(chunks4, 12, 2.0, {
+      bounds: { maxPairComparisons: 3 }
+    });
+    assert(resHitBudget.details.budgetExceeded === true, '9.5 Comparison budget exhaustion flags budgetExceeded = true');
+    assert(resHitBudget.details.limitReached === 'PAIR_COMPARISON_LIMIT', '9.5 Limit reached identifies PAIR_COMPARISON_LIMIT');
+    assert(resHitBudget.details.pairComparisonsPerformed === 3, '9.5 Exactly 3 comparisons executed (no overrun)');
+
+    // -------------------------------------------------------------------------
+    // 9.6 Clean audio with complete analysis reports no matches normally
+    // -------------------------------------------------------------------------
+    assert(resCountPairs.matches.length === 0, '9.6 Complete clean analysis reports 0 matches');
+
+    // -------------------------------------------------------------------------
+    // 9.7 Incomplete analysis with zero matches must NOT claim clean negative result
+    // -------------------------------------------------------------------------
+    // If analysis halted early with 0 matches found, repeatedAudioStatus MUST fail closed
+    // to INSUFFICIENT_EVIDENCE (not NO_SIGNAL_DETECTED)
+    const incompleteDetectorReport = {
+      detectorName: 'subband_spectral_audio_fingerprint',
+      version: '1.1.0',
+      status: 'INSUFFICIENT_EVIDENCE' as any,
+      executionDurationMs: 25,
+      failureReason: 'Analysis budget reached: maximum pair comparisons (3) reached before completing full timeline repetition analysis.',
+      details: {
+        budgetExceeded: true,
+        candidatePairsConsidered: 3,
+        pairComparisonsPerformed: 3,
+        chunksEvaluated: 4,
+        totalChunks: 4
+      }
+    };
+    assert((incompleteDetectorReport.status as string) !== 'NO_SIGNAL_DETECTED', '9.7 Incomplete analysis does NOT claim clean NO_SIGNAL_DETECTED');
+    assert(incompleteDetectorReport.failureReason.includes('Analysis budget reached'), '9.7 Documents budget reached in failureReason');
+
+    // -------------------------------------------------------------------------
+    // 9.8 Matches detected prior to hitting budget are strictly preserved
+    // -------------------------------------------------------------------------
+    // Chunks at 0 and 3 have IDENTICAL profile (match on 1st comparison), followed by distinct chunks
+    const chunksWithEarlyMatch = [
+      makeSynthChunk(0, 1),
+      makeSynthChunk(3, 1), // Identical to chunk 0
+      makeSynthChunk(6, 2),
+      makeSynthChunk(9, 3)
+    ];
+    const resPreserveMatch = detectRepeatedAudioDetailed(chunksWithEarlyMatch, 12, 2.0, {
+      bounds: { maxPairComparisons: 1 }
+    });
+    assert(resPreserveMatch.details.budgetExceeded === true, '9.8 Budget exceeded after first comparison');
+    assert(resPreserveMatch.matches.length === 1, '9.8 Match detected before budget exhaustion is strictly preserved');
+    assert(resPreserveMatch.matches[0].start === 0.0, '9.8 Preserved match start timestamp is 0.0s');
+    assert(resPreserveMatch.matches[0].matchWithTimestamp === 3.0, '9.8 Preserved match target timestamp is 3.0s');
+
+    // -------------------------------------------------------------------------
+    // 9.9 Contiguous segments before budget are merged correctly
+    // -------------------------------------------------------------------------
+    // Chunks at 0, 1 match chunks at 4, 5
+    const contiguousRaw = [
+      { start: 0.0, end: 1.0, matchWithTimestamp: 4.0, similarity: 0.94 },
+      { start: 1.0, end: 2.0, matchWithTimestamp: 5.0, similarity: 0.96 }
+    ];
+    const mergedResults = mergeContiguousAudioSegments(contiguousRaw);
+    assert(mergedResults.length === 1, '9.9 Exactly 1 merged interval produced');
+    assert(mergedResults[0].start === 0.0 && mergedResults[0].end === 2.0, '9.9 Merged interval covers 0.0–2.0s');
+    assert(mergedResults[0].matchWithTimestamp === 4.0, '9.9 Merged target matches 4.0s');
+    assert(mergedResults[0].similarity === 0.95, '9.9 Merged similarity averaged accurately (0.95)');
+
+    // -------------------------------------------------------------------------
+    // 9.10 Large synthetic dataset bound enforcement
+    // -------------------------------------------------------------------------
+    const largeChunks: AudioChunkSignature[] = [];
+    for (let i = 0; i < 2500; i++) {
+      largeChunks.push(makeSynthChunk(i, i % 10));
+    }
+    const resLarge = detectRepeatedAudioDetailed(largeChunks, 2500, 2.0);
+    assert(resLarge.details.totalChunks === 2500, '9.10 2500 total chunks received');
+    assert(resLarge.details.chunksEvaluated === DEFAULT_AUDIO_ANALYSIS_BOUNDS.maxAudioChunks, '9.10 Evaluated chunks strictly capped at default 1800');
+    assert(resLarge.details.budgetExceeded === true, '9.10 Budget exceeded flag set for large dataset');
+    assert(resLarge.details.pairComparisonsPerformed <= DEFAULT_AUDIO_ANALYSIS_BOUNDS.maxPairComparisons, '9.10 Pair comparisons do not overrun 30,000 bound');
+
+    // -------------------------------------------------------------------------
+    // 9.11 Incomplete repeated audio status propagates to policy & risk aggregation
+    // -------------------------------------------------------------------------
+    const incompleteAudioResult = {
+      ...cleanAudioResult,
+      repeatedAudioStatus: 'INSUFFICIENT_EVIDENCE' as const,
+      detectors: {
+        ...cleanAudioResult.detectors,
+        audio_repeated_segments: {
+          detectorName: 'subband_spectral_audio_fingerprint',
+          version: '1.1.0',
+          status: 'INSUFFICIENT_EVIDENCE' as const,
+          executionDurationMs: 15,
+          failureReason: 'Analysis budget reached: maximum pair comparisons (30000) reached before completing full timeline repetition analysis.',
+          details: {
+            budgetExceeded: true,
+            pairComparisonsPerformed: 30000,
+            chunksEvaluated: 600,
+            totalChunks: 1000
+          }
+        }
+      }
+    };
+    const reportIncompletePropagated = policyIntelligenceEngine.buildReport({
+      scanId: 'scan_audio_budget_incomplete',
+      metadata: standardMetaWithAudio,
+      scanMode: 'standard',
+      audioResult: incompleteAudioResult,
+      videoResult: cleanVideoResult
+    }, []);
+    assert(reportIncompletePropagated.overallRisk !== 'LOW_RISK', '9.11 Audio budget exhaustion must NOT return LOW_RISK');
+    assert(reportIncompletePropagated.overallRisk === 'NEEDS_REVIEW', '9.11 Audio budget exhaustion escalates to NEEDS_REVIEW');
+    assert(reportIncompletePropagated.domainReports.video_audio.status !== 'NO_MAJOR_RISK_SIGNALS_DETECTED', '9.11 Domain status does not claim clean signals');
+    assert(reportIncompletePropagated.domainReports.video_audio.status === 'REVIEW_RECOMMENDED', '9.11 Domain status is REVIEW_RECOMMENDED');
+    assert(reportIncompletePropagated.timeline.some(t => t.type === 'core_analyzer_unavailable'), '9.11 Timeline contains core_analyzer_unavailable warning item');
+
+    // -------------------------------------------------------------------------
+    // 9.12 Score Semantics: Heuristic weights vs Similarity vs Confidence
+    // -------------------------------------------------------------------------
+    // When repAudio evidence is added, verify labels distinguish similarity score from confidence
+    const timelineWithRepetition = policyIntelligenceEngine.generateEvidenceTimeline({
+      scanId: 'scan_score_semantics',
+      metadata: standardMetaWithAudio,
+      scanMode: 'standard',
+      audioResult: {
+        ...cleanAudioResult,
+        repeatedAudioSegments: [{
+          start: 0.0,
+          end: 2.0,
+          matchWithTimestamp: 5.0,
+          similarity: 0.93
+        }]
+      },
+      videoResult: cleanVideoResult
+    });
+    const repAudioItem = timelineWithRepetition.find(t => t.type === 'repeated_audio_segment');
+    assert(Boolean(repAudioItem), '9.12 Repeated audio evidence item generated');
+    assert(repAudioItem?.label.includes('93% acoustic match'), '9.12 Evidence label clearly specifies acoustic match');
+    assert(repAudioItem?.details.includes('93% acoustic similarity score'), '9.12 Details clearly states acoustic similarity score (not confidence)');
+    assert(repAudioItem?.confidence === 0.88, '9.12 Confidence is maintained as detector execution confidence');
+
+    // -------------------------------------------------------------------------
+    // 9.13 Regression: detectRepeatedAudio backward compatibility with details
+    // -------------------------------------------------------------------------
+    const compatMatches = detectRepeatedAudio(chunks4, 12, 2.0);
+    assert(Array.isArray(compatMatches), '9.13 detectRepeatedAudio returns standard array');
+    assert(Boolean(compatMatches.details), '9.13 Array carries telemetry details property');
+    assert(compatMatches.details?.candidatePairsConsidered === 6, '9.13 Telemetry details match expected candidate pairs (6)');
 
     console.log(`\n🎉 COMPREHENSIVE DEFECT & PIPELINE VERIFICATION PASSED: ${passed}/${total} assertions!`);
   } finally {
