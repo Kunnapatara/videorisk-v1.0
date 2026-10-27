@@ -595,7 +595,95 @@ export class PolicyIntelligenceEngine {
       }
     }
 
+    // Core analyzer failure check
+    const incompleteCoreAnalyzers = this.getIncompleteCoreAnalyzers(input);
+    for (const detKey of incompleteCoreAnalyzers) {
+      const allDet: Record<string, any> = {
+        ...(input.videoResult?.detectors || {}),
+        ...(input.audioResult?.detectors || {})
+      };
+      const det = allDet[detKey];
+      const reasonSuffix = det?.failureReason ? `: ${det.failureReason}` : '';
+      addItem({
+        domain: 'video_audio',
+        start: 0,
+        end: dur,
+        type: 'core_analyzer_unavailable',
+        category: 'original_contribution',
+        severity: 'warning',
+        confidence: 0.95,
+        confidenceLevel: 'HIGH',
+        uncertaintyReason: 'ANALYZER_UNAVAILABLE',
+        evidenceStatus: 'OBSERVED',
+        provenance: `analyzer:${detKey}`,
+        source: 'pipeline_integrity',
+        label: `🟡 Core Analyzer Unavailable: ${detKey}`,
+        details: `Required core media analysis could not be completed (${detKey}${reasonSuffix}). Automated verification cannot confirm absence of risk signals for this stream.`,
+        contextualInterpretation: 'Automated detectors were unavailable or failed during local media processing.',
+        limitations: 'Automated analysis was incomplete; human review required prior to publishing.',
+        recommendedAction: 'Manually review media for content integrity and policy compliance.'
+      });
+    }
+
     return timeline.sort((a, b) => a.timestampStart - b.timestampStart);
+  }
+
+  /**
+   * Identifies applicable required core analyzers that failed or were unavailable
+   */
+  public getIncompleteCoreAnalyzers(input: IntelligenceInput): string[] {
+    const incomplete: string[] = [];
+    const metadata = input.metadata;
+
+    const hasVideoStream = Boolean(
+      (metadata.width && metadata.width > 0 && metadata.height && metadata.height > 0) ||
+      (metadata.videoCodec && metadata.videoCodec !== 'none') ||
+      (metadata.resolutionLabel && !metadata.resolutionLabel.toLowerCase().includes('audio only'))
+    );
+
+    const hasAudioStream = Boolean(metadata.hasAudio);
+
+    if (hasVideoStream) {
+      const sceneDetector = input.videoResult?.detectors?.video_scene_cut;
+      if (
+        sceneDetector?.status === 'ANALYSIS_UNAVAILABLE' ||
+        (sceneDetector?.failureReason && sceneDetector?.status !== 'DETECTED' && sceneDetector?.status !== 'NO_SIGNAL_DETECTED')
+      ) {
+        incomplete.push('video_scene_cut');
+      }
+
+      const repeatDetector = input.videoResult?.detectors?.video_repeated_footage;
+      const repeatStatus = input.videoResult?.repeatedFootageStatus || repeatDetector?.status;
+      if (
+        repeatStatus === 'ANALYSIS_UNAVAILABLE' ||
+        repeatDetector?.status === 'ANALYSIS_UNAVAILABLE' ||
+        (repeatDetector?.failureReason && repeatStatus !== 'DETECTED' && repeatStatus !== 'NO_SIGNAL_DETECTED')
+      ) {
+        incomplete.push('video_repeated_footage');
+      }
+    }
+
+    if (hasAudioStream) {
+      const volumeDetector = input.audioResult?.detectors?.audio_silence_volume;
+      if (
+        volumeDetector?.status === 'ANALYSIS_UNAVAILABLE' ||
+        (volumeDetector?.failureReason && volumeDetector?.status !== 'DETECTED' && volumeDetector?.status !== 'NO_SIGNAL_DETECTED')
+      ) {
+        incomplete.push('audio_silence_volume');
+      }
+
+      const repeatAudioDetector = input.audioResult?.detectors?.audio_repeated_segments;
+      const repeatAudioStatus = input.audioResult?.repeatedAudioStatus || repeatAudioDetector?.status;
+      if (
+        repeatAudioStatus === 'ANALYSIS_UNAVAILABLE' ||
+        repeatAudioDetector?.status === 'ANALYSIS_UNAVAILABLE' ||
+        (repeatAudioDetector?.failureReason && repeatAudioStatus !== 'DETECTED' && repeatAudioStatus !== 'NO_SIGNAL_DETECTED')
+      ) {
+        incomplete.push('audio_repeated_segments');
+      }
+    }
+
+    return incomplete;
   }
 
   /**
@@ -614,8 +702,50 @@ export class PolicyIntelligenceEngine {
     } = input;
     
     const dur = metadata.durationSeconds;
-    const highWarnings = timeline.filter(t => t.severity === 'high');
-    const warnings = timeline.filter(t => t.severity === 'warning');
+    const incompleteCoreAnalyzers = this.getIncompleteCoreAnalyzers(input);
+    const hasCoreFailures = incompleteCoreAnalyzers.length > 0;
+
+    // Ensure finalTimeline contains core_analyzer_unavailable items if incompleteCoreAnalyzers exist
+    const finalTimeline: EvidenceItem[] = [...timeline];
+    if (hasCoreFailures && !finalTimeline.some(t => t.type === 'core_analyzer_unavailable')) {
+      const allDet: Record<string, any> = {
+        ...(input.videoResult?.detectors || {}),
+        ...(input.audioResult?.detectors || {})
+      };
+      for (const detKey of incompleteCoreAnalyzers) {
+        const det = allDet[detKey];
+        const reasonSuffix = det?.failureReason ? `: ${det.failureReason}` : '';
+        const s = 0;
+        const e = Math.max(1, dur);
+        finalTimeline.push({
+          id: `ev_${scanId}_fail_${detKey}`,
+          scanId,
+          domain: 'video_audio',
+          timestampStart: s,
+          timestampEnd: e,
+          timestampLabel: `${this.formatTimestamp(s)}–${this.formatTimestamp(e)}`,
+          assetLocation: `${this.formatTimestamp(s)}–${this.formatTimestamp(e)}`,
+          type: 'core_analyzer_unavailable',
+          category: 'original_contribution',
+          severity: 'warning',
+          confidence: 0.95,
+          confidenceLevel: 'HIGH',
+          uncertaintyReason: 'ANALYZER_UNAVAILABLE',
+          evidenceStatus: 'OBSERVED',
+          provenance: `analyzer:${detKey}`,
+          source: 'pipeline_integrity',
+          label: `🟡 Core Analyzer Unavailable: ${detKey}`,
+          details: `Required core media analysis could not be completed (${detKey}${reasonSuffix}). Automated verification cannot confirm absence of risk signals for this stream.`,
+          contextualInterpretation: 'Automated detectors were unavailable or failed during local media processing.',
+          limitations: 'Automated analysis was incomplete; human review required prior to publishing.',
+          recommendedAction: 'Manually review media for content integrity and policy compliance.'
+        });
+      }
+      finalTimeline.sort((a, b) => a.timestampStart - b.timestampStart);
+    }
+
+    const highWarnings = finalTimeline.filter(t => t.severity === 'high');
+    const warnings = finalTimeline.filter(t => t.severity === 'warning');
 
     // Evidence integrity: Do not derive original contribution from acoustic energy, silence ratio, or self-reported profiles.
     // When reliable speech/commentary transcript measurement is unavailable, represent as unassessed/insufficient evidence.
@@ -625,7 +755,7 @@ export class PolicyIntelligenceEngine {
     const transformationStatus: EvidenceItem['evidenceStatus'] = 'NOT_ASSESSED';
     
     let reusedContentRatio = 0;
-    const reusedItems = timeline.filter(t => t.category === 'reused_content' && t.severity !== 'info');
+    const reusedItems = finalTimeline.filter(t => t.category === 'reused_content' && t.type !== 'core_analyzer_unavailable' && t.severity !== 'info');
     if (reusedItems.length > 0) {
       const reusedSeconds = reusedItems.reduce((acc, curr) => acc + (curr.timestampEnd - curr.timestampStart), 0);
       reusedContentRatio = Math.min(100, Math.round((reusedSeconds / Math.max(1, dur)) * 100));
@@ -637,17 +767,21 @@ export class PolicyIntelligenceEngine {
 
     if (highWarnings.length > 0 || warnings.length >= 3 || reusedContentRatio > 40) {
       overallRisk = 'HIGH_RISK';
-      riskSummary = 'Potential publishing risks detected. Specific findings require review prior to publishing.';
-    } else if (warnings.length > 0) {
+      riskSummary = hasCoreFailures
+        ? `Potential publishing risks detected. In addition, required automated analysis was incomplete (${incompleteCoreAnalyzers.join(', ')}). Review required prior to publishing.`
+        : 'Potential publishing risks detected. Specific findings require review prior to publishing.';
+    } else if (warnings.length > 0 || hasCoreFailures) {
       overallRisk = 'NEEDS_REVIEW';
-      riskSummary = 'Moderate risk signals detected. Review highlighted segments and recommendations.';
+      riskSummary = hasCoreFailures
+        ? `Automated analysis incomplete: required core media analyzer(s) (${incompleteCoreAnalyzers.join(', ')}) were unavailable or failed to execute. Human review required prior to publishing.`
+        : 'Moderate risk signals detected. Review highlighted segments and recommendations.';
     } else {
       overallRisk = 'LOW_RISK';
       riskSummary = 'No major risk signals detected across analyzed publishing assets. This is not a compliance determination.';
     }
 
     // Top Issues (Grounded in WHAT, WHERE, WHY, FIX, EVIDENCE, CONTEXT, LIMITATIONS)
-    const topIssues: TopIssue[] = timeline
+    const topIssues: TopIssue[] = finalTimeline
       .filter(e => e.severity === 'warning' || e.severity === 'high')
       .map(e => ({
         id: `issue_${e.id}`,
@@ -675,17 +809,23 @@ export class PolicyIntelligenceEngine {
       video_audio: {
         domain: 'video_audio',
         domainLabel: 'Video & Audio Evidence',
-        status: timeline.some(t => t.domain === 'video_audio' && t.severity === 'high') 
+        status: finalTimeline.some(t => t.domain === 'video_audio' && t.severity === 'high') 
           ? 'POTENTIAL_RISK_DETECTED'
-          : timeline.some(t => t.domain === 'video_audio' && t.severity === 'warning')
+          : finalTimeline.some(t => t.domain === 'video_audio' && t.severity === 'warning')
             ? 'REVIEW_RECOMMENDED'
-            : 'NO_MAJOR_RISK_SIGNALS_DETECTED',
-        summary: metadata.hasAudio
-          ? `Acoustic audio activity measured (${Math.round((1 - input.audioResult.silenceRatio) * 100)}% active). ${input.videoResult.scenesCount} scene(s) detected (${input.videoResult.averagePacingSeconds}s pacing). Speech and third-party material are unverified by automated signal analysis.`
-          : 'No audio stream detected in video container. Visual-only analysis performed.',
-        findingsCount: timeline.filter(t => t.domain === 'video_audio' && t.severity !== 'info').length,
-        confidence: 'MEDIUM',
-        limitations: 'Silence and scene cut detection measure acoustic volume and visual transitions; VideoRisk does not verify speech content or query YouTube Content ID / copyright databases.',
+            : hasCoreFailures
+              ? 'ANALYSIS_UNAVAILABLE'
+              : 'NO_MAJOR_RISK_SIGNALS_DETECTED',
+        summary: hasCoreFailures
+          ? `Analysis incomplete: required core media analyzer(s) (${incompleteCoreAnalyzers.join(', ')}) were unavailable. Human review required prior to publishing.`
+          : metadata.hasAudio
+            ? `Acoustic audio activity measured (${Math.round((1 - input.audioResult.silenceRatio) * 100)}% active). ${input.videoResult.scenesCount} scene(s) detected (${input.videoResult.averagePacingSeconds}s pacing). Speech and third-party material are unverified by automated signal analysis.`
+            : 'No audio stream detected in video container. Visual-only analysis performed.',
+        findingsCount: finalTimeline.filter(t => t.domain === 'video_audio' && t.severity !== 'info').length,
+        confidence: hasCoreFailures ? 'LOW' : 'MEDIUM',
+        limitations: hasCoreFailures
+          ? 'Required core media analyzers were unavailable or failed. VideoRisk cannot verify potential risks for this stream.'
+          : 'Silence and scene cut detection measure acoustic volume and visual transitions; VideoRisk does not verify speech content or query YouTube Content ID / copyright databases.',
         details: {
           hasAudio: metadata.hasAudio,
           hasMusicDetected: input.audioResult.hasMusicDetected,
@@ -695,6 +835,7 @@ export class PolicyIntelligenceEngine {
           silenceRatio: input.audioResult.silenceRatio,
           scenesCount: input.videoResult.scenesCount,
           averagePacingSeconds: input.videoResult.averagePacingSeconds,
+          incompleteCoreAnalyzers: hasCoreFailures ? incompleteCoreAnalyzers : undefined,
         }
       },
       title: {
@@ -804,10 +945,10 @@ export class PolicyIntelligenceEngine {
         category: 'reused_content',
         impact: reusedContentRatio > 25 
           ? 'High Scrutiny' 
-          : (channelProfile?.thirdPartyFootageUsage && channelProfile.thirdPartyFootageUsage !== 'none' 
+          : (channelProfile?.thirdPartyFootageUsage && channelProfile.thirdPartyFootageUsage !== 'none'
             ? 'Moderate Concern' 
             : 'No Direct Issues Detected'),
-        signalsCount: timeline.filter(t => t.category === 'reused_content' && t.severity !== 'info').length,
+        signalsCount: finalTimeline.filter(t => t.category === 'reused_content' && t.severity !== 'info').length,
         description: 'Requires that external clips be incorporated into original commentary, critique, or education. VideoRisk does not query third-party visual catalogs; this is not a compliance determination.',
         evidenceStatus: reusedContentRatio > 25 ? 'OBSERVED' : 'INSUFFICIENT_EVIDENCE'
       },
@@ -817,27 +958,27 @@ export class PolicyIntelligenceEngine {
         impact: (!metadata.hasAudio || input.audioResult.silenceRatio > 0.9) 
           ? 'Moderate Concern' 
           : 'Insufficient Evidence',
-        signalsCount: timeline.filter(t => t.category === 'original_contribution' && t.severity !== 'info').length,
+        signalsCount: finalTimeline.filter(t => t.category === 'original_contribution' && t.severity !== 'info').length,
         description: 'Evaluates creator commentary and educational value. Acoustic sound alone does not verify speech presence or original contribution.',
         evidenceStatus: (!metadata.hasAudio || input.audioResult.silenceRatio > 0.9) ? 'OBSERVED' : 'INSUFFICIENT_EVIDENCE'
       },
       {
         policyName: 'Inauthentic & Mass-Produced Content Policy',
         category: 'inauthentic_pattern',
-        impact: timeline.some(t => t.category === 'inauthentic_pattern' && t.severity !== 'info') 
+        impact: finalTimeline.some(t => t.category === 'inauthentic_pattern' && t.severity !== 'info') 
           ? 'Moderate Concern' 
           : 'Not Assessed',
-        signalsCount: timeline.filter(t => t.category === 'inauthentic_pattern' && t.severity !== 'info').length,
+        signalsCount: finalTimeline.filter(t => t.category === 'inauthentic_pattern' && t.severity !== 'info').length,
         description: 'Evaluates repetitive templated video generation. Channel-wide mass production is not assessed from an isolated upload.',
-        evidenceStatus: timeline.some(t => t.category === 'inauthentic_pattern' && t.severity !== 'info') ? 'OBSERVED' : 'NOT_ASSESSED'
+        evidenceStatus: finalTimeline.some(t => t.category === 'inauthentic_pattern' && t.severity !== 'info') ? 'OBSERVED' : 'NOT_ASSESSED'
       },
       {
         policyName: 'Advertiser-Friendly Ad Suitability Guidelines',
         category: 'advertiser_friendly',
-        impact: timeline.some(t => t.category === 'advertiser_friendly' && t.severity !== 'info') 
+        impact: finalTimeline.some(t => t.category === 'advertiser_friendly' && t.severity !== 'info') 
           ? 'Moderate Concern' 
           : 'No Direct Issues Detected',
-        signalsCount: timeline.filter(t => t.category === 'advertiser_friendly' && t.severity !== 'info').length,
+        signalsCount: finalTimeline.filter(t => t.category === 'advertiser_friendly' && t.severity !== 'info').length,
         description: 'Maintains ad suitability standards regarding language and sensitive themes. No policy triggers identified in analyzed text; review YouTube self-certification guidelines upon publishing.',
         evidenceStatus: 'OBSERVED'
       },
@@ -852,16 +993,16 @@ export class PolicyIntelligenceEngine {
     ];
 
     // Evidence-based category risk scoring directly from traceable findings
-    const yppSignals = timeline.filter(t => (t.category === 'reused_content' || t.category === 'inauthentic_pattern' || t.category === 'original_contribution') && t.severity !== 'info');
+    const yppSignals = finalTimeline.filter(t => (t.category === 'reused_content' || t.category === 'inauthentic_pattern' || t.category === 'original_contribution') && t.severity !== 'info');
     const yppScore = Math.min(100, 10 + (reusedContentRatio > 25 ? 40 : (reusedContentRatio > 0 ? 15 : 0)) + (input.videoResult.hasSlideshowPattern ? 20 : 0) + (yppSignals.length * 8));
 
-    const monSignals = timeline.filter(t => t.domain === 'video_audio' && t.severity !== 'info');
+    const monSignals = finalTimeline.filter(t => t.domain === 'video_audio' && t.severity !== 'info');
     const videoMonetizationScore = Math.min(100, 10 + (monSignals.filter(s => s.severity === 'high').length * 35) + (monSignals.filter(s => s.severity === 'warning').length * 15));
 
-    const advSignals = timeline.filter(t => t.category === 'advertiser_friendly' && t.severity !== 'info');
+    const advSignals = finalTimeline.filter(t => t.category === 'advertiser_friendly' && t.severity !== 'info');
     const advertiserScore = Math.min(100, 10 + (advSignals.filter(s => s.severity === 'high').length * 40) + (advSignals.filter(s => s.severity === 'warning').length * 20));
 
-    const copyrightSignals = timeline.filter(t => t.type === 'repeated_visual_footage' || t.type === 'repeated_audio_segment');
+    const copyrightSignals = finalTimeline.filter(t => t.type === 'repeated_visual_footage' || t.type === 'repeated_audio_segment');
     const copyrightScore = Math.min(100, 10 + (reusedContentRatio > 25 ? 30 : (reusedContentRatio > 0 ? 15 : 0)) + (copyrightSignals.length * 10) + (input.channelProfile?.thirdPartyFootageUsage && input.channelProfile.thirdPartyFootageUsage !== 'none' ? 10 : 0));
 
     const allDetectors: Record<string, DetectorReport> = {
@@ -914,7 +1055,7 @@ export class PolicyIntelligenceEngine {
       },
       topIssues,
       policyConnections,
-      timeline,
+      timeline: finalTimeline,
       originalContributionRatio,
       originalContributionStatus,
       reusedContentRatio,

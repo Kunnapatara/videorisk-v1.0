@@ -20,7 +20,7 @@ import { policyIntelligenceEngine } from '../src/server/intelligence/policyIntel
 import { storage } from '../src/server/storage';
 import { apiRouter, secureUploadsHandler } from '../src/server/routes/api';
 import { JobOrchestrator } from '../src/server/pipeline/jobOrchestrator';
-import { ScanJob, RiskReport, MediaMetadata } from '../src/types';
+import { ScanJob, RiskReport, MediaMetadata, EvidenceItem } from '../src/types';
 
 const execFileAsync = promisify(execFile);
 
@@ -971,6 +971,331 @@ export async function runComprehensiveDefectAndPipelineTests() {
     } finally {
       server.close();
     }
+
+    // =========================================================================
+    // 8. STAGE 1: RISK AGGREGATION FAIL-CLOSED & COVERAGE INTEGRITY
+    // =========================================================================
+    console.log('\n[8. Stage 1: Risk Aggregation Fail-Closed & Coverage Integrity]');
+
+    const standardMetaWithAudio: MediaMetadata = {
+      filename: 'sample_media.mp4',
+      originalSize: 1024 * 1024,
+      durationSeconds: 10,
+      width: 1280,
+      height: 720,
+      resolutionLabel: '720p HD',
+      fps: 30,
+      hasAudio: true,
+      videoCodec: 'h264',
+      audioCodec: 'aac',
+      isProxyUsed: false
+    };
+
+    const cleanVideoResult = {
+      scenesCount: 2,
+      framesSampled: 10,
+      hasSlideshowPattern: false,
+      repeatedFootageSegments: [],
+      templateRepetitions: [],
+      averagePacingSeconds: 5,
+      tempFramesDir: '',
+      repeatedFootageStatus: 'NO_SIGNAL_DETECTED' as const,
+      detectors: {
+        video_scene_cut: {
+          detectorName: 'ffmpeg_scene_select',
+          version: '1.0.0',
+          status: 'DETECTED' as const,
+          executionDurationMs: 50
+        },
+        video_repeated_footage: {
+          detectorName: 'perceptual_hash_comparator',
+          version: '1.0.0',
+          status: 'NO_SIGNAL_DETECTED' as const,
+          executionDurationMs: 40
+        }
+      }
+    };
+
+    const cleanAudioResult = {
+      hasVoiceover: false,
+      voiceoverRatio: 0,
+      silenceRatio: 0.1,
+      hasMusicDetected: false,
+      advertiserSpeechFlags: [],
+      segments: [{ start: 0, end: 10, type: 'voice' as const }],
+      transcriptSummary: 'Clean audio.',
+      speechAnalysisStatus: 'NO_SIGNAL_DETECTED' as const,
+      repeatedAudioStatus: 'NO_SIGNAL_DETECTED' as const,
+      repeatedAudioSegments: [],
+      detectors: {
+        audio_silence_volume: {
+          detectorName: 'ffmpeg_silence_and_volume',
+          version: '1.0.0',
+          status: 'DETECTED' as const,
+          executionDurationMs: 30
+        },
+        audio_repeated_segments: {
+          detectorName: 'subband_spectral_audio_fingerprint',
+          version: '1.1.0',
+          status: 'NO_SIGNAL_DETECTED' as const,
+          executionDurationMs: 25
+        }
+      }
+    };
+
+    // -------------------------------------------------------------------------
+    // Test 1: Required video analyzer unavailable
+    // -------------------------------------------------------------------------
+    const failedVideoResult = {
+      ...cleanVideoResult,
+      detectors: {
+        ...cleanVideoResult.detectors,
+        video_scene_cut: {
+          detectorName: 'ffmpeg_scene_select',
+          version: '1.0.0',
+          status: 'ANALYSIS_UNAVAILABLE' as const,
+          executionDurationMs: 5,
+          failureReason: 'FFmpeg scene select filter exited with error'
+        }
+      }
+    };
+
+    const reportVideoFail = policyIntelligenceEngine.buildReport({
+      scanId: 'scan_fail_video_core',
+      metadata: standardMetaWithAudio,
+      scanMode: 'standard',
+      audioResult: cleanAudioResult,
+      videoResult: failedVideoResult,
+      videoTitle: 'Test Video Analyzer Fail'
+    }, []);
+
+    assert(reportVideoFail.overallRisk !== 'LOW_RISK', '8.1 Video core failure must NOT return LOW_RISK (fail-closed)');
+    assert(reportVideoFail.overallRisk === 'NEEDS_REVIEW', '8.1 Video core failure escalates to NEEDS_REVIEW');
+    assert(reportVideoFail.domainReports.video_audio.status !== 'NO_MAJOR_RISK_SIGNALS_DETECTED', '8.1 Video core failure domain does NOT claim NO_MAJOR_RISK_SIGNALS_DETECTED');
+    assert(reportVideoFail.domainReports.video_audio.status === 'REVIEW_RECOMMENDED', '8.1 Video core failure domain status reflects REVIEW_RECOMMENDED');
+    assert(reportVideoFail.riskSummary.toLowerCase().includes('incomplete'), '8.1 Risk summary communicates incomplete analysis');
+    assert(reportVideoFail.timeline.some(t => t.type === 'core_analyzer_unavailable'), '8.1 Timeline contains core_analyzer_unavailable warning item');
+
+    // Also verify when repeatedFootageStatus is ANALYSIS_UNAVAILABLE
+    const failedRepeatedVideoResult = {
+      ...cleanVideoResult,
+      repeatedFootageStatus: 'ANALYSIS_UNAVAILABLE' as const,
+      detectors: {
+        ...cleanVideoResult.detectors,
+        video_repeated_footage: {
+          detectorName: 'perceptual_hash_comparator',
+          version: '1.0.0',
+          status: 'ANALYSIS_UNAVAILABLE' as const,
+          executionDurationMs: 5,
+          failureReason: 'Perceptual frame hashing failed'
+        }
+      }
+    };
+    const reportRepeatVideoFail = policyIntelligenceEngine.buildReport({
+      scanId: 'scan_fail_video_repeat',
+      metadata: standardMetaWithAudio,
+      scanMode: 'standard',
+      audioResult: cleanAudioResult,
+      videoResult: failedRepeatedVideoResult
+    }, []);
+    assert(reportRepeatVideoFail.overallRisk === 'NEEDS_REVIEW', '8.1 Repeated footage failure returns NEEDS_REVIEW');
+
+    // -------------------------------------------------------------------------
+    // Test 2: Required audio analyzer unavailable
+    // -------------------------------------------------------------------------
+    const failedAudioResult = {
+      ...cleanAudioResult,
+      repeatedAudioStatus: 'ANALYSIS_UNAVAILABLE' as const,
+      detectors: {
+        ...cleanAudioResult.detectors,
+        audio_repeated_segments: {
+          detectorName: 'subband_spectral_audio_fingerprint',
+          version: '1.1.0',
+          status: 'ANALYSIS_UNAVAILABLE' as const,
+          executionDurationMs: 10,
+          failureReason: 'PCM extraction failed during local FFmpeg execution'
+        }
+      }
+    };
+
+    const reportAudioFail = policyIntelligenceEngine.buildReport({
+      scanId: 'scan_fail_audio_core',
+      metadata: standardMetaWithAudio,
+      scanMode: 'standard',
+      audioResult: failedAudioResult,
+      videoResult: cleanVideoResult,
+      videoTitle: 'Test Audio Analyzer Fail'
+    }, []);
+
+    assert(reportAudioFail.overallRisk !== 'LOW_RISK', '8.2 Audio core failure must NOT return LOW_RISK');
+    assert(reportAudioFail.overallRisk === 'NEEDS_REVIEW', '8.2 Audio core failure escalates to NEEDS_REVIEW');
+    assert(reportAudioFail.domainReports.video_audio.status !== 'NO_MAJOR_RISK_SIGNALS_DETECTED', '8.2 Audio core failure does NOT claim NO_MAJOR_RISK_SIGNALS_DETECTED');
+    assert(reportAudioFail.riskSummary.toLowerCase().includes('incomplete'), '8.2 Audio failure summary communicates incomplete analysis');
+
+    // -------------------------------------------------------------------------
+    // Test 3: Optional STT unavailable remains compatible
+    // -------------------------------------------------------------------------
+    const optionalSttUnavailableAudioResult = {
+      ...cleanAudioResult,
+      speechAnalysisStatus: 'ANALYSIS_UNAVAILABLE' as const,
+      detectors: {
+        ...cleanAudioResult.detectors,
+        audio_transcription: {
+          detectorName: 'local_speech_to_text_adapter',
+          version: '1.0.0',
+          status: 'ANALYSIS_UNAVAILABLE' as const,
+          executionDurationMs: 0,
+          limitations: 'Local STT binary not found on host'
+        }
+      }
+    };
+
+    const reportSttUnavailable = policyIntelligenceEngine.buildReport({
+      scanId: 'scan_stt_unavailable',
+      metadata: standardMetaWithAudio,
+      scanMode: 'standard',
+      audioResult: optionalSttUnavailableAudioResult,
+      videoResult: cleanVideoResult,
+      videoTitle: 'Clean Video with Unavailable STT'
+    }, []);
+
+    assert(reportSttUnavailable.overallRisk === 'LOW_RISK', '8.3 Optional STT unavailable preserves clean LOW_RISK baseline');
+    assert(reportSttUnavailable.domainReports.video_audio.status === 'NO_MAJOR_RISK_SIGNALS_DETECTED', '8.3 Clean video with unavailable STT reports NO_MAJOR_RISK_SIGNALS_DETECTED');
+    const origContribPolicy = reportSttUnavailable.policyConnections.find(p => p.policyName.includes('Original Creator Contribution'));
+    assert(origContribPolicy?.impact === 'Insufficient Evidence', '8.3 Originality policy marks Insufficient Evidence when speech is unverified');
+
+    // -------------------------------------------------------------------------
+    // Test 4: Optional music classifier unavailable remains compatible
+    // -------------------------------------------------------------------------
+    const optionalMusicUnavailableAudioResult = {
+      ...cleanAudioResult,
+      hasMusicDetected: null,
+      musicAnalysisStatus: 'ANALYSIS_UNAVAILABLE' as const,
+      detectors: {
+        ...cleanAudioResult.detectors,
+        audio_music_detection: {
+          detectorName: 'music_classification_analyzer',
+          version: '1.0.0',
+          status: 'ANALYSIS_UNAVAILABLE' as const,
+          executionDurationMs: 0,
+          limitations: 'Music classifier model not available'
+        }
+      }
+    };
+
+    const reportMusicUnavailable = policyIntelligenceEngine.buildReport({
+      scanId: 'scan_music_unavailable',
+      metadata: standardMetaWithAudio,
+      scanMode: 'standard',
+      audioResult: optionalMusicUnavailableAudioResult,
+      videoResult: cleanVideoResult
+    }, []);
+
+    assert(reportMusicUnavailable.overallRisk === 'LOW_RISK', '8.4 Optional music classifier unavailable preserves LOW_RISK baseline');
+    assert(reportMusicUnavailable.riskCategories.copyrightSignals.status === 'LOW_RISK', '8.4 Copyright category remains LOW_RISK when no flags are present');
+
+    // -------------------------------------------------------------------------
+    // Test 5: Missing stream is not treated as analyzer failure
+    // -------------------------------------------------------------------------
+    // 5A: Video without audio stream
+    const noAudioMeta: MediaMetadata = {
+      ...standardMetaWithAudio,
+      hasAudio: false,
+      audioCodec: undefined
+    };
+    const emptyAudioResult = {
+      ...cleanAudioResult,
+      detectors: {} // no audio detectors run
+    };
+    const reportNoAudio = policyIntelligenceEngine.buildReport({
+      scanId: 'scan_no_audio_stream',
+      metadata: noAudioMeta,
+      scanMode: 'standard',
+      audioResult: emptyAudioResult,
+      videoResult: cleanVideoResult
+    }, []);
+    assert(reportNoAudio.overallRisk === 'LOW_RISK', '8.5A Missing audio stream does NOT trigger audio core fail-closed');
+    assert(reportNoAudio.domainReports.video_audio.status === 'NO_MAJOR_RISK_SIGNALS_DETECTED', '8.5A Clean silent video domain status is NO_MAJOR_RISK_SIGNALS_DETECTED');
+
+    // 5B: Audio-only container (no video stream)
+    const audioOnlyMeta: MediaMetadata = {
+      filename: 'audio_only.mp3',
+      originalSize: 500000,
+      durationSeconds: 10,
+      width: 0,
+      height: 0,
+      resolutionLabel: 'Audio Only (No Video Stream)',
+      fps: 0,
+      hasAudio: true,
+      audioCodec: 'mp3',
+      isProxyUsed: false
+    };
+    const emptyVideoResult = {
+      scenesCount: 0,
+      framesSampled: 0,
+      hasSlideshowPattern: false,
+      repeatedFootageSegments: [],
+      templateRepetitions: [],
+      averagePacingSeconds: 0,
+      tempFramesDir: '',
+      detectors: {} // no video detectors run
+    };
+    const reportAudioOnly = policyIntelligenceEngine.buildReport({
+      scanId: 'scan_audio_only',
+      metadata: audioOnlyMeta,
+      scanMode: 'standard',
+      audioResult: cleanAudioResult,
+      videoResult: emptyVideoResult
+    }, []);
+    assert(reportAudioOnly.overallRisk === 'LOW_RISK', '8.5B Audio-only media does NOT trigger video core fail-closed');
+
+    // -------------------------------------------------------------------------
+    // Test 6: Higher-severity findings take precedence
+    // -------------------------------------------------------------------------
+    // Core video analyzer failed, BUT timeline already contains high-severity warning
+    const highRiskTimeline: EvidenceItem[] = [{
+      id: 'ev_high_1',
+      scanId: 'scan_high_risk_precedence',
+      domain: 'video_audio',
+      timestampStart: 0,
+      timestampEnd: 5,
+      timestampLabel: '00:00–00:05',
+      type: 'severe_policy_violation',
+      category: 'reused_content',
+      severity: 'high',
+      confidence: 0.99,
+      confidenceLevel: 'HIGH',
+      provenance: 'manual_override',
+      source: 'test',
+      label: '🔴 Critical Violation',
+      details: 'Confirmed reused content without modification.'
+    }];
+
+    const reportHighPrecedence = policyIntelligenceEngine.buildReport({
+      scanId: 'scan_high_risk_precedence',
+      metadata: standardMetaWithAudio,
+      scanMode: 'standard',
+      audioResult: cleanAudioResult,
+      videoResult: failedVideoResult // video_scene_cut is ANALYSIS_UNAVAILABLE
+    }, highRiskTimeline);
+
+    assert(reportHighPrecedence.overallRisk === 'HIGH_RISK', '8.6 HIGH_RISK takes precedence over analyzer failure NEEDS_REVIEW');
+    assert(!reportHighPrecedence.riskSummary.includes('No major risk signals'), '8.6 High risk report does NOT claim clean signals');
+
+    // -------------------------------------------------------------------------
+    // Test 7: Clean baseline remains unchanged
+    // -------------------------------------------------------------------------
+    const reportCleanBaseline = policyIntelligenceEngine.buildReport({
+      scanId: 'scan_clean_baseline',
+      metadata: standardMetaWithAudio,
+      scanMode: 'standard',
+      audioResult: cleanAudioResult,
+      videoResult: cleanVideoResult
+    }, []);
+
+    assert(reportCleanBaseline.overallRisk === 'LOW_RISK', '8.7 Clean baseline remains LOW_RISK when all core analyzers complete successfully');
+    assert(reportCleanBaseline.domainReports.video_audio.status === 'NO_MAJOR_RISK_SIGNALS_DETECTED', '8.7 Clean baseline reports NO_MAJOR_RISK_SIGNALS_DETECTED');
+    assert(reportCleanBaseline.riskSummary.includes('No major risk signals detected'), '8.7 Clean baseline summary confirms no major risk signals');
 
     console.log(`\n🎉 COMPREHENSIVE DEFECT & PIPELINE VERIFICATION PASSED: ${passed}/${total} assertions!`);
   } finally {
