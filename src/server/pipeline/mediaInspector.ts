@@ -52,7 +52,7 @@ export class MediaInspector {
       }
 
       let duration = parseFloat(format.duration || '0');
-      if (isNaN(duration) || duration <= 0) {
+      if (isNaN(duration) || duration <= 0 || !Number.isFinite(duration)) {
         if (videoStream?.duration) {
           duration = parseFloat(videoStream.duration);
         } else if (audioStream?.duration) {
@@ -60,9 +60,15 @@ export class MediaInspector {
         }
       }
 
-      if (duration <= 0 || isNaN(duration)) {
+      if (isNaN(duration) || duration <= 0 || !Number.isFinite(duration)) {
         throw new MediaInspectionError('Could not determine valid duration for media container.');
       }
+
+      // Preserve actual fractional duration reported by ffprobe (up to millisecond precision)
+      const accurateDuration = parseFloat(duration.toFixed(3));
+      const durationSeconds = (Number.isFinite(accurateDuration) && accurateDuration > 0)
+        ? accurateDuration
+        : duration;
 
       let width = 0;
       let height = 0;
@@ -112,7 +118,7 @@ export class MediaInspector {
       return {
         filename: originalFilename,
         originalSize,
-        durationSeconds: Math.max(1, Math.round(duration)),
+        durationSeconds,
         width,
         height,
         resolutionLabel,

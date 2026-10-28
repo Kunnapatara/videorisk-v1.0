@@ -462,6 +462,25 @@ export const DEFAULT_AUDIO_ANALYSIS_BOUNDS: AudioAnalysisBounds = Object.freeze(
   maxPairComparisons: 30000
 });
 
+/**
+ * Sanitizes caller-provided bounds to strictly prevent zero, negative, NaN,
+ * infinite, or malformed inputs from bypassing processing limits or causing unbounded loops.
+ */
+export function sanitizeAudioAnalysisBounds(raw?: Partial<AudioAnalysisBounds>): AudioAnalysisBounds {
+  const sanitizeInt = (val: any, fallback: number, min: number = 1): number => {
+    if (typeof val === 'number' && Number.isFinite(val) && !Number.isNaN(val) && val >= min) {
+      return Math.floor(val);
+    }
+    return fallback;
+  };
+
+  return {
+    maxAudioChunks: sanitizeInt(raw?.maxAudioChunks, DEFAULT_AUDIO_ANALYSIS_BOUNDS.maxAudioChunks, 1),
+    maxCandidatePairs: sanitizeInt(raw?.maxCandidatePairs, DEFAULT_AUDIO_ANALYSIS_BOUNDS.maxCandidatePairs, 1),
+    maxPairComparisons: sanitizeInt(raw?.maxPairComparisons, DEFAULT_AUDIO_ANALYSIS_BOUNDS.maxPairComparisons, 1)
+  };
+}
+
 export interface RepeatedAudioMatch {
   start: number;
   end: number;
@@ -604,11 +623,7 @@ export function detectRepeatedAudioDetailed(
   matches: RepeatedAudioMatch[];
   details: RepeatedAudioAnalysisDetails;
 } {
-  const bounds: AudioAnalysisBounds = {
-    maxAudioChunks: options?.bounds?.maxAudioChunks ?? DEFAULT_AUDIO_ANALYSIS_BOUNDS.maxAudioChunks,
-    maxCandidatePairs: options?.bounds?.maxCandidatePairs ?? DEFAULT_AUDIO_ANALYSIS_BOUNDS.maxCandidatePairs,
-    maxPairComparisons: options?.bounds?.maxPairComparisons ?? DEFAULT_AUDIO_ANALYSIS_BOUNDS.maxPairComparisons
-  };
+  const bounds: AudioAnalysisBounds = sanitizeAudioAnalysisBounds(options?.bounds);
 
   const totalChunks = chunkSignatures.length;
   const chunksToEvaluate = totalChunks > bounds.maxAudioChunks
@@ -688,7 +703,7 @@ export function detectRepeatedAudioDetailed(
         const matchTimestamp = parseFloat(c2.sec.toFixed(2));
         const matchEndTimestamp = parseFloat(Math.min(c2.sec + c2.duration, durationSeconds).toFixed(2));
 
-        if (startSec < endSec && endSec <= durationSeconds && matchTimestamp <= durationSeconds) {
+        if (startSec < endSec && endSec <= durationSeconds && matchTimestamp <= durationSeconds && matchEndTimestamp <= durationSeconds) {
           rawMatches.push({
             start: startSec,
             end: endSec,
@@ -844,7 +859,7 @@ export class AudioProcessor {
 
       const bytesPerSec = 16000;
       const totalAudioSeconds = parseFloat((totalBytes / bytesPerSec).toFixed(3));
-      const maxChunks = options?.bounds?.maxAudioChunks ?? DEFAULT_AUDIO_ANALYSIS_BOUNDS.maxAudioChunks;
+      const maxChunks = sanitizeAudioAnalysisBounds(options?.bounds).maxAudioChunks;
 
       // Bounded buffer streaming: read 1-second chunks (16,000 bytes) one at a time
       const fd = fs.openSync(tempPcmPath, 'r');

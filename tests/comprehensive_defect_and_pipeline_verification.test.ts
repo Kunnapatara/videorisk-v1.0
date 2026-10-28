@@ -15,7 +15,8 @@ import {
   mergeContiguousAudioSegments,
   AudioChunkSignature,
   DEFAULT_AUDIO_ANALYSIS_BOUNDS,
-  AudioAnalysisBounds
+  AudioAnalysisBounds,
+  sanitizeAudioAnalysisBounds
 } from '../src/server/pipeline/audioProcessor';
 import { thumbnailInspector } from '../src/server/pipeline/thumbnailInspector';
 import { mediaInspector } from '../src/server/pipeline/mediaInspector';
@@ -1539,6 +1540,59 @@ export async function runComprehensiveDefectAndPipelineTests() {
     assert(Array.isArray(compatMatches), '9.13 detectRepeatedAudio returns standard array');
     assert(Boolean(compatMatches.details), '9.13 Array carries telemetry details property');
     assert(compatMatches.details?.candidatePairsConsidered === 6, '9.13 Telemetry details match expected candidate pairs (6)');
+
+    // -------------------------------------------------------------------------
+    // 9.14 Invalid / zero / negative / NaN bounds safely sanitized to defaults
+    // -------------------------------------------------------------------------
+    const zeroBounds = sanitizeAudioAnalysisBounds({ maxAudioChunks: 0, maxPairComparisons: -10, maxCandidatePairs: NaN });
+    assert(zeroBounds.maxAudioChunks === DEFAULT_AUDIO_ANALYSIS_BOUNDS.maxAudioChunks, '9.14 0 maxAudioChunks safely falls back to default');
+    assert(zeroBounds.maxPairComparisons === DEFAULT_AUDIO_ANALYSIS_BOUNDS.maxPairComparisons, '9.14 Negative maxPairComparisons safely falls back to default');
+    assert(zeroBounds.maxCandidatePairs === DEFAULT_AUDIO_ANALYSIS_BOUNDS.maxCandidatePairs, '9.14 NaN maxCandidatePairs safely falls back to default');
+
+    const nonFiniteBounds = sanitizeAudioAnalysisBounds({ maxAudioChunks: Infinity, maxPairComparisons: 'invalid' as any });
+    assert(nonFiniteBounds.maxAudioChunks === DEFAULT_AUDIO_ANALYSIS_BOUNDS.maxAudioChunks, '9.14 Infinity maxAudioChunks safely falls back to default');
+    assert(nonFiniteBounds.maxPairComparisons === DEFAULT_AUDIO_ANALYSIS_BOUNDS.maxPairComparisons, '9.14 Non-numeric maxPairComparisons safely falls back to default');
+
+    // -------------------------------------------------------------------------
+    // 9.15 Sub-second and fractional media timestamps never exceed duration
+    // -------------------------------------------------------------------------
+    const subSecondTimeline = policyIntelligenceEngine.generateEvidenceTimeline({
+      scanId: 'scan_subsecond_ts',
+      metadata: {
+        filename: 'subsecond.mp4',
+        originalSize: 1000,
+        durationSeconds: 0.42,
+        width: 320,
+        height: 180,
+        resolutionLabel: '320x180',
+        fps: 30,
+        hasAudio: false,
+        isProxyUsed: false
+      },
+      scanMode: 'standard',
+      audioResult: {
+        hasVoiceover: false,
+        voiceoverRatio: 0,
+        silenceRatio: 1,
+        hasMusicDetected: null,
+        isAudible: false,
+        advertiserSpeechFlags: [],
+        segments: [{ start: 0, end: 0.42, type: 'silence' }],
+        transcriptSummary: 'Silent sub-second clip'
+      },
+      videoResult: cleanVideoResult
+    });
+    for (const item of subSecondTimeline) {
+      assert(item.timestampEnd <= 0.42, `9.15 Evidence item ${item.id} timestampEnd (${item.timestampEnd}) <= 0.42`);
+    }
+
+    // -------------------------------------------------------------------------
+    // 9.16 Fractional Media Duration Precision (ffprobe fractional seconds preserved)
+    // -------------------------------------------------------------------------
+    // Inspect partial 4.7s video from test 3.5.8
+    const partialMeta = await mediaInspector.inspect(partialAudioVideoPath, 'partial_4_7s_audio.mp4');
+    assert(partialMeta.durationSeconds === 4.7, '9.16 Fractional duration (4.7s) preserved exactly (not rounded to 5s)');
+    assert(typeof partialMeta.durationSeconds === 'number' && Number.isFinite(partialMeta.durationSeconds), '9.16 Duration is a finite float');
 
     console.log(`\n🎉 COMPREHENSIVE DEFECT & PIPELINE VERIFICATION PASSED: ${passed}/${total} assertions!`);
   } finally {

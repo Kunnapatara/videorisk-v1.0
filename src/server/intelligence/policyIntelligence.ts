@@ -112,7 +112,8 @@ export class PolicyIntelligenceEngine {
       recommendedAction?: string;
     }) => {
       const s = Math.max(0, Math.min(dur, opts.start));
-      const e = Math.max(s + 1, Math.min(dur, opts.end));
+      const requestedEnd = opts.end <= s ? Math.min(dur, s + (dur < 1 ? dur - s : 1)) : opts.end;
+      const e = Math.min(dur, Math.max(s, requestedEnd));
       timeline.push({
         id: `ev_${scanId}_${idCounter++}`,
         scanId,
@@ -717,7 +718,7 @@ export class PolicyIntelligenceEngine {
         const det = allDet[detKey];
         const reasonSuffix = det?.failureReason ? `: ${det.failureReason}` : '';
         const s = 0;
-        const e = Math.max(1, dur);
+        const e = dur;
         finalTimeline.push({
           id: `ev_${scanId}_fail_${detKey}`,
           scanId,
@@ -759,7 +760,7 @@ export class PolicyIntelligenceEngine {
     const reusedItems = finalTimeline.filter(t => t.category === 'reused_content' && t.type !== 'core_analyzer_unavailable' && t.severity !== 'info');
     if (reusedItems.length > 0) {
       const reusedSeconds = reusedItems.reduce((acc, curr) => acc + (curr.timestampEnd - curr.timestampStart), 0);
-      reusedContentRatio = Math.min(100, Math.round((reusedSeconds / Math.max(1, dur)) * 100));
+      reusedContentRatio = Math.min(100, Math.round((reusedSeconds / Math.max(0.001, dur)) * 100));
     }
 
     // Determine overall risk
