@@ -678,7 +678,7 @@ export class PolicyIntelligenceEngine {
       if (
         repeatAudioStatus === 'ANALYSIS_UNAVAILABLE' ||
         repeatAudioDetector?.status === 'ANALYSIS_UNAVAILABLE' ||
-        (repeatAudioDetector?.details?.budgetExceeded && repeatAudioStatus !== 'DETECTED') ||
+        repeatAudioDetector?.details?.budgetExceeded === true ||
         (repeatAudioDetector?.failureReason && repeatAudioStatus !== 'DETECTED' && repeatAudioStatus !== 'NO_SIGNAL_DETECTED')
       ) {
         incomplete.push('audio_repeated_segments');

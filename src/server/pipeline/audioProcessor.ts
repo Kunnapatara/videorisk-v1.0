@@ -774,13 +774,13 @@ export class AudioProcessor {
    * 2. In-Memory Signature Storage:
    *    - Memory consumption is NOT O(1) across the entire pipeline.
    *    - Each extracted chunk allocates an AudioChunkSignature object (~200 bytes, including Float64Array(16)).
-   *    - Accumulation is explicitly capped at maxAudioChunks (default: 600 chunks, ~120 KB heap memory).
+   *    - Accumulation is explicitly capped at maxAudioChunks (default: 1800 chunks, ~360 KB heap memory for signatures).
    *    - Once maxAudioChunks is reached, chunk extraction halts to strictly enforce memory and compute bounds.
    * 3. Pairwise Comparison Workload:
    *    - All-pairs comparison across N chunks is O(N^2) in the worst case (N*(N-1)/2 pairs).
    *    - Workload is explicitly bounded by maxCandidatePairs (default: 50,000) and maxPairComparisons (default: 30,000).
    * 4. Unmeasured Memory Usage:
-   *    - External FFmpeg sub-process heap and OS disk I/O caching during PCM extraction are managed by the OS kernel
+   *    - External FFmpeg sub-process memory and OS disk I/O caching during PCM extraction are managed by the OS kernel
    *      and process execution timeout, not JavaScript V8 heap bounds.
    */
   public async extractPcmAudio(
@@ -1180,11 +1180,13 @@ export class AudioProcessor {
         const isBudgetExceeded = repDetails.budgetExceeded || (pcmExtraction.chunksLimitExceeded === true);
 
         if (isBudgetExceeded) {
-          const budgetCause = repDetails.limitReached === 'CANDIDATE_PAIR_LIMIT'
-            ? `maximum candidate pairs (${repDetails.candidatePairsConsidered}) evaluated`
-            : repDetails.limitReached === 'PAIR_COMPARISON_LIMIT'
-              ? `maximum pair comparisons (${repDetails.pairComparisonsPerformed}) reached`
-              : `audio duration exceeded maximum chunk signature limit (${chunkSignatures.length} chunks extracted)`;
+          const budgetCause = pcmExtraction.chunksLimitExceeded
+            ? `audio duration exceeded maximum chunk signature limit (${chunkSignatures.length} chunks extracted of ${Math.ceil(totalAudioSeconds)} total seconds)`
+            : repDetails.limitReached === 'CANDIDATE_PAIR_LIMIT'
+              ? `maximum candidate pairs (${repDetails.candidatePairsConsidered}) evaluated`
+              : repDetails.limitReached === 'PAIR_COMPARISON_LIMIT'
+                ? `maximum pair comparisons (${repDetails.pairComparisonsPerformed}) reached`
+                : `audio duration exceeded maximum chunk signature limit (${chunkSignatures.length} chunks extracted)`;
 
           const budgetNotice = `Analysis budget reached: ${budgetCause} before completing full timeline repetition analysis.`;
           repeatedAudioLimitations += ` Incomplete coverage notice: ${budgetNotice}`;
@@ -1238,6 +1240,7 @@ export class AudioProcessor {
         : 0;
 
       const totalMs = Date.now() - startTime;
+      const isRepetitionBudgetExceeded = repDetails.budgetExceeded || (pcmExtraction.chunksLimitExceeded === true);
 
       const detectors: Record<string, DetectorReport> = {
         audio_silence_volume: {
@@ -1279,16 +1282,16 @@ export class AudioProcessor {
           version: '1.1.0',
           status: repeatedAudioStatus,
           executionDurationMs: totalMs,
-          confidence: (repeatedAudioStatus === 'ANALYSIS_UNAVAILABLE' || repDetails.budgetExceeded) ? undefined : (repeatedAudioSegments.length > 0 ? 0.90 : 0.92),
+          confidence: (repeatedAudioStatus === 'ANALYSIS_UNAVAILABLE' || repeatedAudioStatus === 'INSUFFICIENT_EVIDENCE' || isRepetitionBudgetExceeded) ? undefined : (repeatedAudioSegments.length > 0 ? 0.90 : 0.92),
           failureReason: repeatedAudioFailureReason,
           limitations: repeatedAudioLimitations,
           details: {
             candidatePairsConsidered: repDetails.candidatePairsConsidered,
             pairComparisonsPerformed: repDetails.pairComparisonsPerformed,
-            budgetExceeded: repDetails.budgetExceeded,
-            limitReached: repDetails.limitReached,
+            budgetExceeded: isRepetitionBudgetExceeded,
+            limitReached: repDetails.limitReached || (pcmExtraction.chunksLimitExceeded ? 'CHUNK_LIMIT' : undefined),
             chunksEvaluated: repDetails.chunksEvaluated,
-            totalChunks: repDetails.totalChunks
+            totalChunks: pcmExtraction.chunksLimitExceeded ? Math.ceil(pcmExtraction.totalAudioSeconds) : repDetails.totalChunks
           }
         }
       };

@@ -31,11 +31,25 @@ export interface BenchmarkSummary {
   accuracy: number;
   datasetDescription: string;
   limitationNotice: string;
+  syntheticRegression?: {
+    totalFixtures: number;
+    passedFixtures: number;
+    failedFixtures: number;
+    allPassed: boolean;
+  };
+  realWorldEvaluation?: {
+    status: 'NOT EVALUATED';
+    precision: 'NOT EVALUATED';
+    recall: 'NOT EVALUATED';
+    f1: 'NOT EVALUATED';
+    reason: string;
+  };
 }
 
 export async function runVisualDuplicateBenchmark(): Promise<BenchmarkSummary> {
   console.log('================================================================');
-  console.log('--- VISUAL DUPLICATE & SLIDESHOW DETECTION BENCHMARK SUITE ---');
+  console.log('--- DETERMINISTIC SYNTHETIC REGRESSION TEST SUITE ---');
+  console.log('    Visual Duplicate & Slideshow Behavioral Fixtures');
   console.log('================================================================\n');
 
   const benchmarkDir = path.resolve(process.cwd(), 'tests', 'fixtures', 'visual_benchmark');
@@ -319,20 +333,33 @@ export async function runVisualDuplicateBenchmark(): Promise<BenchmarkSummary> {
     console.log(`     Details: ${r.details}`);
   }
 
+  const passedCases = results.filter(r => (r.expected === r.actual)).length;
+  const failedCases = results.length - passedCases;
+
   console.log('\n================================================================');
-  console.log('--- CONFUSION MATRIX & DETECTION BENCHMARK SUMMARY ---');
+  console.log('--- SYNTHETIC REGRESSION RESULTS & ACCURACY EVALUATION STATUS ---');
   console.log('================================================================');
-  console.log(`  Total Evaluated Benchmark Fixtures : ${results.length}`);
-  console.log(`  True Positives  (TP)              : ${tp}`);
-  console.log(`  True Negatives  (TN)              : ${tn}`);
-  console.log(`  False Positives (FP)              : ${fp}`);
-  console.log(`  False Negatives (FN)              : ${fn}`);
+  console.log('A. AUTOMATED REGRESSION TEST RESULTS:');
+  console.log(`  Synthetic regression fixtures: ${passedCases}/${results.length} passed`);
+  console.log(`  Fixture failures: ${failedCases}`);
+  console.log(`  Regression behavior status: ${failedCases === 0 ? 'VERIFIED' : 'TEST FAILED'}`);
   console.log('----------------------------------------------------------------');
-  console.log(`  Precision                         : ${(precision * 100).toFixed(1)}%`);
-  console.log(`  Recall                            : ${(recall * 100).toFixed(1)}%`);
-  console.log(`  F1 Score                          : ${(f1Score * 100).toFixed(1)}%`);
-  console.log(`  Specificity (True Negative Rate)  : ${(specificity * 100).toFixed(1)}%`);
-  console.log(`  Overall Accuracy                  : ${(accuracy * 100).toFixed(1)}%`);
+  console.log('B. REAL-WORLD ACCURACY EVALUATION:');
+  console.log('  Real-world precision: NOT EVALUATED');
+  console.log('  Real-world recall:    NOT EVALUATED');
+  console.log('  Real-world F1:        NOT EVALUATED');
+  console.log('  Reason: no validated real-world dataset with ground-truth annotations was evaluated');
+  console.log('----------------------------------------------------------------');
+  console.log('C. SYNTHETIC FIXTURE METRICS (Strictly limited to 8 synthetic cases; NOT production accuracy):');
+  console.log(`  Synthetic True Positives  (TP) : ${tp}`);
+  console.log(`  Synthetic True Negatives  (TN) : ${tn}`);
+  console.log(`  Synthetic False Positives (FP) : ${fp}`);
+  console.log(`  Synthetic False Negatives (FN) : ${fn}`);
+  console.log(`  Synthetic Precision            : ${(precision * 100).toFixed(1)}% (Synthetic test cases only)`);
+  console.log(`  Synthetic Recall               : ${(recall * 100).toFixed(1)}% (Synthetic test cases only)`);
+  console.log(`  Synthetic F1 Score             : ${(f1Score * 100).toFixed(1)}% (Synthetic test cases only)`);
+  console.log(`  Synthetic Specificity          : ${(specificity * 100).toFixed(1)}% (Synthetic test cases only)`);
+  console.log(`  Synthetic Fixture Accuracy     : ${(accuracy * 100).toFixed(1)}% (Synthetic test cases only)`);
   console.log('----------------------------------------------------------------');
   console.log('  Benchmark Dataset Provenance:');
   console.log('  Deterministic synthetic FFmpeg fixtures with mathematically specified patterns.');
@@ -343,6 +370,7 @@ export async function runVisualDuplicateBenchmark(): Promise<BenchmarkSummary> {
   assert(fp === 0, 'Zero false positives on benchmark fixtures');
   assert(fn === 0, 'Zero false negatives on benchmark fixtures');
   assert(f1Score >= 0.95, 'F1 score meets or exceeds 95% on deterministic benchmark');
+  assert(failedCases === 0, 'All 8 synthetic regression fixtures passed');
 
   return {
     totalCases: results.length,
@@ -356,16 +384,29 @@ export async function runVisualDuplicateBenchmark(): Promise<BenchmarkSummary> {
     specificity,
     accuracy,
     datasetDescription: '8 deterministic FFmpeg fixtures evaluating textured repeats, lighting adjustments, color similarities, luminance invariance, short bumpers, continuous motion, and slideshows.',
-    limitationNotice: 'Real-world precision and recall remain unverified against arbitrary production cinema / vlog footage without a human-labeled ground-truth production dataset.'
+    limitationNotice: 'Real-world precision and recall remain unverified against arbitrary production cinema / vlog footage without a human-labeled ground-truth production dataset.',
+    syntheticRegression: {
+      totalFixtures: results.length,
+      passedFixtures: passedCases,
+      failedFixtures: failedCases,
+      allPassed: failedCases === 0
+    },
+    realWorldEvaluation: {
+      status: 'NOT EVALUATED',
+      precision: 'NOT EVALUATED',
+      recall: 'NOT EVALUATED',
+      f1: 'NOT EVALUATED',
+      reason: 'No validated real-world dataset with ground-truth annotations was evaluated.'
+    }
   };
 }
 
 if (process.argv[1] && process.argv[1].endsWith('visual_duplicate_benchmark.test.ts')) {
   runVisualDuplicateBenchmark().then(() => {
-    console.log('🎉 VISUAL DUPLICATE BENCHMARK SUITE EXECUTED SUCCESSFULLY!');
+    console.log('🎉 VISUAL DUPLICATE REGRESSION SUITE EXECUTED SUCCESSFULLY!');
     process.exit(0);
   }).catch((err) => {
-    console.error('❌ VISUAL DUPLICATE BENCHMARK FAILED:', err);
+    console.error('❌ VISUAL DUPLICATE REGRESSION SUITE FAILED:', err);
     process.exit(1);
   });
 }

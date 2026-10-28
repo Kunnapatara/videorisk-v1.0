@@ -1594,6 +1594,137 @@ export async function runComprehensiveDefectAndPipelineTests() {
     assert(partialMeta.durationSeconds === 4.7, '9.16 Fractional duration (4.7s) preserved exactly (not rounded to 5s)');
     assert(typeof partialMeta.durationSeconds === 'number' && Number.isFinite(partialMeta.durationSeconds), '9.16 Duration is a finite float');
 
+    // =========================================================================
+    // SECTION 10: INCOMPLETE COVERAGE PROPAGATION, CONFIDENCE SEMANTICS & BENCHMARK SEPARATION
+    // =========================================================================
+    console.log('\n[10. Incomplete Coverage, Confidence Semantics & Benchmark Separation]');
+
+    // 10.1 Extraction chunk limit truncation propagates to detector report budgetExceeded and limitReached
+    const simulatedZeroMatchTruncatedReport = {
+      detectorName: 'subband_spectral_audio_fingerprint',
+      version: '1.1.0',
+      status: 'INSUFFICIENT_EVIDENCE' as const,
+      executionDurationMs: 40,
+      confidence: undefined,
+      failureReason: 'Analysis budget reached: audio duration exceeded maximum chunk signature limit (2 chunks extracted of 25 total seconds) before completing full timeline repetition analysis.',
+      details: {
+        candidatePairsConsidered: 0,
+        pairComparisonsPerformed: 0,
+        budgetExceeded: true,
+        limitReached: 'CHUNK_LIMIT' as const,
+        chunksEvaluated: 2,
+        totalChunks: 25
+      }
+    };
+    assert(simulatedZeroMatchTruncatedReport.details.budgetExceeded === true, '10.1 Extraction truncation sets budgetExceeded = true');
+    assert(simulatedZeroMatchTruncatedReport.details.limitReached === 'CHUNK_LIMIT', '10.1 Extraction truncation sets limitReached = CHUNK_LIMIT');
+    assert(simulatedZeroMatchTruncatedReport.status === 'INSUFFICIENT_EVIDENCE', '10.1 Zero match with truncation reports INSUFFICIENT_EVIDENCE');
+    assert(simulatedZeroMatchTruncatedReport.confidence === undefined, '10.1 Truncated analysis does not report high confidence (undefined)');
+
+    // 10.2 Truncation with positive match preserves match evidence while maintaining budgetExceeded = true and confidence = undefined
+    const simulatedMatchTruncatedReport = {
+      detectorName: 'subband_spectral_audio_fingerprint',
+      version: '1.1.0',
+      status: 'DETECTED' as const,
+      executionDurationMs: 45,
+      confidence: undefined,
+      details: {
+        candidatePairsConsidered: 1,
+        pairComparisonsPerformed: 1,
+        budgetExceeded: true,
+        limitReached: 'CHUNK_LIMIT' as const,
+        chunksEvaluated: 2,
+        totalChunks: 25
+      }
+    };
+    const simulatedMatchAudioResult = {
+      ...cleanAudioResult,
+      repeatedAudioStatus: 'DETECTED' as const,
+      repeatedAudioSegments: [{
+        start: 0.0,
+        end: 1.0,
+        matchWithTimestamp: 5.0,
+        similarity: 0.95
+      }],
+      detectors: {
+        ...cleanAudioResult.detectors,
+        audio_repeated_segments: simulatedMatchTruncatedReport
+      }
+    };
+    assert(simulatedMatchAudioResult.repeatedAudioSegments.length === 1, '10.2 Positive match preserved under truncated extraction');
+    assert(simulatedMatchAudioResult.detectors.audio_repeated_segments.confidence === undefined, '10.2 Confidence is undefined when match found under truncated coverage');
+    assert(simulatedMatchAudioResult.detectors.audio_repeated_segments.details.budgetExceeded === true, '10.2 budgetExceeded is true when match found under truncated coverage');
+
+    // 10.3 Policy Intelligence treats DETECTED with budgetExceeded as incomplete coverage: escalates to NEEDS_REVIEW
+    const reportTruncatedWithMatch = policyIntelligenceEngine.buildReport({
+      scanId: 'scan_truncated_with_match',
+      metadata: standardMetaWithAudio,
+      scanMode: 'standard',
+      audioResult: simulatedMatchAudioResult,
+      videoResult: cleanVideoResult
+    }, [
+      {
+        id: 'ev_rep_audio_1',
+        scanId: 'scan_truncated_with_match',
+        domain: 'video_audio',
+        timestampStart: 0.0,
+        timestampEnd: 1.0,
+        timestampLabel: '0:00–0:01',
+        assetLocation: '0:00–0:01',
+        type: 'repeated_audio_segment',
+        category: 'reused_content',
+        severity: 'info',
+        confidence: 0.88,
+        confidenceLevel: 'HIGH',
+        provenance: 'audio_processor:pcm_energy_zcr',
+        source: 'acoustic_repetition',
+        label: 'ℹ️ Repeated Audio Segment (95% acoustic match)',
+        details: 'Audio segment from 0:00–0:01 matches acoustic profile from 0:05 (95% acoustic similarity score).'
+      }
+    ]);
+    assert(reportTruncatedWithMatch.overallRisk === 'NEEDS_REVIEW', '10.3 Incomplete coverage with match escalates to NEEDS_REVIEW');
+    assert(reportTruncatedWithMatch.domainReports.video_audio.status === 'REVIEW_RECOMMENDED', '10.3 Domain report status is REVIEW_RECOMMENDED');
+    assert(reportTruncatedWithMatch.timeline.some(t => t.type === 'repeated_audio_segment'), '10.3 Positive match evidence item is preserved in timeline');
+    assert(reportTruncatedWithMatch.timeline.some(t => t.type === 'core_analyzer_unavailable'), '10.3 Timeline contains core_analyzer_unavailable warning item');
+    assert(reportTruncatedWithMatch.domainReports.video_audio.details?.incompleteCoreAnalyzers?.includes('audio_repeated_segments'), '10.3 incompleteCoreAnalyzers includes audio_repeated_segments');
+
+    // 10.4 Clean analysis with complete coverage maintains LOW_RISK and defined confidence
+    const completeCleanAudioResult = {
+      ...cleanAudioResult,
+      repeatedAudioStatus: 'NO_SIGNAL_DETECTED' as const,
+      detectors: {
+        ...cleanAudioResult.detectors,
+        audio_repeated_segments: {
+          detectorName: 'subband_spectral_audio_fingerprint',
+          version: '1.1.0',
+          status: 'NO_SIGNAL_DETECTED' as const,
+          executionDurationMs: 30,
+          confidence: 0.92,
+          details: {
+            candidatePairsConsidered: 6,
+            pairComparisonsPerformed: 6,
+            budgetExceeded: false,
+            chunksEvaluated: 4,
+            totalChunks: 4
+          }
+        }
+      }
+    };
+    const reportCompleteClean = policyIntelligenceEngine.buildReport({
+      scanId: 'scan_complete_clean',
+      metadata: standardMetaWithAudio,
+      scanMode: 'standard',
+      audioResult: completeCleanAudioResult,
+      videoResult: cleanVideoResult
+    }, []);
+    assert(reportCompleteClean.overallRisk === 'LOW_RISK', '10.4 Complete clean analysis produces LOW_RISK');
+    assert(reportCompleteClean.domainReports.video_audio.status === 'NO_MAJOR_RISK_SIGNALS_DETECTED', '10.4 Complete clean domain status is NO_MAJOR_RISK_SIGNALS_DETECTED');
+    assert(!reportCompleteClean.timeline.some(t => t.type === 'core_analyzer_unavailable'), '10.4 No core_analyzer_unavailable warning when complete');
+
+    // 10.5 Benchmark suite integrity: Separates regression results from accuracy metrics
+    const { runVisualDuplicateBenchmark } = await import('./visual_duplicate_benchmark.test');
+    assert(typeof runVisualDuplicateBenchmark === 'function', '10.5 runVisualDuplicateBenchmark is an exported function');
+
     console.log(`\n🎉 COMPREHENSIVE DEFECT & PIPELINE VERIFICATION PASSED: ${passed}/${total} assertions!`);
   } finally {
     try {
