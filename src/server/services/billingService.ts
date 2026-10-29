@@ -11,6 +11,38 @@ export interface CheckoutSessionOptions {
   originUrl: string;
 }
 
+function recordCreditTx(
+  state: any,
+  tx: {
+    userId: string;
+    delta: number;
+    balanceAfter: number;
+    type: string;
+    referenceId?: string;
+    metadataJson?: string;
+  }
+) {
+  const id = `ctx_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+  const now = new Date().toISOString();
+  if (state.prepare && typeof state.prepare === 'function') {
+    state.prepare(`
+      INSERT INTO credit_transactions (id, user_id, delta, balance_after, type, reference_id, metadata_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, tx.userId, tx.delta, tx.balanceAfter, tx.type, tx.referenceId || null, tx.metadataJson || null, now);
+  } else if (Array.isArray(state.creditTransactions)) {
+    state.creditTransactions.push({
+      id,
+      userId: tx.userId,
+      delta: tx.delta,
+      balanceAfter: tx.balanceAfter,
+      type: tx.type as any,
+      referenceId: tx.referenceId,
+      metadataJson: tx.metadataJson,
+      createdAt: now
+    });
+  }
+}
+
 export class BillingService {
   private stripe: Stripe | null = null;
   private isConfigured: boolean = false;
@@ -322,6 +354,15 @@ export class BillingService {
             planGranted: planId,
           };
 
+          recordCreditTx(state, {
+            userId: user.id,
+            delta: creditAllocation,
+            balanceAfter: user.creditsRemaining,
+            type: 'PLAN_PURCHASE',
+            referenceId: event.id,
+            metadataJson: JSON.stringify({ planId, sessionId: session.id })
+          });
+
           console.log(`[BillingService] checkout.session.completed: Allocated ${creditAllocation} credits to ${userId} for plan ${planId}`);
           break;
         }
@@ -346,6 +387,14 @@ export class BillingService {
                     creditsGranted: creditAllocation,
                     planGranted: sub.planId,
                   };
+                  recordCreditTx(state, {
+                    userId: sub.userId,
+                    delta: creditAllocation,
+                    balanceAfter: user.creditsRemaining,
+                    type: 'SUBSCRIPTION_RENEWAL',
+                    referenceId: event.id,
+                    metadataJson: JSON.stringify({ planId: sub.planId, invoiceId: invoice.id })
+                  });
                   return { alreadyProcessed: false };
                 }
               }
@@ -510,6 +559,15 @@ export class BillingService {
         creditsGranted: creditAllocation,
         planGranted: planId,
       };
+
+      recordCreditTx(state, {
+        userId: user.id,
+        delta: creditAllocation,
+        balanceAfter: user.creditsRemaining,
+        type: 'SIMULATED_PURCHASE',
+        referenceId: syntheticEventId,
+        metadataJson: JSON.stringify({ planId })
+      });
 
       return user;
     });

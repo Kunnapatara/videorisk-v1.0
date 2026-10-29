@@ -293,6 +293,80 @@ export async function runPersistenceAndBillingHardeningTests() {
       fs.unlinkSync(tempStorePath);
     }
 
+    // ---------------------------------------------------------
+    // 6. APPEND-ONLY CREDIT TRANSACTION AUDIT LEDGER (TASK 7)
+    // ---------------------------------------------------------
+    console.log('[6. Append-Only Credit Transaction Audit Ledger]');
+
+    // 6.1 Check Migration 4 status and credit_transactions table
+    const auditUserEmail = `audit_ledger_${Date.now()}@videorisk.com`;
+    const auditUser = await storage.users.createUser(auditUserEmail, 'hash_audit', 'salt_audit', 25, 'creator');
+    assert(auditUser.creditsRemaining === 25, '6.1 User created with initial credits');
+
+    // 6.2 Check initial grant transaction record
+    const initialTxs = await storage.billing.getCreditTransactions(auditUser.id);
+    assert(initialTxs.length >= 1, '6.2 INITIAL_GRANT transaction recorded in ledger');
+    assert(initialTxs[0].type === 'INITIAL_GRANT', '6.2 Transaction type is INITIAL_GRANT');
+    assert(initialTxs[0].delta === 25, '6.2 Transaction delta matches initial credits');
+    assert(initialTxs[0].balanceAfter === 25, '6.2 Transaction balance_after matches balance');
+
+    // 6.3 Test scan deduction atomic recording
+    const scanId = `scan_test_${Date.now()}`;
+    await storage.scans.createScan({
+      id: scanId,
+      userId: auditUser.id,
+      videoTitle: 'Test Video',
+      videoFilename: 'test.mp4',
+      videoPath: 'uploads/test.mp4',
+      scanMode: 'standard',
+      status: 'QUEUED',
+      currentStage: 'Media inspection',
+      completedStages: [],
+      creditsUsed: 0,
+      creditsDeducted: 0,
+      creditsRefunded: false,
+      creditsRefundedAmount: 0,
+      createdAt: new Date().toISOString()
+    });
+
+    const deducted = await storage.scans.deductScanCredits(scanId, auditUser.id, 5, { systemBypass: true });
+    assert(deducted === true, '6.3 Scan credits deducted successfully');
+
+    const txsAfterDeduct = await storage.billing.getCreditTransactions(auditUser.id);
+    assert(txsAfterDeduct.length === 2, '6.3 Deduction added an append-only transaction');
+    const deductTx = txsAfterDeduct[1];
+    assert(deductTx.type === 'SCAN_DEDUCTION', '6.3 Transaction type is SCAN_DEDUCTION');
+    assert(deductTx.delta === -5, '6.3 Transaction delta is -5');
+    assert(deductTx.balanceAfter === 20, '6.3 Transaction balance_after is 20');
+    assert(deductTx.referenceId === scanId, '6.3 Reference ID is scan ID');
+
+    // 6.4 Test scan refund atomic recording
+    const refundRes = await storage.scans.refundScanCredits(scanId, undefined, { systemBypass: true });
+    assert(refundRes.refunded === true && refundRes.amount === 5, '6.4 Scan credits refunded successfully');
+
+    const txsAfterRefund = await storage.billing.getCreditTransactions(auditUser.id);
+    assert(txsAfterRefund.length === 3, '6.4 Refund added an append-only transaction');
+    const refundTx = txsAfterRefund[2];
+    assert(refundTx.type === 'SCAN_REFUND', '6.4 Transaction type is SCAN_REFUND');
+    assert(refundTx.delta === 5, '6.4 Transaction delta is +5');
+    assert(refundTx.balanceAfter === 25, '6.4 Transaction balance_after restored to 25');
+    assert(refundTx.referenceId === scanId, '6.4 Refund reference ID matches scan ID');
+
+    // 6.5 Test manual grant transaction
+    await storage.users.addCredits(auditUser.id, 15);
+    const txsAfterAdd = await storage.billing.getCreditTransactions(auditUser.id);
+    assert(txsAfterAdd.length === 4, '6.5 addCredits appended a transaction');
+    const addTx = txsAfterAdd[3];
+    assert(addTx.type === 'MANUAL_GRANT', '6.5 Transaction type is MANUAL_GRANT');
+    assert(addTx.delta === 15, '6.5 Transaction delta is 15');
+    assert(addTx.balanceAfter === 40, '6.5 Balance after is 40');
+
+    // 6.6 Consistency check: Ledger sum matches users.credits_remaining
+    const userRefreshed = await storage.users.getUser(auditUser.id);
+    const sumDelta = txsAfterAdd.reduce((acc, t) => acc + t.delta, 0);
+    assert(userRefreshed?.creditsRemaining === 40, '6.6 User account creditsRemaining is 40');
+    assert(sumDelta === userRefreshed?.creditsRemaining, `6.6 Ledger sum (${sumDelta}) matches user balance (${userRefreshed?.creditsRemaining})`);
+
     console.log(`\n======================================================`);
     console.log(`TEST SUITE 3 COMPLETE: ${passed}/${total} assertions passed!`);
     console.log(`======================================================\n`);

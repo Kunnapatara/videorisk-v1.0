@@ -22,6 +22,8 @@ export class AudioProcessingError extends Error {
 
 export interface AudioAnalysisResult {
   hasVoiceover: boolean;
+  hasTimestampedVoiceover?: boolean;
+  transcriptText?: string;
   voiceoverRatio: number; // 0 to 1
   silenceRatio: number;
   hasMusicDetected: boolean | null; // null when unassessed, unavailable, or insufficient evidence
@@ -1234,8 +1236,10 @@ export class AudioProcessor {
 
       // Evidence integrity: Distinguish measurable acoustic activity from verified speech:
       // Volume and silence filters measure sound energy, NOT speech or narrator identity.
-      const hasVoiceover = sttResult.status === 'DETECTED' && Boolean(sttResult.segments && sttResult.segments.length > 0);
-      const voiceoverRatio = hasVoiceover
+      // Separate speech presence from segment timestamp availability without fabricating timestamps.
+      const hasTimestampedVoiceover = Boolean(sttResult.segments && sttResult.segments.length > 0);
+      const hasVoiceover = sttResult.status === 'DETECTED';
+      const voiceoverRatio = hasTimestampedVoiceover
         ? Math.min(1, parseFloat(((sttResult.segments!.reduce((acc, s) => acc + (s.end - s.start), 0)) / dur).toFixed(2)))
         : 0;
 
@@ -1298,6 +1302,8 @@ export class AudioProcessor {
 
       return {
         hasVoiceover,
+        hasTimestampedVoiceover,
+        transcriptText: sttResult.transcriptText,
         voiceoverRatio,
         silenceRatio: parseFloat(silenceRatio.toFixed(2)),
         hasMusicDetected: musicResult.hasMusic,
@@ -1307,8 +1313,18 @@ export class AudioProcessor {
         segments,
         repeatedAudioSegments,
         transcriptSummary: isAudible 
-          ? `Audio stream inspected. Acoustic energy present across ${Math.round(activeRatio * 100)}% of the timeline (mean volume ${meanVol} dB). ${sttResult.status === 'DETECTED' ? 'Speech transcription completed via local STT.' : 'Speech and voice narration are unverified without transcript analysis.'}`
-          : 'Low volume or quiet audio track.',
+          ? `Audio stream inspected. Acoustic energy present across ${Math.round(activeRatio * 100)}% of the timeline (mean volume ${meanVol} dB). ${
+              sttResult.status === 'DETECTED' 
+                ? (hasTimestampedVoiceover 
+                    ? 'Speech transcription completed via local STT.' 
+                    : 'Speech transcription completed via local STT (plain-text transcript without segment timestamps; voiceover timeline ratio is unestimated).') 
+                : 'Speech and voice narration are unverified without transcript analysis.'
+            }`
+          : (sttResult.status === 'DETECTED'
+              ? (hasTimestampedVoiceover
+                  ? 'Low volume or quiet audio track. Speech transcription completed via local STT.'
+                  : 'Low volume or quiet audio track. Speech transcription completed via local STT (plain-text transcript without segment timestamps; voiceover timeline ratio is unestimated).')
+              : 'Low volume or quiet audio track.'),
         speechAnalysisStatus: sttResult.status,
         musicAnalysisStatus: musicResult.status,
         speechDetectionStatus,

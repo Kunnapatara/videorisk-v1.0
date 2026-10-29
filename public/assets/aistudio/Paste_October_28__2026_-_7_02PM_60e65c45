@@ -1,0 +1,603 @@
+# VideoRisk v1.0 — Complete Remediation, Hardening, and Final Verification
+
+## 1. Mission
+
+You are working on the existing VideoRisk v1.0 repository:
+
+Repository: https://github.com/Kunnapatara/videorisk-v1.0  
+Target branch: `main`  
+Expected starting commit: `7376155c9ab00b245320bb6167fc261e5d5f5c93`  
+Project root: `/app/applet`
+
+Your mission is to resolve all confirmed defects, address justified design limitations within the agreed product scope, strengthen missing regression and integration tests, and verify the complete application without unnecessarily changing working functionality.
+
+This is an implementation task, not another investigation-only task.
+
+**Complete all eight tasks in this execution, using controlled stages, regression tests, and evidence-based decisions. Do not stop after producing a plan or report.**
+
+However, do not force code changes into areas where investigation confirms no defect exists. For those areas, preserve the existing behavior and add or improve verification only where justified.
+
+## 2. Mandatory Rules
+
+### 2.1 Preserve the existing project
+
+- Read the current source files, tests, package scripts, database schema, migrations, and application contracts before editing.
+- Verify the actual repository, current branch or workspace identity, and starting commit when the environment permits.
+- If Git metadata is unavailable, establish the workspace identity using available repository and file evidence. Do not pretend that Git operations succeeded.
+- Do not replace the application with a new implementation.
+- Do not restart, scaffold, redesign, or rewrite the entire project.
+- Do not delete working features, existing tests, routes, API contracts, database records, or UI functionality to simplify the work.
+- Do not overwrite unrelated work or revert existing changes.
+- Keep changes limited to the files required by verified findings and their regression tests.
+- Preserve existing naming conventions, architecture, coding style, and backward compatibility wherever practical.
+- Do not upgrade or replace dependencies unless a verified requirement makes it necessary.
+- Do not add a database, service, or external dependency that the existing architecture does not need.
+
+### 2.2 Evidence and honesty
+
+Before changing each task, inspect the relevant current implementation and confirm that the reported finding still applies.
+
+Classify each finding as one of:
+
+- `CONFIRMED DEFECT`
+- `CONFIRMED DESIGN LIMITATION`
+- `POTENTIAL DEFECT`
+- `NOT VERIFIED`
+- `NO DEFECT FOUND`
+
+Do not convert an assumption into a confirmed defect.
+
+Do not invent model accuracy, benchmark results, production test results, Stripe results, or user-facing functionality.
+
+Distinguish:
+- Unit tests from integration tests.
+- Mocked external services from real external services.
+- Synthetic benchmark fixtures from real-world ground-truth evaluation.
+- A detected signal from a verified conclusion.
+- An unavailable analyzer from an analyzer that found no risk.
+
+### 2.3 Safety and permissions
+
+- Do not expose secrets, API keys, Stripe credentials, database credentials, or personal data in logs or reports.
+- Do not use production credentials or perform real financial transactions.
+- Do not make live payments, issue real refunds, or modify production user balances.
+- Do not deploy the application.
+- Do not push or merge changes unless explicitly authorized.
+- Do not delete or reset user data or existing databases.
+- Back up any local database or migration test fixture before performing operations that could modify it.
+- Never report a successful command unless it actually executed and returned the reported result.
+- If a task is blocked, explain the exact blocker, complete the independent tasks that remain safe, and continue with the rest of the project.
+
+## 3. Starting Baseline
+
+The prior investigation reported the following:
+
+- Workspace files matched GitHub `main` at commit `7376155c9ab00b245320bb6167fc261e5d5f5c93` for the inspected files.
+- Local `.git` metadata was absent in the previous sandbox environment.
+- The TypeScript static check passed.
+- The full test runner reported 14 suites and 242 assertions passing.
+- The visual duplicate benchmark passed eight synthetic fixtures.
+- Whisper and the music classifier were not installed in that environment.
+- Live Stripe integration was not verified.
+- Arbitrary real-world video accuracy was not evaluated.
+
+These are historical observations, not permission to assume the same results now.
+
+Re-run the relevant checks in the current workspace and record the actual results. If the environment or source differs, use the actual current state as the source of truth.
+
+## 4. Task 1 — Music Classification
+
+### Objective
+
+Ensure music classification reports its actual assessment status honestly and does not create false copyright conclusions.
+
+### Required work
+
+1. Inspect `MusicClassificationAdapter`, its executable discovery, process execution, timeout handling, output parsing, schema validation, and error handling.
+2. Verify the behavior when:
+   - `MUSIC_CLASSIFIER_PATH` is unset.
+   - The executable does not exist.
+   - The executable times out or exits unsuccessfully.
+   - Output is empty or invalid JSON.
+   - `hasMusic` is missing or has an invalid type.
+   - The output contains valid or invalid segments.
+   - A valid classifier reports music present or not detected.
+3. Ensure unavailable or invalid analysis is never silently converted into `NO_SIGNAL_DETECTED`.
+4. Preserve explicit `NOT_ASSESSED`, `ANALYSIS_UNAVAILABLE`, or `INSUFFICIENT_EVIDENCE` statuses according to the existing contract.
+5. Verify that the report and UI distinguish an unavailable classifier from a negative detection.
+6. Do not bundle, download, or invent a classifier model. Do not claim production music-detection accuracy without suitable evidence.
+
+### Acceptance criteria
+
+- Existing fallback behavior remains correct.
+- Invalid classifier output cannot produce a false clean result.
+- User-visible status and limitations remain truthful.
+- Regression tests cover relevant failure paths.
+
+If the implementation already satisfies these criteria, avoid unnecessary source changes.
+
+## 5. Task 2 — Speech-to-Text and Voiceover Semantics
+
+### Objective
+
+Resolve the reported inconsistency between detected transcript text and `AudioAnalysisResult.hasVoiceover`, without fabricating timestamps or overstating the evidence.
+
+Reported locations to inspect:
+
+- `src/server/pipeline/audioProcessor.ts`, approximately lines 128–134.
+- `src/server/pipeline/audioProcessor.ts`, approximately lines 1237–1240.
+- Related transcript summaries, report construction, timeline generation, types, and UI.
+
+### Required work
+
+1. Trace the complete data flow from `SpeechTranscriptionAdapter.transcribe()` through `AudioProcessor.analyzeAudio()`, risk aggregation, report serialization, and the UI.
+2. Inspect how the application handles:
+   - No STT executable configured.
+   - Missing executable.
+   - Failed or timed-out STT execution.
+   - Plain-text transcript output without timestamps.
+   - Structured output with valid timestamped segments.
+   - Empty transcript.
+   - Invalid or out-of-range timestamps.
+3. Separate the following concepts clearly:
+   - Transcript text was returned.
+   - Speech presence was assessed.
+   - Timestamped speech segments are available.
+   - Voiceover duration or ratio can be estimated.
+4. Correct the contradictory state where transcript text is present and described as completed, but `hasVoiceover` is false solely because timestamped segments are absent.
+5. Select the smallest compatible change that accurately represents the evidence. If the current public contract cannot express these concepts independently, determine whether a backward-compatible field or a documented status distinction is necessary.
+6. Do not set `voiceoverRatio` to a fabricated value. Do not assign artificial timestamps or pretend that transcript duration is known.
+7. Ensure the timeline does not display a timestamped voiceover segment unless valid timing evidence exists.
+8. Ensure unavailable STT does not become a false claim that no speech exists.
+9. Update types, API contracts, report rendering, and UI only where the data flow requires it.
+10. Add tests for plain-text output, valid timestamped output, empty output, and unavailable STT.
+
+### Acceptance criteria
+
+- Transcript presence and timestamp coverage are represented consistently.
+- No fabricated timing data is introduced.
+- Timeline behavior is correct for both timestamped and plain-text transcripts.
+- Existing API consumers and UI behavior remain compatible where possible.
+- Tests demonstrate the behavior through the relevant downstream stages, not merely by mocking the final result.
+
+## 6. Task 3 — Audio Processing, PCM Extraction, and Resource Bounds
+
+### Objective
+
+Verify and preserve the existing bounded audio-analysis behavior.
+
+Inspect:
+
+- `src/server/pipeline/audioProcessor.ts`
+- `tests/comprehensive_defect_and_pipeline_verification.test.ts`
+- Related types, policies, and test registration.
+
+The prior report described:
+- A default maximum of 1,800 audio chunks.
+- Bounded PCM streaming.
+- Candidate-pair and comparison budgets.
+- Positive repeated-audio match preservation.
+- `INSUFFICIENT_EVIDENCE` when analysis stops before finding a match.
+- Confidence omission when analysis is incomplete.
+- Propagation of incomplete repeated-audio analysis into risk aggregation.
+
+### Required work
+
+1. Verify the actual current limits and their configuration. Do not assume the reported constants are unchanged.
+2. Trace truncation from PCM extraction through repeated-audio detection, detector status, confidence, policy aggregation, and report output.
+3. Verify that reaching a resource limit does not produce an unjustified clean result.
+4. Preserve a positive match found before the limit, while explicitly representing incomplete analysis.
+5. Verify that a lack of matches in truncated analysis is not treated as proof of no repeated audio.
+6. Confirm that confidence is not overstated when coverage is incomplete.
+7. Add or improve integration tests using the real pipeline code and controlled fixtures wherever feasible.
+8. Test both:
+   - The resource limit is reached without a positive match.
+   - A positive match is found before the resource limit.
+9. Ensure tests do not rely solely on manually constructing the final detector object.
+10. Avoid increasing resource limits or weakening safeguards without evidence that a change is required.
+
+### Acceptance criteria
+
+- Resource limits remain bounded.
+- Incomplete analysis is propagated accurately.
+- Positive evidence is preserved without implying complete coverage.
+- Both paths are covered by meaningful regression tests.
+
+If no defect is found, preserve the implementation and document the verified result.
+
+## 7. Task 4 — Visual Duplicate Detection and Timestamp Semantics
+
+### Objective
+
+Make repeated-footage interval semantics unambiguous and preserve honest benchmark claims.
+
+Inspect:
+
+- `src/server/pipeline/videoProcessor.ts`
+- `src/server/pipeline/audioProcessor.ts`
+- `src/server/intelligence/policyIntelligence.ts`
+- Relevant timeline and UI components.
+- `tests/visual_duplicate_benchmark.test.ts`
+
+### Required work
+
+1. Trace how `repeatedFootageSegments` and `repeatedAudioSegments` represent:
+   - The interval being reported.
+   - The original or matching occurrence.
+   - Start and end timestamps.
+   - Confidence and similarity.
+2. Investigate the reported convention difference:
+   - Visual duplicates currently appear to designate the later occurrence in `start`/`end` and point back to the earlier occurrence.
+   - Audio duplicates appear to designate the earlier occurrence and point forward to the later occurrence.
+3. Determine whether the difference causes a user-visible or policy-level defect, or is merely an internal convention difference.
+4. Do not reverse timestamps blindly. First inspect all consumers, including timeline rendering, policy calculations, report serialization, and existing tests.
+5. If normalization is necessary, implement a consistent representation with the smallest compatible change. If changing the contract would create unnecessary risk, document the existing semantics and add tests that prevent misinterpretation.
+6. Verify that interval boundaries are valid, ordered, within the media duration, and suitable for their intended use.
+7. Preserve existing similarity thresholds unless tests or evidence justify a specific correction.
+8. Maintain the separation between synthetic benchmark performance and real-world accuracy.
+9. Keep `NOT EVALUATED` for real-world precision, recall, and F1 unless a properly labelled real-world dataset is actually available and evaluated.
+10. Do not generate fake ground-truth labels or claim that eight synthetic fixtures prove arbitrary-video accuracy.
+
+### Acceptance criteria
+
+- Timestamp semantics are clear and tested.
+- No false timeline or reused-content calculation is introduced.
+- Synthetic benchmark results are reported accurately.
+- No unsupported real-world accuracy claim appears in code, UI, or documentation.
+
+## 8. Task 5 — Risk Aggregation and Incomplete-Analysis Coverage
+
+### Objective
+
+Ensure final risk statuses reflect the actual analysis coverage and preserve the intended distinction between required and optional analyzers.
+
+Inspect `getIncompleteCoreAnalyzers()`, `buildReport()`, detector status propagation, domain scorecards, risk summaries, and UI labels.
+
+### Required work
+
+1. Identify all required and optional analyzers from the actual code and product contract.
+2. Verify how each analyzer represents success, positive detection, no signal, unavailable execution, insufficient evidence, and incomplete processing.
+3. Confirm that incomplete core analyzers escalate to the appropriate review status rather than silently yielding a clean result.
+4. Verify that audio resource-budget exhaustion is propagated correctly.
+5. Inspect the current treatment of optional STT and music-classification analyzers.
+6. Preserve optional-analyzer behavior if it matches the intended contract, but ensure the report does not imply that every possible risk category was assessed when an optional analyzer was unavailable.
+7. If necessary, improve coverage wording or status metadata without unnecessarily changing risk scoring.
+8. Do not automatically classify every missing optional analyzer as `HIGH_RISK`.
+9. Do not automatically classify an unavailable analyzer as evidence of a violation.
+10. Add tests for combinations of:
+    - Complete core analysis with unavailable optional analysis.
+    - Incomplete core analysis.
+    - A positive risk finding combined with incomplete analysis.
+    - A negative detector result with incomplete coverage.
+
+### Acceptance criteria
+
+- Core-analysis failure handling remains fail-closed.
+- Optional-analysis limitations are visible and accurate.
+- Risk levels are not inflated or lowered without a justified rule.
+- The overall status, domain status, summary, and timeline do not contradict one another.
+
+## 9. Task 6 — Media Duration and Credit Calculation
+
+### Objective
+
+Preserve accurate duration handling and verify the billing boundary rules.
+
+Inspect:
+
+- `src/server/pipeline/mediaInspector.ts`
+- `src/server/services/creditService.ts`
+- Storage methods and `usage_ledger`
+- API and UI duration displays
+- Existing duration and billing tests.
+
+### Required work
+
+1. Trace duration from `ffprobe` parsing through metadata, audio/video processing, API output, UI presentation, and credit deduction.
+2. Verify the actual precision policy and any rounding or clamping at each boundary.
+3. Verify the actual credit formula. The prior report described:
+
+   `Math.max(1, Math.ceil(durationSeconds / 60))`
+
+4. Test at least:
+   - A sub-second positive duration.
+   - A duration just below 60 seconds.
+   - Exactly 60 seconds.
+   - A duration just above 60 seconds.
+   - A multi-minute duration.
+   - Invalid, missing, negative, or non-finite duration values where those inputs can reach the function.
+5. Ensure validation rejects invalid durations instead of accidentally creating incorrect credit charges.
+6. Ensure displayed duration and charged duration follow documented, consistent rules.
+7. Do not change the pricing model or rounding policy merely to make a test pass.
+8. Do not change duration precision unless a reproducible defect justifies it.
+
+### Acceptance criteria
+
+- Duration boundaries are deterministic and tested.
+- Credit deductions follow the intended pricing rule.
+- Invalid inputs cannot produce unexpected charges.
+- The UI does not materially contradict the duration used for billing.
+
+If no defect is found, retain the existing implementation.
+
+## 10. Task 7 — Stripe Billing, Credit Mutations, and Append-Only Transactions
+
+### Objective
+
+Improve credit auditability while preserving billing safety, webhook idempotency, and existing user balances.
+
+Inspect:
+
+- `src/server/storage/sqliteStorage.ts`
+- `src/server/services/billingService.ts`
+- `src/server/services/creditService.ts`
+- Existing schema and migrations.
+- All paths that grant, deduct, refund, reverse, or adjust credits.
+- `tests/persistence_and_billing_hardening.test.ts`
+- Existing billing routes and Stripe integration tests.
+
+The prior investigation identified a possible auditability gap: scan deductions, webhook receipts, refunds, and manual grants are not necessarily represented in one unified append-only credit transaction history.
+
+### Phase A — Map every credit mutation
+
+Before editing, locate every code path that changes a user's credit balance, including:
+
+- Paid-plan or checkout grants.
+- Scan deductions.
+- Refunds or reversals.
+- Manual administrative grants or adjustments, if supported.
+- Promotional or bonus credits, if supported.
+- Any other balance mutation discovered in the actual repository.
+
+Record the current balance semantics and the existing relationship between `users.credits_remaining`, `usage_ledger`, and `webhook_events`.
+
+Do not assume that every example listed above already exists as a feature.
+
+### Phase B — Design the smallest safe schema change
+
+If the audit confirms the gap, introduce a dedicated append-only `credit_transactions` table using the project's established migration approach.
+
+The schema should support, at minimum, the following concepts where appropriate to the existing architecture:
+
+- A unique transaction identifier.
+- The affected user.
+- A signed credit delta or another unambiguous representation of the balance change.
+- The transaction type or reason.
+- A stable reference to the originating operation.
+- A creation timestamp.
+- The resulting balance, if it can be captured reliably within the same transaction.
+- An idempotency or uniqueness constraint suitable for the originating event.
+
+Choose the exact schema after inspecting the current storage model. Do not blindly copy this list if an existing abstraction already supplies the same guarantees.
+
+The transaction history must be append-only in application behavior: normal grant, deduction, refund, and adjustment flows must not edit or delete historical transactions to rewrite the past.
+
+### Phase C — Atomic mutation and backward compatibility
+
+1. Implement the migration so existing installations can upgrade without losing users, plans, credit balances, usage history, or webhook history.
+2. Ensure each credit balance mutation and its corresponding transaction record are committed atomically.
+3. Ensure repeated Stripe webhook delivery cannot grant credits twice or create duplicate grant transactions.
+4. Preserve Stripe signature verification and fail-closed behavior.
+5. Ensure failed transactions leave neither an unexplained balance mutation nor a misleading transaction record.
+6. Ensure refunds and reversals have traceable references and do not silently rewrite earlier entries.
+7. Keep existing `usage_ledger` records and semantics unless a verified migration requirement calls for a carefully tested change.
+8. Do not assume the historical balance can be reconstructed perfectly if prior grants or refunds were not recorded in a complete unified ledger.
+9. If historical reconstruction is impossible, document the cutover boundary and establish a correct opening-balance or migration strategy without fabricating historical transactions.
+10. Ensure the application can safely initialize new databases and upgrade existing databases.
+11. Add tests for migration, atomicity, duplicate events, grant, deduction, refund, and balance consistency.
+12. Test concurrent or repeated mutation attempts where supported by the existing storage architecture.
+
+### Phase D — Stripe verification
+
+Verify locally or with mocked test fixtures:
+
+- Missing signature.
+- Invalid signature.
+- Valid webhook handling using a controlled test setup.
+- Duplicate webhook delivery.
+- Invalid or unpaid checkout sessions.
+- Transaction rollback behavior.
+- Correct subscription cancellation state handling.
+- Correct credit balance and transaction history after each supported event.
+
+Do not claim that live Stripe integration was verified unless a real Stripe test-mode integration actually ran.
+
+Do not perform real financial transactions.
+
+### Acceptance criteria
+
+- The database migration is safe and repeatable according to project conventions.
+- Supported credit mutations and transaction records are atomic.
+- Duplicate events do not double-grant credits.
+- Existing users and balances are preserved.
+- The transaction history is append-only in normal application flows.
+- Tests verify balance-to-ledger consistency for new transactions.
+- Historical limitations are explicitly documented.
+
+If a unified ledger is already implemented or the reported issue does not apply to the current source, do not create a redundant table.
+
+## 11. Task 8 — Whole-System Verification
+
+### Objective
+
+Verify the integrated application after all justified changes.
+
+Inspect `package.json`, TypeScript configuration, test runner registration, CI workflow files, database initialization, build configuration, and all relevant test suites.
+
+### Required work
+
+1. Discover the actual scripts and execute the applicable existing checks.
+2. At minimum, run the available equivalents of:
+   - TypeScript static checking / lint.
+   - Full test suite.
+   - Production build.
+   - Environment validation, if supported and safe.
+3. Run the complete test suite after the final source change, not only after individual stages.
+4. Confirm that new tests are registered and actually executed.
+5. Identify skipped tests and explain their reason. Do not state “none skipped” without checking the output.
+6. Separate mock-based tests from real database, FFmpeg, STT, music-classifier, and Stripe integration checks.
+7. Verify migration behavior using isolated test databases or fixtures. Never run destructive migration tests against production data.
+8. Inspect the final diff and confirm that no unrelated files were changed.
+9. Check for accidental secrets, generated files, database artifacts, or modifications to package-lock files that are not justified.
+10. Compare actual test totals and suite counts with the baseline, explaining any difference.
+11. Do not weaken or delete tests to achieve a green result.
+12. If a test fails, determine whether the failure is caused by the change, an existing defect, or an environment limitation. Fix regressions introduced by this work before completion.
+13. If a real external dependency is unavailable, mark that verification as `NOT VERIFIED`; do not substitute a mocked result and describe it as real integration.
+14. Re-run relevant checks after any final fix.
+
+### Acceptance criteria
+
+- All applicable static checks, tests, and builds pass, or every remaining failure is explicitly reported with evidence.
+- No regression is hidden.
+- Test coverage claims reflect actual execution.
+- No production deployment or live financial operation occurs.
+
+## 12. Execution Protocol — One Prompt, Controlled Stages
+
+Execute the work in this order, but complete all stages in the same overall implementation run unless a genuine blocker prevents safe progress.
+
+### Stage 0 — Baseline and change plan
+
+- Verify repository/workspace identity.
+- Inspect the current implementation and tests.
+- Record the starting test/build state.
+- Confirm which reported findings still apply.
+- Identify the files expected to change and why.
+
+Do not stop after producing this plan. Continue to implementation.
+
+### Stage 1 — Task 2: STT and voiceover semantics
+
+Resolve the confirmed inconsistency, update relevant types and downstream consumers if necessary, and add regression tests.
+
+Run the targeted tests before continuing.
+
+### Stage 2 — Task 1: Music-classification status
+
+Verify and harden the actual behavior as required. Preserve truthful unavailable-analysis semantics.
+
+Run targeted tests.
+
+### Stage 3 — Task 3: Audio bounds and incomplete evidence
+
+Verify the complete resource-limit data flow. Add real pipeline regression tests where feasible. Correct only demonstrated defects.
+
+Run targeted tests.
+
+### Stage 4 — Task 4: Visual duplicate semantics
+
+Resolve or document interval semantics based on downstream usage. Preserve honest benchmark reporting.
+
+Run visual regression tests.
+
+### Stage 5 — Tasks 5 and 6: Risk aggregation and duration
+
+Verify that analyzer coverage, final statuses, duration handling, and credit calculation remain consistent. Correct only demonstrated defects.
+
+Run relevant policy, duration, and billing tests.
+
+### Stage 6 — Task 7: Credit transaction auditability
+
+Implement a migration and atomic transaction recording for all supported credit mutations if the reported gap is confirmed. Preserve existing records and webhook idempotency.
+
+Run migration, storage, and billing regression tests using isolated test data.
+
+### Stage 7 — Task 8: Integrated verification
+
+Run the full verification pipeline, review the final diff, and correct any regressions introduced by the changes.
+
+Repeat relevant checks after the final correction.
+
+Do not mark a stage complete merely because its code has been written. Its exit criteria must be supported by observed test results or an explicitly documented verification limitation.
+
+## 13. Change-Control Requirements
+
+Before editing, create a concise internal file-change plan based on the actual source.
+
+During implementation:
+
+- Reuse existing utilities and test conventions.
+- Prefer small, reviewable changes.
+- Keep database migration logic backward-compatible.
+- Avoid unrelated refactoring.
+- Avoid introducing duplicate status fields unless their semantics are clearly defined.
+- Do not silently change API response contracts.
+- When a contract must change, identify all affected consumers and provide compatibility handling where feasible.
+- Do not delete existing test coverage to replace it with weaker tests.
+- Do not change product pricing, risk thresholds, credit allocation, or business rules without a demonstrated defect and explicit justification.
+- Do not add fake datasets or synthetic results to imply real-world validation.
+
+If a design decision is genuinely ambiguous and materially affects financial correctness, public API behavior, or risk claims, choose the safest backward-compatible option where possible. Otherwise, document the precise unresolved decision and continue with independent work.
+
+## 14. Final Deliverables
+
+At completion, produce a report containing all of the following.
+
+### A. Repository and change integrity
+
+- Starting and final commit/workspace identity.
+- Whether Git metadata was available.
+- Exact files changed and the reason for each change.
+- Confirmation that unrelated work was preserved.
+- Confirmation that no deployment or unauthorized push occurred.
+
+### B. Task-by-task outcome
+
+For each Task 1–8, report:
+
+- Original finding.
+- Final classification.
+- Code changes, if any.
+- Tests added or updated.
+- Actual verification results.
+- Remaining limitations.
+
+Use `FIXED`, `VERIFIED — NO CHANGE REQUIRED`, `PARTIALLY COMPLETED`, or `BLOCKED` as the implementation outcome, while preserving the more detailed finding classifications where appropriate.
+
+### C. Database migration and credit audit
+
+If implemented, describe:
+
+- The migration and schema.
+- How existing data is preserved.
+- Which balance mutation paths write transactions.
+- Idempotency and atomicity guarantees.
+- Balance consistency test results.
+- Historical reconstruction limitations, if any.
+
+### D. Test and build evidence
+
+Provide the actual command, exit status, test suite count, assertion/test count when available, skipped tests, and meaningful errors for each verification run.
+
+Clearly identify mocked external dependencies and real integrations that remain unverified.
+
+### E. Remaining issues
+
+List any unresolved defects, environmental blockers, unverified external integrations, and limitations in production accuracy.
+
+Do not describe a blocked item as completed.
+
+### F. Final diff summary
+
+Summarize the substantive changes and explain why each was necessary.
+
+### G. Release-readiness assessment
+
+Give a factual assessment of whether the implementation is:
+
+- Ready for further review.
+- Ready for staging verification.
+- Blocked by specific unresolved issues.
+- Not yet suitable for production.
+
+Do not claim production readiness solely because the unit tests and build pass.
+
+## 15. Final Instruction
+
+Proceed with the implementation now.
+
+Complete all eight tasks in the same overall run, using the staged workflow and the acceptance criteria above. Make only justified changes, preserve existing functionality, run real checks where available, and report the evidence.
+
+If an environmental or permission limitation prevents a specific operation, do not fabricate success or stop unrelated safe work. Complete what can be completed and clearly identify the blocked operation.
+
+Do not deploy or push changes. Leave the final workspace ready for human review and explicit approval.

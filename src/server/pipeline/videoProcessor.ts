@@ -23,6 +23,13 @@ export interface VideoAnalysisResult {
   scenesCount: number;
   framesSampled: number;
   hasSlideshowPattern: boolean;
+  /**
+   * Repeated footage segments identified within the video stream.
+   * Interval Convention:
+   * - `start` and `end`: The timestamp interval of the later (repeated) occurrence.
+   * - `matchWithTimestamp` and `matchWithEndTimestamp`: The timestamp interval of the earlier (original anchor) occurrence.
+   * Both intervals are ordered and bounded within [0, durationSeconds].
+   */
   repeatedFootageSegments: Array<{ 
     start: number; 
     end: number; 
@@ -466,7 +473,7 @@ export class VideoProcessor {
 
         repeatedFootageSegments.push({
           start: matchTStart,
-          end: Math.max(matchTStart + 0.5, matchTEnd),
+          end: Math.min(dur, Math.max(matchTStart + 0.1, matchTEnd)),
           matchWithTimestamp: tStart,
           matchWithEndTimestamp: tEnd,
           similarity: avgSim,

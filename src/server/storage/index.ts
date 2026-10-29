@@ -14,7 +14,8 @@ import {
   PasswordResetRecord,
   JobQueueRecord,
   OperationalMetrics,
-  FencingError
+  FencingError,
+  CreditTransactionRecord
 } from '../../types';
 
 export interface RateLimitStatus {
@@ -138,6 +139,8 @@ export interface IBillingRepository {
   saveSubscription(sub: SubscriptionRecord): Promise<void>;
   getSubscription(id: string): Promise<SubscriptionRecord | null>;
   getSubscriptionsByUserId(userId: string): Promise<SubscriptionRecord[]>;
+  recordCreditTransaction(transaction: CreditTransactionRecord): Promise<void>;
+  getCreditTransactions(userId: string): Promise<CreditTransactionRecord[]>;
 }
 
 export interface IStorageRepository {
@@ -178,6 +181,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
     usage: Array<{ userId: string; scanId: string; durationMinutes: number; creditsDeducted: number; mode: string; timestamp: string }>;
     webhookEvents: Record<string, WebhookEventRecord>;
     subscriptions: Record<string, SubscriptionRecord>;
+    creditTransactions: CreditTransactionRecord[];
   };
 
   constructor(customDataFile?: string) {
@@ -206,6 +210,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
       usage: [],
       webhookEvents: {},
       subscriptions: {},
+      creditTransactions: [],
     };
     this.load();
     this.seedDefaultUserIfNeeded();
@@ -331,6 +336,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
       usage: parsed.usage || [],
       webhookEvents: parsed.webhookEvents || {},
       subscriptions: parsed.subscriptions || {},
+      creditTransactions: Array.isArray(parsed.creditTransactions) ? parsed.creditTransactions : [],
     };
 
     let migratedLegacyFreeTrialFlags = false;
@@ -839,6 +845,20 @@ export class InMemoryStorageRepository implements IStorageRepository {
 
     getSubscriptionsByUserId: async (userId: string) => {
       return Object.values(this.state.subscriptions).filter(s => s.userId === userId);
+    },
+
+    recordCreditTransaction: async (transaction: CreditTransactionRecord) => {
+      if (!this.state.creditTransactions) {
+        this.state.creditTransactions = [];
+      }
+      this.state.creditTransactions.push(transaction);
+      this.save();
+    },
+
+    getCreditTransactions: async (userId: string) => {
+      return (this.state.creditTransactions || [])
+        .filter(t => t.userId === userId)
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     }
   };
 

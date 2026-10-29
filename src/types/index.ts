@@ -372,6 +372,28 @@ export interface WebhookEventRecord {
   planGranted?: string;
 }
 
+export type CreditTransactionType = 
+  | 'INITIAL_GRANT' 
+  | 'FREE_TRIAL' 
+  | 'PLAN_PURCHASE' 
+  | 'SUBSCRIPTION_RENEWAL' 
+  | 'SCAN_DEDUCTION' 
+  | 'SCAN_REFUND' 
+  | 'MANUAL_GRANT'
+  | 'MANUAL_DEDUCTION' 
+  | 'SIMULATED_PURCHASE';
+
+export interface CreditTransactionRecord {
+  id: string;
+  userId: string;
+  delta: number;
+  balanceAfter: number;
+  type: CreditTransactionType;
+  referenceId?: string;
+  metadataJson?: string;
+  createdAt: string;
+}
+
 export interface PasswordResetRecord {
   tokenHash: string;
   userId: string;

@@ -16,7 +16,8 @@ import {
   PasswordResetRecord,
   JobQueueRecord,
   OperationalMetrics,
-  FencingError
+  FencingError,
+  CreditTransactionRecord
 } from '../../types';
 import {
   IStorageRepository,
@@ -467,6 +468,35 @@ export class SqliteStorageRepository implements IStorageRepository {
         throw new Error(`Failed to apply migration 3: ${err}`);
       }
     }
+
+    // Migration 4: Append-only credit transactions audit ledger
+    if (!appliedVersions.has(4)) {
+      this.db.exec('BEGIN IMMEDIATE;');
+      try {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS credit_transactions (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            delta INTEGER NOT NULL,
+            balance_after INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            reference_id TEXT,
+            metadata_json TEXT,
+            created_at TEXT NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_credit_transactions_user ON credit_transactions(user_id, created_at);
+          CREATE INDEX IF NOT EXISTS idx_credit_transactions_ref ON credit_transactions(reference_id);
+        `);
+        this.db.exec(`
+          INSERT INTO schema_migrations (version, name, applied_at)
+          VALUES (4, '004_credit_transactions_append_only_ledger', datetime('now'));
+        `);
+        this.db.exec('COMMIT;');
+      } catch (err) {
+        this.db.exec('ROLLBACK;');
+        throw new Error(`Failed to apply migration 4: ${err}`);
+      }
+    }
   }
 
   private seedDefaultUsersIfNeeded() {
@@ -478,10 +508,16 @@ export class SqliteStorageRepository implements IStorageRepository {
     const seedUser = (id: string, email: string, plan: 'creator' | 'pro' | 'free', credits: number, pass: string) => {
       const salt = crypto.randomBytes(16).toString('hex');
       const passwordHash = crypto.scryptSync(pass, salt, 64).toString('hex');
+      const now = new Date().toISOString();
       this.db.prepare(`
         INSERT OR IGNORE INTO users (id, email, plan, credits_remaining, credits_used_total, total_scans_count, created_at, password_hash, salt, free_trial_claimed)
         VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?, 1)
-      `).run(id, email, plan, credits, new Date().toISOString(), passwordHash, salt);
+      `).run(id, email, plan, credits, now, passwordHash, salt);
+      const txId = `ctx_seed_${id}`;
+      this.db.prepare(`
+        INSERT OR IGNORE INTO credit_transactions (id, user_id, delta, balance_after, type, reference_id, metadata_json, created_at)
+        VALUES (?, ?, ?, ?, 'INITIAL_GRANT', ?, ?, ?)
+      `).run(txId, id, credits, credits, id, JSON.stringify({ seeded: true }), now);
     };
 
     seedUser('user_default', 'creator@videorisk.com', 'creator', 30, 'creator123');
@@ -534,6 +570,12 @@ export class SqliteStorageRepository implements IStorageRepository {
         VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?, ?)
       `).run(id, email.toLowerCase(), initialPlan, initialCredits, now, passwordHash || null, salt || null, freeTrialClaimed);
 
+      const txId = `ctx_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+      this.db.prepare(`
+        INSERT INTO credit_transactions (id, user_id, delta, balance_after, type, reference_id, metadata_json, created_at)
+        VALUES (?, ?, ?, ?, 'INITIAL_GRANT', ?, ?, ?)
+      `).run(txId, id, initialCredits, initialCredits, id, JSON.stringify({ plan: initialPlan }), now);
+
       return (await this.users.getUser(id))!;
     },
 
@@ -554,36 +596,69 @@ export class SqliteStorageRepository implements IStorageRepository {
           success = false;
           return;
         }
+        const newBalance = user.credits_remaining - amount;
+        const now = new Date().toISOString();
         db.prepare(`
           UPDATE users 
           SET credits_remaining = credits_remaining - ?,
               credits_used_total = credits_used_total + ?,
               updated_at = ?
           WHERE id = ?
-        `).run(amount, amount, new Date().toISOString(), userId);
+        `).run(amount, amount, now, userId);
+
+        const txId = `ctx_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+        db.prepare(`
+          INSERT INTO credit_transactions (id, user_id, delta, balance_after, type, reference_id, metadata_json, created_at)
+          VALUES (?, ?, ?, ?, 'MANUAL_DEDUCTION', NULL, NULL, ?)
+        `).run(txId, userId, -amount, newBalance, now);
+
         success = true;
       });
       return success;
     },
 
     addCredits: async (userId: string, amount: number): Promise<UserAccount> => {
-      this.db.prepare(`
-        UPDATE users 
-        SET credits_remaining = credits_remaining + ?,
-            updated_at = ?
-        WHERE id = ?
-      `).run(amount, new Date().toISOString(), userId);
+      await this.runTransaction(db => {
+        const user = db.prepare('SELECT credits_remaining FROM users WHERE id = ?').get(userId) as any;
+        const currentCredits = user ? Number(user.credits_remaining) : 0;
+        const newBalance = currentCredits + amount;
+        const now = new Date().toISOString();
+        db.prepare(`
+          UPDATE users 
+          SET credits_remaining = credits_remaining + ?,
+              updated_at = ?
+          WHERE id = ?
+        `).run(amount, now, userId);
+
+        const txId = `ctx_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+        db.prepare(`
+          INSERT INTO credit_transactions (id, user_id, delta, balance_after, type, reference_id, metadata_json, created_at)
+          VALUES (?, ?, ?, ?, 'MANUAL_GRANT', NULL, NULL, ?)
+        `).run(txId, userId, amount, newBalance, now);
+      });
       return (await this.users.getUser(userId))!;
     },
 
     updatePlan: async (userId: string, plan: 'free' | 'creator' | 'pro' | 'agency', credits: number): Promise<UserAccount> => {
-      this.db.prepare(`
-        UPDATE users 
-        SET plan = ?,
-            credits_remaining = ?,
-            updated_at = ?
-        WHERE id = ?
-      `).run(plan, credits, new Date().toISOString(), userId);
+      await this.runTransaction(db => {
+        const user = db.prepare('SELECT credits_remaining FROM users WHERE id = ?').get(userId) as any;
+        const currentCredits = user ? Number(user.credits_remaining) : 0;
+        const delta = credits - currentCredits;
+        const now = new Date().toISOString();
+        db.prepare(`
+          UPDATE users 
+          SET plan = ?,
+              credits_remaining = ?,
+              updated_at = ?
+          WHERE id = ?
+        `).run(plan, credits, now, userId);
+
+        const txId = `ctx_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+        db.prepare(`
+          INSERT INTO credit_transactions (id, user_id, delta, balance_after, type, reference_id, metadata_json, created_at)
+          VALUES (?, ?, ?, ?, 'PLAN_PURCHASE', NULL, ?, ?)
+        `).run(txId, userId, delta, credits, JSON.stringify({ plan }), now);
+      });
       return (await this.users.getUser(userId))!;
     },
 
@@ -598,13 +673,22 @@ export class SqliteStorageRepository implements IStorageRepository {
           alreadyClaimed = true;
           return;
         }
+        const newBalance = user.credits_remaining + 10;
+        const now = new Date().toISOString();
         db.prepare(`
           UPDATE users 
           SET free_trial_claimed = 1,
               credits_remaining = credits_remaining + 10,
               updated_at = ?
           WHERE id = ? AND free_trial_claimed = 0
-        `).run(new Date().toISOString(), userId);
+        `).run(now, userId);
+
+        const txId = `ctx_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+        db.prepare(`
+          INSERT INTO credit_transactions (id, user_id, delta, balance_after, type, reference_id, metadata_json, created_at)
+          VALUES (?, ?, 10, ?, 'FREE_TRIAL', ?, NULL, ?)
+        `).run(txId, userId, newBalance, `trial_${userId}`, now);
+
         alreadyClaimed = false;
       });
 
@@ -1063,13 +1147,15 @@ export class SqliteStorageRepository implements IStorageRepository {
           return;
         }
 
+        const newBalance = user.credits_remaining - amount;
+        const now = new Date().toISOString();
         db.prepare(`
           UPDATE users 
           SET credits_remaining = credits_remaining - ?,
               credits_used_total = credits_used_total + ?,
               updated_at = ?
           WHERE id = ?
-        `).run(amount, amount, new Date().toISOString(), userId);
+        `).run(amount, amount, now, userId);
 
         db.prepare(`
           UPDATE scans 
@@ -1079,6 +1165,12 @@ export class SqliteStorageRepository implements IStorageRepository {
               credits_refunded_amount = 0
           WHERE id = ?
         `).run(amount, amount, scanId);
+
+        const txId = `ctx_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+        db.prepare(`
+          INSERT INTO credit_transactions (id, user_id, delta, balance_after, type, reference_id, metadata_json, created_at)
+          VALUES (?, ?, ?, ?, 'SCAN_DEDUCTION', ?, NULL, ?)
+        `).run(txId, userId, -amount, newBalance, scanId, now);
 
         success = true;
       });
@@ -1104,13 +1196,18 @@ export class SqliteStorageRepository implements IStorageRepository {
           return;
         }
 
+        const user = db.prepare('SELECT credits_remaining FROM users WHERE id = ?').get(scan.user_id) as any;
+        const currentCredits = user ? Number(user.credits_remaining) : 0;
+        const newBalance = currentCredits + toRefund;
+        const now = new Date().toISOString();
+
         db.prepare(`
           UPDATE users 
           SET credits_remaining = credits_remaining + ?,
               credits_used_total = MAX(0, credits_used_total - ?),
               updated_at = ?
           WHERE id = ?
-        `).run(toRefund, toRefund, new Date().toISOString(), scan.user_id);
+        `).run(toRefund, toRefund, now, scan.user_id);
 
         db.prepare(`
           UPDATE scans 
@@ -1119,6 +1216,12 @@ export class SqliteStorageRepository implements IStorageRepository {
               credits_used = 0
           WHERE id = ?
         `).run(toRefund, scanId);
+
+        const txId = `ctx_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+        db.prepare(`
+          INSERT INTO credit_transactions (id, user_id, delta, balance_after, type, reference_id, metadata_json, created_at)
+          VALUES (?, ?, ?, ?, 'SCAN_REFUND', ?, NULL, ?)
+        `).run(txId, scan.user_id, toRefund, newBalance, scanId, now);
 
         result = { refunded: true, amount: toRefund };
       });
@@ -1665,6 +1768,42 @@ export class SqliteStorageRepository implements IStorageRepository {
         currentPeriodEnd: row.current_period_end || undefined,
         createdAt: row.created_at,
         updatedAt: row.updated_at
+      }));
+    },
+
+    recordCreditTransaction: async (tx: CreditTransactionRecord): Promise<void> => {
+      this.db.prepare(`
+        INSERT INTO credit_transactions (id, user_id, delta, balance_after, type, reference_id, metadata_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        tx.id,
+        tx.userId,
+        tx.delta,
+        tx.balanceAfter,
+        tx.type,
+        tx.referenceId || null,
+        tx.metadataJson || null,
+        tx.createdAt
+      );
+    },
+
+    getCreditTransactions: async (userId: string): Promise<CreditTransactionRecord[]> => {
+      const rows = this.db.prepare(`
+        SELECT id, user_id, delta, balance_after, type, reference_id, metadata_json, created_at
+        FROM credit_transactions
+        WHERE user_id = ?
+        ORDER BY created_at ASC
+      `).all(userId) as any[];
+
+      return rows.map(r => ({
+        id: r.id,
+        userId: r.user_id,
+        delta: Number(r.delta),
+        balanceAfter: Number(r.balance_after),
+        type: r.type,
+        referenceId: r.reference_id || undefined,
+        metadataJson: r.metadata_json || undefined,
+        createdAt: r.created_at
       }));
     }
   };

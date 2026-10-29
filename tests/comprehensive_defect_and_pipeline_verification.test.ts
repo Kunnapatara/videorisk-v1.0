@@ -10,6 +10,7 @@ import { videoProcessor } from '../src/server/pipeline/videoProcessor';
 import { 
   audioProcessor, 
   SpeechTranscriptionAdapter,
+  MusicClassificationAdapter,
   detectRepeatedAudio,
   detectRepeatedAudioDetailed,
   mergeContiguousAudioSegments,
@@ -18,6 +19,7 @@ import {
   AudioAnalysisBounds,
   sanitizeAudioAnalysisBounds
 } from '../src/server/pipeline/audioProcessor';
+import { creditService } from '../src/server/services/creditService';
 import { thumbnailInspector } from '../src/server/pipeline/thumbnailInspector';
 import { mediaInspector } from '../src/server/pipeline/mediaInspector';
 import { policyIntelligenceEngine } from '../src/server/intelligence/policyIntelligence';
@@ -1724,6 +1726,137 @@ export async function runComprehensiveDefectAndPipelineTests() {
     // 10.5 Benchmark suite integrity: Separates regression results from accuracy metrics
     const { runVisualDuplicateBenchmark } = await import('./visual_duplicate_benchmark.test');
     assert(typeof runVisualDuplicateBenchmark === 'function', '10.5 runVisualDuplicateBenchmark is an exported function');
+
+    // =========================================================================
+    // 11. REMEDIATION & HARDENING VERIFICATION (TASKS 1, 2, 4, 6)
+    // =========================================================================
+    console.log('\n[11. Remediation & Hardening Verification]');
+
+    // 11.1 Task 2: STT plain text output vs hasVoiceover & hasTimestampedVoiceover
+    const mockSec11PlainTextScript = path.resolve(testDir, 'mock_stt_sec11_plain_text.sh');
+    fs.writeFileSync(mockSec11PlainTextScript, '#!/bin/sh\necho "Hello and welcome to my original commentary on this topic."\n');
+    fs.chmodSync(mockSec11PlainTextScript, 0o755);
+
+    const prevSttPath = process.env.WHISPER_PATH;
+    process.env.WHISPER_PATH = mockSec11PlainTextScript;
+    try {
+      const sttAdapter = new SpeechTranscriptionAdapter();
+      const ptResult = await sttAdapter.transcribe(silenceVideoPath, 10.0);
+      assert(ptResult.status === 'DETECTED', '11.1 Plain text STT output has status DETECTED');
+      assert(ptResult.transcriptText?.includes('Hello and welcome'), '11.1 Transcript text captured');
+      assert(ptResult.segments?.length === 0, '11.1 No timestamps fabricated for plain text transcript');
+
+      // Now run through audioProcessor.analyzeAudio
+      const silenceMeta: MediaMetadata = {
+        filename: 'silence.mp4',
+        originalSize: 1000,
+        durationSeconds: 10.0,
+        width: 1280,
+        height: 720,
+        resolutionLabel: '720p',
+        fps: 25,
+        hasAudio: true,
+        isProxyUsed: false
+      };
+      const audioAnalysis = await audioProcessor.analyzeAudio(silenceVideoPath, silenceMeta);
+      assert(audioAnalysis.hasVoiceover === true, '11.1 hasVoiceover is true when speech text detected');
+      assert(audioAnalysis.hasTimestampedVoiceover === false, '11.1 hasTimestampedVoiceover is false when segment timestamps absent');
+      assert(audioAnalysis.voiceoverRatio === 0, '11.1 voiceoverRatio is 0 (not fabricated) when segment timestamps absent');
+      assert(audioAnalysis.transcriptSummary.includes('plain-text transcript without segment timestamps'), '11.1 transcriptSummary explicitly notes unestimated voiceover timeline ratio');
+    } finally {
+      process.env.WHISPER_PATH = prevSttPath;
+    }
+
+    // 11.2 Task 1: MusicClassificationAdapter fallback & schema validation
+    const sec11MusicAdapter = new MusicClassificationAdapter();
+    const prevMusicPath = process.env.MUSIC_CLASSIFIER_PATH;
+
+    // Unconfigured
+    delete process.env.MUSIC_CLASSIFIER_PATH;
+    const unconfMusic = await sec11MusicAdapter.classify(silenceVideoPath, 10.0);
+    assert(unconfMusic.status === 'NOT_ASSESSED', '11.2 Unset classifier path returns NOT_ASSESSED');
+    assert(unconfMusic.hasMusic === null, '11.2 hasMusic is null when unassessed');
+
+    // Missing executable
+    process.env.MUSIC_CLASSIFIER_PATH = '/path/to/missing_classifier';
+    const sec11MissingMusic = await sec11MusicAdapter.classify(silenceVideoPath, 10.0);
+    assert(sec11MissingMusic.status === 'ANALYSIS_UNAVAILABLE', '11.2 Missing classifier binary returns ANALYSIS_UNAVAILABLE');
+    assert(sec11MissingMusic.hasMusic === null, '11.2 hasMusic is null when binary is missing');
+
+    // Invalid JSON
+    const mockInvalidJsonScript = path.resolve(testDir, 'mock_music_invalid_json.sh');
+    fs.writeFileSync(mockInvalidJsonScript, '#!/bin/sh\necho "NOT_JSON_OUTPUT"\n');
+    fs.chmodSync(mockInvalidJsonScript, 0o755);
+    process.env.MUSIC_CLASSIFIER_PATH = mockInvalidJsonScript;
+    const invalidJsonMusic = await sec11MusicAdapter.classify(silenceVideoPath, 10.0);
+    assert(invalidJsonMusic.status === 'ANALYSIS_UNAVAILABLE', '11.2 Non-JSON output returns ANALYSIS_UNAVAILABLE');
+    assert(invalidJsonMusic.hasMusic === null, '11.2 Non-JSON output does not claim music absence');
+
+    // Missing hasMusic field
+    const mockMissingHasMusicScript = path.resolve(testDir, 'mock_music_no_hasmusic.sh');
+    fs.writeFileSync(mockMissingHasMusicScript, '#!/bin/sh\necho \'{"confidence": 0.8}\'\n');
+    fs.chmodSync(mockMissingHasMusicScript, 0o755);
+    process.env.MUSIC_CLASSIFIER_PATH = mockMissingHasMusicScript;
+    const missingHasMusic = await sec11MusicAdapter.classify(silenceVideoPath, 10.0);
+    assert(missingHasMusic.status === 'ANALYSIS_UNAVAILABLE', '11.2 Missing hasMusic field returns ANALYSIS_UNAVAILABLE');
+    assert(missingHasMusic.hasMusic === null, '11.2 hasMusic remains null when field is invalid');
+
+    // Valid negative detection
+    const mockNegativeMusicScript = path.resolve(testDir, 'mock_music_negative.sh');
+    fs.writeFileSync(mockNegativeMusicScript, '#!/bin/sh\necho \'{"hasMusic": false, "confidence": 0.95}\'\n');
+    fs.chmodSync(mockNegativeMusicScript, 0o755);
+    process.env.MUSIC_CLASSIFIER_PATH = mockNegativeMusicScript;
+    const sec11NegativeMusic = await sec11MusicAdapter.classify(silenceVideoPath, 10.0);
+    assert(sec11NegativeMusic.status === 'NO_SIGNAL_DETECTED', '11.2 Valid hasMusic: false returns NO_SIGNAL_DETECTED');
+    assert(sec11NegativeMusic.hasMusic === false, '11.2 hasMusic is false');
+
+    process.env.MUSIC_CLASSIFIER_PATH = prevMusicPath;
+
+    // 11.3 Task 6: CreditService duration validation and pricing formula
+    assert(creditService.calculateRequiredCredits(0.5, 'standard') === 1, '11.3 Sub-second duration (0.5s) charges 1 credit');
+    assert(creditService.calculateRequiredCredits(59.9, 'standard') === 1, '11.3 59.9s charges 1 credit');
+    assert(creditService.calculateRequiredCredits(60.0, 'standard') === 1, '11.3 60.0s charges 1 credit');
+    assert(creditService.calculateRequiredCredits(60.1, 'standard') === 2, '11.3 60.1s charges 2 credits');
+    assert(creditService.calculateRequiredCredits(125, 'standard') === 3, '11.3 125s standard scan charges 3 credits');
+    assert(creditService.calculateRequiredCredits(125, 'deep') === 6, '11.3 125s deep scan charges 6 credits');
+
+    // Verify rejection of invalid / non-finite durations
+    let nanRejected = false;
+    try { creditService.calculateRequiredCredits(NaN, 'standard'); } catch { nanRejected = true; }
+    assert(nanRejected, '11.3 NaN duration rejected with Error');
+
+    let negativeRejected = false;
+    try { creditService.calculateRequiredCredits(-15, 'standard'); } catch { negativeRejected = true; }
+    assert(negativeRejected, '11.3 Negative duration rejected with Error');
+
+    let zeroRejected = false;
+    try { creditService.calculateRequiredCredits(0, 'standard'); } catch { zeroRejected = true; }
+    assert(zeroRejected, '11.3 Zero duration rejected with Error');
+
+    let infRejected = false;
+    try { creditService.calculateRequiredCredits(Infinity, 'standard'); } catch { infRejected = true; }
+    assert(infRejected, '11.3 Infinity duration rejected with Error');
+
+    // 11.4 Task 4: Visual repeated footage interval semantics
+    const testVideoMeta: MediaMetadata = {
+      filename: 'sample.mp4',
+      originalSize: 2000,
+      durationSeconds: 12.0,
+      width: 1280,
+      height: 720,
+      resolutionLabel: '720p',
+      fps: 25,
+      hasAudio: false,
+      isProxyUsed: false,
+      videoCodec: 'h264'
+    };
+    const videoResult = await videoProcessor.analyzeVideo(silenceVideoPath, testVideoMeta, 'standard');
+    assert(Array.isArray(videoResult.repeatedFootageSegments), '11.4 repeatedFootageSegments is an array');
+    for (const seg of videoResult.repeatedFootageSegments) {
+      assert(seg.start <= seg.end, `11.4 Segment start (${seg.start}) <= end (${seg.end})`);
+      assert(seg.start >= 0 && seg.end <= testVideoMeta.durationSeconds + 0.05, '11.4 Segment within media duration bounds');
+      assert(seg.matchWithTimestamp <= seg.start, '11.4 matchWithTimestamp points to earlier anchor occurrence');
+    }
 
     console.log(`\n🎉 COMPREHENSIVE DEFECT & PIPELINE VERIFICATION PASSED: ${passed}/${total} assertions!`);
   } finally {

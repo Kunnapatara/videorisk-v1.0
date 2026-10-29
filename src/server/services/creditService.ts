@@ -13,12 +13,18 @@ class CreditService implements ICreditService {
    * Minimum 1 minute (rounded up to nearest whole minute)
    */
   public calculateRequiredCredits(durationSeconds: number, scanMode: ScanMode): number {
+    if (typeof durationSeconds !== 'number' || !Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+      throw new Error(`Invalid media duration for credit calculation: ${durationSeconds}. Expected a finite positive number.`);
+    }
     const minutes = Math.max(1, Math.ceil(durationSeconds / 60));
     const ratePerMinute = scanMode === 'deep' ? 2 : 1;
     return minutes * ratePerMinute;
   }
 
   public formatMinutes(durationSeconds: number): number {
+    if (typeof durationSeconds !== 'number' || !Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+      return 1;
+    }
     return Math.max(1, Math.ceil(durationSeconds / 60));
   }
 }
