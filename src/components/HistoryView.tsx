@@ -16,19 +16,40 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
 }) => {
   const [scans, setScans] = useState<ScanJob[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [searchFilter, setSearchFilter] = useState('');
 
-  useEffect(() => {
+  const fetchScans = () => {
+    setLoading(true);
+    setError(null);
     authFetch('/api/scans')
-      .then(res => res.json())
-      .then(data => {
-        setScans(Array.isArray(data) ? data : []);
-        setLoading(false);
+      .then(async (res) => {
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.error || 'Failed to load user scan history.');
+        }
+        return res.json();
       })
-      .catch(err => {
+      .then((data) => {
+        if (Array.isArray(data)) {
+          setScans(data);
+          setError(null);
+        } else {
+          throw new Error('Invalid archive response.');
+        }
+      })
+      .catch((err) => {
         console.error('Failed to load user scan history:', err);
+        setError('Your scan history could not be retrieved. Check your connection and try again.');
+        setScans([]);
+      })
+      .finally(() => {
         setLoading(false);
       });
+  };
+
+  useEffect(() => {
+    fetchScans();
   }, []);
 
   const filteredScans = scans.filter(s => 
@@ -62,7 +83,7 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
       </div>
 
       {/* Filter / Search input */}
-      {scans.length > 0 && (
+      {!loading && !error && scans.length > 0 && (
         <div className="relative">
           <Search className="w-4 h-4 text-stone-400 absolute left-3 top-2.5" />
           <input
@@ -79,6 +100,25 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
         <div className="p-12 text-center text-xs text-stone-500 bg-white rounded-xl border border-stone-200">
           <div className="w-6 h-6 border-2 border-rose-500 border-t-transparent rounded-full animate-spin mx-auto mb-2" />
           <span>Loading your scan archive...</span>
+        </div>
+      ) : error ? (
+        <div className="p-10 bg-white rounded-2xl border border-rose-200 text-center space-y-4 shadow-xs">
+          <div className="w-12 h-12 rounded-full bg-rose-50 text-rose-600 flex items-center justify-center mx-auto">
+            <AlertTriangle className="w-6 h-6" />
+          </div>
+          <div className="space-y-1">
+            <h3 className="font-bold text-base text-stone-900">Failed to load scan archive</h3>
+            <p className="text-xs text-stone-500 max-w-sm mx-auto leading-relaxed">
+              {error}
+            </p>
+          </div>
+          <button
+            onClick={fetchScans}
+            className="px-5 py-2 bg-stone-900 hover:bg-stone-850 text-white text-xs font-bold rounded-lg shadow-sm transition-colors inline-flex items-center gap-2"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            <span>Retry</span>
+          </button>
         </div>
       ) : scans.length === 0 ? (
         <div className="p-12 bg-white rounded-xl border border-stone-200 text-center space-y-4 shadow-xs">
@@ -139,8 +179,16 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
                     </>
                   )}
                   <span>·</span>
-                  <span className="text-stone-700 font-medium">{scan.creditsUsed} credits used</span>
+                  <span className="text-stone-700 font-medium">
+                    {scan.creditsUsed > 0 ? `${scan.creditsUsed} credits used` : '0 credits used'}
+                  </span>
                 </div>
+
+                {scan.status === 'FAILED' && scan.error && (
+                  <p className="text-[11px] text-stone-500 italic mt-0.5">
+                    Failure reason: {scan.error}
+                  </p>
+                )}
               </div>
 
               {/* Action Buttons */}
@@ -157,17 +205,23 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
                     </button>
                     <button
                       onClick={() => onSelectScan(scan.id)}
-                      className="flex-1 sm:flex-initial px-4 py-1.5 bg-stone-900 hover:bg-stone-800 text-white text-xs font-bold rounded-lg flex items-center justify-center gap-1.5 transition-colors shadow-xs"
+                      className="flex-1 sm:flex-initial px-4 py-1.5 bg-stone-900 hover:bg-stone-850 text-white text-xs font-bold rounded-lg flex items-center justify-center gap-1.5 transition-colors shadow-xs"
                     >
                       <span>View Report</span>
                       <ArrowRight className="w-3.5 h-3.5" />
                     </button>
                   </>
                 ) : scan.status === 'FAILED' ? (
-                  <span className="text-xs text-rose-600 font-semibold flex items-center gap-1">
-                    <XCircle className="w-4 h-4" />
-                    <span>Analysis Error (Credits Refunded)</span>
-                  </span>
+                  <div className="flex items-center gap-1.5 text-xs text-rose-600 font-semibold">
+                    <XCircle className="w-4 h-4 shrink-0" />
+                    <span>
+                      {scan.creditsRefunded || (scan.creditsRefundedAmount && scan.creditsRefundedAmount > 0)
+                        ? 'Analysis Error · Credits Refunded'
+                        : scan.creditsUsed === 0
+                          ? 'Analysis Error · No Credits Deducted'
+                          : 'Analysis Error'}
+                    </span>
+                  </div>
                 ) : (
                   <button
                     onClick={() => onSelectScan(scan.id)}

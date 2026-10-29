@@ -43,6 +43,7 @@ export const ChannelProfileView: React.FC<ChannelProfileViewProps> = ({ user, on
     patterns: CrossVideoPattern[];
     disclaimer: string;
   } | null>(null);
+  const [patternsError, setPatternsError] = useState<string | null>(null);
 
   useEffect(() => {
     loadProfileAndPatterns();
@@ -50,6 +51,7 @@ export const ChannelProfileView: React.FC<ChannelProfileViewProps> = ({ user, on
 
   const loadProfileAndPatterns = async () => {
     setLoading(true);
+    setPatternsError(null);
     try {
       // 1. Load Profile
       const profRes = await authFetch('/api/channel/profile');
@@ -73,9 +75,13 @@ export const ChannelProfileView: React.FC<ChannelProfileViewProps> = ({ user, on
       if (patRes.ok) {
         const patData = await patRes.json();
         setPatternsData(patData);
+        setPatternsError(null);
+      } else {
+        setPatternsError('Unable to load cross-video patterns.');
       }
     } catch (err) {
       console.warn('Failed to load channel context profile:', err);
+      setPatternsError('Unable to load cross-video patterns.');
     } finally {
       setLoading(false);
     }
@@ -130,13 +136,13 @@ export const ChannelProfileView: React.FC<ChannelProfileViewProps> = ({ user, on
         <div>
           <div className="inline-flex items-center gap-2 px-2.5 py-1 rounded bg-stone-200 text-stone-800 text-xs font-semibold mb-2">
             <Tv className="w-3.5 h-3.5 text-rose-600" />
-            <span>Persistent Context Intelligence</span>
+            <span>Declared Creator Context</span>
           </div>
           <h1 className="text-2xl sm:text-3xl font-extrabold text-stone-900 tracking-tight">
             Channel Context Profile
           </h1>
           <p className="text-xs sm:text-sm text-stone-600 mt-1 max-w-2xl leading-relaxed">
-            Tell VideoRisk about your production format and fair-use workflow. Grounding analysis in your declared channel context prevents false positives and improves policy interpretation.
+            Tell VideoRisk about your production format and fair-use workflow. Grounding analysis in your declared creator context helps interpret findings according to your creative intentions. It does not substitute for independent copyright permissions or guarantee that YouTube will approve a video or channel.
           </p>
         </div>
 
@@ -156,7 +162,7 @@ export const ChannelProfileView: React.FC<ChannelProfileViewProps> = ({ user, on
           <span>About Channel Context Grounding</span>
         </div>
         <p className="leading-relaxed text-stone-300">
-          Channel context is user-declared. It helps VideoRisk distinguish educational commentary from unedited compilations, but does not substitute for independent copyright permissions or guarantee YouTube Partner Program decisions.
+          Channel context is user-declared. It provides additional creator-declared context to help interpret scan findings, but does not guarantee that findings are correct or that YouTube will approve a video or channel. It does not independently verify Fair Use or determine legal outcomes.
         </p>
       </div>
 
@@ -369,7 +375,15 @@ export const ChannelProfileView: React.FC<ChannelProfileViewProps> = ({ user, on
           )}
         </div>
 
-        {patternsData?.patterns && patternsData.patterns.length > 0 ? (
+        {patternsError ? (
+          <div className="p-6 bg-rose-50/50 rounded-xl border border-rose-200 text-center text-xs text-rose-900 space-y-2">
+            <AlertCircle className="w-6 h-6 text-rose-600 mx-auto" />
+            <p className="font-bold text-sm">Cross-Video Analysis Unavailable</p>
+            <p className="text-rose-700 max-w-md mx-auto leading-relaxed">
+              Unable to retrieve catalog risk patterns. Check your connection or retry later.
+            </p>
+          </div>
+        ) : patternsData?.patterns && patternsData.patterns.length > 0 ? (
           <div className="space-y-3">
             {patternsData.patterns.map((pat) => (
               <div 
@@ -396,12 +410,28 @@ export const ChannelProfileView: React.FC<ChannelProfileViewProps> = ({ user, on
               </div>
             ))}
           </div>
+        ) : !patternsData || patternsData.sampleSize === 0 ? (
+          <div className="p-6 bg-stone-50 rounded-xl text-center text-xs text-stone-600 space-y-1.5 border border-stone-200">
+            <Info className="w-6 h-6 text-stone-400 mx-auto mb-1" />
+            <p className="font-bold text-sm text-stone-900">No Scans Analyzed Yet</p>
+            <p className="max-w-md mx-auto leading-relaxed text-stone-500">
+              Analyze videos to begin building a channel-level pattern baseline. At least 2 completed scans are required.
+            </p>
+          </div>
+        ) : patternsData.sampleSize === 1 ? (
+          <div className="p-6 bg-amber-50/50 rounded-xl text-center text-xs text-amber-900 space-y-1.5 border border-amber-200">
+            <Info className="w-6 h-6 text-amber-600 mx-auto mb-1" />
+            <p className="font-bold text-sm text-amber-950">Preliminary Channel Sample</p>
+            <p className="max-w-md mx-auto leading-relaxed text-amber-800">
+              1 completed scan is not enough to identify recurring patterns across videos. Analyze at least one more video.
+            </p>
+          </div>
         ) : (
-          <div className="p-6 bg-stone-50 rounded-xl text-center text-xs text-stone-500 space-y-1">
+          <div className="p-6 bg-emerald-50/40 rounded-xl text-center text-xs text-emerald-950 space-y-1.5 border border-emerald-200">
             <CheckCircle2 className="w-6 h-6 text-emerald-600 mx-auto mb-1" />
-            <p className="font-bold text-stone-800">No Recurring Risk Patterns Detected</p>
-            <p className="max-w-md mx-auto">
-              Your uploaded scans exhibit consistent creative differentiation and narrative variation.
+            <p className="font-bold text-sm text-emerald-950">No Recurring Risk Patterns Detected</p>
+            <p className="max-w-md mx-auto leading-relaxed text-emerald-800">
+              No recurring patterns were identified across the {patternsData.sampleSize} analyzed videos. This does not guarantee copyright clearance, YouTube policy compliance, or monetization approval.
             </p>
           </div>
         )}

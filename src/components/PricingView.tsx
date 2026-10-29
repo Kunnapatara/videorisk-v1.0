@@ -78,7 +78,7 @@ export const PricingView: React.FC<PricingViewProps> = ({ user, onPlanUpdated, o
           const errData = await res.json().catch(() => ({}));
           setCheckoutMessage({
             type: 'error',
-            text: errData.error || 'Free trial has already been claimed for this account.'
+            text: errData.error || 'The 10-minute evaluation trial has already been claimed for this account. Select a plan below to add minutes to your balance.'
           });
         }
         return;
@@ -125,7 +125,7 @@ export const PricingView: React.FC<PricingViewProps> = ({ user, onPlanUpdated, o
           Credit-based on Input Video Minutes
         </h1>
         <p className="text-sm sm:text-base text-stone-600 leading-relaxed max-w-2xl mx-auto">
-          Pay for what you scan. 1 credit = 1 input minute for Standard Scan. 4K footage is processed with 1080p proxy with zero resolution surcharge.
+          Pay for what you scan. 1 credit = 1 input minute for Standard Scan. 4K footage is optimized automatically with zero resolution surcharge.
         </p>
       </div>
 
@@ -237,9 +237,11 @@ export const PricingView: React.FC<PricingViewProps> = ({ user, onPlanUpdated, o
                   ) : isCurrent ? (
                     'Current Plan'
                   ) : plan.id === 'free' ? (
-                    'Select Free'
+                    'Claim 10-Min Free Trial'
+                  ) : plan.period === 'one-time' ? (
+                    `Purchase $${plan.priceUsd} · One-Time`
                   ) : (
-                    `Subscribe $${plan.priceUsd}`
+                    `Subscribe · $${plan.priceUsd}/month`
                   )}
                 </button>
               </div>

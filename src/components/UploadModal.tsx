@@ -45,9 +45,9 @@ export const UploadModal: React.FC<UploadModalProps> = ({
 
   // Client-side quick file metadata inspect
   const [clientMeta, setClientMeta] = useState<{
-    durationSeconds: number;
-    width: number;
-    height: number;
+    durationSeconds: number | null;
+    width: number | null;
+    height: number | null;
     sizeMb: number;
   } | null>(null);
 
@@ -66,18 +66,18 @@ export const UploadModal: React.FC<UploadModalProps> = ({
     videoElem.src = URL.createObjectURL(selectedFile);
     videoElem.onloadedmetadata = () => {
       setClientMeta({
-        durationSeconds: Math.round(videoElem.duration || 60),
-        width: videoElem.videoWidth || 1920,
-        height: videoElem.videoHeight || 1080,
+        durationSeconds: videoElem.duration && isFinite(videoElem.duration) && videoElem.duration > 0 ? Math.round(videoElem.duration) : null,
+        width: videoElem.videoWidth || null,
+        height: videoElem.videoHeight || null,
         sizeMb: parseFloat((selectedFile.size / (1024 * 1024)).toFixed(2))
       });
       URL.revokeObjectURL(videoElem.src);
     };
     videoElem.onerror = () => {
       setClientMeta({
-        durationSeconds: 120,
-        width: 1920,
-        height: 1080,
+        durationSeconds: null,
+        width: null,
+        height: null,
         sizeMb: parseFloat((selectedFile.size / (1024 * 1024)).toFixed(2))
       });
     };
@@ -97,8 +97,11 @@ export const UploadModal: React.FC<UploadModalProps> = ({
     setThumbnailPreview(null);
   };
 
-  const calculateRequiredCredits = () => {
-    const mins = clientMeta ? Math.max(1, Math.ceil(clientMeta.durationSeconds / 60)) : 2;
+  const calculateRequiredCredits = (): number | null => {
+    if (!clientMeta || clientMeta.durationSeconds === null) {
+      return null;
+    }
+    const mins = Math.max(1, Math.ceil(clientMeta.durationSeconds / 60));
     return scanMode === 'deep' ? mins * 2 : mins;
   };
 
@@ -307,7 +310,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
                   Drag and drop your video file here, or <span className="text-rose-600 underline">browse files</span>
                 </p>
                 <p className="text-xs text-stone-500 mt-1">
-                  Supports MP4, MOV, WebM, MKV · Up to 4K resolution (1080p proxy decode)
+                  Supports MP4, MOV, WebM, MKV · Up to 4K resolution (optimized automatically for media inspection)
                 </p>
               </div>
             )}
@@ -316,27 +319,52 @@ export const UploadModal: React.FC<UploadModalProps> = ({
 
         {/* Client Metadata Preview */}
         {clientMeta && (
-          <div className="bg-stone-50 rounded-xl p-3.5 border border-stone-200 grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
-            <div>
-              <span className="text-stone-500 block text-[11px]">Duration</span>
-              <span className="font-bold text-stone-900">
-                {Math.floor(clientMeta.durationSeconds / 60)}m {clientMeta.durationSeconds % 60}s
-              </span>
+          <div className="bg-stone-50 rounded-xl p-3.5 border border-stone-200 space-y-2">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+              <div>
+                <span className="text-stone-500 block text-[11px]">Duration</span>
+                {clientMeta.durationSeconds !== null ? (
+                  <span className="font-bold text-stone-900">
+                    {Math.floor(clientMeta.durationSeconds / 60)}m {clientMeta.durationSeconds % 60}s
+                  </span>
+                ) : (
+                  <span className="font-semibold text-stone-600 italic">
+                    Pending server inspection
+                  </span>
+                )}
+              </div>
+              <div>
+                <span className="text-stone-500 block text-[11px]">Resolution</span>
+                {clientMeta.width && clientMeta.height ? (
+                  <span className="font-bold text-stone-900">
+                    {clientMeta.width}x{clientMeta.height}
+                  </span>
+                ) : (
+                  <span className="font-semibold text-stone-600 italic">
+                    Detected upon upload
+                  </span>
+                )}
+              </div>
+              <div>
+                <span className="text-stone-500 block text-[11px]">File Size</span>
+                <span className="font-bold text-stone-900">{clientMeta.sizeMb} MB</span>
+              </div>
+              <div>
+                <span className="text-stone-500 block text-[11px]">Credits Required</span>
+                {calculateRequiredCredits() !== null ? (
+                  <span className="font-extrabold text-rose-600 font-mono">
+                    {calculateRequiredCredits()} mins (preliminary)
+                  </span>
+                ) : (
+                  <span className="font-semibold text-stone-600 italic">
+                    Calculated upon upload
+                  </span>
+                )}
+              </div>
             </div>
-            <div>
-              <span className="text-stone-500 block text-[11px]">Resolution</span>
-              <span className="font-bold text-stone-900">
-                {clientMeta.width}x{clientMeta.height}
-              </span>
-            </div>
-            <div>
-              <span className="text-stone-500 block text-[11px]">File Size</span>
-              <span className="font-bold text-stone-900">{clientMeta.sizeMb} MB</span>
-            </div>
-            <div>
-              <span className="text-stone-500 block text-[11px]">Credits Required</span>
-              <span className="font-extrabold text-rose-600 font-mono">{calculateRequiredCredits()} mins</span>
-            </div>
+            <p className="text-[10px] text-stone-400">
+              *Preliminary estimate based on browser decoding. The server calculates authoritative duration and billing upon media inspection.*
+            </p>
           </div>
         )}
 
@@ -467,7 +495,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
                 <span className="text-xs text-rose-600 font-bold">1 credit / min</span>
               </div>
               <p className="text-xs text-stone-600 leading-relaxed">
-                Fast media inspection, audio silencedetect, scene cuts, metadata coherence, and full policy mapping.
+                Fast media inspection covering spoken commentary presence, scene pacing, title-content alignment, and policy-related risk checks.
               </p>
             </div>
 
@@ -484,7 +512,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
                 <span className="text-xs text-rose-600 font-bold">2 credits / min</span>
               </div>
               <p className="text-xs text-stone-600 leading-relaxed">
-                Granular perceptual frame hashing, heavier cross-segment comparison, and intensive pattern audit.
+                Comprehensive visual repetition analysis, detailed segment-by-segment comparison, and intensive pattern audit.
               </p>
             </div>
           </div>
@@ -517,7 +545,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
               {isUploading ? (
                 <>
                   <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                  <span>Processing Media Pipeline...</span>
+                  <span>Uploading and inspecting media...</span>
                 </>
               ) : (
                 <>
@@ -531,10 +559,15 @@ export const UploadModal: React.FC<UploadModalProps> = ({
 
         {/* Interactive Quick Demo Scans for Immediate Verification */}
         <div className="pt-4 border-t border-stone-100 bg-stone-50 -mx-6 sm:-mx-8 -mb-6 sm:-mb-8 p-6 sm:p-8 space-y-3">
-          <div className="flex items-center gap-1.5 text-xs text-stone-700">
-            <Zap className="w-4 h-4 text-amber-500" />
-            <span className="font-bold">Instant Sandbox Playground:</span>
-            <span>Test the pre-publish intelligence engine with creator sample profiles:</span>
+          <div className="space-y-1">
+            <div className="flex items-center gap-1.5 text-xs text-stone-700">
+              <Zap className="w-4 h-4 text-amber-500 shrink-0" />
+              <span className="font-bold">Instant Sandbox Playground:</span>
+              <span>Test the intelligence engine with sample creator profiles:</span>
+            </div>
+            <p className="text-[11px] text-stone-500 pl-5.5">
+              Sample scans run in your account, require an available credit balance, and consume 2 evaluation credits.
+            </p>
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
@@ -544,11 +577,14 @@ export const UploadModal: React.FC<UploadModalProps> = ({
               onClick={() => handleStartDemoScan('problematic')}
               className="p-3 bg-white border border-stone-200 hover:border-rose-400 rounded-xl text-left transition-colors shadow-2xs group"
             >
-              <div className="font-bold text-stone-900 group-hover:text-rose-600 flex items-center justify-between">
+              <div className="font-bold text-stone-900 group-hover:text-rose-600 flex flex-wrap items-center justify-between gap-1.5">
                 <span>Sample A: Raw Montage Clip</span>
-                <span className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.2 rounded font-semibold">Reused Signals</span>
+                <div className="flex items-center gap-1">
+                  <span className="text-[10px] text-stone-600 bg-stone-100 border border-stone-200 px-1.5 py-0.5 rounded font-mono font-semibold">2 credits</span>
+                  <span className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded font-semibold">Reused Signals</span>
+                </div>
               </div>
-              <p className="text-[11px] text-stone-500 mt-1">
+              <p className="text-[11px] text-stone-500 mt-1.5 leading-relaxed">
                 Simulates video with third-party clips, low creator voiceover, and static slideshow patterns.
               </p>
             </button>
@@ -559,11 +595,14 @@ export const UploadModal: React.FC<UploadModalProps> = ({
               onClick={() => handleStartDemoScan('revised')}
               className="p-3 bg-white border border-stone-200 hover:border-emerald-400 rounded-xl text-left transition-colors shadow-2xs group"
             >
-              <div className="font-bold text-stone-900 group-hover:text-emerald-600 flex items-center justify-between">
+              <div className="font-bold text-stone-900 group-hover:text-emerald-600 flex flex-wrap items-center justify-between gap-1.5">
                 <span>Sample B: Clean Commentary Cut</span>
-                <span className="text-[10px] text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.2 rounded font-semibold">Transformative</span>
+                <div className="flex items-center gap-1">
+                  <span className="text-[10px] text-stone-600 bg-stone-100 border border-stone-200 px-1.5 py-0.5 rounded font-mono font-semibold">2 credits</span>
+                  <span className="text-[10px] text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded font-semibold">Transformative</span>
+                </div>
               </div>
-              <p className="text-[11px] text-stone-500 mt-1">
+              <p className="text-[11px] text-stone-500 mt-1.5 leading-relaxed">
                 Simulates revised cut with voice commentary, narrative framing, and corrected metadata.
               </p>
             </button>

@@ -76,14 +76,18 @@ export const HomeView: React.FC<HomeViewProps> = ({
               className="w-full sm:w-auto px-7 py-3.5 bg-stone-800 hover:bg-stone-700 active:scale-98 text-stone-200 border border-stone-700 font-semibold text-sm rounded-xl transition-all flex items-center justify-center gap-2 shadow-xs"
             >
               <Zap className="w-4 h-4 text-amber-400" />
-              <span>Try Demo Scan</span>
+              <span>Explore Sample Scan · 2 credits</span>
             </button>
           </div>
+
+          <p className="text-[11px] text-stone-400 max-w-md mx-auto pt-1">
+            Sample evaluations run in your account, require an available credit balance, and consume 2 evaluation credits.
+          </p>
 
           {/* Technical Specs & Disclaimer */}
           <div className="space-y-2 pt-2">
             <p className="text-xs text-stone-400">
-              Supports MP4, MOV, WebM, MKV · Up to 4K resolution · 10 free minutes included
+              Supports MP4, MOV, WebM, MKV · Up to 4K resolution · 10-minute evaluation trial for new accounts
             </p>
             <p className="text-[11px] text-stone-400 italic max-w-xl mx-auto leading-normal">
               *VideoRisk provides evidence-based risk analysis, not a guarantee of YouTube approval, copyright clearance, or monetization eligibility.*
@@ -92,227 +96,152 @@ export const HomeView: React.FC<HomeViewProps> = ({
         </div>
       </section>
 
-      {/* 2. UNDERSTAND YOUR VIDEO BEYOND A SINGLE SCORE */}
+      {/* 2. THREE PILLARS OF PRE-PUBLISH RISK INTELLIGENCE */}
       <section className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 space-y-10">
         <div className="text-center max-w-3xl mx-auto space-y-3">
+          <span className="text-xs uppercase tracking-wider text-rose-600 font-extrabold">
+            Comprehensive Analysis Architecture
+          </span>
           <h2 className="text-2xl sm:text-3xl font-extrabold text-stone-900 tracking-tight">
-            Understand Your Video Beyond a Single Score
+            Three Pillars of Pre-Publish Risk Intelligence
           </h2>
           <p className="text-sm sm:text-base text-stone-600 leading-relaxed">
-            A useful review should explain more than whether something looks risky. It should help you understand what was observed, why it may matter, and what deserves your attention.
+            A reliable review connects multi-modal media inspection, creator production context, and before-and-after cut verification into one explainable workflow.
           </p>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {/* Card 1: Reused-content signals */}
-          <div className="bg-white rounded-2xl border border-stone-200 p-6 shadow-xs hover:border-stone-300 transition-all flex flex-col justify-between space-y-5">
-            <div className="space-y-3">
-              <div className="w-10 h-10 rounded-xl bg-rose-50 text-rose-600 flex items-center justify-center font-bold">
-                <Layers className="w-5 h-5" />
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 sm:gap-8">
+          {/* Pillar 1: Detection Engines */}
+          <div className="bg-white rounded-2xl border border-stone-200 p-6 sm:p-7 shadow-xs hover:border-stone-300 transition-all flex flex-col justify-between space-y-6">
+            <div className="space-y-4">
+              <div className="w-12 h-12 rounded-xl bg-rose-50 text-rose-600 flex items-center justify-center font-bold">
+                <Layers className="w-6 h-6" />
               </div>
-              <h3 className="font-bold text-base text-stone-900">
-                Reused-content signals
-              </h3>
-              <p className="text-xs text-stone-600 leading-relaxed">
-                Identify available signals that may warrant closer review of third-party footage or externally sourced sequences. Understand why context, meaningful original contribution, and the way content is used matter when evaluating reused-content concerns.
+              <div>
+                <span className="text-[11px] font-mono uppercase tracking-wider text-rose-600 font-bold block mb-1">
+                  Pillar 01
+                </span>
+                <h3 className="font-bold text-lg text-stone-900">
+                  Multi-Modal Detection Engines
+                </h3>
+              </div>
+              <p className="text-xs sm:text-sm text-stone-600 leading-relaxed">
+                Inspects video frames, audio tracks, spoken narration, scene pacing, and metadata alignment to identify potential policy friction points before upload.
               </p>
+              
+              <ul className="space-y-2 pt-2 border-t border-stone-100 text-xs text-stone-600">
+                <li className="flex items-start gap-2">
+                  <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  <span><strong>Audio & Speech:</strong> Measures spoken commentary presence and voiceover consistency.</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  <span><strong>Visual Repetition:</strong> Analyzes scene duration, static slides, and reused visual segments.</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  <span><strong>Metadata Coherence:</strong> Evaluates title-to-content alignment and thumbnail integrity.</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  <span><strong>Ad Suitability:</strong> Flags sensitive themes, shocking imagery, and profanity signals.</span>
+                </li>
+              </ul>
             </div>
-            <div className="pt-3 border-t border-stone-100 bg-stone-50/60 -mx-6 -mb-6 p-4 rounded-b-2xl">
-              <p className="text-xs text-stone-800 leading-normal">
-                <strong className="font-bold text-stone-900">What you gain:</strong> Clearer guidance on which material to review and what evidence of your contribution may be relevant.
+
+            <div className="pt-3 border-t border-stone-100 bg-stone-50/70 -mx-6 -mb-6 sm:-mx-7 sm:-mb-7 p-4 sm:p-5 rounded-b-2xl">
+              <p className="text-xs text-stone-700 leading-normal">
+                <strong className="font-bold text-stone-900">Evidence First:</strong> Every finding links directly to timestamps and concrete media observations.
               </p>
             </div>
           </div>
 
-          {/* Card 2: Original contribution */}
-          <div className="bg-white rounded-2xl border border-stone-200 p-6 shadow-xs hover:border-stone-300 transition-all flex flex-col justify-between space-y-5">
-            <div className="space-y-3">
-              <div className="w-10 h-10 rounded-xl bg-emerald-50 text-emerald-600 flex items-center justify-center font-bold">
-                <CheckCircle2 className="w-5 h-5" />
+          {/* Pillar 2: Channel Context */}
+          <div className="bg-white rounded-2xl border border-stone-200 p-6 sm:p-7 shadow-xs hover:border-stone-300 transition-all flex flex-col justify-between space-y-6">
+            <div className="space-y-4">
+              <div className="w-12 h-12 rounded-xl bg-amber-50 text-amber-700 flex items-center justify-center font-bold">
+                <Sliders className="w-6 h-6" />
               </div>
-              <h3 className="font-bold text-base text-stone-900">
-                Original contribution
-              </h3>
-              <p className="text-xs text-stone-600 leading-relaxed">
-                Review available indicators related to creator commentary, analysis, creative context, and how the video adds value beyond its source material.
+              <div>
+                <span className="text-[11px] font-mono uppercase tracking-wider text-amber-700 font-bold block mb-1">
+                  Pillar 02
+                </span>
+                <h3 className="font-bold text-lg text-stone-900">
+                  Declared Channel Context
+                </h3>
+              </div>
+              <p className="text-xs sm:text-sm text-stone-600 leading-relaxed">
+                Grounds findings in your declared production workflow—such as critical commentary, educational breakdown, or gaming critique—preventing false alarms.
               </p>
+              
+              <ul className="space-y-2 pt-2 border-t border-stone-100 text-xs text-stone-600">
+                <li className="flex items-start gap-2">
+                  <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  <span><strong>Format Grounding:</strong> Applies fair-use transformational standards tailored to your niche.</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  <span><strong>Snapshot Versioning:</strong> Saves a permanent profile record with every video scan.</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  <span><strong>Catalog Patterns:</strong> Tracks cross-video risk trends across your completed scans (requires 2+ videos).</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  <span><strong>Clear Scope:</strong> Distinguishes creator-declared context from independent platform clearance.</span>
+                </li>
+              </ul>
             </div>
-            <div className="pt-3 border-t border-stone-100 bg-stone-50/60 -mx-6 -mb-6 p-4 rounded-b-2xl">
-              <p className="text-xs text-stone-800 leading-normal">
-                <strong className="font-bold text-stone-900">What you gain:</strong> A better understanding of the questions to ask about your own contribution, without treating audio activity or editing intensity as proof of originality.
+
+            <div className="pt-3 border-t border-stone-100 bg-stone-50/70 -mx-6 -mb-6 sm:-mx-7 sm:-mb-7 p-4 sm:p-5 rounded-b-2xl">
+              <p className="text-xs text-stone-700 leading-normal">
+                <strong className="font-bold text-stone-900">Context That Matters:</strong> Avoids treating review clips or parody excerpts as raw reused content.
               </p>
             </div>
           </div>
 
-          {/* Card 3: Repetitive and mass-produced patterns */}
-          <div className="bg-white rounded-2xl border border-stone-200 p-6 shadow-xs hover:border-stone-300 transition-all flex flex-col justify-between space-y-5">
-            <div className="space-y-3">
-              <div className="w-10 h-10 rounded-xl bg-amber-50 text-amber-600 flex items-center justify-center font-bold">
-                <Sliders className="w-5 h-5" />
+          {/* Pillar 3: Verifiable Comparison */}
+          <div className="bg-white rounded-2xl border border-stone-200 p-6 sm:p-7 shadow-xs hover:border-stone-300 transition-all flex flex-col justify-between space-y-6">
+            <div className="space-y-4">
+              <div className="w-12 h-12 rounded-xl bg-emerald-50 text-emerald-600 flex items-center justify-center font-bold">
+                <Scale className="w-6 h-6" />
               </div>
-              <h3 className="font-bold text-base text-stone-900">
-                Repetitive and mass-produced patterns
-              </h3>
-              <p className="text-xs text-stone-600 leading-relaxed">
-                Examine observable scene, pacing, and repetition patterns that may deserve a closer look. Understand the difference between a measurable editing pattern and a conclusion about repetitive or inauthentic content.
-              </p>
-            </div>
-            <div className="pt-3 border-t border-stone-100 bg-stone-50/60 -mx-6 -mb-6 p-4 rounded-b-2xl">
-              <p className="text-xs text-stone-800 leading-normal">
-                <strong className="font-bold text-stone-900">What you gain:</strong> More informed decisions about differentiation, creative value, and whether further review is needed.
-              </p>
-            </div>
-          </div>
-
-          {/* Card 4: AI-generated and synthetic-content signals */}
-          <div className="bg-white rounded-2xl border border-stone-200 p-6 shadow-xs hover:border-stone-300 transition-all flex flex-col justify-between space-y-5">
-            <div className="space-y-3">
-              <div className="w-10 h-10 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center font-bold">
-                <Eye className="w-5 h-5" />
+              <div>
+                <span className="text-[11px] font-mono uppercase tracking-wider text-emerald-700 font-bold block mb-1">
+                  Pillar 03
+                </span>
+                <h3 className="font-bold text-lg text-stone-900">
+                  Verifiable Cut Comparison
+                </h3>
               </div>
-              <h3 className="font-bold text-base text-stone-900">
-                AI-generated and synthetic-content signals
-              </h3>
-              <p className="text-xs text-stone-600 leading-relaxed">
-                Review available signals that may be relevant to synthetic audio or other AI-assisted content. Understand when additional context or a separate disclosure check may be necessary.
+              <p className="text-xs sm:text-sm text-stone-600 leading-relaxed">
+                Upload revised cuts to verify that edits resolved targeted signals, track before-and-after deltas, and document residual considerations.
               </p>
-            </div>
-            <div className="pt-3 border-t border-stone-100 bg-stone-50/60 -mx-6 -mb-6 p-4 rounded-b-2xl">
-              <p className="text-xs text-stone-800 leading-normal">
-                <strong className="font-bold text-stone-900">What you gain:</strong> Better awareness of potential disclosure considerations, without assuming that a voice or sound pattern alone proves AI generation or determines whether disclosure is required.
-              </p>
-            </div>
-          </div>
-
-          {/* Card 5: Third-party content and copyright signals */}
-          <div className="bg-white rounded-2xl border border-stone-200 p-6 shadow-xs hover:border-stone-300 transition-all flex flex-col justify-between space-y-5">
-            <div className="space-y-3">
-              <div className="w-10 h-10 rounded-xl bg-rose-50 text-rose-700 flex items-center justify-center font-bold">
-                <Scale className="w-5 h-5" />
-              </div>
-              <h3 className="font-bold text-base text-stone-900">
-                Third-party content and copyright signals
-              </h3>
-              <p className="text-xs text-stone-600 leading-relaxed">
-                Keep copyright-related observations separate from YouTube Partner Program reused-content considerations. Review available evidence and licensing questions to determine what may need further verification.
-              </p>
-              <p className="text-[11px] text-stone-500 italic leading-snug pt-1">
-                *VideoRisk does not perform YouTube Content ID matching or prove copyright clearance unless a specific, verified capability is explicitly available.*
-              </p>
-            </div>
-            <div className="pt-3 border-t border-stone-100 bg-stone-50/60 -mx-6 -mb-6 p-4 rounded-b-2xl">
-              <p className="text-xs text-stone-800 leading-normal">
-                <strong className="font-bold text-stone-900">What you gain:</strong> A clearer path to checking source material, permissions, and other relevant rights instead of treating every third-party-content concern as the same problem.
-              </p>
-            </div>
-          </div>
-
-          {/* Card 6: Advertiser-friendly content signals */}
-          <div className="bg-white rounded-2xl border border-stone-200 p-6 shadow-xs hover:border-stone-300 transition-all flex flex-col justify-between space-y-5">
-            <div className="space-y-3">
-              <div className="w-10 h-10 rounded-xl bg-amber-50 text-amber-700 flex items-center justify-center font-bold">
-                <AlertCircle className="w-5 h-5" />
-              </div>
-              <h3 className="font-bold text-base text-stone-900">
-                Advertiser-friendly content signals
-              </h3>
-              <p className="text-xs text-stone-600 leading-relaxed">
-                Review available indicators involving profanity, sensitive themes, or potentially shocking material. Understand which findings may warrant a closer look at advertiser-friendly guidelines.
-              </p>
-            </div>
-            <div className="pt-3 border-t border-stone-100 bg-stone-50/60 -mx-6 -mb-6 p-4 rounded-b-2xl">
-              <p className="text-xs text-stone-800 leading-normal">
-                <strong className="font-bold text-stone-900">What you gain:</strong> More context for reviewing sensitive sections before publishing, without assuming that a detected signal automatically makes a video unsuitable for advertising.
-              </p>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* 3. THE VIDEORISK DIFFERENCE */}
-      <section className="bg-stone-50 border-y border-stone-200 py-16 sm:py-20 px-4 sm:px-6 lg:px-8">
-        <div className="max-w-6xl mx-auto space-y-12">
-          <div className="text-center max-w-3xl mx-auto space-y-3">
-            <span className="text-xs uppercase tracking-wider text-rose-600 font-extrabold">
-              The VideoRisk Difference
-            </span>
-            <h2 className="text-2xl sm:text-4xl font-black text-stone-900 tracking-tight">
-              Not a simplistic score. An explainable workflow.
-            </h2>
-            <div className="text-sm sm:text-base text-stone-600 space-y-2 max-w-2xl mx-auto leading-relaxed">
-              <p>
-                A finding is only useful when you can understand where it came from, why it matters, and what to do next.
-              </p>
-              <p>
-                VideoRisk is designed to connect multiple stages of review into one practical workflow.
-              </p>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-            {/* Step 1: Evidence */}
-            <div className="p-6 bg-white rounded-2xl border border-stone-200 shadow-xs space-y-2.5">
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-black text-rose-600 bg-rose-50 px-2 py-0.5 rounded">01</span>
-                <h3 className="font-bold text-base text-stone-900">1. Evidence</h3>
-              </div>
-              <p className="text-xs text-stone-600 leading-relaxed">
-                Examine available audio, visual, scene, and video-context signals. Findings should be traceable to the evidence actually collected.
-              </p>
+              
+              <ul className="space-y-2 pt-2 border-t border-stone-100 text-xs text-stone-600">
+                <li className="flex items-start gap-2">
+                  <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  <span><strong>Side-by-Side Deltas:</strong> Compares original vs. revised risk scores and signal counts.</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  <span><strong>Resolved Issues:</strong> Confirms which specific segment warnings have been resolved.</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  <span><strong>Residual Questions:</strong> Highlights remaining items still requiring your editorial review.</span>
+                </li>
+                <li className="flex items-start gap-2">
+                  <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  <span><strong>Revision Archive:</strong> Keeps parent-child scan lineage organized in your account archive.</span>
+                </li>
+              </ul>
             </div>
 
-            {/* Step 2: Policy Context */}
-            <div className="p-6 bg-white rounded-2xl border border-stone-200 shadow-xs space-y-2.5">
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-black text-rose-600 bg-rose-50 px-2 py-0.5 rounded">02</span>
-                <h3 className="font-bold text-base text-stone-900">2. Policy Context</h3>
-              </div>
-              <p className="text-xs text-stone-600 leading-relaxed">
-                Understand the relevant YouTube policy area and how it relates to the finding. Keep copyright, reused content, inauthentic content, and advertiser suitability distinct.
-              </p>
-            </div>
-
-            {/* Step 3: Risk Interpretation */}
-            <div className="p-6 bg-white rounded-2xl border border-stone-200 shadow-xs space-y-2.5">
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-black text-rose-600 bg-rose-50 px-2 py-0.5 rounded">03</span>
-                <h3 className="font-bold text-base text-stone-900">3. Risk Interpretation</h3>
-              </div>
-              <p className="text-xs text-stone-600 leading-relaxed">
-                See why an observation may deserve attention, together with its confidence, limitations, and unresolved questions.
-              </p>
-            </div>
-
-            {/* Step 4: Explanation */}
-            <div className="p-6 bg-white rounded-2xl border border-stone-200 shadow-xs space-y-2.5">
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-black text-rose-600 bg-rose-50 px-2 py-0.5 rounded">04</span>
-                <h3 className="font-bold text-base text-stone-900">4. Explanation</h3>
-              </div>
-              <p className="text-xs text-stone-600 leading-relaxed">
-                Learn what was observed, why it may matter, and what the system cannot establish from the available evidence.
-              </p>
-            </div>
-
-            {/* Step 5: Actionable Guidance */}
-            <div className="p-6 bg-white rounded-2xl border border-stone-200 shadow-xs space-y-2.5">
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-black text-rose-600 bg-rose-50 px-2 py-0.5 rounded">05</span>
-                <h3 className="font-bold text-base text-stone-900">5. Actionable Guidance</h3>
-              </div>
-              <p className="text-xs text-stone-600 leading-relaxed">
-                Get practical next steps tailored to the finding, such as reviewing a specific segment, checking a source, verifying permissions, or documenting your creative contribution.
-              </p>
-            </div>
-
-            {/* Step 6: Re-scan and Compare */}
-            <div className="p-6 bg-white rounded-2xl border border-rose-300 bg-rose-50/20 shadow-xs space-y-2.5">
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-black text-rose-700 bg-rose-100 px-2 py-0.5 rounded">06</span>
-                <h3 className="font-bold text-base text-rose-900">6. Re-scan and Compare</h3>
-              </div>
-              <p className="text-xs text-stone-600 leading-relaxed">
-                Review your revised video and compare the new findings with the previous scan. Understand what changed, what remains unresolved, and which conclusions still require independent verification.
+            <div className="pt-3 border-t border-stone-100 bg-stone-50/70 -mx-6 -mb-6 sm:-mx-7 sm:-mb-7 p-4 sm:p-5 rounded-b-2xl">
+              <p className="text-xs text-stone-700 leading-normal">
+                <strong className="font-bold text-stone-900">Actionable Feedback:</strong> Close the loop with measured verification before uploading to YouTube.
               </p>
             </div>
           </div>
