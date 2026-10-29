@@ -22,6 +22,7 @@ interface UploadModalProps {
   onCancel: () => void;
   parentScanId?: string; // If doing a re-scan
   onGoToChannelProfile?: () => void;
+  onExplorePricing?: () => void;
 }
 
 export const UploadModal: React.FC<UploadModalProps> = ({ 
@@ -29,7 +30,8 @@ export const UploadModal: React.FC<UploadModalProps> = ({
   onScanCreated, 
   onCancel,
   parentScanId,
-  onGoToChannelProfile
+  onGoToChannelProfile,
+  onExplorePricing
 }) => {
   const [file, setFile] = useState<File | null>(null);
   const [videoTitle, setVideoTitle] = useState('');
@@ -265,6 +267,29 @@ export const UploadModal: React.FC<UploadModalProps> = ({
               <p className="font-bold text-sm">Unable to process video</p>
               <p className="mt-0.5">{uploadError}</p>
             </div>
+          </div>
+        )}
+
+        {user && user.creditsRemaining <= 0 && (
+          <div className="p-4 bg-amber-50 border border-amber-200 rounded-xl text-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-amber-900">
+            <div className="flex items-start gap-2.5">
+              <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-bold text-sm text-amber-950">Insufficient Credit Balance</p>
+                <p className="mt-0.5 text-amber-800">
+                  You currently have 0 credits. Video risk analysis and sample evaluation require an active credit balance.
+                </p>
+              </div>
+            </div>
+            {onExplorePricing && (
+              <button
+                type="button"
+                onClick={onExplorePricing}
+                className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-semibold rounded-lg text-xs shrink-0 transition-colors shadow-2xs"
+              >
+                View Credit Plans
+              </button>
+            )}
           </div>
         )}
 
@@ -512,7 +537,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
                 <span className="text-xs text-rose-600 font-bold">2 credits / min</span>
               </div>
               <p className="text-xs text-stone-600 leading-relaxed">
-                Comprehensive visual repetition analysis, detailed segment-by-segment comparison, and intensive pattern audit.
+                Comprehensive visual repetition analysis, detailed segment-by-segment comparison, and thorough pacing inspection.
               </p>
             </div>
           </div>

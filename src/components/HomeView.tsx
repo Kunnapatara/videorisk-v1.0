@@ -39,17 +39,17 @@ export const HomeView: React.FC<HomeViewProps> = ({
           </div>
 
           {/* Main Headline */}
-          <h1 className="text-3xl sm:text-5xl md:text-6xl font-black tracking-tight leading-[1.1] text-white">
+          <h1 className="text-3xl sm:text-5xl md:text-6xl font-black tracking-tight leading-[1.15] text-white max-w-3xl mx-auto text-balance">
             Know the risk before you publish.
           </h1>
 
           {/* Subheading */}
-          <p className="text-lg sm:text-2xl font-bold text-stone-200 tracking-tight">
+          <p className="text-lg sm:text-2xl font-bold text-stone-200 tracking-tight text-balance">
             Your video deserves more than a score.
           </p>
 
           {/* Core Body Copy */}
-          <div className="text-sm sm:text-base text-stone-300 max-w-2xl mx-auto space-y-3 font-normal leading-relaxed text-stone-300/90">
+          <div className="text-sm sm:text-base text-stone-300 max-w-2xl mx-auto space-y-3 font-normal leading-relaxed text-stone-300/90 text-pretty">
             <p>
               VideoRisk examines available video, audio, scene, and publishing-context signals to help you understand what may need attention before your video goes live.
             </p>
@@ -62,12 +62,12 @@ export const HomeView: React.FC<HomeViewProps> = ({
           </div>
 
           {/* Primary Action Buttons */}
-          <div className="pt-4 flex flex-col sm:flex-row items-center justify-center gap-3.5">
+          <div className="pt-4 flex flex-col sm:flex-row items-center justify-center gap-3.5 max-w-md sm:max-w-none mx-auto">
             <button
               onClick={onStartUpload}
               className="w-full sm:w-auto px-8 py-3.5 bg-rose-600 hover:bg-rose-500 active:scale-98 text-white font-bold text-sm rounded-xl shadow-lg shadow-rose-950/40 transition-all flex items-center justify-center gap-2"
             >
-              <Video className="w-4 h-4" />
+              <Video className="w-4 h-4 shrink-0" />
               <span>Upload Video</span>
             </button>
 
@@ -75,21 +75,25 @@ export const HomeView: React.FC<HomeViewProps> = ({
               onClick={onTryDemo}
               className="w-full sm:w-auto px-7 py-3.5 bg-stone-800 hover:bg-stone-700 active:scale-98 text-stone-200 border border-stone-700 font-semibold text-sm rounded-xl transition-all flex items-center justify-center gap-2 shadow-xs"
             >
-              <Zap className="w-4 h-4 text-amber-400" />
+              <Zap className="w-4 h-4 text-amber-400 shrink-0" />
               <span>Explore Sample Scan · 2 credits</span>
             </button>
           </div>
 
-          <p className="text-[11px] text-stone-400 max-w-md mx-auto pt-1">
+          <p className="text-[11px] text-stone-400 max-w-md mx-auto pt-1 text-balance">
             Sample evaluations run in your account, require an available credit balance, and consume 2 evaluation credits.
           </p>
 
           {/* Technical Specs & Disclaimer */}
           <div className="space-y-2 pt-2">
-            <p className="text-xs text-stone-400">
-              Supports MP4, MOV, WebM, MKV · Up to 4K resolution · 10-minute evaluation trial for new accounts
-            </p>
-            <p className="text-[11px] text-stone-400 italic max-w-xl mx-auto leading-normal">
+            <div className="flex flex-wrap items-center justify-center gap-x-2 gap-y-1 text-xs text-stone-400 max-w-2xl mx-auto text-balance">
+              <span>Supports MP4, MOV, WebM, MKV</span>
+              <span aria-hidden="true" className="hidden sm:inline">·</span>
+              <span>Up to 4K resolution</span>
+              <span aria-hidden="true" className="hidden sm:inline">·</span>
+              <span>10-minute evaluation trial for new accounts</span>
+            </div>
+            <p className="text-[11px] text-stone-400 italic max-w-xl mx-auto leading-normal text-balance">
               *VideoRisk provides evidence-based risk analysis, not a guarantee of YouTube approval, copyright clearance, or monetization eligibility.*
             </p>
           </div>
@@ -102,146 +106,185 @@ export const HomeView: React.FC<HomeViewProps> = ({
           <span className="text-xs uppercase tracking-wider text-rose-600 font-extrabold">
             Comprehensive Analysis Architecture
           </span>
-          <h2 className="text-2xl sm:text-3xl font-extrabold text-stone-900 tracking-tight">
+          <h2 className="text-2xl sm:text-3xl font-extrabold text-stone-900 tracking-tight text-balance">
             Three Pillars of Pre-Publish Risk Intelligence
           </h2>
-          <p className="text-sm sm:text-base text-stone-600 leading-relaxed">
+          <p className="text-sm sm:text-base text-stone-600 leading-relaxed text-pretty">
             A reliable review connects multi-modal media inspection, creator production context, and before-and-after cut verification into one explainable workflow.
           </p>
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 sm:gap-8">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 sm:gap-7">
           {/* Pillar 1: Detection Engines */}
-          <div className="bg-white rounded-2xl border border-stone-200 p-6 sm:p-7 shadow-xs hover:border-stone-300 transition-all flex flex-col justify-between space-y-6">
+          <div className="bg-white rounded-2xl border border-stone-200 p-6 sm:p-7 shadow-xs hover:border-stone-300 transition-all flex flex-col justify-between space-y-6 min-w-0">
             <div className="space-y-4">
-              <div className="w-12 h-12 rounded-xl bg-rose-50 text-rose-600 flex items-center justify-center font-bold">
+              <div className="w-12 h-12 rounded-xl bg-rose-50 text-rose-600 flex items-center justify-center font-bold shrink-0">
                 <Layers className="w-6 h-6" />
               </div>
               <div>
                 <span className="text-[11px] font-mono uppercase tracking-wider text-rose-600 font-bold block mb-1">
                   Pillar 01
                 </span>
-                <h3 className="font-bold text-lg text-stone-900">
+                <h3 className="font-bold text-lg text-stone-900 leading-snug">
                   Multi-Modal Detection Engines
                 </h3>
               </div>
-              <p className="text-xs sm:text-sm text-stone-600 leading-relaxed">
+              <p className="text-xs sm:text-sm text-stone-600 leading-relaxed text-pretty">
                 Inspects video frames, audio tracks, spoken narration, scene pacing, and metadata alignment to identify potential policy friction points before upload.
               </p>
               
-              <ul className="space-y-2 pt-2 border-t border-stone-100 text-xs text-stone-600">
-                <li className="flex items-start gap-2">
+              <ul className="space-y-2.5 pt-2 border-t border-stone-100 text-xs text-stone-600">
+                <li className="flex items-start gap-2.5">
                   <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                  <span><strong>Audio & Speech:</strong> Measures spoken commentary presence and voiceover consistency.</span>
+                  <span className="leading-snug">
+                    <strong className="font-semibold text-stone-900 mr-1">Audio & Speech:</strong>
+                    <span>Measures spoken commentary presence and voiceover consistency.</span>
+                  </span>
                 </li>
-                <li className="flex items-start gap-2">
+                <li className="flex items-start gap-2.5">
                   <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                  <span><strong>Visual Repetition:</strong> Analyzes scene duration, static slides, and reused visual segments.</span>
+                  <span className="leading-snug">
+                    <strong className="font-semibold text-stone-900 mr-1">Visual Repetition:</strong>
+                    <span>Analyzes scene duration, static slides, and repeated visual segments.</span>
+                  </span>
                 </li>
-                <li className="flex items-start gap-2">
+                <li className="flex items-start gap-2.5">
                   <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                  <span><strong>Metadata Coherence:</strong> Evaluates title-to-content alignment and thumbnail integrity.</span>
+                  <span className="leading-snug">
+                    <strong className="font-semibold text-stone-900 mr-1">Metadata Alignment:</strong>
+                    <span>Evaluates title-to-content alignment and thumbnail integrity.</span>
+                  </span>
                 </li>
-                <li className="flex items-start gap-2">
+                <li className="flex items-start gap-2.5">
                   <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                  <span><strong>Ad Suitability:</strong> Flags sensitive themes, shocking imagery, and profanity signals.</span>
+                  <span className="leading-snug">
+                    <strong className="font-semibold text-stone-900 mr-1">Ad Suitability:</strong>
+                    <span>Flags sensitive themes, shocking imagery, and profanity signals.</span>
+                  </span>
                 </li>
               </ul>
             </div>
 
             <div className="pt-3 border-t border-stone-100 bg-stone-50/70 -mx-6 -mb-6 sm:-mx-7 sm:-mb-7 p-4 sm:p-5 rounded-b-2xl">
               <p className="text-xs text-stone-700 leading-normal">
-                <strong className="font-bold text-stone-900">Evidence First:</strong> Every finding links directly to timestamps and concrete media observations.
+                <strong className="font-bold text-stone-900 mr-1">Evidence First:</strong>
+                <span>Every finding links directly to timestamps and concrete media observations.</span>
               </p>
             </div>
           </div>
 
           {/* Pillar 2: Channel Context */}
-          <div className="bg-white rounded-2xl border border-stone-200 p-6 sm:p-7 shadow-xs hover:border-stone-300 transition-all flex flex-col justify-between space-y-6">
+          <div className="bg-white rounded-2xl border border-stone-200 p-6 sm:p-7 shadow-xs hover:border-stone-300 transition-all flex flex-col justify-between space-y-6 min-w-0">
             <div className="space-y-4">
-              <div className="w-12 h-12 rounded-xl bg-amber-50 text-amber-700 flex items-center justify-center font-bold">
+              <div className="w-12 h-12 rounded-xl bg-amber-50 text-amber-700 flex items-center justify-center font-bold shrink-0">
                 <Sliders className="w-6 h-6" />
               </div>
               <div>
                 <span className="text-[11px] font-mono uppercase tracking-wider text-amber-700 font-bold block mb-1">
                   Pillar 02
                 </span>
-                <h3 className="font-bold text-lg text-stone-900">
+                <h3 className="font-bold text-lg text-stone-900 leading-snug">
                   Declared Channel Context
                 </h3>
               </div>
-              <p className="text-xs sm:text-sm text-stone-600 leading-relaxed">
-                Grounds findings in your declared production workflow—such as critical commentary, educational breakdown, or gaming critique—preventing false alarms.
+              <p className="text-xs sm:text-sm text-stone-600 leading-relaxed text-pretty">
+                Uses your declared production context as additional information when interpreting scan findings. Context does not independently verify Fair Use or guarantee that a finding is correct.
               </p>
               
-              <ul className="space-y-2 pt-2 border-t border-stone-100 text-xs text-stone-600">
-                <li className="flex items-start gap-2">
+              <ul className="space-y-2.5 pt-2 border-t border-stone-100 text-xs text-stone-600">
+                <li className="flex items-start gap-2.5">
                   <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                  <span><strong>Format Grounding:</strong> Applies fair-use transformational standards tailored to your niche.</span>
+                  <span className="leading-snug">
+                    <strong className="font-semibold text-stone-900 mr-1">Production Workflow:</strong>
+                    <span>Incorporates your declared commentary and editing format into the review context.</span>
+                  </span>
                 </li>
-                <li className="flex items-start gap-2">
+                <li className="flex items-start gap-2.5">
                   <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                  <span><strong>Snapshot Versioning:</strong> Saves a permanent profile record with every video scan.</span>
+                  <span className="leading-snug">
+                    <strong className="font-semibold text-stone-900 mr-1">Snapshot Record:</strong>
+                    <span>Preserves your declared profile version alongside each video scan.</span>
+                  </span>
                 </li>
-                <li className="flex items-start gap-2">
+                <li className="flex items-start gap-2.5">
                   <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                  <span><strong>Catalog Patterns:</strong> Tracks cross-video risk trends across your completed scans (requires 2+ videos).</span>
+                  <span className="leading-snug">
+                    <strong className="font-semibold text-stone-900 mr-1">Catalog Patterns:</strong>
+                    <span>Tracks recurring signals across your scan history when at least 2 completed scans exist.</span>
+                  </span>
                 </li>
-                <li className="flex items-start gap-2">
+                <li className="flex items-start gap-2.5">
                   <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                  <span><strong>Clear Scope:</strong> Distinguishes creator-declared context from independent platform clearance.</span>
+                  <span className="leading-snug">
+                    <strong className="font-semibold text-stone-900 mr-1">Declared Scope:</strong>
+                    <span>User-provided context provides nuance to findings, but does not determine legal Fair Use.</span>
+                  </span>
                 </li>
               </ul>
             </div>
 
             <div className="pt-3 border-t border-stone-100 bg-stone-50/70 -mx-6 -mb-6 sm:-mx-7 sm:-mb-7 p-4 sm:p-5 rounded-b-2xl">
               <p className="text-xs text-stone-700 leading-normal">
-                <strong className="font-bold text-stone-900">Context That Matters:</strong> Avoids treating review clips or parody excerpts as raw reused content.
+                <strong className="font-bold text-stone-900 mr-1">Context That Matters:</strong>
+                <span>Evaluates video evidence in light of your declared format without guessing creative intent.</span>
               </p>
             </div>
           </div>
 
-          {/* Pillar 3: Verifiable Comparison */}
-          <div className="bg-white rounded-2xl border border-stone-200 p-6 sm:p-7 shadow-xs hover:border-stone-300 transition-all flex flex-col justify-between space-y-6">
+          {/* Pillar 3: Original and Revised Cut Comparison */}
+          <div className="bg-white rounded-2xl border border-stone-200 p-6 sm:p-7 shadow-xs hover:border-stone-300 transition-all flex flex-col justify-between space-y-6 min-w-0 md:col-span-2 lg:col-span-1">
             <div className="space-y-4">
-              <div className="w-12 h-12 rounded-xl bg-emerald-50 text-emerald-600 flex items-center justify-center font-bold">
+              <div className="w-12 h-12 rounded-xl bg-emerald-50 text-emerald-600 flex items-center justify-center font-bold shrink-0">
                 <Scale className="w-6 h-6" />
               </div>
               <div>
                 <span className="text-[11px] font-mono uppercase tracking-wider text-emerald-700 font-bold block mb-1">
                   Pillar 03
                 </span>
-                <h3 className="font-bold text-lg text-stone-900">
-                  Verifiable Cut Comparison
+                <h3 className="font-bold text-lg text-stone-900 leading-snug">
+                  Original & Revised Cut Comparison
                 </h3>
               </div>
-              <p className="text-xs sm:text-sm text-stone-600 leading-relaxed">
-                Upload revised cuts to verify that edits resolved targeted signals, track before-and-after deltas, and document residual considerations.
+              <p className="text-xs sm:text-sm text-stone-600 leading-relaxed text-pretty">
+                Compare findings from the original and revised scans to identify which signals changed, which remain, and which could not be verified.
               </p>
               
-              <ul className="space-y-2 pt-2 border-t border-stone-100 text-xs text-stone-600">
-                <li className="flex items-start gap-2">
+              <ul className="space-y-2.5 pt-2 border-t border-stone-100 text-xs text-stone-600">
+                <li className="flex items-start gap-2.5">
                   <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                  <span><strong>Side-by-Side Deltas:</strong> Compares original vs. revised risk scores and signal counts.</span>
+                  <span className="leading-snug">
+                    <strong className="font-semibold text-stone-900 mr-1">Side-by-Side Deltas:</strong>
+                    <span>Compares original vs. revised risk levels and signal counts.</span>
+                  </span>
                 </li>
-                <li className="flex items-start gap-2">
+                <li className="flex items-start gap-2.5">
                   <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                  <span><strong>Resolved Issues:</strong> Confirms which specific segment warnings have been resolved.</span>
+                  <span className="leading-snug">
+                    <strong className="font-semibold text-stone-900 mr-1">Signal Changes:</strong>
+                    <span>Identifies which specific observations changed between video cuts.</span>
+                  </span>
                 </li>
-                <li className="flex items-start gap-2">
+                <li className="flex items-start gap-2.5">
                   <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                  <span><strong>Residual Questions:</strong> Highlights remaining items still requiring your editorial review.</span>
+                  <span className="leading-snug">
+                    <strong className="font-semibold text-stone-900 mr-1">Unverified Items:</strong>
+                    <span>Highlights remaining questions that still require your editorial review.</span>
+                  </span>
                 </li>
-                <li className="flex items-start gap-2">
+                <li className="flex items-start gap-2.5">
                   <Check className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                  <span><strong>Revision Archive:</strong> Keeps parent-child scan lineage organized in your account archive.</span>
+                  <span className="leading-snug">
+                    <strong className="font-semibold text-stone-900 mr-1">Revision Lineage:</strong>
+                    <span>Organizes original and revised cuts in your account archive.</span>
+                  </span>
                 </li>
               </ul>
             </div>
 
             <div className="pt-3 border-t border-stone-100 bg-stone-50/70 -mx-6 -mb-6 sm:-mx-7 sm:-mb-7 p-4 sm:p-5 rounded-b-2xl">
               <p className="text-xs text-stone-700 leading-normal">
-                <strong className="font-bold text-stone-900">Actionable Feedback:</strong> Close the loop with measured verification before uploading to YouTube.
+                <strong className="font-bold text-stone-900 mr-1">Actionable Feedback:</strong>
+                <span>Compare findings across revisions before you publish to YouTube.</span>
               </p>
             </div>
           </div>
@@ -321,57 +364,63 @@ export const HomeView: React.FC<HomeViewProps> = ({
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 sm:gap-6">
-            <div className="flex items-start gap-3">
+            <div className="flex items-start gap-3 min-w-0">
               <div className="w-5 h-5 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0 mt-0.5">
                 <Check className="w-3.5 h-3.5 stroke-3" />
               </div>
-              <p className="text-xs sm:text-sm text-stone-700 leading-relaxed">
-                <strong className="font-bold text-stone-900">Evidence you can investigate:</strong> Understand the observations behind each finding.
+              <p className="text-xs sm:text-sm text-stone-700 leading-relaxed text-pretty">
+                <strong className="font-semibold text-stone-900 mr-1">Evidence you can investigate:</strong>
+                <span>Understand the observations behind each finding.</span>
               </p>
             </div>
 
-            <div className="flex items-start gap-3">
+            <div className="flex items-start gap-3 min-w-0">
               <div className="w-5 h-5 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0 mt-0.5">
                 <Check className="w-3.5 h-3.5 stroke-3" />
               </div>
-              <p className="text-xs sm:text-sm text-stone-700 leading-relaxed">
-                <strong className="font-bold text-stone-900">Context that matters:</strong> Learn which policy area may be relevant and why.
+              <p className="text-xs sm:text-sm text-stone-700 leading-relaxed text-pretty">
+                <strong className="font-semibold text-stone-900 mr-1">Context that matters:</strong>
+                <span>Learn which policy area may be relevant and why.</span>
               </p>
             </div>
 
-            <div className="flex items-start gap-3">
+            <div className="flex items-start gap-3 min-w-0">
               <div className="w-5 h-5 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0 mt-0.5">
                 <Check className="w-3.5 h-3.5 stroke-3" />
               </div>
-              <p className="text-xs sm:text-sm text-stone-700 leading-relaxed">
-                <strong className="font-bold text-stone-900">Clear limitations:</strong> Know what was not verified or cannot be concluded.
+              <p className="text-xs sm:text-sm text-stone-700 leading-relaxed text-pretty">
+                <strong className="font-semibold text-stone-900 mr-1">Clear limitations:</strong>
+                <span>Know what was not verified or cannot be concluded.</span>
               </p>
             </div>
 
-            <div className="flex items-start gap-3">
+            <div className="flex items-start gap-3 min-w-0">
               <div className="w-5 h-5 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0 mt-0.5">
                 <Check className="w-3.5 h-3.5 stroke-3" />
               </div>
-              <p className="text-xs sm:text-sm text-stone-700 leading-relaxed">
-                <strong className="font-bold text-stone-900">Practical next steps:</strong> Turn findings into actions you can evaluate and perform.
+              <p className="text-xs sm:text-sm text-stone-700 leading-relaxed text-pretty">
+                <strong className="font-semibold text-stone-900 mr-1">Practical next steps:</strong>
+                <span>Turn findings into actions you can evaluate and perform.</span>
               </p>
             </div>
 
-            <div className="flex items-start gap-3">
+            <div className="flex items-start gap-3 min-w-0">
               <div className="w-5 h-5 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0 mt-0.5">
                 <Check className="w-3.5 h-3.5 stroke-3" />
               </div>
-              <p className="text-xs sm:text-sm text-stone-700 leading-relaxed">
-                <strong className="font-bold text-stone-900">A record of your reviews:</strong> Revisit previous scans and their findings.
+              <p className="text-xs sm:text-sm text-stone-700 leading-relaxed text-pretty">
+                <strong className="font-semibold text-stone-900 mr-1">A record of your reviews:</strong>
+                <span>Revisit previous scans and their findings.</span>
               </p>
             </div>
 
-            <div className="flex items-start gap-3">
+            <div className="flex items-start gap-3 min-w-0">
               <div className="w-5 h-5 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0 mt-0.5">
                 <Check className="w-3.5 h-3.5 stroke-3" />
               </div>
-              <p className="text-xs sm:text-sm text-stone-700 leading-relaxed">
-                <strong className="font-bold text-stone-900">Before-and-after comparison:</strong> Where supported by the scan data, compare findings after making changes.
+              <p className="text-xs sm:text-sm text-stone-700 leading-relaxed text-pretty">
+                <strong className="font-semibold text-stone-900 mr-1">Before-and-after comparison:</strong>
+                <span>Where supported by the scan data, compare findings after making changes.</span>
               </p>
             </div>
           </div>

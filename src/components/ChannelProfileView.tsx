@@ -238,7 +238,7 @@ export const ChannelProfileView: React.FC<ChannelProfileViewProps> = ({ user, on
                 <option value="mixed">Mixed / Multi-Format Creator</option>
               </select>
               <span className="text-[11px] text-stone-400 mt-1 block">
-                Informs fair-use transformational standards.
+                Provides context on your primary format.
               </span>
             </div>
 
@@ -260,7 +260,7 @@ export const ChannelProfileView: React.FC<ChannelProfileViewProps> = ({ user, on
                 <option value="frequent_clips">Frequent external montage clips</option>
               </select>
               <span className="text-[11px] text-stone-400 mt-1 block">
-                Sets baseline for reused-material thresholds.
+                Provides context on your footage practices.
               </span>
             </div>
 
@@ -281,7 +281,7 @@ export const ChannelProfileView: React.FC<ChannelProfileViewProps> = ({ user, on
                 <option value="none">Music-only compilation</option>
               </select>
               <span className="text-[11px] text-stone-400 mt-1 block">
-                Crucial indicator for YPP human monetization review.
+                Provides context on your voice commentary frequency.
               </span>
             </div>
           </div>
@@ -376,12 +376,22 @@ export const ChannelProfileView: React.FC<ChannelProfileViewProps> = ({ user, on
         </div>
 
         {patternsError ? (
-          <div className="p-6 bg-rose-50/50 rounded-xl border border-rose-200 text-center text-xs text-rose-900 space-y-2">
+          <div className="p-6 bg-rose-50/50 rounded-xl border border-rose-200 text-center text-xs text-rose-900 space-y-3">
             <AlertCircle className="w-6 h-6 text-rose-600 mx-auto" />
-            <p className="font-bold text-sm">Cross-Video Analysis Unavailable</p>
-            <p className="text-rose-700 max-w-md mx-auto leading-relaxed">
-              Unable to retrieve catalog risk patterns. Check your connection or retry later.
-            </p>
+            <div>
+              <p className="font-bold text-sm">Cross-Video Analysis Unavailable</p>
+              <p className="text-rose-700 max-w-md mx-auto leading-relaxed mt-0.5">
+                Unable to retrieve catalog risk patterns. Check your connection or retry later.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => loadProfileAndPatterns()}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg text-xs shadow-xs transition-colors"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>Retry Analysis</span>
+            </button>
           </div>
         ) : patternsData?.patterns && patternsData.patterns.length > 0 ? (
           <div className="space-y-3">
@@ -423,7 +433,7 @@ export const ChannelProfileView: React.FC<ChannelProfileViewProps> = ({ user, on
             <Info className="w-6 h-6 text-amber-600 mx-auto mb-1" />
             <p className="font-bold text-sm text-amber-950">Preliminary Channel Sample</p>
             <p className="max-w-md mx-auto leading-relaxed text-amber-800">
-              1 completed scan is not enough to identify recurring patterns across videos. Analyze at least one more video.
+              One completed scan is not enough to identify recurring patterns across videos. Analyze at least one more video.
             </p>
           </div>
         ) : (

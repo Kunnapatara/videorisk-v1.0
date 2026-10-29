@@ -163,6 +163,8 @@ export function App() {
               onScanCreated={handleScanCreated}
               onCancel={() => setActiveTab('home')}
               parentScanId={rescanParentId}
+              onGoToChannelProfile={() => setActiveTab('channel')}
+              onExplorePricing={() => setActiveTab('pricing')}
             />
           </div>
         )}
