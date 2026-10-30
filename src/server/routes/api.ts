@@ -11,6 +11,7 @@ import { mediaInspector } from '../pipeline/mediaInspector';
 import { thumbnailInspector } from '../pipeline/thumbnailInspector';
 import { creditService } from '../services/creditService';
 import { billingService, ALLOWED_PAID_PLANS } from '../services/billingService';
+import { ensureDemoFixtures, getDemoFixture } from '../fixtures/demoMedia';
 import { ScanJob, ScanMode, UserAccount, CrossVideoPattern } from '../../types';
 
 export const apiRouter = Router();
@@ -1657,11 +1658,36 @@ apiRouter.get('/billing/session-status', async (req: Request, res: Response) => 
       return res.status(400).json({ error: 'Invalid checkout session or payment provider unconfigured.' });
     }
 
-    const verification = await billingService.verifyCheckoutSession(sessionId, user.id);
-    return res.json(verification);
+    const verification = await billingService.verifyAndSynchronizeSession(sessionId, user.id);
+    return res.json({
+      status: verification.status,
+      paymentStatus: verification.paymentStatus,
+      planId: verification.planId,
+      livemode: verification.livemode,
+      entitlementActive: verification.entitlementActive,
+      user: verification.user ? sanitizeUser(verification.user) : undefined,
+      message: verification.message
+    });
   } catch (err: any) {
     const statusCode = (err.statusCode && err.statusCode >= 400 && err.statusCode < 500 && err.statusCode !== 401) ? err.statusCode : 400;
     res.status(statusCode).json({ error: err.message || 'Failed to verify session status.' });
+  }
+});
+
+// Create Customer Portal Session (Self-service Subscription Management & Cancellation)
+apiRouter.post('/billing/create-portal-session', async (req: Request, res: Response) => {
+  try {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+
+    const originUrl = req.get('origin') || `${req.protocol}://${req.get('host')}`;
+    const returnUrl = (req.body && req.body.returnUrl) ? String(req.body.returnUrl) : `${originUrl}/`;
+
+    const portal = await billingService.createCustomerPortalSession(user.id, returnUrl);
+    res.json(portal);
+  } catch (err: any) {
+    const statusCode = (err.statusCode && err.statusCode >= 400 && err.statusCode < 600 && err.statusCode !== 401) ? err.statusCode : 500;
+    res.status(statusCode).json({ error: err.message || 'Failed to create customer portal session.' });
   }
 });
 
@@ -1959,10 +1985,15 @@ apiRouter.post('/scans', async (req: Request, res: Response) => {
       }
     }
 
-    // Financial: Prevent queuing if user has 0 or insufficient credits
-    if (user.creditsRemaining <= 0) {
+    // Authoritative media inspection & credit preflight before queuing work
+    const effectiveScanMode = (scanMode === 'deep' ? 'deep' : 'standard') as ScanMode;
+    const metadata = await mediaInspector.inspect(videoPath, videoFilename || path.basename(videoPath));
+    const requiredCredits = creditService.calculateRequiredCredits(metadata.durationSeconds, effectiveScanMode);
+
+    if (user.creditsRemaining < requiredCredits) {
       return res.status(402).json({ 
-        error: 'Insufficient credits. Please top up or upgrade your plan to analyze videos.',
+        error: `Insufficient credits. Required: ${requiredCredits} credit(s), but available balance is ${user.creditsRemaining}.`,
+        requiredCredits,
         creditsRemaining: user.creditsRemaining
       });
     }
@@ -1979,11 +2010,11 @@ apiRouter.post('/scans', async (req: Request, res: Response) => {
       videoPath,
       thumbnailPath: thumbnailPath || undefined,
       thumbnailFilename: thumbnailFilename || undefined,
-      scanMode: (scanMode === 'deep' ? 'deep' : 'standard') as ScanMode,
+      scanMode: effectiveScanMode,
       status: 'QUEUED',
       currentStage: 'Upload',
       completedStages: ['Upload'],
-      creditsUsed: 0,
+      creditsUsed: requiredCredits,
       createdAt: new Date().toISOString(),
       parentScanId,
       isRescan: !!isRescan
@@ -1996,15 +2027,17 @@ apiRouter.post('/scans', async (req: Request, res: Response) => {
 
     res.status(201).json(scanJob);
   } catch (err: any) {
-    res.status(500).json({ error: 'Failed to create scan.' });
+    res.status(500).json({ error: err.message || 'Failed to create scan.' });
   }
 });
 
-// 8. Create Demo Scan (Quick Creator Playground with Strict User Ownership)
+// 8. Create Demo Scan (Quick Creator Playground with Genuine Media & Strict User Ownership)
 apiRouter.post('/scans/demo', async (req: Request, res: Response) => {
   try {
     const user = await requireAuth(req, res);
     if (!user) return;
+
+    await ensureDemoFixtures();
 
     const { 
       demoType = 'problematic', 
@@ -2014,27 +2047,57 @@ apiRouter.post('/scans/demo', async (req: Request, res: Response) => {
       hasThumbnail = false
     } = req.body;
 
-    if (user.creditsRemaining <= 0) {
-      return res.status(402).json({ 
-        error: 'Insufficient credits to launch demo scan.',
-        creditsRemaining: user.creditsRemaining 
-      });
-    }
+    const fixture = getDemoFixture(demoType === 'revised' ? 'revised' : 'problematic');
 
-    const demoFilename = demoType === 'revised' 
-      ? 'Clean_Cut_Creator_Commentary_Final.mp4' 
-      : 'Top10_Gaming_Montage_With_Clips.mp4';
+    const demoFilename = fixture.videoFilename;
     const demoPath = path.join(uploadDir, `demo_${Date.now()}_${demoFilename}`);
-    
-    fs.writeFileSync(demoPath, 'VIDEORISK_SAMPLE_CONTAINER');
+    fs.copyFileSync(fixture.videoPath, demoPath);
+
+    // Record upload for user ownership isolation & retention cleanup
+    const videoStats = fs.statSync(demoPath);
+    await storage.uploads.recordUpload({
+      fileId: path.basename(demoPath),
+      userId: user.id,
+      filename: demoFilename,
+      filePath: demoPath,
+      fileSize: videoStats.size,
+      type: 'video',
+      createdAt: new Date().toISOString()
+    });
 
     let demoThumbPath: string | undefined;
     let demoThumbFilename: string | undefined;
 
-    if (hasThumbnail) {
-      demoThumbFilename = 'demo_thumbnail_16x9.jpg';
+    if (hasThumbnail && fs.existsSync(fixture.thumbnailPath)) {
+      demoThumbFilename = fixture.thumbnailFilename;
       demoThumbPath = path.join(uploadDir, `demo_thumb_${Date.now()}.jpg`);
-      fs.writeFileSync(demoThumbPath, 'VIDEORISK_SAMPLE_THUMBNAIL');
+      fs.copyFileSync(fixture.thumbnailPath, demoThumbPath);
+      const thumbStats = fs.statSync(demoThumbPath);
+      await storage.uploads.recordUpload({
+        fileId: path.basename(demoThumbPath),
+        userId: user.id,
+        filename: demoThumbFilename,
+        filePath: demoThumbPath,
+        fileSize: thumbStats.size,
+        type: 'thumbnail',
+        createdAt: new Date().toISOString()
+      });
+    }
+
+    // Server-side authoritative media inspection & credit preflight
+    const metadata = await mediaInspector.inspect(demoPath, demoFilename);
+    const effectiveScanMode = (scanMode === 'deep' ? 'deep' : 'standard') as ScanMode;
+    const requiredCredits = creditService.calculateRequiredCredits(metadata.durationSeconds, effectiveScanMode);
+
+    if (user.creditsRemaining < requiredCredits) {
+      // Clean up copied files on preflight rejection
+      try { fs.unlinkSync(demoPath); } catch { /* ignore */ }
+      if (demoThumbPath) { try { fs.unlinkSync(demoThumbPath); } catch { /* ignore */ } }
+      return res.status(402).json({ 
+        error: `Insufficient credits to launch demo scan. Required: ${requiredCredits} credit(s), but available balance is ${user.creditsRemaining}.`,
+        requiredCredits,
+        creditsRemaining: user.creditsRemaining 
+      });
     }
 
     const scanId = `scan_demo_${Date.now()}`;
@@ -2051,11 +2114,11 @@ apiRouter.post('/scans/demo', async (req: Request, res: Response) => {
       videoPath: demoPath,
       thumbnailPath: demoThumbPath,
       thumbnailFilename: demoThumbFilename,
-      scanMode: scanMode as ScanMode,
+      scanMode: effectiveScanMode,
       status: 'QUEUED',
       currentStage: 'Upload',
       completedStages: ['Upload'],
-      creditsUsed: 2,
+      creditsUsed: requiredCredits,
       createdAt: new Date().toISOString(),
       isRescan: demoType === 'revised',
       parentScanId: req.body.parentScanId
@@ -2066,7 +2129,7 @@ apiRouter.post('/scans/demo', async (req: Request, res: Response) => {
 
     res.status(201).json(scanJob);
   } catch (err: any) {
-    res.status(500).json({ error: 'Failed to launch demo scan.' });
+    res.status(500).json({ error: err.message || 'Failed to launch demo scan.' });
   }
 });
 
@@ -2170,16 +2233,6 @@ apiRouter.post('/scans/:id/rescan', requireAuthMiddleware, validateRescanAuthori
       return res.status(403).json({ error: 'Access denied: Cannot re-scan video belonging to another user.' });
     }
 
-    if (user.creditsRemaining <= 0) {
-      if (req.file && fs.existsSync(req.file.path)) {
-        try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
-      }
-      return res.status(402).json({ 
-        error: 'Insufficient credits for re-scan. Please top up your balance.',
-        creditsRemaining: user.creditsRemaining 
-      });
-    }
-
     let filePath = '';
     let filename = '';
 
@@ -2211,6 +2264,32 @@ apiRouter.post('/scans/:id/rescan', requireAuthMiddleware, validateRescanAuthori
       });
     }
 
+    // Authoritative media inspection & credit preflight before queuing re-scan job
+    let metadata;
+    try {
+      metadata = await mediaInspector.inspect(filePath, filename);
+    } catch (inspectErr: any) {
+      if (req.file && fs.existsSync(req.file.path)) {
+        try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
+      }
+      return res.status(400).json({
+        error: `Media validation failed: ${inspectErr.message || 'Invalid or unreadable media'}`
+      });
+    }
+
+    const requiredCredits = creditService.calculateRequiredCredits(metadata.durationSeconds, parentScan.scanMode);
+
+    if (user.creditsRemaining < requiredCredits) {
+      if (req.file && fs.existsSync(req.file.path)) {
+        try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
+      }
+      return res.status(402).json({ 
+        error: `Insufficient credits for re-scan. Required: ${requiredCredits} credit(s), but available balance is ${user.creditsRemaining}.`,
+        requiredCredits,
+        creditsRemaining: user.creditsRemaining 
+      });
+    }
+
     const newScanId = `scan_rescan_${Date.now()}`;
 
     const rescanJob: ScanJob = {
@@ -2226,7 +2305,7 @@ apiRouter.post('/scans/:id/rescan', requireAuthMiddleware, validateRescanAuthori
       status: 'QUEUED',
       currentStage: 'Upload',
       completedStages: ['Upload'],
-      creditsUsed: 0,
+      creditsUsed: requiredCredits,
       createdAt: new Date().toISOString(),
       parentScanId: parentScan.id,
       isRescan: true

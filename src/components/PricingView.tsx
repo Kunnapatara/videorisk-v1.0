@@ -13,7 +13,60 @@ export const PricingView: React.FC<PricingViewProps> = ({ user, onPlanUpdated, o
   const [plans, setPlans] = useState<PlanDetails[]>([]);
   const [loading, setLoading] = useState(false);
   const [selectedPlanId, setSelectedPlanId] = useState<string | null>(null);
-  const [checkoutMessage, setCheckoutMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [checkoutMessage, setCheckoutMessage] = useState<{ type: 'success' | 'error' | 'pending'; text: string } | null>(null);
+  const [pendingSession, setPendingSession] = useState<{ sessionId: string; plan?: string | null; mode?: string | null } | null>(null);
+  const [portalLoading, setPortalLoading] = useState(false);
+
+  const pollSessionStatus = async (sessionId: string, plan?: string | null, mode?: string | null, attempt = 1, maxAttempts = 5) => {
+    setLoading(true);
+    try {
+      const res = await authFetch(`/api/billing/session-status?sessionId=${encodeURIComponent(sessionId)}&plan=${encodeURIComponent(plan || '')}&mode=${encodeURIComponent(mode || '')}`);
+      const data = await res.json();
+
+      if (res.ok && data.status === 'complete' && data.user) {
+        onPlanUpdated(data.user);
+        setCheckoutMessage({
+          type: 'success',
+          text: 'Payment received! Your plan entitlement and credits have been successfully activated.'
+        });
+        setPendingSession(null);
+        window.history.replaceState({}, document.title, window.location.pathname);
+      } else if (data.status === 'pending' || !data.user) {
+        if (attempt < maxAttempts) {
+          setCheckoutMessage({
+            type: 'pending',
+            text: `Payment is processing with Stripe... Verifying entitlement (attempt ${attempt} of ${maxAttempts}).`
+          });
+          setTimeout(() => {
+            pollSessionStatus(sessionId, plan, mode, attempt + 1, maxAttempts);
+          }, 2000);
+          return;
+        } else {
+          setPendingSession({ sessionId, plan, mode });
+          setCheckoutMessage({
+            type: 'pending',
+            text: 'Payment is still being processed by the payment network. You can retry confirmation now or your balance will update automatically upon completion.'
+          });
+          window.history.replaceState({}, document.title, window.location.pathname);
+        }
+      } else {
+        setCheckoutMessage({
+          type: 'error',
+          text: data.error || 'Session confirmation could not be verified.'
+        });
+        window.history.replaceState({}, document.title, window.location.pathname);
+      }
+    } catch (err: any) {
+      console.error('Error synchronizing session status:', err);
+      setPendingSession({ sessionId, plan, mode });
+      setCheckoutMessage({
+        type: 'error',
+        text: 'Network error communicating with billing service. You can retry manual verification.'
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
     authFetch('/api/plans')
@@ -28,24 +81,8 @@ export const PricingView: React.FC<PricingViewProps> = ({ user, onPlanUpdated, o
     const plan = urlParams.get('plan');
     const mode = urlParams.get('mode');
 
-    if (checkoutStatus === 'success') {
-      setLoading(true);
-      authFetch(`/api/billing/session-status?sessionId=${sessionId || ''}&plan=${plan || ''}&mode=${mode || ''}`)
-        .then(res => res.json())
-        .then(data => {
-          if (data.user) {
-            onPlanUpdated(data.user);
-            setCheckoutMessage({
-              type: 'success',
-              text: 'Payment received! Your plan entitlement and credits have been successfully activated.'
-            });
-          }
-          window.history.replaceState({}, document.title, window.location.pathname);
-        })
-        .catch(err => {
-          console.error('Error synchronizing session status:', err);
-        })
-        .finally(() => setLoading(false));
+    if (checkoutStatus === 'success' && sessionId) {
+      pollSessionStatus(sessionId, plan, mode, 1, 5);
     } else if (checkoutStatus === 'canceled') {
       setCheckoutMessage({
         type: 'error',
@@ -54,6 +91,40 @@ export const PricingView: React.FC<PricingViewProps> = ({ user, onPlanUpdated, o
       window.history.replaceState({}, document.title, window.location.pathname);
     }
   }, [onPlanUpdated]);
+
+  const handleManualRetry = () => {
+    if (pendingSession) {
+      pollSessionStatus(pendingSession.sessionId, pendingSession.plan, pendingSession.mode, 1, 3);
+    }
+  };
+
+  const handleManageSubscription = async () => {
+    setPortalLoading(true);
+    setCheckoutMessage(null);
+    try {
+      const res = await authFetch('/api/billing/create-portal-session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ returnUrl: window.location.href })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to open customer billing portal.');
+      }
+      if (data.url) {
+        window.location.href = data.url;
+      } else {
+        throw new Error('Billing portal URL was not returned.');
+      }
+    } catch (err: any) {
+      setCheckoutMessage({
+        type: 'error',
+        text: err.message || 'Unable to open billing portal. Please contact support.'
+      });
+    } finally {
+      setPortalLoading(false);
+    }
+  };
 
   const handleSelectPlan = async (plan: PlanDetails) => {
     setLoading(true);
@@ -131,44 +202,98 @@ export const PricingView: React.FC<PricingViewProps> = ({ user, onPlanUpdated, o
 
       {/* Checkout feedback notification */}
       {checkoutMessage && (
-        <div className={`p-4 rounded-xl border max-w-3xl mx-auto flex items-start gap-3 text-xs shadow-sm ${
+        <div className={`p-4 rounded-xl border max-w-3xl mx-auto flex items-start justify-between gap-3 text-xs shadow-sm ${
           checkoutMessage.type === 'success' 
             ? 'bg-emerald-50 border-emerald-200 text-emerald-900' 
-            : 'bg-rose-50 border-rose-200 text-rose-900'
+            : checkoutMessage.type === 'pending'
+              ? 'bg-amber-50 border-amber-200 text-amber-900'
+              : 'bg-rose-50 border-rose-200 text-rose-900'
         }`}>
-          {checkoutMessage.type === 'success' ? (
-            <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
-          ) : (
-            <AlertCircle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
-          )}
-          <div>
-            <p className="font-bold text-sm">{checkoutMessage.type === 'success' ? 'Transaction Completed' : 'Checkout Notice'}</p>
-            <p className="mt-0.5">{checkoutMessage.text}</p>
+          <div className="flex items-start gap-3">
+            {checkoutMessage.type === 'success' ? (
+              <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
+            ) : checkoutMessage.type === 'pending' ? (
+              <RefreshCw className="w-5 h-5 text-amber-600 shrink-0 mt-0.5 animate-spin" />
+            ) : (
+              <AlertCircle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+            )}
+            <div>
+              <p className="font-bold text-sm">
+                {checkoutMessage.type === 'success' ? 'Transaction Completed' : checkoutMessage.type === 'pending' ? 'Payment Confirmation In Progress' : 'Checkout Notice'}
+              </p>
+              <p className="mt-0.5">{checkoutMessage.text}</p>
+            </div>
           </div>
+          {pendingSession && (
+            <button
+              onClick={handleManualRetry}
+              disabled={loading}
+              className="shrink-0 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-bold rounded-lg text-xs flex items-center gap-1.5 transition-colors"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+              Retry Sync
+            </button>
+          )}
         </div>
       )}
 
-      {/* Credit Formula Banner */}
-      <div className="bg-stone-900 text-stone-100 rounded-2xl p-5 sm:p-6 max-w-3xl mx-auto grid grid-cols-1 sm:grid-cols-3 gap-4 text-center text-xs shadow-lg">
-        <div className="p-3 border-b sm:border-b-0 sm:border-r border-stone-800 space-y-1">
-          <span className="text-stone-400 block text-[11px] font-semibold uppercase tracking-wider">STANDARD SCAN</span>
-          <strong className="text-base text-white font-extrabold block">1 Credit / Min</strong>
-          <span className="text-stone-400 text-[11px] block">Full policy & evidence timeline</span>
+      {/* Credit Formula & Subscription Management Banner */}
+      <div className="bg-stone-900 text-stone-100 rounded-2xl p-5 sm:p-6 max-w-3xl mx-auto shadow-lg space-y-4">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-center text-xs">
+          <div className="p-3 border-b sm:border-b-0 sm:border-r border-stone-800 space-y-1">
+            <span className="text-stone-400 block text-[11px] font-semibold uppercase tracking-wider">STANDARD SCAN</span>
+            <strong className="text-base text-white font-extrabold block">1 Credit / Min</strong>
+            <span className="text-stone-400 text-[11px] block">Full policy & evidence timeline</span>
+          </div>
+          <div className="p-3 border-b sm:border-b-0 sm:border-r border-stone-800 space-y-1">
+            <span className="text-stone-400 block text-[11px] font-semibold uppercase tracking-wider">DEEP SCAN</span>
+            <strong className="text-base text-white font-extrabold block">2 Credits / Min</strong>
+            <span className="text-stone-400 text-[11px] block">Perceptual hash & cross-segment audit</span>
+          </div>
+          <div className="p-3 space-y-1">
+            <span className="text-stone-400 block text-[11px] font-semibold uppercase tracking-wider">YOUR ACCOUNT</span>
+            <strong className="text-base text-emerald-400 font-extrabold block font-mono">
+              {user?.creditsRemaining ?? 0} Minutes
+            </strong>
+            <span className="text-stone-300 text-[11px] block truncate max-w-[200px] mx-auto">
+              {user?.email || 'Active User'}
+            </span>
+          </div>
         </div>
-        <div className="p-3 border-b sm:border-b-0 sm:border-r border-stone-800 space-y-1">
-          <span className="text-stone-400 block text-[11px] font-semibold uppercase tracking-wider">DEEP SCAN</span>
-          <strong className="text-base text-white font-extrabold block">2 Credits / Min</strong>
-          <span className="text-stone-400 text-[11px] block">Perceptual hash & cross-segment audit</span>
-        </div>
-        <div className="p-3 space-y-1">
-          <span className="text-stone-400 block text-[11px] font-semibold uppercase tracking-wider">YOUR ACCOUNT</span>
-          <strong className="text-base text-emerald-400 font-extrabold block font-mono">
-            {user?.creditsRemaining ?? 0} Minutes
-          </strong>
-          <span className="text-stone-300 text-[11px] block truncate max-w-[200px] mx-auto">
-            {user?.email || 'Active User'}
-          </span>
-        </div>
+
+        {/* Self-service customer portal when user has an active Stripe customer/subscription profile */}
+        {(user?.stripeCustomerId || (user?.plan && user.plan !== 'free')) && (
+          <div className="pt-3 border-t border-stone-800 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs">
+            <div className="text-stone-400 text-center sm:text-left">
+              <span>Subscription status: </span>
+              <span className="font-semibold text-stone-200 capitalize">
+                {user?.subscriptionStatus || (user?.plan !== 'free' ? 'Active' : 'None')}
+              </span>
+              {user?.plan && user.plan !== 'free' && (
+                <span className="ml-2 px-2 py-0.5 rounded-full bg-stone-800 text-stone-300 text-[10px] uppercase font-bold">
+                  {user.plan}
+                </span>
+              )}
+            </div>
+            <button
+              onClick={handleManageSubscription}
+              disabled={portalLoading}
+              className="px-3.5 py-1.5 bg-stone-800 hover:bg-stone-700 active:scale-98 text-stone-200 hover:text-white font-semibold rounded-lg text-xs flex items-center gap-2 border border-stone-700 transition-colors"
+            >
+              {portalLoading ? (
+                <>
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                  <span>Loading Portal...</span>
+                </>
+              ) : (
+                <>
+                  <CreditCard className="w-3.5 h-3.5 text-stone-400" />
+                  <span>Manage Subscription & Invoices</span>
+                </>
+              )}
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Responsive Plans Grid (1 col on mobile, 2 on tablet, 3 on desktop, 5 on wide screens) */}
