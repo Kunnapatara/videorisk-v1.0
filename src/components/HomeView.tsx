@@ -13,19 +13,25 @@ import {
   ArrowRight,
   BookOpen,
   Sliders,
-  Check
+  Check,
+  Sparkles
 } from 'lucide-react';
+import { UserAccount } from '../types';
 
 interface HomeViewProps {
+  user?: UserAccount | null;
   onStartUpload: () => void;
   onExplorePricing: () => void;
   onTryDemo: () => void;
+  onOpenRegister?: () => void;
 }
 
 export const HomeView: React.FC<HomeViewProps> = ({ 
+  user,
   onStartUpload, 
   onExplorePricing, 
-  onTryDemo 
+  onTryDemo,
+  onOpenRegister
 }) => {
   return (
     <div className="space-y-16 sm:space-y-20 pb-20">
@@ -62,26 +68,43 @@ export const HomeView: React.FC<HomeViewProps> = ({
           </div>
 
           {/* Primary Action Buttons */}
-          <div className="pt-4 flex flex-col sm:flex-row items-center justify-center gap-3.5 max-w-md sm:max-w-none mx-auto">
-            <button
-              onClick={onStartUpload}
-              className="w-full sm:w-auto px-8 py-3.5 bg-rose-600 hover:bg-rose-500 active:scale-98 text-white font-bold text-sm rounded-xl shadow-lg shadow-rose-950/40 transition-all flex items-center justify-center gap-2"
-            >
-              <Video className="w-4 h-4 shrink-0" />
-              <span>Upload Video</span>
-            </button>
+          <div className="pt-4 flex flex-col items-center justify-center gap-3 max-w-md sm:max-w-none mx-auto">
+            {/* Row 1: Upload Video & Demo Scan */}
+            <div className="flex flex-col sm:flex-row items-center justify-center gap-3.5 w-full sm:w-auto">
+              <button
+                onClick={onStartUpload}
+                className="w-full sm:w-auto px-8 py-3.5 bg-rose-600 hover:bg-rose-500 active:scale-98 text-white font-bold text-sm rounded-xl shadow-lg shadow-rose-950/40 transition-all flex items-center justify-center gap-2"
+              >
+                <Video className="w-4 h-4 shrink-0" />
+                <span>Upload Video</span>
+              </button>
 
-            <button
-              onClick={onTryDemo}
-              className="w-full sm:w-auto px-7 py-3.5 bg-stone-800 hover:bg-stone-700 active:scale-98 text-stone-200 border border-stone-700 font-semibold text-sm rounded-xl transition-all flex items-center justify-center gap-2 shadow-xs"
-            >
-              <Zap className="w-4 h-4 text-amber-400 shrink-0" />
-              <span>Explore Sample Scan · 2 credits</span>
-            </button>
+              <button
+                onClick={onTryDemo}
+                className="w-full sm:w-auto px-7 py-3.5 bg-stone-800 hover:bg-stone-700 active:scale-98 text-stone-200 border border-stone-700 font-semibold text-sm rounded-xl transition-all flex items-center justify-center gap-2 shadow-xs"
+              >
+                <Zap className="w-4 h-4 text-amber-400 shrink-0" />
+                <span>Demo Scan</span>
+              </button>
+            </div>
+
+            {/* Row 2: Free Registration Starter Offer (Only visible when user is not logged in) */}
+            {!user && onOpenRegister && (
+              <div className="w-full sm:w-auto pt-0.5">
+                <button
+                  onClick={onOpenRegister}
+                  className="w-full sm:w-auto px-7 py-2.5 bg-rose-500/10 hover:bg-rose-500/20 active:scale-98 text-rose-300 border border-rose-500/40 hover:border-rose-400 font-semibold text-xs sm:text-sm rounded-xl transition-all flex items-center justify-center gap-2 shadow-xs group"
+                >
+                  <Sparkles className="w-4 h-4 text-rose-400 group-hover:scale-110 transition-transform shrink-0" />
+                  <span>Get started for free · 10 credits</span>
+                  <ArrowRight className="w-3.5 h-3.5 text-rose-400 group-hover:translate-x-0.5 transition-transform shrink-0" />
+                </button>
+              </div>
+            )}
           </div>
 
           <p className="text-[11px] text-stone-400 max-w-md mx-auto pt-1 text-balance">
-            Sample evaluations run in your account, require an available credit balance, and consume 2 evaluation credits.
+            Demo Scan evaluations run in your account, require an available credit balance.
           </p>
 
           {/* Technical Specs & Disclaimer */}

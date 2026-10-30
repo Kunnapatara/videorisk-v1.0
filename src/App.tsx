@@ -16,6 +16,7 @@ export function App() {
   const [activeTab, setActiveTab] = useState<'home' | 'upload' | 'processing' | 'report' | 'comparison' | 'history' | 'pricing' | 'channel'>('home');
   const [user, setUser] = useState<UserAccount | null>(null);
   const [authModalOpen, setAuthModalOpen] = useState(false);
+  const [authModalInitialMode, setAuthModalInitialMode] = useState<'account' | 'login' | 'register' | 'switch' | 'forgot' | 'reset'>('login');
 
   // Active scan state
   const [activeScanId, setActiveScanId] = useState<string | null>(null);
@@ -138,12 +139,16 @@ export function App() {
           setRescanParentId(undefined);
           setActiveTab('upload');
         }}
-        onOpenAuth={() => setAuthModalOpen(true)}
+        onOpenAuth={() => {
+          setAuthModalInitialMode(user ? 'account' : 'login');
+          setAuthModalOpen(true);
+        }}
       />
 
       <main className="flex-1 w-full">
         {activeTab === 'home' && (
           <HomeView
+            user={user}
             onStartUpload={() => {
               setRescanParentId(undefined);
               setActiveTab('upload');
@@ -152,6 +157,10 @@ export function App() {
             onTryDemo={() => {
               setRescanParentId(undefined);
               setActiveTab('upload');
+            }}
+            onOpenRegister={() => {
+              setAuthModalInitialMode('register');
+              setAuthModalOpen(true);
             }}
           />
         )}
@@ -247,6 +256,7 @@ export function App() {
       <AuthModal
         currentUser={user}
         isOpen={authModalOpen}
+        initialMode={authModalInitialMode}
         onClose={() => setAuthModalOpen(false)}
         onUserChanged={handleUserChanged}
       />

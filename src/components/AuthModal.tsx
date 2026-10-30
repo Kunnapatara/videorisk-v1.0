@@ -8,6 +8,7 @@ interface AuthModalProps {
   isOpen: boolean;
   onClose: () => void;
   onUserChanged: (user: UserAccount | null) => void;
+  initialMode?: 'account' | 'login' | 'register' | 'switch' | 'forgot' | 'reset';
 }
 
 export const AuthModal: React.FC<AuthModalProps> = ({
@@ -15,6 +16,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   isOpen,
   onClose,
   onUserChanged,
+  initialMode
 }) => {
   const [mode, setMode] = useState<'account' | 'login' | 'register' | 'switch' | 'forgot' | 'reset'>('account');
   const [email, setEmail] = useState('');
@@ -38,10 +40,14 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     if (isOpen) {
       setError(null);
       setSuccess(null);
-      setMode(currentUser ? 'account' : 'login');
+      if (initialMode) {
+        setMode(initialMode);
+      } else {
+        setMode(currentUser ? 'account' : 'login');
+      }
       loadAccountsIfAvailable();
     }
-  }, [isOpen, currentUser]);
+  }, [isOpen, currentUser, initialMode]);
 
   const loadAccountsIfAvailable = async () => {
     try {
