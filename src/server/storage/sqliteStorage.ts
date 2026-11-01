@@ -102,6 +102,16 @@ export class SqliteStorageRepository implements IStorageRepository {
       set: (_target, prop: string, value: any) => {
         mutatedUsers.set(prop, value);
         return true;
+      },
+      ownKeys: () => {
+        const rows = this.db.prepare('SELECT id FROM users').all() as any[];
+        return rows.map(r => r.id);
+      },
+      getOwnPropertyDescriptor: (_target, prop: string) => {
+        return {
+          enumerable: true,
+          configurable: true,
+        };
       }
     });
 

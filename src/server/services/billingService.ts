@@ -50,11 +50,14 @@ export class BillingService {
     return process.env.NODE_ENV === 'production';
   }
 
+  private hasExplicitTestClient: boolean = false;
+
   constructor() {
     this.reconfigure();
   }
 
   public reconfigure(): void {
+    this.hasExplicitTestClient = false;
     const apiKey = process.env.STRIPE_SECRET_KEY;
     if (apiKey) {
       this.stripe = new Stripe(apiKey, {
@@ -71,8 +74,14 @@ export class BillingService {
     }
   }
 
+  public setStripeClientForTest(client: Stripe | any): void {
+    this.stripe = client;
+    this.isConfigured = !!client;
+    this.hasExplicitTestClient = true;
+  }
+
   public getStripeClient(): Stripe | null {
-    if (!this.stripe && process.env.STRIPE_SECRET_KEY) {
+    if (!this.hasExplicitTestClient && !this.stripe && process.env.STRIPE_SECRET_KEY) {
       this.reconfigure();
     }
     return this.stripe;
@@ -95,6 +104,130 @@ export class BillingService {
   }
 
   /**
+   * Canonical application URL helper
+   */
+  public getCanonicalAppUrl(): string {
+    const url = process.env.APP_URL || process.env.PUBLIC_APP_URL || 'https://videorisk.com';
+    return url.replace(/\/+$/, '');
+  }
+
+  /**
+   * Resolves list of trusted application origins
+   */
+  public getTrustedOrigins(): string[] {
+    const origins = new Set<string>();
+    origins.add('https://videorisk.com');
+    origins.add('https://www.videorisk.com');
+
+    const canonical = this.getCanonicalAppUrl();
+    try {
+      origins.add(new URL(canonical).origin);
+    } catch {
+      // ignore
+    }
+
+    if (process.env.ALLOWED_ORIGINS) {
+      process.env.ALLOWED_ORIGINS.split(',').forEach(o => {
+        const trimmed = o.trim();
+        if (trimmed) {
+          try {
+            origins.add(new URL(trimmed).origin);
+          } catch {
+            // ignore malformed entry
+          }
+        }
+      });
+    }
+
+    // In development or test environments, permit localhost / 127.0.0.1
+    if (!this.isProduction || process.env.VIDEORISK_TEST_RUN === 'true') {
+      origins.add('http://localhost:3000');
+      origins.add('http://127.0.0.1:3000');
+      origins.add('http://localhost:5173');
+      origins.add('http://127.0.0.1:5173');
+      origins.add('https://localhost:3000');
+      origins.add('https://127.0.0.1:3000');
+    }
+
+    return Array.from(origins);
+  }
+
+  /**
+   * Validates Customer Portal return URL strictly against trusted application origins.
+   * Rejects external origins, protocol-relative URLs, malformed URLs, and dangerous schemes.
+   */
+  public validatePortalReturnUrl(inputUrl?: string | null): string {
+    // Missing return URL falls back to canonical application URL
+    if (!inputUrl || typeof inputUrl !== 'string' || !inputUrl.trim()) {
+      return `${this.getCanonicalAppUrl()}/?view=pricing`;
+    }
+
+    const trimmed = inputUrl.trim();
+
+    // Reject protocol-relative URLs
+    if (trimmed.startsWith('//')) {
+      const err: any = new Error('Protocol-relative return URLs are strictly forbidden.');
+      err.statusCode = 400;
+      throw err;
+    }
+
+    // Reject malformed URLs
+    let parsed: URL;
+    try {
+      parsed = new URL(trimmed);
+    } catch {
+      const err: any = new Error('Malformed return URL format.');
+      err.statusCode = 400;
+      throw err;
+    }
+
+    // Reject unexpected schemes (javascript:, data:, file:, etc.)
+    if (parsed.protocol === 'javascript:' || parsed.protocol === 'data:' || parsed.protocol === 'file:') {
+      const err: any = new Error(`Dangerous return URL scheme: ${parsed.protocol}`);
+      err.statusCode = 400;
+      throw err;
+    }
+
+    const isDevOrTest = !this.isProduction || process.env.VIDEORISK_TEST_RUN === 'true';
+
+    if (parsed.protocol === 'http:') {
+      const isLocalHost = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
+      if (!isDevOrTest || !isLocalHost) {
+        const err: any = new Error('Insecure HTTP return URLs are not permitted outside of development localhost.');
+        err.statusCode = 400;
+        throw err;
+      }
+    } else if (parsed.protocol !== 'https:') {
+      const err: any = new Error(`Unsupported return URL protocol: ${parsed.protocol}`);
+      err.statusCode = 400;
+      throw err;
+    }
+
+    // Origin check against trusted application origins
+    const trustedOrigins = this.getTrustedOrigins();
+    const isTrusted = trustedOrigins.some(trusted => {
+      try {
+        const t = new URL(trusted);
+        if (parsed.origin === t.origin) return true;
+        if (isDevOrTest && (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') && (t.hostname === 'localhost' || t.hostname === '127.0.0.1')) {
+          return true;
+        }
+      } catch {
+        return false;
+      }
+      return false;
+    });
+
+    if (!isTrusted) {
+      const err: any = new Error(`Return URL origin '${parsed.origin}' is not authorized.`);
+      err.statusCode = 400;
+      throw err;
+    }
+
+    return parsed.toString();
+  }
+
+  /**
    * Reverse-maps a Stripe price ID to our internal plan identifier
    */
   public getPlanFromPriceId(priceId: string): AllowedPaidPlan | null {
@@ -106,14 +239,24 @@ export class BillingService {
   }
 
   /**
-   * Evaluates whether a given subscription status and billing period confers active paid entitlements
+   * Evaluates whether a given subscription status and billing period confers active paid entitlements.
+   * Explicitly handles active, trialing, past_due, canceled, unpaid, incomplete, and incomplete_expired.
    */
   public isSubscriptionEntitled(
     status?: string,
     currentPeriodEnd?: string | number | null
   ): boolean {
     if (!status) return false;
-    if (status === 'active' || status === 'trialing') return true;
+
+    // Explicitly unentitled statuses
+    if (status === 'unpaid' || status === 'incomplete' || status === 'incomplete_expired') {
+      return false;
+    }
+
+    // Active and trialing are always entitled
+    if (status === 'active' || status === 'trialing') {
+      return true;
+    }
 
     const now = Date.now();
     const periodEndMs = typeof currentPeriodEnd === 'number'
@@ -121,16 +264,15 @@ export class BillingService {
       : (currentPeriodEnd ? new Date(currentPeriodEnd).getTime() : 0);
 
     // Canceled but still within the prepaid period
-    if (status === 'canceled' && periodEndMs > now) {
-      return true;
+    if (status === 'canceled') {
+      return periodEndMs > now;
     }
 
     // Past due: 7-day grace period from period end
-    if (status === 'past_due' && periodEndMs > 0) {
+    if (status === 'past_due') {
+      if (periodEndMs <= 0) return false;
       const gracePeriodMs = 7 * 24 * 60 * 60 * 1000;
-      if (now <= periodEndMs + gracePeriodMs) {
-        return true;
-      }
+      return now <= periodEndMs + gracePeriodMs;
     }
 
     return false;
@@ -344,13 +486,34 @@ export class BillingService {
         return { alreadyProcessed: true };
       }
 
+      const eventCreatedMs = (event.created || 0) * 1000;
+      const isOutOfOrder = (subRecord: any) => {
+        if (!subRecord || !subRecord.updatedAt || !event.created) return false;
+        const subUpdatedMs = new Date(subRecord.updatedAt).getTime();
+        return subUpdatedMs > 0 && eventCreatedMs < subUpdatedMs;
+      };
+
       switch (event.type) {
         case 'checkout.session.completed': {
           const session = event.data.object as Stripe.Checkout.Session;
-          const userId = session.client_reference_id || session.metadata?.userId;
+          const clientRefId = (session.client_reference_id && typeof session.client_reference_id === 'string')
+            ? session.client_reference_id.trim()
+            : undefined;
+          const metadataUserId = (session.metadata?.userId && typeof session.metadata.userId === 'string')
+            ? session.metadata.userId.trim()
+            : undefined;
+
+          if (!clientRefId && !metadataUserId) {
+            throw new Error(`checkout.session.completed missing user reference in session ${session.id}`);
+          }
+          if (clientRefId && metadataUserId && clientRefId !== metadataUserId) {
+            throw new Error(`checkout.session.completed has conflicting user references in session ${session.id}`);
+          }
+          const userId = clientRefId || metadataUserId;
           if (!userId) {
             throw new Error(`checkout.session.completed missing user reference in session ${session.id}`);
           }
+
           const user = state.users[userId];
           if (!user) {
             throw new Error(`User not found for checkout session: ${userId}`);
@@ -396,7 +559,7 @@ export class BillingService {
               planId,
               status: 'active',
               createdAt: new Date().toISOString(),
-              updatedAt: new Date().toISOString(),
+              updatedAt: new Date(Math.max(Date.now(), eventCreatedMs)).toISOString(),
             };
           }
 
@@ -425,13 +588,30 @@ export class BillingService {
 
         case 'invoice.paid': {
           const invoice = event.data.object as any;
-          if (invoice.billing_reason === 'subscription_cycle') {
-            const subId = typeof invoice.subscription === 'string' ? invoice.subscription : invoice.subscription?.id;
-            if (subId) {
-              const sub = state.subscriptions[subId];
-              if (sub) {
-                const user = state.users[sub.userId];
-                if (user) {
+          const subId = typeof invoice.subscription === 'string' ? invoice.subscription : invoice.subscription?.id;
+          if (subId) {
+            const sub = state.subscriptions[subId];
+            if (sub) {
+              if (isOutOfOrder(sub)) {
+                console.log(`[BillingService] Out-of-order invoice.paid event ${event.id} ignored.`);
+                state.webhookEvents[event.id] = {
+                  eventId: event.id,
+                  provider: 'stripe',
+                  eventType: event.type,
+                  processedAt: new Date().toISOString(),
+                };
+                return { alreadyProcessed: false };
+              }
+
+              sub.status = 'active';
+              sub.updatedAt = new Date(Math.max(Date.now(), eventCreatedMs)).toISOString();
+
+              const user = state.users[sub.userId];
+              if (user) {
+                user.subscriptionStatus = 'active';
+                user.plan = sub.planId as any;
+
+                if (invoice.billing_reason === 'subscription_cycle') {
                   const creditAllocation = this.getPlanCreditAllocation(sub.planId);
                   user.creditsRemaining += creditAllocation;
                   state.webhookEvents[event.id] = {
@@ -475,10 +655,31 @@ export class BillingService {
             : undefined;
 
           let sub = state.subscriptions[subId];
+          if (sub && isOutOfOrder(sub)) {
+            console.log(`[BillingService] Out-of-order customer.subscription.updated event ${event.id} ignored.`);
+            state.webhookEvents[event.id] = {
+              eventId: event.id,
+              provider: 'stripe',
+              eventType: event.type,
+              processedAt: new Date().toISOString(),
+              userId: sub.userId,
+            };
+            return { alreadyProcessed: false };
+          }
+
           let userId = sub?.userId;
+          if (!userId && (subscription.metadata?.userId || (subscription as any).client_reference_id)) {
+            userId = (subscription.metadata?.userId || (subscription as any).client_reference_id).trim();
+          }
           if (!userId && customerId) {
-            const userWithCustomer = Object.values(state.users).find((u: any) => u.stripeCustomerId === customerId);
-            if (userWithCustomer) userId = (userWithCustomer as any).id;
+            if (state.prepare && typeof state.prepare === 'function') {
+              const row = state.prepare('SELECT id FROM users WHERE stripe_customer_id = ?').get(customerId) as any;
+              if (row) userId = row.id;
+            }
+            if (!userId) {
+              const userWithCustomer = Object.values(state.users).find((u: any) => u.stripeCustomerId === customerId);
+              if (userWithCustomer) userId = (userWithCustomer as any).id;
+            }
           }
 
           if (userId) {
@@ -498,7 +699,7 @@ export class BillingService {
               const entitled = this.isSubscriptionEntitled(status, currentPeriodEnd);
               if (entitled) {
                 user.plan = mappedPlanId as any;
-              } else if (status === 'canceled' || status === 'unpaid' || status === 'incomplete_expired') {
+              } else {
                 user.plan = 'free';
               }
 
@@ -509,7 +710,7 @@ export class BillingService {
                 status: status as any,
                 currentPeriodEnd,
                 createdAt: sub?.createdAt || new Date().toISOString(),
-                updatedAt: new Date().toISOString(),
+                updatedAt: new Date(Math.max(Date.now(), eventCreatedMs)).toISOString(),
               };
             }
           }
@@ -526,21 +727,71 @@ export class BillingService {
 
         case 'customer.subscription.deleted': {
           const subscription = event.data.object as Stripe.Subscription;
-          const sub = state.subscriptions[subscription.id];
-          if (sub) {
-            sub.status = 'canceled';
-            sub.updatedAt = new Date().toISOString();
-            const user = state.users[sub.userId];
-            if (user) {
-              user.subscriptionStatus = 'canceled';
-              user.plan = 'free';
+          const customerId = typeof subscription.customer === 'string' ? subscription.customer : subscription.customer?.id;
+          let sub = state.subscriptions[subscription.id];
+          if (sub && isOutOfOrder(sub)) {
+            console.log(`[BillingService] Out-of-order customer.subscription.deleted event ${event.id} ignored.`);
+            state.webhookEvents[event.id] = {
+              eventId: event.id,
+              provider: 'stripe',
+              eventType: event.type,
+              processedAt: new Date().toISOString(),
+            };
+            return { alreadyProcessed: false };
+          }
+
+          let userId = sub?.userId;
+          if (!userId && (subscription.metadata?.userId || (subscription as any).client_reference_id)) {
+            userId = (subscription.metadata?.userId || (subscription as any).client_reference_id).trim();
+          }
+          if (!userId && customerId) {
+            if (state.prepare && typeof state.prepare === 'function') {
+              const row = state.prepare('SELECT id FROM users WHERE stripe_customer_id = ?').get(customerId) as any;
+              if (row) userId = row.id;
+            }
+            if (!userId) {
+              const userWithCustomer = Object.values(state.users).find((u: any) => u.stripeCustomerId === customerId);
+              if (userWithCustomer) userId = (userWithCustomer as any).id;
             }
           }
+
+          const currentPeriodEnd = (subscription as any).current_period_end 
+            ? new Date((subscription as any).current_period_end * 1000).toISOString() 
+            : sub?.currentPeriodEnd;
+
+          if (sub) {
+            sub.status = 'canceled';
+            sub.currentPeriodEnd = currentPeriodEnd;
+            sub.updatedAt = new Date(Math.max(Date.now(), eventCreatedMs)).toISOString();
+          } else if (userId) {
+            state.subscriptions[subscription.id] = {
+              id: subscription.id,
+              userId,
+              planId: 'free',
+              status: 'canceled',
+              currentPeriodEnd,
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date(Math.max(Date.now(), eventCreatedMs)).toISOString(),
+            };
+          }
+
+          if (userId) {
+            const user = state.users[userId];
+            if (user) {
+              user.subscriptionStatus = 'canceled';
+              const entitled = this.isSubscriptionEntitled('canceled', currentPeriodEnd);
+              if (!entitled) {
+                user.plan = 'free';
+              }
+            }
+          }
+
           state.webhookEvents[event.id] = {
             eventId: event.id,
             provider: 'stripe',
             eventType: event.type,
             processedAt: new Date().toISOString(),
+            userId: userId || undefined,
           };
           break;
         }
@@ -548,17 +799,46 @@ export class BillingService {
         case 'invoice.payment_failed': {
           const invoice = event.data.object as any;
           const subId = typeof invoice.subscription === 'string' ? invoice.subscription : invoice.subscription?.id;
+          const customerId = typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id;
+          let sub = subId ? state.subscriptions[subId] : undefined;
+          let userId = sub?.userId;
+
+          if (!userId && customerId) {
+            if (state.prepare && typeof state.prepare === 'function') {
+              const row = state.prepare('SELECT id FROM users WHERE stripe_customer_id = ?').get(customerId) as any;
+              if (row) userId = row.id;
+            }
+            if (!userId) {
+              const userWithCustomer = Object.values(state.users).find((u: any) => u.stripeCustomerId === customerId);
+              if (userWithCustomer) userId = (userWithCustomer as any).id;
+            }
+          }
+
           if (subId) {
-            const sub = state.subscriptions[subId];
             if (sub) {
+              if (isOutOfOrder(sub)) {
+                console.log(`[BillingService] Out-of-order invoice.payment_failed event ${event.id} ignored.`);
+                state.webhookEvents[event.id] = {
+                  eventId: event.id,
+                  provider: 'stripe',
+                  eventType: event.type,
+                  processedAt: new Date().toISOString(),
+                };
+                return { alreadyProcessed: false };
+              }
+
               sub.status = 'past_due';
-              sub.updatedAt = new Date().toISOString();
-              const user = state.users[sub.userId];
-              if (user) {
-                user.subscriptionStatus = 'past_due';
-                if (!this.isSubscriptionEntitled('past_due', sub.currentPeriodEnd)) {
-                  user.plan = 'free';
-                }
+              sub.updatedAt = new Date(Math.max(Date.now(), eventCreatedMs)).toISOString();
+            }
+          }
+
+          if (userId) {
+            const user = state.users[userId];
+            if (user) {
+              user.subscriptionStatus = 'past_due';
+              const periodEnd = sub?.currentPeriodEnd;
+              if (!this.isSubscriptionEntitled('past_due', periodEnd)) {
+                user.plan = 'free';
               }
             }
           }
@@ -597,7 +877,9 @@ export class BillingService {
   }> {
     const stripe = this.getStripeClient();
     if (!stripe) {
-      throw new Error('Stripe client is not configured.');
+      const err: any = new Error('Stripe client is not configured.');
+      err.statusCode = 500;
+      throw err;
     }
     const session = await stripe.checkout.sessions.retrieve(sessionId);
     if (!session) {
@@ -605,8 +887,30 @@ export class BillingService {
       err.statusCode = 404;
       throw err;
     }
-    const sessionUserId = session.client_reference_id || session.metadata?.userId;
-    if (sessionUserId && sessionUserId !== authenticatedUserId) {
+
+    const clientRefId = (session.client_reference_id && typeof session.client_reference_id === 'string')
+      ? session.client_reference_id.trim()
+      : undefined;
+    const metadataUserId = (session.metadata?.userId && typeof session.metadata.userId === 'string')
+      ? session.metadata.userId.trim()
+      : undefined;
+
+    // Fail closed: require authoritative non-empty ownership identifier
+    if (!clientRefId && !metadataUserId) {
+      const err: any = new Error('Checkout session is missing authoritative user ownership metadata.');
+      err.statusCode = 403;
+      throw err;
+    }
+
+    // Reject conflicting ownership metadata
+    if (clientRefId && metadataUserId && clientRefId !== metadataUserId) {
+      const err: any = new Error('Checkout session contains conflicting user ownership identifiers.');
+      err.statusCode = 403;
+      throw err;
+    }
+
+    const sessionUserId = clientRefId || metadataUserId;
+    if (!sessionUserId || sessionUserId !== authenticatedUserId) {
       const err: any = new Error('Checkout session does not belong to the authenticated user.');
       err.statusCode = 403;
       throw err;
@@ -644,33 +948,43 @@ export class BillingService {
     user?: UserAccount;
     message?: string;
   }> {
-    let session: Stripe.Checkout.Session;
-    if (sessionId.startsWith('cs_test_mock_') || (process.env.VIDEORISK_TEST_RUN === 'true' && sessionId.startsWith('mock_'))) {
-      session = {
-        id: sessionId,
-        object: 'checkout.session',
-        client_reference_id: authenticatedUserId,
-        metadata: { userId: authenticatedUserId, planId: 'creator' },
-        payment_status: 'paid',
-        status: 'complete',
-        livemode: false,
-      } as any;
-    } else {
-      const stripe = this.getStripeClient();
-      if (!stripe) {
-        throw new Error('Stripe client is not configured.');
-      }
-
-      session = await stripe.checkout.sessions.retrieve(sessionId);
-      if (!session) {
-        const err: any = new Error(`Checkout session ${sessionId} not found.`);
-        err.statusCode = 404;
-        throw err;
-      }
+    const stripe = this.getStripeClient();
+    if (!stripe) {
+      const err: any = new Error('Stripe client is not configured.');
+      err.statusCode = 500;
+      throw err;
     }
 
-    const sessionUserId = session.client_reference_id || session.metadata?.userId;
-    if (sessionUserId && sessionUserId !== authenticatedUserId) {
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    if (!session) {
+      const err: any = new Error(`Checkout session ${sessionId} not found.`);
+      err.statusCode = 404;
+      throw err;
+    }
+
+    const clientRefId = (session.client_reference_id && typeof session.client_reference_id === 'string')
+      ? session.client_reference_id.trim()
+      : undefined;
+    const metadataUserId = (session.metadata?.userId && typeof session.metadata.userId === 'string')
+      ? session.metadata.userId.trim()
+      : undefined;
+
+    // Fail closed: require authoritative non-empty ownership identifier
+    if (!clientRefId && !metadataUserId) {
+      const err: any = new Error('Checkout session is missing authoritative user ownership metadata.');
+      err.statusCode = 403;
+      throw err;
+    }
+
+    // Reject conflicting ownership metadata
+    if (clientRefId && metadataUserId && clientRefId !== metadataUserId) {
+      const err: any = new Error('Checkout session contains conflicting user ownership identifiers.');
+      err.statusCode = 403;
+      throw err;
+    }
+
+    const sessionUserId = clientRefId || metadataUserId;
+    if (!sessionUserId || sessionUserId !== authenticatedUserId) {
       const err: any = new Error('Checkout session does not belong to the authenticated user.');
       err.statusCode = 403;
       throw err;
@@ -686,7 +1000,7 @@ export class BillingService {
     const isPaid = session.payment_status === 'paid' || session.payment_status === 'no_payment_required';
 
     if (!isPaid) {
-      let status: 'pending' | 'unpaid' | 'expired' | 'canceled' = 'pending';
+      let status: 'complete' | 'pending' | 'unpaid' | 'expired' | 'canceled' | 'unknown' = 'pending';
       if (session.payment_status === 'unpaid') {
         status = 'unpaid';
       } else if (session.status === 'expired') {
@@ -709,7 +1023,7 @@ export class BillingService {
 
     // Payment verified: Synchronize user entitlement idempotently inside database transaction
     const syncEventId = `sync_${session.id}`;
-    const targetUserId = sessionUserId || authenticatedUserId;
+    const targetUserId = sessionUserId;
 
     const updatedUser = await storage.runTransaction(async (state) => {
       const user = state.users[targetUserId];
@@ -790,10 +1104,12 @@ export class BillingService {
   /**
    * Generates an authenticated Stripe Customer Portal session URL
    */
-  public async createCustomerPortalSession(userId: string, returnUrl: string): Promise<{ url: string }> {
+  public async createCustomerPortalSession(userId: string, returnUrl?: string | null): Promise<{ url: string }> {
     const stripe = this.getStripeClient();
     if (!stripe) {
-      throw new Error('Stripe client is not configured.');
+      const err: any = new Error('Stripe client is not configured.');
+      err.statusCode = 500;
+      throw err;
     }
 
     const user = await storage.users.getUser(userId);
@@ -809,14 +1125,13 @@ export class BillingService {
       throw err;
     }
 
-    if (process.env.VIDEORISK_TEST_RUN === 'true' || user.stripeCustomerId?.startsWith('cus_test_')) {
-      return { url: `https://billing.stripe.com/p/session/test_${user.stripeCustomerId}` };
-    }
+    // Strict validation of return URL against trusted origins
+    const validatedReturnUrl = this.validatePortalReturnUrl(returnUrl);
 
     try {
       const portalSession = await stripe.billingPortal.sessions.create({
         customer: user.stripeCustomerId,
-        return_url: returnUrl,
+        return_url: validatedReturnUrl,
       });
 
       return { url: portalSession.url };

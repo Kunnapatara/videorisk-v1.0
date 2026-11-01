@@ -1680,10 +1680,8 @@ apiRouter.post('/billing/create-portal-session', async (req: Request, res: Respo
     const user = await requireAuth(req, res);
     if (!user) return;
 
-    const originUrl = req.get('origin') || `${req.protocol}://${req.get('host')}`;
-    const returnUrl = (req.body && req.body.returnUrl) ? String(req.body.returnUrl) : `${originUrl}/`;
-
-    const portal = await billingService.createCustomerPortalSession(user.id, returnUrl);
+    const requestedReturnUrl = req.body && req.body.returnUrl ? String(req.body.returnUrl) : undefined;
+    const portal = await billingService.createCustomerPortalSession(user.id, requestedReturnUrl);
     res.json(portal);
   } catch (err: any) {
     const statusCode = (err.statusCode && err.statusCode >= 400 && err.statusCode < 600 && err.statusCode !== 401) ? err.statusCode : 500;
@@ -2047,6 +2045,24 @@ apiRouter.post('/scans/demo', async (req: Request, res: Response) => {
       hasThumbnail = false
     } = req.body;
 
+    // Strict Parent Scan Ownership & Eligibility Validation
+    const rawParentId = req.body.parentScanId;
+    let validatedParentScanId: string | undefined;
+    if (rawParentId !== undefined && rawParentId !== null && String(rawParentId).trim() !== '') {
+      const parentScanId = String(rawParentId).trim();
+      const parentScan = await storage.scans.getScan(parentScanId);
+      if (!parentScan) {
+        return res.status(404).json({ error: 'Original scan not found.' });
+      }
+      if (parentScan.userId !== user.id) {
+        return res.status(403).json({ error: 'Access denied: Cannot re-scan video belonging to another user.' });
+      }
+      if (parentScan.status !== 'COMPLETED') {
+        return res.status(400).json({ error: 'Parent scan must be completed before initiating a re-scan.' });
+      }
+      validatedParentScanId = parentScan.id;
+    }
+
     const fixture = getDemoFixture(demoType === 'revised' ? 'revised' : 'problematic');
 
     const demoFilename = fixture.videoFilename;
@@ -2120,8 +2136,8 @@ apiRouter.post('/scans/demo', async (req: Request, res: Response) => {
       completedStages: ['Upload'],
       creditsUsed: requiredCredits,
       createdAt: new Date().toISOString(),
-      isRescan: demoType === 'revised',
-      parentScanId: req.body.parentScanId
+      isRescan: demoType === 'revised' || !!validatedParentScanId,
+      parentScanId: validatedParentScanId
     };
 
     await storage.scans.createScan(scanJob);
