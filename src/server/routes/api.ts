@@ -12,7 +12,7 @@ import { thumbnailInspector } from '../pipeline/thumbnailInspector';
 import { creditService } from '../services/creditService';
 import { billingService, ALLOWED_PAID_PLANS } from '../services/billingService';
 import { ensureDemoFixtures, getDemoFixture } from '../fixtures/demoMedia';
-import { ScanJob, ScanMode, UserAccount, CrossVideoPattern } from '../../types';
+import { ScanJob, ScanMode, UserAccount, CrossVideoPattern, ChannelCoverageReport, ChannelCoverageDetail, ChannelPatternsResponse } from '../../types';
 
 export const apiRouter = Router();
 
@@ -1866,63 +1866,239 @@ apiRouter.get('/channel/patterns', async (req: Request, res: Response) => {
     if (!user) return;
 
     const userScans = await storage.scans.getAllScans(user.id);
-    const completedScans = userScans.filter(s => s.status === 'COMPLETED');
+    
+    // Strict integrity: only include unique, completed scans belonging to the authenticated user
+    const seenScanIds = new Set<string>();
+    const completedScans: ScanJob[] = [];
+    for (const s of userScans) {
+      if (s.status === 'COMPLETED' && !seenScanIds.has(s.id)) {
+        seenScanIds.add(s.id);
+        completedScans.push(s);
+      }
+    }
 
-    const patterns: CrossVideoPattern[] = [];
     const sampleSize = completedScans.length;
 
-    if (sampleSize >= 2) {
-      // 1. Analyze recurring lack of voiceover
-      let lowVoiceCount = 0;
-      let titleMismatchCount = 0;
+    // Explicit Capability Coverage Reporting
+    const coverage: ChannelCoverageReport = {
+      titleMetadata: 'AVAILABLE',
+      introOutro: 'NOT_AVAILABLE',
+      crossVideoFootage: 'NOT_AVAILABLE',
+      audioPatterns: 'NOT_AVAILABLE',
+      originalContribution: 'INSUFFICIENT_EVIDENCE'
+    };
 
-      for (const s of completedScans) {
-        const report = await storage.scans.getReport(s.id);
-        if (report) {
-          if (typeof report.originalContributionRatio === 'number' && report.originalContributionRatio < 20) {
-            lowVoiceCount++;
-          }
-          if (report.topIssues.some(i => i.domain === 'title' && i.category === 'metadata_coherence')) {
-            titleMismatchCount++;
-          }
-        }
+    const coverageDetails: Record<keyof ChannelCoverageReport, ChannelCoverageDetail> = {
+      titleMetadata: {
+        status: 'AVAILABLE',
+        reason: 'Evaluates persisted video titles, descriptions, tags, and metadata coherence findings across completed scans in your account.',
+        dataRequirements: 'Requires at least 2 completed video scans with metadata.'
+      },
+      introOutro: {
+        status: 'NOT_AVAILABLE',
+        reason: 'VideoProcessor perceptual frame signatures are transient in-memory structures and are not stored in the database after job execution. Cross-scan intro/outro comparison requires persistent structural frame signatures.',
+        dataRequirements: 'Requires persistent cross-video visual signature index.'
+      },
+      crossVideoFootage: {
+        status: 'NOT_AVAILABLE',
+        reason: 'Production VideoProcessor evaluates intra-video repeated footage only. Cross-video visual comparison across distinct uploads is not currently persisted.',
+        dataRequirements: 'Requires persistent visual signature hashing across scans.'
+      },
+      audioPatterns: {
+        status: 'NOT_AVAILABLE',
+        reason: 'Audio processing buffers and acoustic energy measurements are transient. Unconfigured STT or music classification cannot be used to infer audio pattern recurrence across scans.',
+        dataRequirements: 'Requires configured speech transcription and acoustic fingerprint persistence.'
+      },
+      originalContribution: {
+        status: 'INSUFFICIENT_EVIDENCE',
+        reason: 'Automated transcript and original contribution measurement is not established for uploaded videos. VideoRisk preserves null rather than fabricating an arbitrary original contribution score.',
+        dataRequirements: 'Requires verified spoken dialogue transcript analysis and verified third-party source attribution.'
       }
+    };
 
-      if (lowVoiceCount >= 2) {
-        patterns.push({
-          id: 'pat_reused_signal',
-          patternType: 'repeated_reused_signal',
-          label: 'Recurring Absence of Creator Commentary',
-          severity: 'warning',
-          frequency: parseFloat(((lowVoiceCount / sampleSize) * 100).toFixed(0)),
-          affectedScansCount: lowVoiceCount,
-          explanation: `In ${lowVoiceCount} of your ${sampleSize} analyzed videos, audio tracks lacked an identifiable creator voice track.`,
-          recommendation: 'Adding consistent spoken perspective or voiceover transforms material under YouTube YPP reused-content policies.',
-          disclaimer: 'Observed pattern across your uploaded video sample; not an automated channel-wide YouTube audit.'
-        });
-      }
+    const MANDATORY_COVERAGE_STATEMENT = 
+      'Channel insights are based only on videos uploaded and analyzed in your VideoRisk account. This is not a complete audit of all videos on your YouTube channel.';
 
-      if (titleMismatchCount >= 2) {
+    // Insufficient sample size check: requires at least 2 completed scans
+    if (sampleSize < 2) {
+      return res.json({
+        sampleSize,
+        patterns: [],
+        coverage,
+        coverageDetails,
+        disclaimer: MANDATORY_COVERAGE_STATEMENT,
+        mandatoryCoverageStatement: MANDATORY_COVERAGE_STATEMENT
+      });
+    }
+
+    const patterns: CrossVideoPattern[] = [];
+
+    // -------------------------------------------------------------------------
+    // 1. EXACT REPEATED TITLES
+    // -------------------------------------------------------------------------
+    const titleGroups = new Map<string, ScanJob[]>();
+    for (const s of completedScans) {
+      const rawTitle = (s.videoTitle || '').trim();
+      if (!rawTitle) continue;
+      const normalizedTitle = rawTitle.toLowerCase().replace(/\s+/g, ' ');
+      const existing = titleGroups.get(normalizedTitle) || [];
+      existing.push(s);
+      titleGroups.set(normalizedTitle, existing);
+    }
+
+    for (const [normTitle, group] of titleGroups.entries()) {
+      if (group.length >= 2) {
+        const affectedCount = group.length;
+        const frequency = parseFloat(((affectedCount / sampleSize) * 100).toFixed(0));
+        const sampleOriginalTitle = group[0].videoTitle;
         patterns.push({
-          id: 'pat_metadata_gap',
-          patternType: 'title_content_mismatch',
-          label: 'Recurring Title-to-Content Pacing Gap',
+          id: `pat_title_exact_${Buffer.from(normTitle).toString('base64url').substring(0, 16)}`,
+          patternType: 'exact_repeated_title',
+          label: `Identical Video Titles (${affectedCount} videos)`,
           severity: 'warning',
-          frequency: parseFloat(((titleMismatchCount / sampleSize) * 100).toFixed(0)),
-          affectedScansCount: titleMismatchCount,
-          explanation: `In ${titleMismatchCount} of ${sampleSize} videos, titles suggested case studies while opening sequences lacked direct spoken hooks.`,
-          recommendation: 'Ensure video openings immediately connect to the topic promised in the title.',
-          disclaimer: 'Observed pattern across your uploaded video sample; not an automated channel-wide YouTube audit.'
+          sampleSize,
+          affectedScansCount: affectedCount,
+          frequency,
+          evidenceReferences: group.map(g => g.id),
+          explanation: `${affectedCount} of ${sampleSize} analyzed videos share the exact title: "${sampleOriginalTitle}". Re-uploading identical titles can confuse audience search indexing and trigger platform spam or duplicate metadata filters.`,
+          recommendation: 'Ensure each uploaded video features a distinct, descriptive title accurately reflecting its specific focus.',
+          confidence: 'HIGH',
+          limitations: 'Evaluates exact normalized text parity across stored scan titles.',
+          disclaimer: MANDATORY_COVERAGE_STATEMENT
         });
       }
     }
 
+    // -------------------------------------------------------------------------
+    // 2. SERIES / EPISODIC TITLE TEMPLATES (Observation, NOT a policy violation)
+    // -------------------------------------------------------------------------
+    // Identify series patterns like "Topic - Episode 1", "Show Part 2", "Series #3"
+    const seriesRegex = /^(.*?)(?:[\s\-_|:]*(?:ep(?:isode)?|part|vol(?:ume)?|#)\s*\d+.*)$/i;
+    const seriesGroups = new Map<string, ScanJob[]>();
+
+    for (const s of completedScans) {
+      const rawTitle = (s.videoTitle || '').trim();
+      const match = seriesRegex.exec(rawTitle);
+      if (match && match[1] && match[1].trim().length >= 3) {
+        const seriesPrefix = match[1].trim().toLowerCase();
+        const existing = seriesGroups.get(seriesPrefix) || [];
+        existing.push(s);
+        seriesGroups.set(seriesPrefix, existing);
+      }
+    }
+
+    for (const [prefix, group] of seriesGroups.entries()) {
+      // Only report if there are at least 2 videos in the series and they are NOT already flagged as identical titles
+      const distinctTitles = new Set(group.map(g => (g.videoTitle || '').trim().toLowerCase()));
+      if (group.length >= 2 && distinctTitles.size >= 2) {
+        const affectedCount = group.length;
+        const frequency = parseFloat(((affectedCount / sampleSize) * 100).toFixed(0));
+        const sampleSeriesTitle = group[0].videoTitle;
+        patterns.push({
+          id: `pat_title_series_${Buffer.from(prefix).toString('base64url').substring(0, 16)}`,
+          patternType: 'series_title_template',
+          label: `Consistent Series Title Formatting`,
+          severity: 'info',
+          sampleSize,
+          affectedScansCount: affectedCount,
+          frequency,
+          evidenceReferences: group.map(g => g.id),
+          explanation: `${affectedCount} of ${sampleSize} analyzed videos follow a structured episodic or series naming template (e.g., "${sampleSeriesTitle}"). This is a standard episodic series format.`,
+          recommendation: 'Maintain episodic branding while highlighting the episode-specific topic or guest name to maximize search discoverability.',
+          confidence: 'HIGH',
+          limitations: 'Recognizes serial numbering and common episodic naming prefixes.',
+          disclaimer: MANDATORY_COVERAGE_STATEMENT
+        });
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. IDENTICAL VIDEO DESCRIPTIONS
+    // -------------------------------------------------------------------------
+    const descGroups = new Map<string, ScanJob[]>();
+    for (const s of completedScans) {
+      const rawDesc = (s.videoDescription || '').trim();
+      if (!rawDesc || rawDesc.length < 25) continue; // Skip empty or trivial descriptions
+      const normDesc = rawDesc.toLowerCase().replace(/\s+/g, ' ');
+      const existing = descGroups.get(normDesc) || [];
+      existing.push(s);
+      descGroups.set(normDesc, existing);
+    }
+
+    for (const [normDesc, group] of descGroups.entries()) {
+      if (group.length >= 2) {
+        const affectedCount = group.length;
+        const frequency = parseFloat(((affectedCount / sampleSize) * 100).toFixed(0));
+        patterns.push({
+          id: `pat_desc_exact_${Buffer.from(normDesc).toString('base64url').substring(0, 16)}`,
+          patternType: 'repeated_description',
+          label: `Identical Video Descriptions (${affectedCount} videos)`,
+          severity: 'info',
+          sampleSize,
+          affectedScansCount: affectedCount,
+          frequency,
+          evidenceReferences: group.map(g => g.id),
+          explanation: `${affectedCount} of ${sampleSize} analyzed videos share identical description text. While boilerplate channel links and disclaimers are standard, unique video descriptions provide essential context for search indexing.`,
+          recommendation: 'Include 1–2 paragraphs of unique summary describing the specific topics and takeaways of each video alongside your standard channel links.',
+          confidence: 'HIGH',
+          limitations: 'Evaluates exact text parity across saved video descriptions.',
+          disclaimer: MANDATORY_COVERAGE_STATEMENT
+        });
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. RECURRING TITLE-TO-CONTENT COHERENCE GAPS
+    // -------------------------------------------------------------------------
+    let titleMismatchCount = 0;
+    const mismatchScanRefs: string[] = [];
+
+    for (const s of completedScans) {
+      const report = await storage.scans.getReport(s.id);
+      if (report && Array.isArray(report.topIssues)) {
+        const hasMismatch = report.topIssues.some(i => 
+          (i.domain === 'title' && (i.category === 'metadata_coherence' || i.type === 'title_content_mismatch')) ||
+          i.type === 'title_duration_mismatch'
+        );
+        if (hasMismatch) {
+          titleMismatchCount++;
+          mismatchScanRefs.push(s.id);
+        }
+      }
+    }
+
+    if (titleMismatchCount >= 2) {
+      const frequency = parseFloat(((titleMismatchCount / sampleSize) * 100).toFixed(0));
+      patterns.push({
+        id: 'pat_metadata_gap',
+        patternType: 'title_content_mismatch',
+        label: 'Recurring Title-to-Content Pacing Gap',
+        severity: 'warning',
+        sampleSize,
+        affectedScansCount: titleMismatchCount,
+        frequency,
+        evidenceReferences: mismatchScanRefs,
+        explanation: `In ${titleMismatchCount} of ${sampleSize} analyzed videos, title promises differed from opening segment pacing or detected content structure.`,
+        recommendation: 'Ensure opening hooks immediately address the subject introduced in the title to maintain audience trust and retention.',
+        confidence: 'MEDIUM',
+        limitations: 'Derived from automated title lexicon matching against initial scene transitions and metadata.',
+        disclaimer: MANDATORY_COVERAGE_STATEMENT
+      });
+    }
+
+    // Strict integrity: originalContributionRatio is NOT measured when reliable transcript evidence is unavailable.
+    // It remains null / INSUFFICIENT_EVIDENCE. No pattern is fabricated from null or acoustic energy.
+
     res.json({
       sampleSize,
       patterns,
-      disclaimer: 'Cross-video insights reflect patterns in your authorized uploaded scans only. YouTube Studio remains the authoritative destination for platform checks.'
+      coverage,
+      coverageDetails,
+      disclaimer: MANDATORY_COVERAGE_STATEMENT,
+      mandatoryCoverageStatement: MANDATORY_COVERAGE_STATEMENT
     });
   } catch (err: any) {
+    console.error('[API] Failed to compute cross-video patterns:', err);
     res.status(500).json({ error: 'Failed to compute cross-video patterns.' });
   }
 });

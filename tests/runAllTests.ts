@@ -43,6 +43,7 @@ async function main() {
     const { runP1DefectRemediationTests } = await import('./p1_defect_remediation.test');
     const { runPhase1StripeReliabilityAndLifecycleTests } = await import('./phase1_stripe_reliability_and_lifecycle.test');
     const { runPhase2DetectionValidationTests } = await import('./phase2_detection_validation.test');
+    const { runPhase3ChannelIntelligenceTests } = await import('./phase3_channel_intelligence.test');
 
     // Narrowly scoped cleanup of test-specific rate limits (never deletes real/unrelated records)
     await storage.rateLimits.clearRateLimits?.();
@@ -97,6 +98,9 @@ async function main() {
 
     // Run Suite 17: Phase 2 Detection Validation & Benchmarks
     await runPhase2DetectionValidationTests();
+
+    // Run Suite 18: Phase 3 Channel Intelligence
+    await runPhase3ChannelIntelligenceTests();
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log(`\n🎉 ALL AUTOMATED VERIFICATION SUITES COMPLETED SUCCESSFULLY in ${elapsed}s!`);

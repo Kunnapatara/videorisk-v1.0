@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { ChannelContextProfile, CrossVideoPattern, UserAccount } from '../types';
+import { ChannelContextProfile, CrossVideoPattern, UserAccount, ChannelPatternsResponse } from '../types';
 import { authFetch } from '../utils/api';
 import { 
   Tv, 
@@ -13,7 +13,9 @@ import {
   Layers, 
   FileCheck,
   AlertTriangle,
-  ArrowRight
+  ArrowRight,
+  ShieldAlert,
+  Database
 } from 'lucide-react';
 
 interface ChannelProfileViewProps {
@@ -38,11 +40,7 @@ export const ChannelProfileView: React.FC<ChannelProfileViewProps> = ({ user, on
   const [typicalSources, setTypicalSources] = useState('');
 
   // Cross-video patterns
-  const [patternsData, setPatternsData] = useState<{
-    sampleSize: number;
-    patterns: CrossVideoPattern[];
-    disclaimer: string;
-  } | null>(null);
+  const [patternsData, setPatternsData] = useState<ChannelPatternsResponse | null>(null);
   const [patternsError, setPatternsError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -354,34 +352,104 @@ export const ChannelProfileView: React.FC<ChannelProfileViewProps> = ({ user, on
       </div>
 
       {/* Cross-Video Recurring Patterns Section */}
-      <div className="bg-white rounded-2xl border border-stone-200 shadow-xs p-6 sm:p-8 space-y-4">
-        <div className="flex items-center justify-between pb-3 border-b border-stone-100">
+      <div className="bg-white rounded-2xl border border-stone-200 shadow-xs p-6 sm:p-8 space-y-6">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-4 border-b border-stone-100 gap-2">
           <div>
             <div className="flex items-center gap-2">
               <TrendingUp className="w-4 h-4 text-rose-600" />
               <h2 className="text-base font-bold text-stone-900">
-                Cross-Video Recurring Patterns
+                Cross-Video Pattern Intelligence
               </h2>
             </div>
             <p className="text-xs text-stone-500 mt-0.5">
-              Identifies potential recurring signals across your own scan history.
+              Evidence-based analysis of recurring patterns across videos uploaded and analyzed in your VideoRisk account.
             </p>
           </div>
 
           {patternsData && (
-            <span className="text-xs text-stone-500 font-semibold">
-              Sample: {patternsData.sampleSize} scanned video(s)
+            <span className="text-xs text-stone-600 font-semibold bg-stone-100 px-3 py-1 rounded-full self-start sm:self-auto">
+              Sample: {patternsData.sampleSize} completed video scan(s)
             </span>
           )}
         </div>
 
+        {/* Mandatory Coverage Statement */}
+        <div className="p-3.5 bg-stone-50 border border-stone-200 rounded-xl text-xs text-stone-600 space-y-1">
+          <div className="flex items-center gap-1.5 font-bold text-stone-800">
+            <Info className="w-3.5 h-3.5 text-stone-500 shrink-0" />
+            <span>Coverage Scope Notice</span>
+          </div>
+          <p className="leading-relaxed text-[11px] text-stone-600">
+            Channel insights are based only on videos uploaded and analyzed in your VideoRisk account. This is not a complete audit of all videos on your YouTube channel.
+          </p>
+        </div>
+
+        {/* Intelligence Capability Coverage Matrix */}
+        <div className="space-y-2">
+          <h3 className="text-xs font-bold text-stone-700 uppercase tracking-wider">
+            Intelligence Capability Coverage
+          </h3>
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2.5 text-xs">
+            <div className="p-3 rounded-lg border border-emerald-200 bg-emerald-50/50 space-y-1">
+              <div className="flex items-center justify-between">
+                <span className="font-bold text-emerald-950">Title & Metadata</span>
+                <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800">AVAILABLE</span>
+              </div>
+              <p className="text-[11px] text-emerald-800 leading-tight">
+                Analyzed across persisted titles, descriptions, tags, and report coherence findings.
+              </p>
+            </div>
+
+            <div className="p-3 rounded-lg border border-stone-200 bg-stone-50 space-y-1">
+              <div className="flex items-center justify-between">
+                <span className="font-bold text-stone-800">Original Contribution</span>
+                <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-stone-200 text-stone-700">INSUFFICIENT_EVIDENCE</span>
+              </div>
+              <p className="text-[11px] text-stone-600 leading-tight">
+                Preserved as unassessed when verified transcript and attribution evidence is unavailable.
+              </p>
+            </div>
+
+            <div className="p-3 rounded-lg border border-stone-200 bg-stone-50 space-y-1">
+              <div className="flex items-center justify-between">
+                <span className="font-bold text-stone-800">Intro / Outro Repetition</span>
+                <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-stone-200 text-stone-700">NOT_AVAILABLE</span>
+              </div>
+              <p className="text-[11px] text-stone-600 leading-tight">
+                Perceptual frame signatures are transient in-memory buffers; cross-scan index is not stored.
+              </p>
+            </div>
+
+            <div className="p-3 rounded-lg border border-stone-200 bg-stone-50 space-y-1">
+              <div className="flex items-center justify-between">
+                <span className="font-bold text-stone-800">Cross-Video Footage</span>
+                <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-stone-200 text-stone-700">NOT_AVAILABLE</span>
+              </div>
+              <p className="text-[11px] text-stone-600 leading-tight">
+                VideoProcessor assesses within-video repeated footage only; cross-scan footage index is not stored.
+              </p>
+            </div>
+
+            <div className="p-3 rounded-lg border border-stone-200 bg-stone-50 space-y-1 sm:col-span-2 md:col-span-1">
+              <div className="flex items-center justify-between">
+                <span className="font-bold text-stone-800">Audio Pattern Recurrence</span>
+                <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-stone-200 text-stone-700">NOT_AVAILABLE</span>
+              </div>
+              <p className="text-[11px] text-stone-600 leading-tight">
+                Acoustic buffers are transient; unconfigured speech/music models do not infer pattern recurrence.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {/* Pattern Findings */}
         {patternsError ? (
           <div className="p-6 bg-rose-50/50 rounded-xl border border-rose-200 text-center text-xs text-rose-900 space-y-3">
             <AlertCircle className="w-6 h-6 text-rose-600 mx-auto" />
             <div>
               <p className="font-bold text-sm">Cross-Video Analysis Unavailable</p>
               <p className="text-rose-700 max-w-md mx-auto leading-relaxed mt-0.5">
-                Unable to retrieve catalog risk patterns. Check your connection or retry later.
+                Unable to retrieve cross-video patterns. Check your connection or retry later.
               </p>
             </div>
             <button
@@ -394,46 +462,94 @@ export const ChannelProfileView: React.FC<ChannelProfileViewProps> = ({ user, on
             </button>
           </div>
         ) : patternsData?.patterns && patternsData.patterns.length > 0 ? (
-          <div className="space-y-3">
-            {patternsData.patterns.map((pat) => (
-              <div 
-                key={pat.id}
-                className="p-4 rounded-xl border border-amber-200 bg-amber-50/60 space-y-2 text-xs"
-              >
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2 font-bold text-amber-950">
-                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
-                    <span>{pat.label}</span>
+          <div className="space-y-3 pt-2">
+            <h3 className="text-xs font-bold text-stone-700 uppercase tracking-wider">
+              Identified Catalog Patterns ({patternsData.patterns.length})
+            </h3>
+            {patternsData.patterns.map((pat) => {
+              const isWarning = pat.severity === 'warning';
+              const isHigh = pat.severity === 'high';
+              const borderCls = isHigh 
+                ? 'border-rose-300 bg-rose-50/60 text-rose-950' 
+                : isWarning 
+                  ? 'border-amber-200 bg-amber-50/60 text-amber-950' 
+                  : 'border-sky-200 bg-sky-50/60 text-sky-950';
+              const badgeCls = isHigh
+                ? 'bg-rose-100 text-rose-800'
+                : isWarning
+                  ? 'bg-amber-100 text-amber-800'
+                  : 'bg-sky-100 text-sky-800';
+
+              return (
+                <div 
+                  key={pat.id}
+                  className={`p-4 rounded-xl border ${borderCls} space-y-2.5 text-xs`}
+                >
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
+                    <div className="flex items-center gap-2 font-bold">
+                      {isHigh ? (
+                        <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                      ) : isWarning ? (
+                        <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                      ) : (
+                        <Info className="w-4 h-4 text-sky-600 shrink-0" />
+                      )}
+                      <span>{pat.label}</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className={`${badgeCls} font-bold px-2 py-0.5 rounded text-[11px]`}>
+                        {pat.affectedScansCount} of {pat.sampleSize || patternsData.sampleSize} videos ({pat.frequency}%)
+                      </span>
+                      {pat.confidence && (
+                        <span className="text-[10px] font-semibold text-stone-500 bg-white/70 px-1.5 py-0.5 rounded border border-stone-200">
+                          {pat.confidence} CONFIDENCE
+                        </span>
+                      )}
+                    </div>
                   </div>
-                  <span className="bg-amber-100 text-amber-800 font-bold px-2 py-0.5 rounded text-[11px]">
-                    {pat.frequency}% of videos
-                  </span>
+
+                  <p className="leading-relaxed">{pat.explanation}</p>
+
+                  {/* Evidence References */}
+                  {pat.evidenceReferences && pat.evidenceReferences.length > 0 && (
+                    <div className="flex items-center gap-1.5 flex-wrap text-[11px]">
+                      <span className="font-semibold text-stone-600">Affected Scans:</span>
+                      {pat.evidenceReferences.map((ref) => (
+                        <span key={ref} className="font-mono text-[10px] bg-white px-1.5 py-0.5 rounded border border-stone-200 text-stone-700">
+                          {ref}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="p-2.5 bg-white/90 rounded-lg border border-stone-200 text-stone-900">
+                    <span className="font-bold block mb-0.5 text-stone-800">Recommended Action:</span>
+                    <span className="text-stone-700 leading-relaxed">{pat.recommendation}</span>
+                  </div>
+
+                  {pat.limitations && (
+                    <p className="text-[10px] text-stone-500 italic">
+                      Limitations: {pat.limitations}
+                    </p>
+                  )}
                 </div>
-                <p className="text-amber-900 leading-relaxed">{pat.explanation}</p>
-                <div className="p-2.5 bg-white/80 rounded-lg border border-amber-200/80 text-amber-950">
-                  <span className="font-bold block mb-0.5">Recommended Adjustment:</span>
-                  <span>{pat.recommendation}</span>
-                </div>
-                <span className="text-[10px] text-amber-700 block italic">
-                  {pat.disclaimer}
-                </span>
-              </div>
-            ))}
+              );
+            })}
           </div>
         ) : !patternsData || patternsData.sampleSize === 0 ? (
           <div className="p-6 bg-stone-50 rounded-xl text-center text-xs text-stone-600 space-y-1.5 border border-stone-200">
             <Info className="w-6 h-6 text-stone-400 mx-auto mb-1" />
-            <p className="font-bold text-sm text-stone-900">No Scans Analyzed Yet</p>
+            <p className="font-bold text-sm text-stone-900">No Completed Scans Analyzed Yet</p>
             <p className="max-w-md mx-auto leading-relaxed text-stone-500">
-              Analyze videos to begin building a channel-level pattern baseline. At least 2 completed scans are required.
+              Upload and analyze videos in VideoRisk to begin building a channel-level pattern baseline. At least 2 completed scans are required to evaluate recurring patterns.
             </p>
           </div>
         ) : patternsData.sampleSize === 1 ? (
           <div className="p-6 bg-amber-50/50 rounded-xl text-center text-xs text-amber-900 space-y-1.5 border border-amber-200">
             <Info className="w-6 h-6 text-amber-600 mx-auto mb-1" />
-            <p className="font-bold text-sm text-amber-950">Preliminary Channel Sample</p>
+            <p className="font-bold text-sm text-amber-950">Preliminary Channel Sample (1 Video)</p>
             <p className="max-w-md mx-auto leading-relaxed text-amber-800">
-              One completed scan is not enough to identify recurring patterns across videos. Analyze at least one more video.
+              One completed scan is insufficient to identify recurring patterns across videos. Analyze at least one additional video to evaluate cross-video consistency.
             </p>
           </div>
         ) : (
@@ -441,7 +557,10 @@ export const ChannelProfileView: React.FC<ChannelProfileViewProps> = ({ user, on
             <CheckCircle2 className="w-6 h-6 text-emerald-600 mx-auto mb-1" />
             <p className="font-bold text-sm text-emerald-950">No Recurring Risk Patterns Detected</p>
             <p className="max-w-md mx-auto leading-relaxed text-emerald-800">
-              No recurring patterns were identified across the {patternsData.sampleSize} analyzed videos. This does not guarantee copyright clearance, YouTube policy compliance, or monetization approval.
+              No duplicate titles or recurring metadata coherence gaps were identified across the {patternsData.sampleSize} analyzed videos in your account sample.
+            </p>
+            <p className="text-[11px] text-emerald-700 max-w-md mx-auto italic mt-1">
+              Note: This observation is limited to the uploaded sample in your VideoRisk account and does not guarantee platform compliance, copyright clearance, or YouTube monetization approval.
             </p>
           </div>
         )}

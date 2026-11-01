@@ -215,16 +215,59 @@ export interface ChannelContextProfile {
   updatedAt: string;
 }
 
+export type CrossVideoPatternType = 
+  | 'exact_repeated_title'
+  | 'series_title_template'
+  | 'repeated_description'
+  | 'title_content_mismatch'
+  | 'recurring_metadata_coherence'
+  | 'repeated_reused_signal'
+  | 'recurring_silence'
+  | 'consistent_originality';
+
 export interface CrossVideoPattern {
   id: string;
-  patternType: 'repeated_reused_signal' | 'recurring_silence' | 'title_content_mismatch' | 'consistent_originality';
+  patternType: CrossVideoPatternType | string;
   label: string;
   severity: 'info' | 'warning' | 'high';
-  frequency: number;
+  sampleSize: number;
   affectedScansCount: number;
+  frequency: number;
+  evidenceReferences?: string[];
   explanation: string;
   recommendation: string;
+  confidence?: ConfidenceLevel;
+  limitations?: string;
   disclaimer: string;
+}
+
+export type ChannelIntelligenceCoverageStatus = 
+  | 'AVAILABLE' 
+  | 'NOT_AVAILABLE' 
+  | 'INSUFFICIENT_EVIDENCE' 
+  | 'NOT_ASSESSED';
+
+export interface ChannelCoverageReport {
+  titleMetadata: ChannelIntelligenceCoverageStatus;
+  introOutro: ChannelIntelligenceCoverageStatus;
+  crossVideoFootage: ChannelIntelligenceCoverageStatus;
+  audioPatterns: ChannelIntelligenceCoverageStatus;
+  originalContribution: ChannelIntelligenceCoverageStatus;
+}
+
+export interface ChannelCoverageDetail {
+  status: ChannelIntelligenceCoverageStatus;
+  reason: string;
+  dataRequirements?: string;
+}
+
+export interface ChannelPatternsResponse {
+  sampleSize: number;
+  patterns: CrossVideoPattern[];
+  coverage: ChannelCoverageReport;
+  coverageDetails?: Record<keyof ChannelCoverageReport, ChannelCoverageDetail>;
+  disclaimer: string;
+  mandatoryCoverageStatement: string;
 }
 
 export interface RiskReport {
