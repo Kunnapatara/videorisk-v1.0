@@ -186,7 +186,7 @@ export class PolicyIntelligenceEngine {
           details: `Acoustic sound energy detected across ${activePct}% of the audio track. Acoustic filters cannot verify whether sound represents spoken commentary, music, sound effects, or ambient noise.`,
           contextualInterpretation: 'Audible sound is present, but creator speech is unverified without transcript analysis.',
           limitations: 'Silence and volume detection measure decibel energy; they do not verify speech presence or original commentary.',
-          recommendedAction: 'If incorporating third-party visuals, ensure original spoken commentary, critique, or education is included.'
+          recommendedAction: 'Verify audio track mix meets intended production standards.'
         });
       }
     } else {
@@ -207,7 +207,7 @@ export class PolicyIntelligenceEngine {
         details: 'No active audio stream or audible sound energy detected.',
         contextualInterpretation: 'Silent videos or text-annotated tutorials are permitted, but absence of creator commentary may receive closer human review under YPP monetization guidelines if third-party footage is used.',
         limitations: 'Audio inspection measures sound presence only; text-on-screen and subtitles are not evaluated by the audio pipeline.',
-        recommendedAction: 'If this video incorporates external footage, consider adding spoken commentary or descriptive contextual audio.'
+        recommendedAction: 'Ensure silent or text-annotated format aligns with your intended production style; no policy action required unless external third-party clips are reused without commentary.'
       });
     }
 
@@ -390,7 +390,7 @@ export class PolicyIntelligenceEngine {
           label: '🟡 Title-to-Video Coherence Review Recommended',
           details: 'Title suggests an in-depth personal case study or factual demonstration, but video audio track is completely silent.',
           contextualInterpretation: 'Large gap between title claims and actual delivered media can trigger Clickbait / Deceptive Practices demotion.',
-          recommendedAction: 'Align title with the actual video subject matter or add an opening spoken hook.'
+          recommendedAction: 'Ensure title accurately reflects the video presentation, or clarify non-verbal format in the title or description.'
         });
       }
     }
@@ -1179,6 +1179,19 @@ export interface ComparisonOptions {
       }
       if (domain === 'video_audio' && origIssue?.evidence?.startsWith('video:') && !revMeta.videoCodec) {
         return { verifiable: false, reason: 'revised scan contains no video stream to verify visual resolution' };
+      }
+      if (domain === 'video_audio' && !revMeta.hasAudio && (origIssue?.evidence?.includes('audio') || origIssue?.type === 'extended_silence' || (origIssue?.category as string) === 'audio_clarity')) {
+        return { verifiable: false, reason: 'revised scan contains no audio track to verify audio issue resolution' };
+      }
+      if (typeof origIssue?.timestampSeconds === 'number' && origIssue.timestampSeconds > 0 && typeof revMeta.durationSeconds === 'number' && revMeta.durationSeconds < origIssue.timestampSeconds) {
+        return { verifiable: false, reason: `revised scan media duration (${revMeta.durationSeconds}s) is shorter than baseline issue timestamp (${origIssue.timestampSeconds}s)` };
+      }
+      // Identical media file check: byte-for-byte identical files cannot resolve media-level defects
+      const origSha = options?.originalScanRecord?.metadata?.sha256;
+      const revSha = revMeta.sha256;
+      const isValidHex64 = (h?: string): boolean => typeof h === 'string' && /^[a-fA-F0-9]{64}$/.test(h.trim());
+      if (domain === 'video_audio' && isValidHex64(origSha) && isValidHex64(revSha) && origSha!.trim().toLowerCase() === revSha!.trim().toLowerCase()) {
+        return { verifiable: false, reason: 'revised media is byte-for-byte identical to baseline (matching SHA-256); media-level findings cannot be resolved without media modifications' };
       }
     }
 

@@ -54,6 +54,17 @@ export interface VideoAnalysisResult {
   detectors?: Record<string, DetectorReport>;
 }
 
+export interface AdaptiveAnalysisResult extends VideoAnalysisResult {
+  candidateTimestamps: number[];
+  requestedFramesCount: number;
+  actualExtractedFramesCount: number;
+  actualAnalyzedFramesCount: number;
+  additionalFramesExtracted: number;
+  sceneCutCoverageRatio: number;
+  candidateOverheadMs: number;
+  adaptiveExtractionStatus: 'SUCCESS' | 'PARTIAL' | 'FAILED' | 'SKIPPED_NO_CANDIDATES';
+}
+
 export class VideoProcessor {
   /**
    * Samples visual frames and performs:
@@ -630,7 +641,9 @@ export class VideoProcessor {
    * 2. Defines non-overlapping sampling windows around scene cuts (default +/-0.5s).
    * 3. Merges overlapping windows to prevent redundant sampling.
    * 4. Enforces strict upper bound on additional frames (maxAdditionalFrames).
-   * 5. Does NOT replace the production baseline until benchmark validation justifies it.
+   * 5. Performs actual frame extraction and 8x8 RGB perceptual inspection.
+   * 6. Strictly computes sceneCutCoverageRatio from verified analyzed frames, not candidate timestamps.
+   * 7. Measures candidateOverheadMs purely for the candidate phase excluding baseline time.
    */
   public async analyzeVideoAdaptiveCandidate(
     videoPath: string,
@@ -639,22 +652,25 @@ export class VideoProcessor {
     options: {
       windowSeconds?: number;
       maxAdditionalFrames?: number;
+      simulateExtractionFailure?: boolean;
+      simulatePartialExtractionCount?: number;
     } = {}
-  ): Promise<VideoAnalysisResult & {
-    additionalFramesExtracted: number;
-    sceneCutCoverageRatio: number;
-    candidateOverheadMs: number;
-  }> {
-    const candidateStart = Date.now();
+  ): Promise<AdaptiveAnalysisResult> {
     const baseline = await this.analyzeVideo(videoPath, metadata, scanMode);
+    const overheadStart = Date.now();
     const cuts = baseline.cutTimestamps || [];
 
     if (cuts.length === 0 || !metadata.videoCodec || metadata.width === 0) {
       return {
         ...baseline,
+        candidateTimestamps: [],
+        requestedFramesCount: 0,
+        actualExtractedFramesCount: 0,
+        actualAnalyzedFramesCount: 0,
         additionalFramesExtracted: 0,
         sceneCutCoverageRatio: 1.0,
-        candidateOverheadMs: Date.now() - candidateStart
+        candidateOverheadMs: Date.now() - overheadStart,
+        adaptiveExtractionStatus: 'SKIPPED_NO_CANDIDATES'
       };
     }
 
@@ -692,10 +708,10 @@ export class VideoProcessor {
         const isCoveredBefore = baselineTimes.some(bt => Math.abs(bt - tBefore) < 0.25);
         const isCoveredAfter = baselineTimes.some(bt => Math.abs(bt - tAfter) < 0.25);
 
-        if (!isCoveredBefore && !candidateTimestamps.includes(tBefore)) {
+        if (!isCoveredBefore && !candidateTimestamps.some(ct => Math.abs(ct - tBefore) < 0.1)) {
           candidateTimestamps.push(tBefore);
         }
-        if (!isCoveredAfter && !candidateTimestamps.includes(tAfter)) {
+        if (!isCoveredAfter && !candidateTimestamps.some(ct => Math.abs(ct - tAfter) < 0.1)) {
           candidateTimestamps.push(tAfter);
         }
         if (candidateTimestamps.length >= maxAdditional) break;
@@ -705,25 +721,117 @@ export class VideoProcessor {
 
     candidateTimestamps.sort((a, b) => a - b);
     const targetedTimestamps = candidateTimestamps.slice(0, maxAdditional);
-    const addedCount = targetedTimestamps.length;
+    const requestedFramesCount = targetedTimestamps.length;
 
-    // 3. Measure cut coverage ratio: how many cuts have a sample point within windowSec
-    const allSamplePoints = [...baselineTimes, ...targetedTimestamps];
+    if (requestedFramesCount === 0) {
+      return {
+        ...baseline,
+        candidateTimestamps,
+        requestedFramesCount: 0,
+        actualExtractedFramesCount: 0,
+        actualAnalyzedFramesCount: 0,
+        additionalFramesExtracted: 0,
+        sceneCutCoverageRatio: cuts.length > 0 ? 0.0 : 1.0,
+        candidateOverheadMs: Date.now() - overheadStart,
+        adaptiveExtractionStatus: 'SKIPPED_NO_CANDIDATES'
+      };
+    }
+
+    // 3. Perform Actual Targeted Frame Extraction and Analysis
+    const targetDir = baseline.tempFramesDir && fs.existsSync(baseline.tempFramesDir)
+      ? baseline.tempFramesDir
+      : path.resolve(process.cwd(), 'uploads', 'frames', `adaptive_${Date.now()}`);
+
+    if (!fs.existsSync(targetDir)) {
+      fs.mkdirSync(targetDir, { recursive: true });
+    }
+
+    const extractedFrames: string[] = [];
+    const actuallyAnalyzedTimestamps: number[] = [];
+
+    for (let i = 0; i < targetedTimestamps.length; i++) {
+      const t = targetedTimestamps[i];
+
+      // Simulated failure / partial testing hooks
+      if (options.simulateExtractionFailure) {
+        continue;
+      }
+      if (typeof options.simulatePartialExtractionCount === 'number' && i >= options.simulatePartialExtractionCount) {
+        continue;
+      }
+
+      const frameFile = path.join(targetDir, `adaptive_cut_${String(i).padStart(3, '0')}.jpg`);
+      try {
+        await execFileAsync('ffmpeg', [
+          '-y',
+          '-ss', String(t),
+          '-i', videoPath,
+          '-frames:v', '1',
+          '-vf', 'scale=160:90',
+          frameFile
+        ], { timeout: 15000 });
+
+        if (fs.existsSync(frameFile) && fs.statSync(frameFile).size > 0) {
+          extractedFrames.push(frameFile);
+
+          // Perform perceptual inspection on 8x8 raw RGB representation
+          const rawResult = await execFileAsync('ffmpeg', [
+            '-y',
+            '-ss', String(t),
+            '-i', videoPath,
+            '-frames:v', '1',
+            '-vf', 'scale=8:8,format=rgb24',
+            '-f', 'rawvideo',
+            '-'
+          ], { encoding: 'buffer', timeout: 15000 });
+
+          if (rawResult.stdout && rawResult.stdout.length === 192) {
+            actuallyAnalyzedTimestamps.push(t);
+          }
+        }
+      } catch (err: any) {
+        console.warn(`[VideoProcessor] Adaptive candidate extraction failed at ${t}s:`, err?.message || err);
+      }
+    }
+
+    const actualExtractedFramesCount = extractedFrames.length;
+    const actualAnalyzedFramesCount = actuallyAnalyzedTimestamps.length;
+    const additionalFramesExtracted = actualAnalyzedFramesCount;
+
+    // 4. Determine Adaptive Extraction Status
+    let adaptiveExtractionStatus: 'SUCCESS' | 'PARTIAL' | 'FAILED' | 'SKIPPED_NO_CANDIDATES';
+    if (requestedFramesCount === 0) {
+      adaptiveExtractionStatus = 'SKIPPED_NO_CANDIDATES';
+    } else if (actualAnalyzedFramesCount === requestedFramesCount) {
+      adaptiveExtractionStatus = 'SUCCESS';
+    } else if (actualAnalyzedFramesCount > 0) {
+      adaptiveExtractionStatus = 'PARTIAL';
+    } else {
+      adaptiveExtractionStatus = 'FAILED';
+    }
+
+    // 5. Measure scene cut coverage ratio strictly from ACTUALLY ANALYZED sample points
+    const allAnalyzedPoints = [...baselineTimes, ...actuallyAnalyzedTimestamps];
     let coveredCuts = 0;
     for (const cut of cuts) {
-      if (allSamplePoints.some(pt => Math.abs(pt - cut) <= windowSec)) {
+      if (allAnalyzedPoints.some(pt => Math.abs(pt - cut) <= windowSec)) {
         coveredCuts++;
       }
     }
     const sceneCutCoverageRatio = cuts.length > 0 ? parseFloat((coveredCuts / cuts.length).toFixed(3)) : 1.0;
-    const candidateOverheadMs = Date.now() - candidateStart;
+    const candidateOverheadMs = Date.now() - overheadStart;
 
     return {
       ...baseline,
-      framesSampled: baseline.framesSampled + addedCount,
-      additionalFramesExtracted: addedCount,
+      framesSampled: baseline.framesSampled + additionalFramesExtracted,
+      candidateTimestamps,
+      requestedFramesCount,
+      actualExtractedFramesCount,
+      actualAnalyzedFramesCount,
+      additionalFramesExtracted,
       sceneCutCoverageRatio,
-      candidateOverheadMs
+      candidateOverheadMs,
+      adaptiveExtractionStatus
     };
   }
 

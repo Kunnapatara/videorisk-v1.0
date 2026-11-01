@@ -1972,18 +1972,29 @@ apiRouter.get('/channel/patterns', async (req: Request, res: Response) => {
     // -------------------------------------------------------------------------
     // 2. SERIES / EPISODIC TITLE TEMPLATES (Observation, NOT a policy violation)
     // -------------------------------------------------------------------------
-    // Identify series patterns like "Topic - Episode 1", "Show Part 2", "Series #3"
-    const seriesRegex = /^(.*?)(?:[\s\-_|:]*(?:ep(?:isode)?|part|vol(?:ume)?|#)\s*\d+.*)$/i;
+    // Identify series patterns like "Topic - Episode 1", "Show Part 2", "Series #3", or "Episode 1: Tech Review"
+    const seriesPrefixRegex = /^(.*?)(?:[\s\-_|:]*(?:ep(?:isode)?|part|vol(?:ume)?|#)\s*\d+.*)$/i;
+    const seriesLeadingRegex = /^(?:(?:ep(?:isode)?|part|vol(?:ume)?|#)\s*\d+[\s\-_|:]*)(.*?)$/i;
     const seriesGroups = new Map<string, ScanJob[]>();
 
     for (const s of completedScans) {
       const rawTitle = (s.videoTitle || '').trim();
-      const match = seriesRegex.exec(rawTitle);
-      if (match && match[1] && match[1].trim().length >= 3) {
-        const seriesPrefix = match[1].trim().toLowerCase();
-        const existing = seriesGroups.get(seriesPrefix) || [];
+      const matchPrefix = seriesPrefixRegex.exec(rawTitle);
+      const matchLeading = seriesLeadingRegex.exec(rawTitle);
+
+      let seriesKey: string | null = null;
+      if (matchPrefix && matchPrefix[1] && matchPrefix[1].trim().length >= 3) {
+        seriesKey = matchPrefix[1].trim().toLowerCase();
+      } else if (matchLeading && matchLeading[1] && matchLeading[1].trim().length >= 3) {
+        seriesKey = matchLeading[1].trim().toLowerCase();
+      } else if (matchLeading) {
+        seriesKey = 'episodic_format';
+      }
+
+      if (seriesKey) {
+        const existing = seriesGroups.get(seriesKey) || [];
         existing.push(s);
-        seriesGroups.set(seriesPrefix, existing);
+        seriesGroups.set(seriesKey, existing);
       }
     }
 
