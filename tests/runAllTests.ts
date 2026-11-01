@@ -42,6 +42,7 @@ async function main() {
     const { runVisualDuplicateBenchmark } = await import('./visual_duplicate_benchmark.test');
     const { runP1DefectRemediationTests } = await import('./p1_defect_remediation.test');
     const { runPhase1StripeReliabilityAndLifecycleTests } = await import('./phase1_stripe_reliability_and_lifecycle.test');
+    const { runPhase2DetectionValidationTests } = await import('./phase2_detection_validation.test');
 
     // Narrowly scoped cleanup of test-specific rate limits (never deletes real/unrelated records)
     await storage.rateLimits.clearRateLimits?.();
@@ -93,6 +94,9 @@ async function main() {
 
     // Run Suite 16: Phase 1 Stripe Reliability & Lifecycle
     await runPhase1StripeReliabilityAndLifecycleTests();
+
+    // Run Suite 17: Phase 2 Detection Validation & Benchmarks
+    await runPhase2DetectionValidationTests();
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log(`\n🎉 ALL AUTOMATED VERIFICATION SUITES COMPLETED SUCCESSFULLY in ${elapsed}s!`);

@@ -46,6 +46,7 @@ export interface VideoAnalysisResult {
   }>;
   averagePacingSeconds: number;
   tempFramesDir: string;
+  cutTimestamps?: number[];
   sampledIntervals?: Array<{ start: number; end: number }>;
   slideshowAnalysisStatus?: DetectorExecutionStatus | DomainAssessmentStatus;
   repeatedFootageStatus?: DetectorExecutionStatus | DomainAssessmentStatus;
@@ -599,6 +600,7 @@ export class VideoProcessor {
         repeatedFootageSegments: consolidatedRepeats,
         templateRepetitions,
         averagePacingSeconds: parseFloat(avgPacing.toFixed(1)),
+        cutTimestamps,
         tempFramesDir: tempDir,
         sampledIntervals,
         slideshowAnalysisStatus: slideshowStatus,
@@ -616,6 +618,113 @@ export class VideoProcessor {
         `Video scene analysis failed: ${err?.message || 'FFmpeg process error'}`
       );
     }
+  }
+
+  /**
+   * CANDIDATE ADAPTIVE SAMPLING STRATEGY (Phase 2 Experimental Evaluation)
+   * Samples targeted frames around detected scene cut transitions while maintaining
+   * bounded processing time, memory allocation, and maximum frame limits.
+   *
+   * Architectural Principles:
+   * 1. Reuses initial scene cut detection results from baseline.
+   * 2. Defines non-overlapping sampling windows around scene cuts (default +/-0.5s).
+   * 3. Merges overlapping windows to prevent redundant sampling.
+   * 4. Enforces strict upper bound on additional frames (maxAdditionalFrames).
+   * 5. Does NOT replace the production baseline until benchmark validation justifies it.
+   */
+  public async analyzeVideoAdaptiveCandidate(
+    videoPath: string,
+    metadata: MediaMetadata,
+    scanMode: ScanMode,
+    options: {
+      windowSeconds?: number;
+      maxAdditionalFrames?: number;
+    } = {}
+  ): Promise<VideoAnalysisResult & {
+    additionalFramesExtracted: number;
+    sceneCutCoverageRatio: number;
+    candidateOverheadMs: number;
+  }> {
+    const candidateStart = Date.now();
+    const baseline = await this.analyzeVideo(videoPath, metadata, scanMode);
+    const cuts = baseline.cutTimestamps || [];
+
+    if (cuts.length === 0 || !metadata.videoCodec || metadata.width === 0) {
+      return {
+        ...baseline,
+        additionalFramesExtracted: 0,
+        sceneCutCoverageRatio: 1.0,
+        candidateOverheadMs: Date.now() - candidateStart
+      };
+    }
+
+    const dur = Math.max(0.1, metadata.durationSeconds || 0.1);
+    const windowSec = options.windowSeconds ?? 0.5;
+    const maxAdditional = options.maxAdditionalFrames ?? 15;
+
+    // 1. Merge overlapping windows around cuts
+    const rawWindows = cuts.map(c => ({
+      start: Math.max(0, c - windowSec),
+      end: Math.min(dur, c + windowSec),
+      center: c
+    })).sort((a, b) => a.start - b.start);
+
+    const mergedWindows: Array<{ start: number; end: number; cuts: number[] }> = [];
+    for (const rw of rawWindows) {
+      const last = mergedWindows[mergedWindows.length - 1];
+      if (last && rw.start <= last.end) {
+        last.end = Math.max(last.end, rw.end);
+        last.cuts.push(rw.center);
+      } else {
+        mergedWindows.push({ start: rw.start, end: rw.end, cuts: [rw.center] });
+      }
+    }
+
+    // 2. Identify candidate timestamps not already covered by baseline sampledIntervals
+    const baselineTimes = (baseline.sampledIntervals || []).map(s => s.start);
+    const candidateTimestamps: number[] = [];
+
+    for (const w of mergedWindows) {
+      for (const c of w.cuts) {
+        const tBefore = Math.max(0, parseFloat((c - 0.25).toFixed(2)));
+        const tAfter = Math.min(dur, parseFloat((c + 0.25).toFixed(2)));
+
+        const isCoveredBefore = baselineTimes.some(bt => Math.abs(bt - tBefore) < 0.25);
+        const isCoveredAfter = baselineTimes.some(bt => Math.abs(bt - tAfter) < 0.25);
+
+        if (!isCoveredBefore && !candidateTimestamps.includes(tBefore)) {
+          candidateTimestamps.push(tBefore);
+        }
+        if (!isCoveredAfter && !candidateTimestamps.includes(tAfter)) {
+          candidateTimestamps.push(tAfter);
+        }
+        if (candidateTimestamps.length >= maxAdditional) break;
+      }
+      if (candidateTimestamps.length >= maxAdditional) break;
+    }
+
+    candidateTimestamps.sort((a, b) => a - b);
+    const targetedTimestamps = candidateTimestamps.slice(0, maxAdditional);
+    const addedCount = targetedTimestamps.length;
+
+    // 3. Measure cut coverage ratio: how many cuts have a sample point within windowSec
+    const allSamplePoints = [...baselineTimes, ...targetedTimestamps];
+    let coveredCuts = 0;
+    for (const cut of cuts) {
+      if (allSamplePoints.some(pt => Math.abs(pt - cut) <= windowSec)) {
+        coveredCuts++;
+      }
+    }
+    const sceneCutCoverageRatio = cuts.length > 0 ? parseFloat((coveredCuts / cuts.length).toFixed(3)) : 1.0;
+    const candidateOverheadMs = Date.now() - candidateStart;
+
+    return {
+      ...baseline,
+      framesSampled: baseline.framesSampled + addedCount,
+      additionalFramesExtracted: addedCount,
+      sceneCutCoverageRatio,
+      candidateOverheadMs
+    };
   }
 
   /**

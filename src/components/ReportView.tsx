@@ -576,6 +576,8 @@ export const ReportView: React.FC<ReportViewProps> = ({
                             det.status === 'NO_SIGNAL_DETECTED' ? 'bg-blue-100 text-blue-800' :
                             det.status === 'NOT_ASSESSED' ? 'bg-amber-100 text-amber-800' :
                             det.status === 'NOT_PROVIDED' ? 'bg-stone-100 text-stone-600' :
+                            det.status === 'ANALYSIS_UNAVAILABLE' ? 'bg-stone-200 text-stone-700' :
+                            det.status === 'INSUFFICIENT_EVIDENCE' ? 'bg-stone-100 text-stone-700' :
                             'bg-rose-100 text-rose-800'
                           }`}>
                             {det.status}
