@@ -95,13 +95,14 @@ export async function runEvidenceIntegrityRegressionTests() {
 
     assert(adaptiveFull.requestedFramesCount > 0, '1.3 Requested frames count > 0');
     assert(adaptiveFull.actualExtractedFramesCount === adaptiveFull.requestedFramesCount, '1.3 All requested frames extracted on disk');
-    assert(adaptiveFull.actualAnalyzedFramesCount === adaptiveFull.requestedFramesCount, '1.3 All extracted frames verified with raw 8x8 RGB perceptual inspection');
-    assert.strictEqual(adaptiveFull.additionalFramesExtracted, adaptiveFull.actualAnalyzedFramesCount, '1.3 additionalFramesExtracted matches actual analyzed frames');
+    assert(adaptiveFull.framesValidatedReadable === adaptiveFull.requestedFramesCount, '1.3 All extracted frames validated readable');
+    assert.strictEqual(adaptiveFull.actualAnalyzedFramesCount, 0, '1.3 actualAnalyzedFramesCount is strictly 0 since no perceptual algorithm is implemented');
+    assert.strictEqual(adaptiveFull.additionalFramesExtracted, adaptiveFull.framesValidatedReadable, '1.3 additionalFramesExtracted matches framesValidatedReadable');
     assert.strictEqual(adaptiveFull.framesSampled, baseline.framesSampled + adaptiveFull.additionalFramesExtracted, '1.3 framesSampled strictly equals baseline + verified additional frames');
     assert.strictEqual(adaptiveFull.adaptiveExtractionStatus, 'SUCCESS', '1.3 Adaptive extraction status is SUCCESS');
-    assert(adaptiveFull.sceneCutCoverageRatio >= 0.80, '1.3 sceneCutCoverageRatio calculated from analyzed frames achieves >= 80%');
+    assert(adaptiveFull.sceneCutCoverageRatio >= 0.80, '1.3 sceneCutCoverageRatio calculated from validated frames achieves >= 80%');
     assert(adaptiveFull.candidateOverheadMs >= 0, '1.3 candidateOverheadMs is non-negative and isolated');
-    console.log('  ✅ PASS: 1.1 Full actual adaptive frame extraction, 8x8 analysis, and coverage verified');
+    console.log('  ✅ PASS: 1.1 Full actual adaptive frame extraction, readability validation, and coverage verified');
 
     // 1.4 Simulated extraction failure (FAILED)
     const adaptiveFailed = await videoProcessor.analyzeVideoAdaptiveCandidate(multiCutVideo, metaMultiCut, 'standard', {
@@ -113,13 +114,30 @@ export async function runEvidenceIntegrityRegressionTests() {
 
     assert(adaptiveFailed.requestedFramesCount > 0, '1.4 Candidate timestamps identified');
     assert.strictEqual(adaptiveFailed.actualExtractedFramesCount, 0, '1.4 Zero frames extracted on failure');
+    assert.strictEqual(adaptiveFailed.framesValidatedReadable, 0, '1.4 Zero frames validated on failure');
     assert.strictEqual(adaptiveFailed.actualAnalyzedFramesCount, 0, '1.4 Zero frames analyzed on failure');
     assert.strictEqual(adaptiveFailed.additionalFramesExtracted, 0, '1.4 additionalFramesExtracted is 0 on extraction failure');
     assert.strictEqual(adaptiveFailed.framesSampled, baseline.framesSampled, '1.4 framesSampled does NOT increment when extraction fails');
     assert.strictEqual(adaptiveFailed.adaptiveExtractionStatus, 'FAILED', '1.4 Adaptive extraction status is FAILED');
     console.log('  ✅ PASS: 1.2 Extraction failure safely caught: 0 frames counted, status FAILED');
 
-    // 1.5 Simulated partial extraction (PARTIAL)
+    // 1.5 Simulated corrupt / truncated RGB bytes (<192 bytes)
+    const adaptiveCorruptRgb = await videoProcessor.analyzeVideoAdaptiveCandidate(multiCutVideo, metaMultiCut, 'standard', {
+      windowSeconds: 0.5,
+      maxAdditionalFrames: 10,
+      simulateCorruptRgbBytes: true
+    });
+    await videoProcessor.cleanupFrames(adaptiveCorruptRgb.tempFramesDir);
+
+    assert(adaptiveCorruptRgb.actualExtractedFramesCount > 0, '1.5 Frames extracted on disk');
+    assert.strictEqual(adaptiveCorruptRgb.framesValidatedReadable, 0, '1.5 Zero frames validated readable when RGB bytes are corrupt');
+    assert.strictEqual(adaptiveCorruptRgb.actualAnalyzedFramesCount, 0, '1.5 Zero frames analyzed');
+    assert.strictEqual(adaptiveCorruptRgb.additionalFramesExtracted, 0, '1.5 additionalFramesExtracted is 0 when validation fails');
+    assert.strictEqual(adaptiveCorruptRgb.framesSampled, baseline.framesSampled, '1.5 framesSampled does NOT increment for unreadable frames');
+    assert.strictEqual(adaptiveCorruptRgb.adaptiveExtractionStatus, 'FAILED', '1.5 Status is FAILED when all extractions fail readability');
+    console.log('  ✅ PASS: 1.3 Corrupt RGB bytes (<192 bytes) rejected from sampled frames, status FAILED');
+
+    // 1.6 Simulated partial extraction (PARTIAL)
     const adaptivePartial = await videoProcessor.analyzeVideoAdaptiveCandidate(multiCutVideo, metaMultiCut, 'standard', {
       windowSeconds: 0.5,
       maxAdditionalFrames: 10,
@@ -127,13 +145,14 @@ export async function runEvidenceIntegrityRegressionTests() {
     });
     await videoProcessor.cleanupFrames(adaptivePartial.tempFramesDir);
 
-    assert(adaptivePartial.requestedFramesCount > 2, '1.5 Requested frames count > 2');
-    assert.strictEqual(adaptivePartial.actualExtractedFramesCount, 2, '1.5 Exactly 2 frames extracted');
-    assert.strictEqual(adaptivePartial.actualAnalyzedFramesCount, 2, '1.5 Exactly 2 frames analyzed');
-    assert.strictEqual(adaptivePartial.additionalFramesExtracted, 2, '1.5 additionalFramesExtracted is exactly 2');
-    assert.strictEqual(adaptivePartial.framesSampled, baseline.framesSampled + 2, '1.5 framesSampled increments only by verified 2 frames');
-    assert.strictEqual(adaptivePartial.adaptiveExtractionStatus, 'PARTIAL', '1.5 Adaptive extraction status is PARTIAL');
-    console.log('  ✅ PASS: 1.3 Partial extraction accurately counts only extracted frames, status PARTIAL');
+    assert(adaptivePartial.requestedFramesCount > 2, '1.6 Requested frames count > 2');
+    assert.strictEqual(adaptivePartial.actualExtractedFramesCount, 2, '1.6 Exactly 2 frames extracted');
+    assert.strictEqual(adaptivePartial.framesValidatedReadable, 2, '1.6 Exactly 2 frames validated readable');
+    assert.strictEqual(adaptivePartial.actualAnalyzedFramesCount, 0, '1.6 actualAnalyzedFramesCount remains 0');
+    assert.strictEqual(adaptivePartial.additionalFramesExtracted, 2, '1.6 additionalFramesExtracted is exactly 2');
+    assert.strictEqual(adaptivePartial.framesSampled, baseline.framesSampled + 2, '1.6 framesSampled increments only by verified 2 frames');
+    assert.strictEqual(adaptivePartial.adaptiveExtractionStatus, 'PARTIAL', '1.6 Adaptive extraction status is PARTIAL');
+    console.log('  ✅ PASS: 1.4 Partial extraction accurately counts only extracted frames, status PARTIAL');
 
     // 1.6 Continuous video without cuts (SKIPPED_NO_CANDIDATES)
     const continuousVideo = path.resolve(fixtureDir, 'adaptive_continuous.mp4');
@@ -150,12 +169,12 @@ export async function runEvidenceIntegrityRegressionTests() {
     const adaptiveNoCuts = await videoProcessor.analyzeVideoAdaptiveCandidate(continuousVideo, metaContinuous, 'standard');
     await videoProcessor.cleanupFrames(adaptiveNoCuts.tempFramesDir);
 
-    assert.strictEqual(adaptiveNoCuts.requestedFramesCount, 0, '1.6 Zero candidate timestamps for continuous video');
-    assert.strictEqual(adaptiveNoCuts.additionalFramesExtracted, 0, '1.6 Zero additional frames for continuous video');
-    assert.strictEqual(adaptiveNoCuts.adaptiveExtractionStatus, 'SKIPPED_NO_CANDIDATES', '1.6 Status is SKIPPED_NO_CANDIDATES');
-    console.log('  ✅ PASS: 1.4 Continuous video with 0 cuts reports SKIPPED_NO_CANDIDATES without redundant extraction');
+    assert.strictEqual(adaptiveNoCuts.requestedFramesCount, 0, '1.7 Zero candidate timestamps for continuous video');
+    assert.strictEqual(adaptiveNoCuts.additionalFramesExtracted, 0, '1.7 Zero additional frames for continuous video');
+    assert.strictEqual(adaptiveNoCuts.adaptiveExtractionStatus, 'SKIPPED_NO_CANDIDATES', '1.7 Status is SKIPPED_NO_CANDIDATES');
+    console.log('  ✅ PASS: 1.5 Continuous video with 0 cuts reports SKIPPED_NO_CANDIDATES without redundant extraction');
 
-    // 1.7 Non-video input (audio-only container)
+    // 1.8 Non-video input (audio-only container)
     const audioOnlyMeta: MediaMetadata = {
       filename: 'audio_only.mp3',
       durationSeconds: 15,
@@ -169,9 +188,9 @@ export async function runEvidenceIntegrityRegressionTests() {
       originalSize: 10000
     };
     const adaptiveAudio = await videoProcessor.analyzeVideoAdaptiveCandidate(continuousVideo, audioOnlyMeta, 'standard');
-    assert.strictEqual(adaptiveAudio.additionalFramesExtracted, 0, '1.7 Zero frames extracted for audio-only container');
-    assert.strictEqual(adaptiveAudio.adaptiveExtractionStatus, 'SKIPPED_NO_CANDIDATES', '1.7 Status is SKIPPED_NO_CANDIDATES');
-    console.log('  ✅ PASS: 1.5 Audio-only container safely handled with 0 frames added');
+    assert.strictEqual(adaptiveAudio.additionalFramesExtracted, 0, '1.8 Zero frames extracted for audio-only container');
+    assert.strictEqual(adaptiveAudio.adaptiveExtractionStatus, 'SKIPPED_NO_CANDIDATES', '1.8 Status is SKIPPED_NO_CANDIDATES');
+    console.log('  ✅ PASS: 1.6 Audio-only container safely handled with 0 frames added');
 
     // -------------------------------------------------------------------------
     // SECTION 2: CHANNEL INTELLIGENCE & TENANT ISOLATION REGRESSION
@@ -548,6 +567,225 @@ export async function runEvidenceIntegrityRegressionTests() {
     assert.strictEqual(compVerifiable.notVerifiedIssues?.length || 0, 0, '3.8 Zero unverified issues');
     assert(compVerifiable.comparisonSummary.includes('Re-scan verified. Resolved 2 prior risk signal(s) with evidence'), '3.8 Verified summary generated');
     console.log('  ✅ PASS: 3.8 Verifiable Resolution confirmed with evidence and updated media version');
+
+    // 3.9 Missing and Invalid SHA-256 Hash Handling (Never falsely claims DIFFERENT or IDENTICAL)
+    const compMissingSha = policyIntelligenceEngine.generateComparison(baseReport, {
+      ...baseReport,
+      topIssues: [],
+      domainReports: {
+        ...baseReport.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean.' }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: undefined } }, // Missing hash!
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'e'.repeat(64) } }
+    });
+    assert.strictEqual(compMissingSha.mediaIdentity?.comparisonStatus, 'UNVERIFIED', '3.9 Missing hash marked UNVERIFIED');
+    assert.strictEqual(compMissingSha.mediaIdentity?.isIdenticalMedia, false, '3.9 Missing hash is not identical');
+
+    const compInvalidSha = policyIntelligenceEngine.generateComparison(baseReport, {
+      ...baseReport,
+      topIssues: [],
+      domainReports: {
+        ...baseReport.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean.' }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'short_invalid_hash' } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'not_a_valid_sha256' } }
+    });
+    assert.strictEqual(compInvalidSha.mediaIdentity?.comparisonStatus, 'UNVERIFIED', '3.9 Invalid format hash marked UNVERIFIED');
+    console.log('  ✅ PASS: 3.9 Missing and invalid SHA-256 hashes safely declared UNVERIFIED without false claims');
+
+    // 3.10 Timestamp = 0 and Near-Boundary Duration Verification
+    const reportWithZeroAndBoundary: RiskReport = {
+      ...baseReport,
+      topIssues: [
+        {
+          id: 'issue_intro_zero',
+          domain: 'video_audio',
+          type: 'repeated_visual_footage',
+          what: '🟡 Intro Repetition',
+          where: '00:00–00:08',
+          why: 'Repeats intro.',
+          fix: 'Vary opening.',
+          evidence: 'video:frame_repeat',
+          context: 'Intro review',
+          recommendedAction: 'Trim intro.',
+          limitations: 'Local check.',
+          confidence: 'HIGH',
+          severity: 'warning',
+          policyArea: 'REUSED CONTENT',
+          category: 'reused_content',
+          timestampSeconds: 0 // Timestamp is 0, but span extends to 8s
+        },
+        {
+          id: 'issue_outro_boundary',
+          domain: 'video_audio',
+          type: 'extended_silence',
+          what: '🟡 Outro Dead Air',
+          where: '00:27–00:30',
+          why: 'Silence at end of 30s video.',
+          fix: 'Trim outro.',
+          evidence: 'audio:silencedetect:gap',
+          context: 'Outro review',
+          recommendedAction: 'Trim outro.',
+          limitations: 'Decibel check.',
+          confidence: 'HIGH',
+          severity: 'warning',
+          policyArea: 'ORIGINAL CONTRIBUTION',
+          category: 'original_contribution',
+          timestampSeconds: 27 // Timestamp near duration boundary
+        }
+      ]
+    };
+
+    // Revised video is only 5s: shorter than intro span (8s)
+    const compIntroTruncated = policyIntelligenceEngine.generateComparison(reportWithZeroAndBoundary, {
+      ...reportWithZeroAndBoundary,
+      topIssues: [],
+      domainReports: {
+        ...reportWithZeroAndBoundary.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean.' }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, durationSeconds: 5, sha256: 'b'.repeat(64) } }
+    });
+    const introNotVerified = compIntroTruncated.notVerifiedIssues!.find(i => i.includes('Intro Repetition'));
+    assert(Boolean(introNotVerified), '3.10 Finding with timestamp=0 spanning to 8s rejected when revised video is 5s');
+    assert(introNotVerified?.includes('shorter than baseline issue timestamp'), '3.10 Reason notes duration truncation for timestamp=0 range');
+
+    // Revised video has 0 duration
+    const compZeroDuration = policyIntelligenceEngine.generateComparison(reportWithZeroAndBoundary, {
+      ...reportWithZeroAndBoundary,
+      topIssues: [],
+      domainReports: {
+        ...reportWithZeroAndBoundary.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean.' }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, durationSeconds: 0, sha256: 'b'.repeat(64) } }
+    });
+    assert(compZeroDuration.notVerifiedIssues!.every(i => i.includes('zero or invalid duration')), '3.10 Zero duration rejected with clear reason');
+    console.log('  ✅ PASS: 3.10 Timestamp=0 ranges, near-boundary timestamps, and zero duration strictly verified');
+
+    // 3.11 Audio Finding Formats & Visual Stream Verification
+    const reportDiverseFindings: RiskReport = {
+      ...baseReport,
+      topIssues: [
+        {
+          id: 'issue_audio_pcm',
+          domain: 'video_audio',
+          type: 'repeated_audio_segment',
+          what: 'ℹ️ Repeated Acoustic Pattern',
+          where: '00:05–00:12',
+          why: 'Acoustic energy repeats.',
+          fix: 'Vary audio.',
+          evidence: 'Direct measured observation via audio_processor:pcm_energy_zcr', // Doesn't start with 'audio:'
+          context: 'Acoustic review',
+          recommendedAction: 'Check licensing.',
+          limitations: 'Local check.',
+          confidence: 'HIGH',
+          severity: 'warning',
+          policyArea: 'REUSED CONTENT',
+          category: 'reused_content',
+          timestampSeconds: 5
+        },
+        {
+          id: 'issue_audio_category',
+          domain: 'video_audio',
+          what: '🟡 Audio Clarity Anomaly',
+          where: '00:10',
+          why: 'Unusual audio mix.',
+          fix: 'Adjust mix.',
+          evidence: 'dsp_filter:bandpass', // No 'audio' in evidence string
+          context: 'Mix review',
+          recommendedAction: 'Adjust mix.',
+          limitations: 'Frequency filter.',
+          confidence: 'HIGH',
+          severity: 'warning',
+          policyArea: 'AUDIO QUALITY',
+          category: 'audio_clarity' as any, // Testing fallback category handling
+          timestampSeconds: 10
+        },
+        {
+          id: 'issue_visual_slideshow',
+          domain: 'video_audio',
+          type: 'slideshow_pattern_detected',
+          what: '🟡 Slideshow Presentation Pattern Detected',
+          where: '00:00–00:30',
+          why: 'Static stills.',
+          fix: 'Add motion.',
+          evidence: 'video_processor:intra_scene_invariance_heuristic',
+          context: 'Slideshow review',
+          recommendedAction: 'Add commentary.',
+          limitations: 'Pacing check.',
+          confidence: 'HIGH',
+          severity: 'warning',
+          policyArea: 'INAUTHENTIC PATTERN',
+          category: 'inauthentic_pattern',
+          timestampSeconds: 0
+        }
+      ]
+    };
+
+    // When revised media has no audio, both audio findings must be NOT VERIFIED
+    const compAudioDiverse = policyIntelligenceEngine.generateComparison(reportDiverseFindings, {
+      ...reportDiverseFindings,
+      topIssues: [],
+      domainReports: {
+        ...reportDiverseFindings.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean.' }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, hasAudio: false, audioCodec: undefined, sha256: 'b'.repeat(64) } }
+    });
+    const pcmNotVerified = compAudioDiverse.notVerifiedIssues!.find(i => i.includes('Repeated Acoustic Pattern'));
+    const catNotVerified = compAudioDiverse.notVerifiedIssues!.find(i => i.includes('Audio Clarity Anomaly'));
+    assert(Boolean(pcmNotVerified), '3.11 PCM audio repetition marked NOT VERIFIED without audio stream');
+    assert(Boolean(catNotVerified), '3.11 audio_clarity category marked NOT VERIFIED without audio stream');
+
+    // When revised media has no video codec, visual finding must be NOT VERIFIED
+    const compVisualNoStream = policyIntelligenceEngine.generateComparison(reportDiverseFindings, {
+      ...reportDiverseFindings,
+      topIssues: [],
+      domainReports: {
+        ...reportDiverseFindings.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean.' }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, videoCodec: undefined, width: 0, sha256: 'b'.repeat(64) } }
+    });
+    const slideNotVerified = compVisualNoStream.notVerifiedIssues!.find(i => i.includes('Slideshow Presentation'));
+    assert(Boolean(slideNotVerified), '3.11 Visual issue marked NOT VERIFIED when video stream is absent');
+    assert(slideNotVerified?.includes('contains no video stream'), '3.11 Reason mentions no video stream');
+    console.log('  ✅ PASS: 3.11 Audio finding patterns and visual stream prerequisites comprehensively verified');
+
+    // 3.12 Non-Completed and In-Progress Scan State Verification
+    const compProcessing = policyIntelligenceEngine.generateComparison(baseReport, {
+      ...baseReport,
+      topIssues: []
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'PROCESSING', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } } // In progress!
+    });
+    assert.strictEqual(compProcessing.resolvedIssues.length, 0, '3.12 In-progress revised scan cannot resolve issues');
+    assert(compProcessing.notVerifiedIssues!.every(i => i.includes('not completed')), '3.12 Mentions not completed');
+
+    const compZeroSize = policyIntelligenceEngine.generateComparison(baseReport, {
+      ...baseReport,
+      topIssues: []
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, originalSize: 0, sha256: 'b'.repeat(64) } } // 0 bytes file
+    });
+    assert.strictEqual(compZeroSize.resolvedIssues.length, 0, '3.12 Empty (0 byte) file cannot resolve issues');
+    assert(compZeroSize.notVerifiedIssues!.every(i => i.includes('empty (0 bytes)')), '3.12 Mentions empty (0 bytes)');
+    console.log('  ✅ PASS: 3.12 Incomplete scan states and empty media fail-closed to NOT VERIFIED');
 
     console.log('\n======================================================');
     console.log('✅ ALL EVIDENCE INTEGRITY & REGRESSION TESTS PASSED');

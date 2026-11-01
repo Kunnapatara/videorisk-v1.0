@@ -58,6 +58,7 @@ export interface AdaptiveAnalysisResult extends VideoAnalysisResult {
   candidateTimestamps: number[];
   requestedFramesCount: number;
   actualExtractedFramesCount: number;
+  framesValidatedReadable: number;
   actualAnalyzedFramesCount: number;
   additionalFramesExtracted: number;
   sceneCutCoverageRatio: number;
@@ -654,6 +655,7 @@ export class VideoProcessor {
       maxAdditionalFrames?: number;
       simulateExtractionFailure?: boolean;
       simulatePartialExtractionCount?: number;
+      simulateCorruptRgbBytes?: boolean | number[];
     } = {}
   ): Promise<AdaptiveAnalysisResult> {
     const baseline = await this.analyzeVideo(videoPath, metadata, scanMode);
@@ -666,6 +668,7 @@ export class VideoProcessor {
         candidateTimestamps: [],
         requestedFramesCount: 0,
         actualExtractedFramesCount: 0,
+        framesValidatedReadable: 0,
         actualAnalyzedFramesCount: 0,
         additionalFramesExtracted: 0,
         sceneCutCoverageRatio: 1.0,
@@ -724,20 +727,27 @@ export class VideoProcessor {
     const requestedFramesCount = targetedTimestamps.length;
 
     if (requestedFramesCount === 0) {
+      let coveredCuts = 0;
+      for (const cut of cuts) {
+        if (baselineTimes.some(pt => Math.abs(pt - cut) <= windowSec)) {
+          coveredCuts++;
+        }
+      }
       return {
         ...baseline,
         candidateTimestamps,
         requestedFramesCount: 0,
         actualExtractedFramesCount: 0,
+        framesValidatedReadable: 0,
         actualAnalyzedFramesCount: 0,
         additionalFramesExtracted: 0,
-        sceneCutCoverageRatio: cuts.length > 0 ? 0.0 : 1.0,
+        sceneCutCoverageRatio: cuts.length > 0 ? parseFloat((coveredCuts / cuts.length).toFixed(3)) : 1.0,
         candidateOverheadMs: Date.now() - overheadStart,
         adaptiveExtractionStatus: 'SKIPPED_NO_CANDIDATES'
       };
     }
 
-    // 3. Perform Actual Targeted Frame Extraction and Analysis
+    // 3. Perform Actual Targeted Frame Extraction and Validation
     const targetDir = baseline.tempFramesDir && fs.existsSync(baseline.tempFramesDir)
       ? baseline.tempFramesDir
       : path.resolve(process.cwd(), 'uploads', 'frames', `adaptive_${Date.now()}`);
@@ -747,7 +757,7 @@ export class VideoProcessor {
     }
 
     const extractedFrames: string[] = [];
-    const actuallyAnalyzedTimestamps: number[] = [];
+    const validatedReadableTimestamps: number[] = [];
 
     for (let i = 0; i < targetedTimestamps.length; i++) {
       const t = targetedTimestamps[i];
@@ -774,19 +784,32 @@ export class VideoProcessor {
         if (fs.existsSync(frameFile) && fs.statSync(frameFile).size > 0) {
           extractedFrames.push(frameFile);
 
-          // Perform perceptual inspection on 8x8 raw RGB representation
-          const rawResult = await execFileAsync('ffmpeg', [
-            '-y',
-            '-ss', String(t),
-            '-i', videoPath,
-            '-frames:v', '1',
-            '-vf', 'scale=8:8,format=rgb24',
-            '-f', 'rawvideo',
-            '-'
-          ], { encoding: 'buffer', timeout: 15000 });
+          // Validate raw pixel decode readability (8x8 RGB raw video: 8 * 8 * 3 = 192 bytes).
+          // NOTE: Perceptual analysis is NOT implemented for candidate frames.
+          // This verifies only that raw bytes can be extracted and decoded from the container.
+          let isReadable = false;
+          if (options.simulateCorruptRgbBytes === true) {
+            isReadable = false;
+          } else if (Array.isArray(options.simulateCorruptRgbBytes) && options.simulateCorruptRgbBytes.includes(i)) {
+            isReadable = false;
+          } else {
+            const rawResult = await execFileAsync('ffmpeg', [
+              '-y',
+              '-ss', String(t),
+              '-i', videoPath,
+              '-frames:v', '1',
+              '-vf', 'scale=8:8,format=rgb24',
+              '-f', 'rawvideo',
+              '-'
+            ], { encoding: 'buffer', timeout: 15000 });
 
-          if (rawResult.stdout && rawResult.stdout.length === 192) {
-            actuallyAnalyzedTimestamps.push(t);
+            if (rawResult.stdout && rawResult.stdout.length === 192) {
+              isReadable = true;
+            }
+          }
+
+          if (isReadable) {
+            validatedReadableTimestamps.push(t);
           }
         }
       } catch (err: any) {
@@ -795,26 +818,28 @@ export class VideoProcessor {
     }
 
     const actualExtractedFramesCount = extractedFrames.length;
-    const actualAnalyzedFramesCount = actuallyAnalyzedTimestamps.length;
-    const additionalFramesExtracted = actualAnalyzedFramesCount;
+    const framesValidatedReadable = validatedReadableTimestamps.length;
+    // Perceptual analysis is not implemented; actualAnalyzedFramesCount is strictly 0
+    const actualAnalyzedFramesCount = 0;
+    const additionalFramesExtracted = framesValidatedReadable;
 
     // 4. Determine Adaptive Extraction Status
     let adaptiveExtractionStatus: 'SUCCESS' | 'PARTIAL' | 'FAILED' | 'SKIPPED_NO_CANDIDATES';
     if (requestedFramesCount === 0) {
       adaptiveExtractionStatus = 'SKIPPED_NO_CANDIDATES';
-    } else if (actualAnalyzedFramesCount === requestedFramesCount) {
+    } else if (framesValidatedReadable === requestedFramesCount && actualExtractedFramesCount === requestedFramesCount) {
       adaptiveExtractionStatus = 'SUCCESS';
-    } else if (actualAnalyzedFramesCount > 0) {
+    } else if (framesValidatedReadable > 0) {
       adaptiveExtractionStatus = 'PARTIAL';
     } else {
       adaptiveExtractionStatus = 'FAILED';
     }
 
-    // 5. Measure scene cut coverage ratio strictly from ACTUALLY ANALYZED sample points
-    const allAnalyzedPoints = [...baselineTimes, ...actuallyAnalyzedTimestamps];
+    // 5. Measure scene cut coverage ratio strictly from ACTUALLY VALIDATED sample points
+    const allValidatedPoints = [...baselineTimes, ...validatedReadableTimestamps];
     let coveredCuts = 0;
     for (const cut of cuts) {
-      if (allAnalyzedPoints.some(pt => Math.abs(pt - cut) <= windowSec)) {
+      if (allValidatedPoints.some(pt => Math.abs(pt - cut) <= windowSec)) {
         coveredCuts++;
       }
     }
@@ -827,6 +852,7 @@ export class VideoProcessor {
       candidateTimestamps,
       requestedFramesCount,
       actualExtractedFramesCount,
+      framesValidatedReadable,
       actualAnalyzedFramesCount,
       additionalFramesExtracted,
       sceneCutCoverageRatio,

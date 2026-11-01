@@ -1147,6 +1147,132 @@ export interface ComparisonOptions {
   }
 
   /**
+   * Helper to identify if a finding is audio-related based on type, evidence, category, or label
+   */
+  private isAudioFinding(issue?: TopIssue): boolean {
+    if (!issue || issue.domain !== 'video_audio') return false;
+
+    // Specific audio types in VideoRisk
+    const audioTypes = [
+      'silent_audio_track',
+      'extended_silence',
+      'repeated_audio_segment',
+      'acoustic_activity_unverified',
+      'audio_mix_unverified',
+      'audio_pacing_gap'
+    ];
+    if (issue.type && audioTypes.includes(issue.type)) {
+      return true;
+    }
+    if (issue.type && (issue.type.includes('audio') || issue.type.includes('silence') || issue.type.includes('acoustic'))) {
+      return true;
+    }
+
+    if ((issue.category as string) === 'audio_clarity') {
+      return true;
+    }
+
+    const ev = (issue.evidence || '').toLowerCase();
+    if (
+      ev.includes('audio') || 
+      ev.includes('silence') || 
+      ev.includes('volumedetect') || 
+      ev.includes('pcm') || 
+      ev.includes('acoustic')
+    ) {
+      return true;
+    }
+
+    const what = (issue.what || '').toLowerCase();
+    // Guard against visual issues that mention audio in passing
+    const visualTypes = ['repeated_visual_footage', 'slideshow_pattern_detected', 'template_repetition', 'scene_pacing_observation'];
+    if (issue.type && visualTypes.includes(issue.type)) {
+      return false;
+    }
+
+    if (
+      what.includes('audio') || 
+      what.includes('silence') || 
+      what.includes('acoustic') ||
+      what.includes('dead air')
+    ) {
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Helper to identify if a finding is visual-related based on type, evidence, or label
+   */
+  private isVisualFinding(issue?: TopIssue): boolean {
+    if (!issue || issue.domain !== 'video_audio') return false;
+
+    const visualTypes = [
+      'repeated_visual_footage',
+      'slideshow_pattern_detected',
+      'template_repetition',
+      'scene_pacing_observation'
+    ];
+    if (issue.type && visualTypes.includes(issue.type)) {
+      return true;
+    }
+    if (issue.type && (issue.type.includes('visual') || issue.type.includes('scene') || issue.type.includes('slideshow') || issue.type.includes('template'))) {
+      return true;
+    }
+
+    const ev = (issue.evidence || '').toLowerCase();
+    if (
+      ev.startsWith('video:') || 
+      ev.includes('video_processor') || 
+      ev.includes('scene_detect') || 
+      ev.includes('perceptual_hash') ||
+      ev.includes('intra_scene') ||
+      ev.includes('template_comparator')
+    ) {
+      return true;
+    }
+
+    const what = (issue.what || '').toLowerCase();
+    if (what.includes('visual') || what.includes('scene') || what.includes('slideshow') || what.includes('template')) {
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Extracts start and end timestamps in seconds from TopIssue (where string or timestampSeconds)
+   */
+  private getFindingTimeSpan(issue?: TopIssue): { start: number; end: number } {
+    let start = typeof issue?.timestampSeconds === 'number' ? issue.timestampSeconds : 0;
+    let end = start;
+
+    if (issue?.where) {
+      const timeRegex = /(?:(\d{1,2}):)?(\d{1,2}):(\d{2})/g;
+      const matches = Array.from(issue.where.matchAll(timeRegex));
+      if (matches.length > 0) {
+        const parsedSeconds: number[] = [];
+        for (const m of matches) {
+          const h = m[1] ? parseInt(m[1], 10) : 0;
+          const min = parseInt(m[2], 10);
+          const sec = parseInt(m[3], 10);
+          parsedSeconds.push(h * 3600 + min * 60 + sec);
+        }
+        if (parsedSeconds.length === 1) {
+          start = parsedSeconds[0];
+          end = parsedSeconds[0];
+        } else if (parsedSeconds.length >= 2) {
+          start = Math.min(parsedSeconds[0], parsedSeconds[1]);
+          end = Math.max(parsedSeconds[0], parsedSeconds[1]);
+        }
+      }
+    }
+
+    return { start, end };
+  }
+
+  /**
    * Determines if a domain detector in the revised scan has sufficient evidence
    * and completed execution to legitimately verify the absence/resolution of an issue.
    */
@@ -1157,12 +1283,15 @@ export interface ComparisonOptions {
     options?: ComparisonOptions,
     origIssue?: TopIssue
   ): { verifiable: boolean; reason?: string } {
-    // 1. Revised scan failure check
+    // 1. Revised scan failure / incomplete check
     if (options?.isRevisedFailed) {
       return { verifiable: false, reason: 'revised scan job failed' };
     }
     if (options?.revisedScanRecord?.status === 'FAILED') {
       return { verifiable: false, reason: 'revised scan status is FAILED' };
+    }
+    if (options?.revisedScanRecord && options.revisedScanRecord.status !== 'COMPLETED') {
+      return { verifiable: false, reason: `revised scan is not completed (status: ${options.revisedScanRecord.status})` };
     }
     if (options?.revisedScanRecord?.error) {
       return { verifiable: false, reason: `revised scan error: ${options.revisedScanRecord.error}` };
@@ -1171,20 +1300,27 @@ export interface ComparisonOptions {
     // 1b. Revised scan media validity check
     const revMeta = options?.revisedScanRecord?.metadata;
     if (revMeta) {
-      if (typeof revMeta.durationSeconds === 'number' && revMeta.durationSeconds <= 0) {
+      if (typeof revMeta.durationSeconds === 'number' && (revMeta.durationSeconds <= 0 || isNaN(revMeta.durationSeconds))) {
         return { verifiable: false, reason: 'revised scan media has zero or invalid duration' };
       }
       if (typeof revMeta.originalSize === 'number' && revMeta.originalSize <= 0) {
         return { verifiable: false, reason: 'revised scan media is empty (0 bytes)' };
       }
-      if (domain === 'video_audio' && origIssue?.evidence?.startsWith('video:') && !revMeta.videoCodec) {
+      if (domain === 'video_audio' && this.isVisualFinding(origIssue) && (!revMeta.videoCodec || revMeta.width === 0)) {
         return { verifiable: false, reason: 'revised scan contains no video stream to verify visual resolution' };
       }
-      if (domain === 'video_audio' && !revMeta.hasAudio && (origIssue?.evidence?.includes('audio') || origIssue?.type === 'extended_silence' || (origIssue?.category as string) === 'audio_clarity')) {
+      if (domain === 'video_audio' && this.isAudioFinding(origIssue) && !revMeta.hasAudio) {
         return { verifiable: false, reason: 'revised scan contains no audio track to verify audio issue resolution' };
       }
-      if (typeof origIssue?.timestampSeconds === 'number' && origIssue.timestampSeconds > 0 && typeof revMeta.durationSeconds === 'number' && revMeta.durationSeconds < origIssue.timestampSeconds) {
-        return { verifiable: false, reason: `revised scan media duration (${revMeta.durationSeconds}s) is shorter than baseline issue timestamp (${origIssue.timestampSeconds}s)` };
+      if (domain === 'video_audio') {
+        const { start: findingStart, end: findingEnd } = this.getFindingTimeSpan(origIssue);
+        const targetTimestamp = findingEnd > findingStart ? findingEnd : (typeof origIssue?.timestampSeconds === 'number' ? origIssue.timestampSeconds : findingStart);
+        if (targetTimestamp > 0 && typeof revMeta.durationSeconds === 'number' && revMeta.durationSeconds < targetTimestamp) {
+          return { verifiable: false, reason: `revised scan media duration (${revMeta.durationSeconds}s) is shorter than baseline issue timestamp (${targetTimestamp}s)` };
+        }
+        if (targetTimestamp === 0 && findingEnd > 0 && typeof revMeta.durationSeconds === 'number' && revMeta.durationSeconds < findingEnd) {
+          return { verifiable: false, reason: `revised scan media duration (${revMeta.durationSeconds}s) is shorter than baseline issue timestamp (${findingEnd}s)` };
+        }
       }
       // Identical media file check: byte-for-byte identical files cannot resolve media-level defects
       const origSha = options?.originalScanRecord?.metadata?.sha256;
@@ -1193,6 +1329,8 @@ export interface ComparisonOptions {
       if (domain === 'video_audio' && isValidHex64(origSha) && isValidHex64(revSha) && origSha!.trim().toLowerCase() === revSha!.trim().toLowerCase()) {
         return { verifiable: false, reason: 'revised media is byte-for-byte identical to baseline (matching SHA-256); media-level findings cannot be resolved without media modifications' };
       }
+    } else if (domain === 'video_audio' && options?.revisedScanRecord) {
+      return { verifiable: false, reason: 'revised media metadata unavailable to verify resolution' };
     }
 
     // 2. Baseline scan completeness check
@@ -1201,6 +1339,9 @@ export interface ComparisonOptions {
       return { verifiable: false, reason: 'baseline scan missing domain report' };
     }
     if (options?.originalScanRecord?.status === 'FAILED') {
+      return { verifiable: false, reason: 'baseline scan was incomplete/failed' };
+    }
+    if (options?.originalScanRecord && options.originalScanRecord.status !== 'COMPLETED') {
       return { verifiable: false, reason: 'baseline scan was incomplete/failed' };
     }
 
