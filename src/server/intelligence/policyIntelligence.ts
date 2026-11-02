@@ -1007,11 +1007,12 @@ export class PolicyIntelligenceEngine {
     const copyrightSignals = finalTimeline.filter(t => t.type === 'repeated_visual_footage' || t.type === 'repeated_audio_segment');
     const copyrightScore = Math.min(100, 10 + (reusedContentRatio > 25 ? 30 : (reusedContentRatio > 0 ? 15 : 0)) + (copyrightSignals.length * 10) + (input.channelProfile?.thirdPartyFootageUsage && input.channelProfile.thirdPartyFootageUsage !== 'none' ? 10 : 0));
 
-    const allDetectors: Record<string, DetectorReport> = {
+    const rawDetectors = {
       ...(input.videoResult.detectors || {}),
       ...(input.audioResult.detectors || {}),
       ...(input.thumbnailMetadata?.detectors || {})
     };
+    const allDetectors: Record<string, DetectorReport> | undefined = Object.keys(rawDetectors).length > 0 ? rawDetectors : undefined;
 
     const timings = input.benchmarkTimings;
 
@@ -1147,12 +1148,36 @@ export interface ComparisonOptions {
   }
 
   /**
-   * Helper to identify if a finding is audio-related based on type, evidence, category, or label
+   * Deterministically classifies a finding in the video_audio domain as 'audio' | 'visual' | 'unknown'.
+   * Enforces strict precedence:
+   * 1. Definitive Visual Types always classify as 'visual' (even if evidence mentions audio).
+   * 2. Definitive Audio Types always classify as 'audio' (even if evidence mentions video or lacks audio).
+   * 3. Non-conflicting type substrings.
+   * 4. Provenance analyzer identifiers.
+   * 5. Domain-specific category (audio_clarity).
+   * 6. Non-conflicting evidence signatures.
+   * 7. Any ambiguous or unidentifiable finding returns 'unknown' (never guessed).
    */
-  private isAudioFinding(issue?: TopIssue): boolean {
-    if (!issue || issue.domain !== 'video_audio') return false;
+  public classifyMediaFindingDomain(issue?: TopIssue): 'audio' | 'visual' | 'unknown' {
+    if (!issue || issue.domain !== 'video_audio') return 'unknown';
 
-    // Specific audio types in VideoRisk
+    const type = issue.type;
+
+    // 1. Strict Type Precedence: Known Visual Types
+    const visualTypes = [
+      'repeated_visual_footage',
+      'slideshow_pattern_detected',
+      'template_repetition',
+      'scene_pacing_observation'
+    ];
+    if (type && visualTypes.includes(type)) {
+      return 'visual';
+    }
+    if (type && (type.startsWith('video_') || type.startsWith('visual_'))) {
+      return 'visual';
+    }
+
+    // 2. Strict Type Precedence: Known Audio Types
     const audioTypes = [
       'silent_audio_track',
       'extended_silence',
@@ -1161,84 +1186,147 @@ export interface ComparisonOptions {
       'audio_mix_unverified',
       'audio_pacing_gap'
     ];
-    if (issue.type && audioTypes.includes(issue.type)) {
-      return true;
+    if (type && audioTypes.includes(type)) {
+      return 'audio';
     }
-    if (issue.type && (issue.type.includes('audio') || issue.type.includes('silence') || issue.type.includes('acoustic'))) {
-      return true;
-    }
-
-    if ((issue.category as string) === 'audio_clarity') {
-      return true;
+    if (type && type.startsWith('audio_')) {
+      return 'audio';
     }
 
+    // 3. Unambiguous Substring in type
+    const typeLower = (type || '').toLowerCase();
+    const hasVisualTypeKw = typeLower.includes('visual') || typeLower.includes('slideshow') || typeLower.includes('scene');
+    const hasAudioTypeKw = typeLower.includes('audio') || typeLower.includes('silence') || typeLower.includes('acoustic');
+    if (hasVisualTypeKw && !hasAudioTypeKw) return 'visual';
+    if (hasAudioTypeKw && !hasVisualTypeKw) return 'audio';
+
+    // 4. Provenance Precedence
     const ev = (issue.evidence || '').toLowerCase();
-    if (
-      ev.includes('audio') || 
-      ev.includes('silence') || 
-      ev.includes('volumedetect') || 
-      ev.includes('pcm') || 
-      ev.includes('acoustic')
-    ) {
-      return true;
+    const hasVisualProv = ev.includes('video_processor:') || ev.includes('ffmpeg:scene_detect') || ev.startsWith('video:');
+    const hasAudioProv = ev.includes('audio_processor:') || ev.includes('ffmpeg:silencedetect') || ev.includes('ffmpeg:volumedetect') || ev.startsWith('audio:');
+    if (hasVisualProv && !hasAudioProv) return 'visual';
+    if (hasAudioProv && !hasVisualProv) return 'audio';
+
+    // 5. Category Precedence (only when type is non-conflicting or absent)
+    if ((issue.category as string) === 'audio_clarity') {
+      return 'audio';
     }
 
-    const what = (issue.what || '').toLowerCase();
-    // Guard against visual issues that mention audio in passing
-    const visualTypes = ['repeated_visual_footage', 'slideshow_pattern_detected', 'template_repetition', 'scene_pacing_observation'];
-    if (issue.type && visualTypes.includes(issue.type)) {
-      return false;
-    }
+    // 6. Strict Non-Conflicting Evidence Substrings
+    const hasVisualEv = ev.includes('perceptual_hash') || ev.includes('intra_scene') || ev.includes('structural_template');
+    const hasAudioEv = ev.includes('pcm_energy') || ev.includes('subband_spectral') || ev.includes('decibel');
+    if (hasVisualEv && !hasAudioEv) return 'visual';
+    if (hasAudioEv && !hasVisualEv) return 'audio';
 
-    if (
-      what.includes('audio') || 
-      what.includes('silence') || 
-      what.includes('acoustic') ||
-      what.includes('dead air')
-    ) {
-      return true;
-    }
-
-    return false;
+    // 7. Ambiguous or unknown: never guess
+    return 'unknown';
   }
 
   /**
-   * Helper to identify if a finding is visual-related based on type, evidence, or label
+   * Helper to identify if a finding is audio-related with strict precedence
    */
-  private isVisualFinding(issue?: TopIssue): boolean {
-    if (!issue || issue.domain !== 'video_audio') return false;
+  public isAudioFinding(issue?: TopIssue): boolean {
+    return this.classifyMediaFindingDomain(issue) === 'audio';
+  }
 
-    const visualTypes = [
-      'repeated_visual_footage',
-      'slideshow_pattern_detected',
-      'template_repetition',
-      'scene_pacing_observation'
-    ];
-    if (issue.type && visualTypes.includes(issue.type)) {
-      return true;
-    }
-    if (issue.type && (issue.type.includes('visual') || issue.type.includes('scene') || issue.type.includes('slideshow') || issue.type.includes('template'))) {
-      return true;
+  /**
+   * Helper to identify if a finding is visual-related with strict precedence
+   */
+  public isVisualFinding(issue?: TopIssue): boolean {
+    return this.classifyMediaFindingDomain(issue) === 'visual';
+  }
+
+  /**
+   * Deterministically identifies the responsible detector key for a finding.
+   * Never guesses. Returns null if responsible detector cannot be safely determined.
+   */
+  public getResponsibleDetectorKey(issue?: TopIssue): string | null {
+    if (!issue) return null;
+
+    if (issue.domain === 'video_audio') {
+      const type = issue.type;
+
+      // 1. Definite Visual Types
+      if (type === 'repeated_visual_footage') return 'video_repeated_footage';
+      if (type === 'slideshow_pattern_detected') return 'video_slideshow_heuristic';
+      if (type === 'template_repetition') return 'video_template_heuristic';
+      if (type === 'scene_pacing_observation') return 'video_scene_cut';
+
+      // 2. Definite Audio Types
+      if (
+        type === 'extended_silence' ||
+        type === 'silent_audio_track' ||
+        type === 'acoustic_activity_unverified' ||
+        type === 'audio_mix_unverified' ||
+        type === 'audio_pacing_gap'
+      ) {
+        return 'audio_silence_volume';
+      }
+      if (type === 'repeated_audio_segment') return 'audio_repeated_segments';
+      if (type === 'speech_unverified' || type === 'missing_voiceover') return 'audio_speech_activity';
+      if (type === 'untranscribed_speech') return 'audio_transcription';
+      if (type === 'unlicensed_music') return 'audio_music_detection';
+
+      // 3. Provenance-based mapping
+      const ev = (issue.evidence || '').toLowerCase();
+      if (ev.includes('perceptual_hash_comparator') || ev.includes('frame_repeat') || ev.startsWith('video:repeated_footage')) {
+        return 'video_repeated_footage';
+      }
+      if (ev.includes('intra_scene_invariance') || ev.includes('slideshow')) {
+        return 'video_slideshow_heuristic';
+      }
+      if (ev.includes('structural_template')) {
+        return 'video_template_heuristic';
+      }
+      if (ev.includes('scene_detect') || ev.includes('pts_intervals')) {
+        return 'video_scene_cut';
+      }
+      if (ev.includes('silencedetect') || ev.includes('volumedetect') || ev.startsWith('audio:silencedetect')) {
+        return 'audio_silence_volume';
+      }
+      if (ev.includes('pcm_energy') || ev.includes('subband_spectral')) {
+        return 'audio_repeated_segments';
+      }
+      if (ev.includes('acoustic_energy_modulation')) {
+        return 'audio_speech_activity';
+      }
+
+      // 4. Category-based fallback
+      if ((issue.category as string) === 'audio_clarity') {
+        return 'audio_silence_volume';
+      }
+
+      // Ambiguous or unknown
+      return null;
     }
 
-    const ev = (issue.evidence || '').toLowerCase();
-    if (
-      ev.startsWith('video:') || 
-      ev.includes('video_processor') || 
-      ev.includes('scene_detect') || 
-      ev.includes('perceptual_hash') ||
-      ev.includes('intra_scene') ||
-      ev.includes('template_comparator')
-    ) {
-      return true;
+    if (issue.domain === 'thumbnail') {
+      const type = issue.type;
+      if (type === 'thumbnail_aspect_ratio' || type === 'thumbnail_resolution') {
+        return 'thumbnail_geometry';
+      }
+      if (type === 'thumbnail_dark' || type === 'thumbnail_luminance') {
+        return 'thumbnail_luminance';
+      }
+      if (type === 'thumbnail_ocr_claim' || type === 'thumbnail_text') {
+        return 'thumbnail_ocr';
+      }
+
+      const ev = (issue.evidence || '').toLowerCase();
+      if (ev.includes('stream_geometry') || ev.includes('ffprobe:dimensions') || ev.includes('ffprobe')) {
+        return 'thumbnail_geometry';
+      }
+      if (ev.includes('signalstats') || ev.includes('yavg') || ev.includes('luminance')) {
+        return 'thumbnail_luminance';
+      }
+      if (ev.includes('ocr') || ev.includes('text_detect')) {
+        return 'thumbnail_ocr';
+      }
+
+      return null;
     }
 
-    const what = (issue.what || '').toLowerCase();
-    if (what.includes('visual') || what.includes('scene') || what.includes('slideshow') || what.includes('template')) {
-      return true;
-    }
-
-    return false;
+    return null;
   }
 
   /**
@@ -1298,21 +1386,32 @@ export interface ComparisonOptions {
     }
 
     // 1b. Revised scan media validity check
-    const revMeta = options?.revisedScanRecord?.metadata;
-    if (revMeta) {
-      if (typeof revMeta.durationSeconds === 'number' && (revMeta.durationSeconds <= 0 || isNaN(revMeta.durationSeconds))) {
-        return { verifiable: false, reason: 'revised scan media has zero or invalid duration' };
+    if (domain === 'video_audio') {
+      // If options are provided (production & explicit options testing), revisedScanRecord & metadata are required
+      if (options) {
+        if (!options.revisedScanRecord) {
+          return { verifiable: false, reason: 'revised scan record unavailable to verify resolution' };
+        }
+        if (!options.revisedScanRecord.metadata) {
+          return { verifiable: false, reason: 'revised media metadata unavailable to verify resolution' };
+        }
       }
-      if (typeof revMeta.originalSize === 'number' && revMeta.originalSize <= 0) {
-        return { verifiable: false, reason: 'revised scan media is empty (0 bytes)' };
-      }
-      if (domain === 'video_audio' && this.isVisualFinding(origIssue) && (!revMeta.videoCodec || revMeta.width === 0)) {
-        return { verifiable: false, reason: 'revised scan contains no video stream to verify visual resolution' };
-      }
-      if (domain === 'video_audio' && this.isAudioFinding(origIssue) && !revMeta.hasAudio) {
-        return { verifiable: false, reason: 'revised scan contains no audio track to verify audio issue resolution' };
-      }
-      if (domain === 'video_audio') {
+
+      const revMeta = options?.revisedScanRecord?.metadata;
+      if (revMeta) {
+        if (typeof revMeta.durationSeconds === 'number' && (revMeta.durationSeconds <= 0 || isNaN(revMeta.durationSeconds))) {
+          return { verifiable: false, reason: 'revised scan media has zero or invalid duration' };
+        }
+        if (typeof revMeta.originalSize === 'number' && revMeta.originalSize <= 0) {
+          return { verifiable: false, reason: 'revised scan media is empty (0 bytes)' };
+        }
+        if (this.isVisualFinding(origIssue) && (!revMeta.videoCodec || revMeta.width === 0)) {
+          return { verifiable: false, reason: 'revised scan contains no video stream to verify visual resolution' };
+        }
+        if (this.isAudioFinding(origIssue) && !revMeta.hasAudio) {
+          return { verifiable: false, reason: 'revised scan contains no audio track to verify audio issue resolution' };
+        }
+
         const { start: findingStart, end: findingEnd } = this.getFindingTimeSpan(origIssue);
         const targetTimestamp = findingEnd > findingStart ? findingEnd : (typeof origIssue?.timestampSeconds === 'number' ? origIssue.timestampSeconds : findingStart);
         if (targetTimestamp > 0 && typeof revMeta.durationSeconds === 'number' && revMeta.durationSeconds < targetTimestamp) {
@@ -1321,16 +1420,15 @@ export interface ComparisonOptions {
         if (targetTimestamp === 0 && findingEnd > 0 && typeof revMeta.durationSeconds === 'number' && revMeta.durationSeconds < findingEnd) {
           return { verifiable: false, reason: `revised scan media duration (${revMeta.durationSeconds}s) is shorter than baseline issue timestamp (${findingEnd}s)` };
         }
+
+        // Identical media file check: byte-for-byte identical files cannot resolve media-level defects
+        const origSha = options?.originalScanRecord?.metadata?.sha256;
+        const revSha = revMeta.sha256;
+        const isValidHex64 = (h?: string): boolean => typeof h === 'string' && /^[a-fA-F0-9]{64}$/.test(h.trim());
+        if (isValidHex64(origSha) && isValidHex64(revSha) && origSha!.trim().toLowerCase() === revSha!.trim().toLowerCase()) {
+          return { verifiable: false, reason: 'revised media is byte-for-byte identical to baseline (matching SHA-256); media-level findings cannot be resolved without media modifications' };
+        }
       }
-      // Identical media file check: byte-for-byte identical files cannot resolve media-level defects
-      const origSha = options?.originalScanRecord?.metadata?.sha256;
-      const revSha = revMeta.sha256;
-      const isValidHex64 = (h?: string): boolean => typeof h === 'string' && /^[a-fA-F0-9]{64}$/.test(h.trim());
-      if (domain === 'video_audio' && isValidHex64(origSha) && isValidHex64(revSha) && origSha!.trim().toLowerCase() === revSha!.trim().toLowerCase()) {
-        return { verifiable: false, reason: 'revised media is byte-for-byte identical to baseline (matching SHA-256); media-level findings cannot be resolved without media modifications' };
-      }
-    } else if (domain === 'video_audio' && options?.revisedScanRecord) {
-      return { verifiable: false, reason: 'revised media metadata unavailable to verify resolution' };
     }
 
     // 2. Baseline scan completeness check
@@ -1369,6 +1467,41 @@ export interface ComparisonOptions {
     }
     if ((revDomain.status as string) === 'ERROR') {
       return { verifiable: false, reason: `detector for ${domain} encountered an execution error` };
+    }
+
+    // 5. Detector-level verification for domains with instrumented detectors (video_audio, thumbnail)
+    if ((domain === 'video_audio' || domain === 'thumbnail') && origIssue) {
+      const responsibleKey = this.getResponsibleDetectorKey(origIssue);
+      if (!responsibleKey) {
+        return { verifiable: false, reason: 'unable to safely determine responsible detector for finding' };
+      }
+
+      const revDetectors = revisedReport.detectors;
+      const hasRevDetectors = Boolean(revDetectors && Object.keys(revDetectors).length > 0);
+      if (hasRevDetectors) {
+        const detectorReport = revDetectors![responsibleKey] || Object.values(revDetectors!).find(d => d.detectorName === responsibleKey);
+        if (!detectorReport) {
+          return { verifiable: false, reason: `responsible detector (${responsibleKey}) execution record is missing from revised scan` };
+        }
+        if (detectorReport.status === 'NOT_ASSESSED') {
+          return { verifiable: false, reason: `responsible detector (${responsibleKey}) was not assessed (NOT_ASSESSED) in revised scan` };
+        }
+        if (detectorReport.status === 'ANALYSIS_UNAVAILABLE') {
+          return { verifiable: false, reason: `analysis for responsible detector (${responsibleKey}) was unavailable (ANALYSIS_UNAVAILABLE) in revised scan` };
+        }
+        if (detectorReport.status === 'NOT_PROVIDED') {
+          return { verifiable: false, reason: `responsible detector (${responsibleKey}) was not provided (NOT_PROVIDED) in revised scan` };
+        }
+        if (detectorReport.status === 'INSUFFICIENT_EVIDENCE') {
+          return { verifiable: false, reason: `responsible detector (${responsibleKey}) reported insufficient evidence (INSUFFICIENT_EVIDENCE) in revised scan` };
+        }
+        if ((detectorReport.status as string) === 'ERROR' || detectorReport.failureReason) {
+          return { verifiable: false, reason: `responsible detector (${responsibleKey}) encountered an execution error (ERROR): ${detectorReport.failureReason || 'execution failure'}` };
+        }
+      } else if (options && 'revisedScanRecord' in options && options.revisedScanRecord?.metadata?.sha256) {
+        // Modern production scan with SHA-256 metadata must have detector reports
+        return { verifiable: false, reason: `responsible detector (${responsibleKey}) execution record is missing from revised scan` };
+      }
     }
 
     return { verifiable: true };

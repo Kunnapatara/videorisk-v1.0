@@ -391,6 +391,26 @@ export async function runEvidenceIntegrityRegressionTests() {
         description_tags: { domain: 'description_tags', domainLabel: 'Desc', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Text check.' },
         thumbnail: { domain: 'thumbnail', domainLabel: 'Thumb', status: 'NOT_PROVIDED', summary: 'None', findingsCount: 0, confidence: 'UNKNOWN', limitations: 'Format check.' },
         channel_context: { domain: 'channel_context', domainLabel: 'Profile', status: 'NOT_PROVIDED', summary: 'None', findingsCount: 0, confidence: 'UNKNOWN', limitations: 'Self-reported.' }
+      },
+      detectors: {
+        video_repeated_footage: {
+          detectorName: 'video_repeated_footage',
+          domain: 'video_audio',
+          status: 'SIGNAL_DETECTED',
+          findingsCount: 1,
+          confidence: 'HIGH',
+          executionTimeMs: 120,
+          evidenceSummary: 'Repeated visual footage detected'
+        },
+        audio_silence_volume: {
+          detectorName: 'audio_silence_volume',
+          domain: 'video_audio',
+          status: 'SIGNAL_DETECTED',
+          findingsCount: 1,
+          confidence: 'HIGH',
+          executionTimeMs: 80,
+          evidenceSummary: 'Extended silence detected'
+        }
       }
     } as any;
 
@@ -556,7 +576,27 @@ export async function runEvidenceIntegrityRegressionTests() {
       domainReports: {
         ...baseReport.domainReports,
         video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean audio/video verified', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean.' }
-      }
+      },
+      detectors: {
+        video_repeated_footage: {
+          detectorName: 'video_repeated_footage',
+          domain: 'video_audio',
+          status: 'NO_SIGNAL_DETECTED',
+          findingsCount: 0,
+          confidence: 'HIGH',
+          executionTimeMs: 110,
+          evidenceSummary: 'No repeated footage detected'
+        },
+        audio_silence_volume: {
+          detectorName: 'audio_silence_volume',
+          domain: 'video_audio',
+          status: 'NO_SIGNAL_DETECTED',
+          findingsCount: 0,
+          confidence: 'HIGH',
+          executionTimeMs: 75,
+          evidenceSummary: 'No silence detected'
+        }
+      } as any
     }, {
       originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
       revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, durationSeconds: 30, sha256: 'e'.repeat(64) } }
@@ -786,6 +826,370 @@ export async function runEvidenceIntegrityRegressionTests() {
     assert.strictEqual(compZeroSize.resolvedIssues.length, 0, '3.12 Empty (0 byte) file cannot resolve issues');
     assert(compZeroSize.notVerifiedIssues!.every(i => i.includes('empty (0 bytes)')), '3.12 Mentions empty (0 bytes)');
     console.log('  ✅ PASS: 3.12 Incomplete scan states and empty media fail-closed to NOT VERIFIED');
+
+    // =========================================================================
+    // [4. Phase 5: 20 Detector-Level Verification & Re-Scan Classification Tests]
+    // =========================================================================
+    console.log('\n[4. Phase 5: 20 Detector-Level Verification & Re-Scan Classification Tests]');
+
+    // Case 1: Visual type with audio in evidence text (classifies as Visual, not Audio)
+    const issueCase1: TopIssue = {
+      id: 'issue_case1',
+      domain: 'video_audio',
+      type: 'repeated_visual_footage',
+      what: 'Visual Repetition with audio keyword in evidence',
+      where: '00:00–00:10',
+      why: 'Repeated frame sequence',
+      fix: 'Trim redundant video frames',
+      evidence: 'video_processor:frame_repeat with background audio track',
+      confidence: 'HIGH',
+      severity: 'warning',
+      policyArea: 'REUSED CONTENT'
+    } as any;
+    assert.strictEqual(policyIntelligenceEngine.classifyMediaFindingDomain(issueCase1), 'visual', 'Case 1: Visual finding with audio text in evidence classifies as visual');
+    assert.strictEqual(policyIntelligenceEngine.isVisualFinding(issueCase1), true, 'Case 1: isVisualFinding is true');
+    assert.strictEqual(policyIntelligenceEngine.isAudioFinding(issueCase1), false, 'Case 1: isAudioFinding is false');
+
+    // Case 2: Audio type with no audio keyword in evidence text (classifies as Audio)
+    const issueCase2: TopIssue = {
+      id: 'issue_case2',
+      domain: 'video_audio',
+      type: 'extended_silence',
+      what: 'Dead Air',
+      where: '00:05–00:15',
+      why: 'Decibel level drop',
+      fix: 'Check pacing',
+      evidence: 'dsp_filter:decibel_drop_below_threshold', // no 'audio' keyword
+      confidence: 'HIGH',
+      severity: 'warning',
+      policyArea: 'ORIGINAL CONTRIBUTION'
+    } as any;
+    assert.strictEqual(policyIntelligenceEngine.classifyMediaFindingDomain(issueCase2), 'audio', 'Case 2: Audio type with no audio keyword in evidence classifies as audio');
+    assert.strictEqual(policyIntelligenceEngine.isAudioFinding(issueCase2), true, 'Case 2: isAudioFinding is true');
+    assert.strictEqual(policyIntelligenceEngine.isVisualFinding(issueCase2), false, 'Case 2: isVisualFinding is false');
+
+    // Case 3: Visual type with audio keywords mixed in provenance (Visual precedence preserved)
+    const issueCase3: TopIssue = {
+      id: 'issue_case3',
+      domain: 'video_audio',
+      type: 'slideshow_pattern_detected',
+      what: 'Slideshow presentation',
+      where: '00:00–00:20',
+      why: 'Static stills',
+      fix: 'Add motion',
+      evidence: 'video_processor:intra_scene; audio_crossfeed:true',
+      confidence: 'HIGH',
+      severity: 'warning',
+      policyArea: 'INAUTHENTIC PATTERN'
+    } as any;
+    assert.strictEqual(policyIntelligenceEngine.classifyMediaFindingDomain(issueCase3), 'visual', 'Case 3: Visual type with mixed provenance preserves visual precedence');
+    assert.strictEqual(policyIntelligenceEngine.isVisualFinding(issueCase3), true, 'Case 3: isVisualFinding is true');
+    assert.strictEqual(policyIntelligenceEngine.isAudioFinding(issueCase3), false, 'Case 3: isAudioFinding is false');
+
+    // Case 4: Unknown Finding type with ambiguous evidence (NOT VERIFIED, cannot map to detector)
+    const issueCase4: TopIssue = {
+      id: 'issue_case4',
+      domain: 'video_audio',
+      type: 'unrecognized_custom_anomaly' as any,
+      what: 'Unknown Custom Anomaly',
+      where: '00:01–00:05',
+      why: 'Ambiguous heuristic',
+      fix: 'Review media',
+      evidence: 'ambiguous_raw_signal',
+      confidence: 'LOW',
+      severity: 'warning',
+      policyArea: 'UNKNOWN'
+    } as any;
+    assert.strictEqual(policyIntelligenceEngine.classifyMediaFindingDomain(issueCase4), 'unknown', 'Case 4: Ambiguous issue domain classification is unknown');
+    assert.strictEqual(policyIntelligenceEngine.getResponsibleDetectorKey(issueCase4), null, 'Case 4: Responsible detector cannot be safely determined (returns null)');
+    const reportCase4: RiskReport = {
+      ...baseReport,
+      topIssues: [issueCase4]
+    };
+    const compCase4 = policyIntelligenceEngine.generateComparison(reportCase4, {
+      ...reportCase4,
+      topIssues: [],
+      domainReports: {
+        ...reportCase4.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      },
+      detectors: {
+        video_repeated_footage: { detectorName: 'video_repeated_footage', domain: 'video_audio', status: 'NO_SIGNAL_DETECTED', findingsCount: 0, confidence: 'HIGH', executionTimeMs: 10, evidenceSummary: 'Clean' }
+      } as any
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+    });
+    assert.strictEqual(compCase4.resolvedIssues.length, 0, 'Case 4: Unknown issue cannot be resolved without identifiable detector');
+    assert(compCase4.notVerifiedIssues!.some(i => i.includes('unable to safely determine responsible detector')), 'Case 4: NOT VERIFIED due to undetermined responsible detector');
+
+    // Case 5: Category conflicting with finding type (finding type precedence preserved)
+    const issueCase5: TopIssue = {
+      id: 'issue_case5',
+      domain: 'video_audio',
+      type: 'repeated_visual_footage',
+      what: 'Visual Footprint Anomaly',
+      where: '00:00–00:10',
+      why: 'Frame hash repetition',
+      fix: 'Trim redundant video',
+      evidence: 'video_processor:frame_repeat',
+      confidence: 'HIGH',
+      severity: 'warning',
+      policyArea: 'ORIGINAL CONTRIBUTION',
+      category: 'audio_clarity' as any // Conflicting category!
+    } as any;
+    assert.strictEqual(policyIntelligenceEngine.classifyMediaFindingDomain(issueCase5), 'visual', 'Case 5: Finding type overrides conflicting category');
+    assert.strictEqual(policyIntelligenceEngine.getResponsibleDetectorKey(issueCase5), 'video_repeated_footage', 'Case 5: Maps to video_repeated_footage despite conflicting category');
+
+    // Case 6: Domain clean (NO_MAJOR_RISK_SIGNALS_DETECTED), but responsible detector is NOT_ASSESSED -> NOT VERIFIED
+    const reportCase6: RiskReport = {
+      ...baseReport,
+      topIssues: [issueCase1]
+    };
+    const compCase6 = policyIntelligenceEngine.generateComparison(reportCase6, {
+      ...reportCase6,
+      topIssues: [],
+      domainReports: {
+        ...reportCase6.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      },
+      detectors: {
+        video_repeated_footage: { detectorName: 'video_repeated_footage', domain: 'video_audio', status: 'NOT_ASSESSED', findingsCount: 0, confidence: 'UNKNOWN', executionTimeMs: 0, evidenceSummary: 'Not run' }
+      } as any
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+    });
+    assert.strictEqual(compCase6.resolvedIssues.length, 0, 'Case 6: NOT_ASSESSED detector cannot resolve issue');
+    assert(compCase6.notVerifiedIssues!.some(i => i.includes('NOT_ASSESSED')), 'Case 6: Mentions NOT_ASSESSED');
+
+    // Case 7: Domain clean, but responsible detector is ANALYSIS_UNAVAILABLE -> NOT VERIFIED
+    const compCase7 = policyIntelligenceEngine.generateComparison(reportCase6, {
+      ...reportCase6,
+      topIssues: [],
+      domainReports: {
+        ...reportCase6.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      },
+      detectors: {
+        video_repeated_footage: { detectorName: 'video_repeated_footage', domain: 'video_audio', status: 'ANALYSIS_UNAVAILABLE', findingsCount: 0, confidence: 'LOW', executionTimeMs: 5, evidenceSummary: 'Unavailable' }
+      } as any
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+    });
+    assert.strictEqual(compCase7.resolvedIssues.length, 0, 'Case 7: ANALYSIS_UNAVAILABLE detector cannot resolve issue');
+    assert(compCase7.notVerifiedIssues!.some(i => i.includes('ANALYSIS_UNAVAILABLE')), 'Case 7: Mentions ANALYSIS_UNAVAILABLE');
+
+    // Case 8: Domain clean, but responsible detector is ERROR -> NOT VERIFIED
+    const compCase8 = policyIntelligenceEngine.generateComparison(reportCase6, {
+      ...reportCase6,
+      topIssues: [],
+      domainReports: {
+        ...reportCase6.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      },
+      detectors: {
+        video_repeated_footage: { detectorName: 'video_repeated_footage', domain: 'video_audio', status: 'ERROR', findingsCount: 0, confidence: 'LOW', executionTimeMs: 12, evidenceSummary: 'Fatal error in detector' }
+      } as any
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+    });
+    assert.strictEqual(compCase8.resolvedIssues.length, 0, 'Case 8: ERROR detector cannot resolve issue');
+    assert(compCase8.notVerifiedIssues!.some(i => i.includes('ERROR')), 'Case 8: Mentions ERROR');
+
+    // Case 9: Domain clean, but responsible detector report is missing -> NOT VERIFIED
+    const compCase9 = policyIntelligenceEngine.generateComparison(reportCase6, {
+      ...reportCase6,
+      topIssues: [],
+      domainReports: {
+        ...reportCase6.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      },
+      detectors: {
+        // video_repeated_footage is omitted/missing!
+        audio_silence_volume: { detectorName: 'audio_silence_volume', domain: 'video_audio', status: 'NO_SIGNAL_DETECTED', findingsCount: 0, confidence: 'HIGH', executionTimeMs: 10, evidenceSummary: 'Clean' }
+      } as any
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+    });
+    assert.strictEqual(compCase9.resolvedIssues.length, 0, 'Case 9: Missing responsible detector record cannot resolve issue');
+    assert(compCase9.notVerifiedIssues!.some(i => i.includes('is missing from revised scan')), 'Case 9: Mentions missing detector execution record');
+
+    // Case 10: Responsible detector completed successfully (status: NO_SIGNAL_DETECTED) -> Resolved
+    const compCase10 = policyIntelligenceEngine.generateComparison(reportCase6, {
+      ...reportCase6,
+      topIssues: [],
+      domainReports: {
+        ...reportCase6.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      },
+      detectors: {
+        video_repeated_footage: { detectorName: 'video_repeated_footage', domain: 'video_audio', status: 'NO_SIGNAL_DETECTED', findingsCount: 0, confidence: 'HIGH', executionTimeMs: 85, evidenceSummary: 'Clean' }
+      } as any
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+    });
+    assert.strictEqual(compCase10.resolvedIssues.length, 1, 'Case 10: Successful detector resolves finding');
+    assert.strictEqual(compCase10.notVerifiedIssues?.length || 0, 0, 'Case 10: Zero unverified issues');
+
+    // Case 11: Unrelated detector is NOT_ASSESSED, but responsible detector completed successfully -> Resolved
+    const compCase11 = policyIntelligenceEngine.generateComparison(reportCase6, {
+      ...reportCase6,
+      topIssues: [],
+      domainReports: {
+        ...reportCase6.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      },
+      detectors: {
+        video_repeated_footage: { detectorName: 'video_repeated_footage', domain: 'video_audio', status: 'NO_SIGNAL_DETECTED', findingsCount: 0, confidence: 'HIGH', executionTimeMs: 85, evidenceSummary: 'Clean' },
+        audio_silence_volume: { detectorName: 'audio_silence_volume', domain: 'video_audio', status: 'NOT_ASSESSED', findingsCount: 0, confidence: 'UNKNOWN', executionTimeMs: 0, evidenceSummary: 'Not run' }
+      } as any
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+    });
+    assert.strictEqual(compCase11.resolvedIssues.length, 1, 'Case 11: Responsible detector success resolves issue even if unrelated detector is NOT_ASSESSED');
+
+    // Case 12: Responsible detector has INSUFFICIENT_EVIDENCE -> NOT VERIFIED
+    const compCase12 = policyIntelligenceEngine.generateComparison(reportCase6, {
+      ...reportCase6,
+      topIssues: [],
+      domainReports: {
+        ...reportCase6.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      },
+      detectors: {
+        video_repeated_footage: { detectorName: 'video_repeated_footage', domain: 'video_audio', status: 'INSUFFICIENT_EVIDENCE', findingsCount: 0, confidence: 'LOW', executionTimeMs: 30, evidenceSummary: 'Insufficient frames' }
+      } as any
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+    });
+    assert.strictEqual(compCase12.resolvedIssues.length, 0, 'Case 12: INSUFFICIENT_EVIDENCE detector cannot resolve issue');
+    assert(compCase12.notVerifiedIssues!.some(i => i.includes('INSUFFICIENT_EVIDENCE')), 'Case 12: Mentions INSUFFICIENT_EVIDENCE');
+
+    // Case 13: Revised scan record missing (options.revisedScanRecord omitted) -> NOT VERIFIED
+    const compCase13 = policyIntelligenceEngine.generateComparison(reportCase6, {
+      ...reportCase6,
+      topIssues: [],
+      domainReports: {
+        ...reportCase6.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } }
+      // revisedScanRecord intentionally missing!
+    });
+    assert.strictEqual(compCase13.resolvedIssues.length, 0, 'Case 13: Missing revisedScanRecord cannot resolve issue');
+    assert(compCase13.notVerifiedIssues!.some(i => i.includes('revised scan record unavailable')), 'Case 13: Mentions revised scan record unavailable');
+
+    // Case 14: Revised media metadata missing (options.revisedScanRecord.metadata undefined) -> NOT VERIFIED
+    const compCase14 = policyIntelligenceEngine.generateComparison(reportCase6, {
+      ...reportCase6,
+      topIssues: [],
+      domainReports: {
+        ...reportCase6.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: undefined } as any // metadata undefined!
+    });
+    assert.strictEqual(compCase14.resolvedIssues.length, 0, 'Case 14: Missing revised media metadata cannot resolve issue');
+    assert(compCase14.notVerifiedIssues!.some(i => i.includes('revised media metadata unavailable')), 'Case 14: Mentions revised media metadata unavailable');
+
+    // Case 15: Revised scan SHA-256 missing -> comparisonStatus: UNVERIFIED
+    const compCase15 = policyIntelligenceEngine.generateComparison(reportCase6, {
+      ...reportCase6,
+      topIssues: [],
+      domainReports: {
+        ...reportCase6.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: undefined } } // SHA-256 missing!
+    });
+    assert.strictEqual(compCase15.mediaIdentity?.comparisonStatus, 'UNVERIFIED', 'Case 15: Missing SHA-256 sets comparisonStatus to UNVERIFIED');
+    assert.strictEqual(compCase15.mediaIdentity?.isIdenticalMedia, false, 'Case 15: isIdenticalMedia is false');
+
+    // Case 16: Revised scan SHA-256 invalid format (non-64-hex) -> comparisonStatus: UNVERIFIED
+    const compCase16 = policyIntelligenceEngine.generateComparison(reportCase6, {
+      ...reportCase6,
+      topIssues: [],
+      domainReports: {
+        ...reportCase6.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'not-a-valid-sha256-string' } } // Invalid SHA!
+    });
+    assert.strictEqual(compCase16.mediaIdentity?.comparisonStatus, 'UNVERIFIED', 'Case 16: Invalid format SHA-256 sets comparisonStatus to UNVERIFIED');
+
+    // Case 17: Identical SHA-256 between original and revised -> NOT VERIFIED
+    const compCase17 = policyIntelligenceEngine.generateComparison(reportCase6, {
+      ...reportCase6,
+      topIssues: [],
+      domainReports: {
+        ...reportCase6.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      },
+      detectors: {
+        video_repeated_footage: { detectorName: 'video_repeated_footage', domain: 'video_audio', status: 'NO_SIGNAL_DETECTED', findingsCount: 0, confidence: 'HIGH', executionTimeMs: 85, evidenceSummary: 'Clean' }
+      } as any
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'c'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'c'.repeat(64) } } // EXACT IDENTICAL SHA!
+    });
+    assert.strictEqual(compCase17.resolvedIssues.length, 0, 'Case 17: Identical SHA-256 cannot resolve media-level issues');
+    assert(compCase17.notVerifiedIssues!.some(i => i.includes('byte-for-byte identical to baseline')), 'Case 17: Mentions byte-for-byte identical');
+
+    // Case 18: Revised scan status is PROCESSING (not COMPLETED) -> NOT VERIFIED
+    const compCase18 = policyIntelligenceEngine.generateComparison(reportCase6, {
+      ...reportCase6,
+      topIssues: []
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'PROCESSING', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+    });
+    assert.strictEqual(compCase18.resolvedIssues.length, 0, 'Case 18: PROCESSING revised scan cannot resolve issue');
+    assert(compCase18.notVerifiedIssues!.some(i => i.includes('not completed')), 'Case 18: Mentions not completed');
+
+    // Case 19: Revised scan status is FAILED -> NOT VERIFIED
+    const compCase19 = policyIntelligenceEngine.generateComparison(reportCase6, {
+      ...reportCase6,
+      topIssues: []
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'FAILED', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+    });
+    assert.strictEqual(compCase19.resolvedIssues.length, 0, 'Case 19: FAILED revised scan cannot resolve issue');
+    assert(compCase19.notVerifiedIssues!.some(i => i.includes('status is FAILED')), 'Case 19: Mentions status is FAILED');
+
+    // Case 20: Revised scan COMPLETED, but responsible detector failed/unavailable -> NOT VERIFIED
+    const compCase20 = policyIntelligenceEngine.generateComparison(reportCase6, {
+      ...reportCase6,
+      topIssues: [],
+      domainReports: {
+        ...reportCase6.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      },
+      detectors: {
+        video_repeated_footage: { detectorName: 'video_repeated_footage', domain: 'video_audio', status: 'ANALYSIS_UNAVAILABLE', findingsCount: 0, confidence: 'LOW', executionTimeMs: 15, evidenceSummary: 'Decoder crashed' }
+      } as any
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+    });
+    assert.strictEqual(compCase20.resolvedIssues.length, 0, 'Case 20: COMPLETED scan with unavailable detector cannot resolve issue');
+    assert(compCase20.notVerifiedIssues!.some(i => i.includes('ANALYSIS_UNAVAILABLE')), 'Case 20: Mentions detector failure/unavailability');
+
+    console.log('  ✅ PASS: All 20 Phase 5 Detector-Level Verification & Re-Scan Classification test cases passed successfully!');
 
     console.log('\n======================================================');
     console.log('✅ ALL EVIDENCE INTEGRITY & REGRESSION TESTS PASSED');
