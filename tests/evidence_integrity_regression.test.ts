@@ -1191,6 +1191,530 @@ export async function runEvidenceIntegrityRegressionTests() {
 
     console.log('  ✅ PASS: All 20 Phase 5 Detector-Level Verification & Re-Scan Classification test cases passed successfully!');
 
+    // =========================================================================
+    // [5. Fail-Closed Detector Verification Hardening Regression Suite]
+    // =========================================================================
+    console.log('\n[5. Fail-Closed Detector Verification Hardening Regression Suite]');
+
+    const baselineRepVisual: RiskReport = {
+      ...baseReport,
+      topIssues: [
+        {
+          id: 'issue_rep_footage_base',
+          domain: 'video_audio',
+          type: 'repeated_visual_footage',
+          what: '🟡 Repeated Visual Footage (95% match)',
+          where: '00:02–00:08',
+          why: 'Repeats frames from earlier segment.',
+          fix: 'Trim redundant video frames.',
+          evidence: 'video_processor:perceptual_hash_comparator',
+          context: 'Frame redundancy detected',
+          recommendedAction: 'Trim redundant video frames',
+          limitations: 'Local analysis only',
+          confidence: 'HIGH',
+          severity: 'warning',
+          policyArea: 'REUSED CONTENT',
+          category: 'reused_content',
+          timestampSeconds: 2
+        }
+      ]
+    };
+
+    // 5.1 Revised report has NO detector records (detectors undefined or empty) -> NOT VERIFIED
+    const comp5_1_undefined = policyIntelligenceEngine.generateComparison(baselineRepVisual, {
+      ...baselineRepVisual,
+      topIssues: [],
+      detectors: undefined,
+      domainReports: {
+        ...baselineRepVisual.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+    });
+    assert.strictEqual(comp5_1_undefined.resolvedIssues.length, 0, '5.1 Revised report with detectors: undefined cannot resolve finding');
+    assert(comp5_1_undefined.notVerifiedIssues!.some(i => i.includes('responsible detector (video_repeated_footage) execution record is missing from revised scan')), '5.1 notVerifiedIssues notes missing detector execution record when detectors is undefined');
+
+    const comp5_1_empty = policyIntelligenceEngine.generateComparison(baselineRepVisual, {
+      ...baselineRepVisual,
+      topIssues: [],
+      detectors: {},
+      domainReports: {
+        ...baselineRepVisual.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+    });
+    assert.strictEqual(comp5_1_empty.resolvedIssues.length, 0, '5.1 Revised report with detectors: {} cannot resolve finding');
+    assert(comp5_1_empty.notVerifiedIssues!.some(i => i.includes('responsible detector (video_repeated_footage) execution record is missing from revised scan')), '5.1 notVerifiedIssues notes missing detector execution record when detectors is empty');
+    console.log('  ✅ PASS: 5.1 Revised report with no detector records fails closed to NOT VERIFIED');
+
+    // 5.2 Revised report has detector record under unexpected key but with unrelated detector name, or mismatched detectorName under key
+    const comp5_2_unrelated = policyIntelligenceEngine.generateComparison(baselineRepVisual, {
+      ...baselineRepVisual,
+      topIssues: [],
+      detectors: {
+        unexpected_custom_key: {
+          detectorName: 'unrelated_audio_detector',
+          version: '1.0.0',
+          status: 'NO_SIGNAL_DETECTED',
+          executionDurationMs: 50,
+          confidence: 0.95,
+          limitations: 'Unrelated detector'
+        } as any
+      },
+      domainReports: {
+        ...baselineRepVisual.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+    });
+    assert.strictEqual(comp5_2_unrelated.resolvedIssues.length, 0, '5.2 Unrelated detector record under unexpected key cannot resolve finding');
+    assert(comp5_2_unrelated.notVerifiedIssues!.some(i => i.includes('responsible detector (video_repeated_footage) execution record is missing from revised scan')), '5.2 notVerifiedIssues notes missing detector execution record for unrelated detector');
+
+    const comp5_2_mismatchedName = policyIntelligenceEngine.generateComparison(baselineRepVisual, {
+      ...baselineRepVisual,
+      topIssues: [],
+      detectors: {
+        video_repeated_footage: {
+          detectorName: 'audio_silence_volume', // Mismatched detector name under key!
+          version: '1.0.0',
+          status: 'NO_SIGNAL_DETECTED',
+          executionDurationMs: 50,
+          confidence: 0.95,
+          limitations: 'Mismatched detector'
+        } as any
+      },
+      domainReports: {
+        ...baselineRepVisual.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+    });
+    assert.strictEqual(comp5_2_mismatchedName.resolvedIssues.length, 0, '5.2 Mismatched detectorName under responsibleKey cannot resolve finding');
+    assert(comp5_2_mismatchedName.notVerifiedIssues!.some(i => i.includes('responsible detector (video_repeated_footage) execution record is missing from revised scan')), '5.2 notVerifiedIssues notes missing detector execution record for mismatched name');
+
+    // Positive case: Valid alias detectorName ('perceptual_hash_comparator') under alternate key resolves correctly
+    const comp5_2_alias = policyIntelligenceEngine.generateComparison(baselineRepVisual, {
+      ...baselineRepVisual,
+      topIssues: [],
+      detectors: {
+        custom_key_detector: {
+          detectorName: 'perceptual_hash_comparator', // Valid alias name for video_repeated_footage!
+          version: '1.0.0',
+          status: 'NO_SIGNAL_DETECTED',
+          executionDurationMs: 65,
+          confidence: 0.95,
+          limitations: 'Clean'
+        } as any
+      },
+      domainReports: {
+        ...baselineRepVisual.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+    });
+    assert.strictEqual(comp5_2_alias.resolvedIssues.length, 1, '5.2 Valid alias detectorName correctly verifies resolution');
+    console.log('  ✅ PASS: 5.2 Unrelated detector names rejected and valid aliases safely accepted');
+
+    // 5.3 Responsible detector is missing while SHA-256 metadata is missing or invalid
+    const comp5_3_missingSha = policyIntelligenceEngine.generateComparison(baselineRepVisual, {
+      ...baselineRepVisual,
+      topIssues: [],
+      detectors: {},
+      domainReports: {
+        ...baselineRepVisual.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: undefined } } // SHA missing!
+    });
+    assert.strictEqual(comp5_3_missingSha.resolvedIssues.length, 0, '5.3 Missing responsible detector with missing SHA cannot resolve finding');
+    assert(comp5_3_missingSha.notVerifiedIssues!.some(i => i.includes('responsible detector (video_repeated_footage) execution record is missing from revised scan')), '5.3 Missing detector rejected even when SHA is missing');
+
+    const comp5_3_invalidSha = policyIntelligenceEngine.generateComparison(baselineRepVisual, {
+      ...baselineRepVisual,
+      topIssues: [],
+      detectors: {},
+      domainReports: {
+        ...baselineRepVisual.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'invalid_non_hex_sha' } } // SHA invalid!
+    });
+    assert.strictEqual(comp5_3_invalidSha.resolvedIssues.length, 0, '5.3 Missing responsible detector with invalid SHA cannot resolve finding');
+    assert(comp5_3_invalidSha.notVerifiedIssues!.some(i => i.includes('responsible detector (video_repeated_footage) execution record is missing from revised scan')), '5.3 Missing detector rejected when SHA is invalid');
+    console.log('  ✅ PASS: 5.3 Missing responsible detector fails closed regardless of missing or invalid SHA-256 metadata');
+
+    // 5.4 Responsible detector is missing while revised domain report claims no major risk signals
+    const comp5_4 = policyIntelligenceEngine.generateComparison(baselineRepVisual, {
+      ...baselineRepVisual,
+      topIssues: [],
+      detectors: {
+        // audio_silence_volume is provided, but video_repeated_footage is MISSING!
+        audio_silence_volume: {
+          detectorName: 'audio_silence_volume',
+          version: '1.0.0',
+          status: 'NO_SIGNAL_DETECTED',
+          executionDurationMs: 40,
+          confidence: 0.95
+        } as any
+      },
+      domainReports: {
+        ...baselineRepVisual.domainReports,
+        // video_audio domain status claims NO_MAJOR_RISK_SIGNALS_DETECTED
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Claims clean signals', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+    });
+    assert.strictEqual(comp5_4.resolvedIssues.length, 0, '5.4 Missing responsible detector cannot resolve even if domain report claims NO_MAJOR_RISK_SIGNALS_DETECTED');
+    assert(comp5_4.notVerifiedIssues!.some(i => i.includes('responsible detector (video_repeated_footage) execution record is missing from revised scan')), '5.4 Missing detector explicitly reported as NOT VERIFIED');
+    console.log('  ✅ PASS: 5.4 Missing responsible detector is not excused by clean domain status claim');
+
+    // 5.5 Responsible detector reports each unavailable or incomplete status
+    const statusesToTest: Array<{ status: any; failureReason?: string; expectedFragment: string }> = [
+      { status: 'NOT_PROVIDED', expectedFragment: 'NOT_PROVIDED' },
+      { status: 'NOT_ASSESSED', expectedFragment: 'NOT_ASSESSED' },
+      { status: 'ANALYSIS_UNAVAILABLE', expectedFragment: 'ANALYSIS_UNAVAILABLE' },
+      { status: 'INSUFFICIENT_EVIDENCE', expectedFragment: 'INSUFFICIENT_EVIDENCE' },
+      { status: 'ERROR', failureReason: 'Process crashed with SIGSEGV', expectedFragment: 'ERROR' },
+      { status: 'DETECTED', expectedFragment: 'detected active risk signals' }
+    ];
+
+    for (const st of statusesToTest) {
+      const compStatus = policyIntelligenceEngine.generateComparison(baselineRepVisual, {
+        ...baselineRepVisual,
+        topIssues: [], // Finding omitted from topIssues!
+        detectors: {
+          video_repeated_footage: {
+            detectorName: 'video_repeated_footage',
+            version: '1.0.0',
+            status: st.status,
+            failureReason: st.failureReason,
+            executionDurationMs: 30,
+            confidence: 0.5
+          } as any
+        },
+        domainReports: {
+          ...baselineRepVisual.domainReports,
+          video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Claimed clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+        }
+      }, {
+        originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+        revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+      });
+      assert.strictEqual(compStatus.resolvedIssues.length, 0, `5.5 Status ${st.status} cannot resolve finding`);
+      assert(compStatus.notVerifiedIssues!.some(i => i.includes(st.expectedFragment)), `5.5 Status ${st.status} documents ${st.expectedFragment} in reason`);
+    }
+    console.log('  ✅ PASS: 5.5 All unavailable/incomplete statuses (NOT_PROVIDED, NOT_ASSESSED, ANALYSIS_UNAVAILABLE, INSUFFICIENT_EVIDENCE, ERROR, DETECTED) fail closed');
+
+    // 5.6 Responsible detector reports a completed NO_SIGNAL_DETECTED result (verifiably resolved)
+    const comp5_6_video = policyIntelligenceEngine.generateComparison(baselineRepVisual, {
+      ...baselineRepVisual,
+      topIssues: [],
+      detectors: {
+        video_repeated_footage: {
+          detectorName: 'video_repeated_footage',
+          version: '1.0.0',
+          status: 'NO_SIGNAL_DETECTED',
+          executionDurationMs: 95,
+          confidence: 0.95,
+          evidenceSummary: 'No repeated footage detected.'
+        } as any
+      },
+      domainReports: {
+        ...baselineRepVisual.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+    });
+    assert.strictEqual(comp5_6_video.resolvedIssues.length, 1, '5.6 Completed NO_SIGNAL_DETECTED detector verifiably resolves finding');
+    assert.strictEqual(comp5_6_video.notVerifiedIssues?.length || 0, 0, '5.6 Zero unverified issues on completed clean detector');
+
+    // Also test thumbnail domain completed NO_SIGNAL_DETECTED resolution
+    const baselineThumbOcr: RiskReport = {
+      ...baseReport,
+      topIssues: [
+        {
+          id: 'issue_thumb_ocr_base',
+          domain: 'thumbnail',
+          type: 'thumbnail_ocr_claim',
+          what: '🟡 Sensational Text Claim Detected',
+          where: 'Thumbnail overlay',
+          why: 'Clickbait text cue found in image.',
+          fix: 'Remove sensational text.',
+          evidence: 'thumbnail_inspector:ocr text="CURE GUARANTEED"',
+          context: 'Overlay text',
+          recommendedAction: 'Remove sensational text',
+          limitations: 'OCR confidence bound',
+          confidence: 'HIGH',
+          severity: 'warning',
+          policyArea: 'THUMBNAIL INTEGRITY',
+          category: 'thumbnail_integrity',
+          timestampSeconds: 0
+        }
+      ]
+    };
+    const comp5_6_thumb = policyIntelligenceEngine.generateComparison(baselineThumbOcr, {
+      ...baselineThumbOcr,
+      topIssues: [],
+      detectors: {
+        thumbnail_ocr: {
+          detectorName: 'local_ocr_adapter',
+          version: '1.0.0',
+          status: 'NO_SIGNAL_DETECTED',
+          executionDurationMs: 40,
+          confidence: 0.90
+        } as any
+      },
+      domainReports: {
+        ...baselineThumbOcr.domainReports,
+        thumbnail: { domain: 'thumbnail', domainLabel: 'Thumb', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean text', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      }
+    });
+    assert.strictEqual(comp5_6_thumb.resolvedIssues.length, 1, '5.6 Completed NO_SIGNAL_DETECTED thumbnail OCR detector verifiably resolves finding');
+    console.log('  ✅ PASS: 5.6 Completed NO_SIGNAL_DETECTED detector runs verifiably resolve findings with evidence');
+
+    // 5.7 Visual and audio Findings are correctly mapped despite misleading evidence strings
+    const issueVisualWithAudioWord: TopIssue = {
+      id: 'issue_vis_misleading',
+      domain: 'video_audio',
+      type: 'repeated_visual_footage',
+      what: '🟡 Visual Scene Repetition',
+      where: '00:00–00:10',
+      why: 'Visual frames repeat.',
+      fix: 'Trim redundant video frames.',
+      evidence: 'video_processor:perceptual_hash_comparator while audio silence was also measured', // Mentions audio & silence!
+      context: 'Video frame match',
+      recommendedAction: 'Trim redundant video frames',
+      limitations: 'Keyframe hash match',
+      confidence: 'HIGH',
+      severity: 'warning',
+      policyArea: 'REUSED CONTENT',
+      category: 'reused_content',
+      timestampSeconds: 0
+    };
+    assert.strictEqual(policyIntelligenceEngine.classifyMediaFindingDomain(issueVisualWithAudioWord), 'visual', '5.7 Visual finding with audio word in evidence classifies as visual');
+    assert.strictEqual(policyIntelligenceEngine.getResponsibleDetectorKey(issueVisualWithAudioWord), 'video_repeated_footage', '5.7 Visual finding maps strictly to video_repeated_footage');
+
+    const issueAudioWithVisualWord: TopIssue = {
+      id: 'issue_aud_misleading',
+      domain: 'video_audio',
+      type: 'extended_silence',
+      what: '🟡 Extended Silence / Unedited Gap',
+      where: '00:10–00:20',
+      why: 'Decibel volume dropped.',
+      fix: 'Trim dead air.',
+      evidence: 'ffmpeg:silencedetect across video scene transition frame', // Mentions video & scene!
+      context: 'Silence threshold exceeded',
+      recommendedAction: 'Trim dead air',
+      limitations: 'Audio silence filter',
+      confidence: 'HIGH',
+      severity: 'warning',
+      policyArea: 'ORIGINAL CONTRIBUTION',
+      category: 'original_contribution',
+      timestampSeconds: 10
+    };
+    assert.strictEqual(policyIntelligenceEngine.classifyMediaFindingDomain(issueAudioWithVisualWord), 'audio', '5.7 Audio finding with video words in evidence classifies as audio');
+    assert.strictEqual(policyIntelligenceEngine.getResponsibleDetectorKey(issueAudioWithVisualWord), 'audio_silence_volume', '5.7 Audio finding maps strictly to audio_silence_volume');
+
+    const issueDeclaredNarration: TopIssue = {
+      id: 'issue_declared_narr',
+      domain: 'video_audio',
+      type: 'declared_narration_unverified',
+      what: 'ℹ️ Declared Narration Unverified',
+      where: '00:00–00:30',
+      why: 'Voice declared in profile but speech unverified.',
+      fix: 'Verify spoken audio.',
+      evidence: 'channel_profile:self_reported + ffmpeg:volumedetect',
+      context: 'Channel profile mismatch',
+      recommendedAction: 'Add verified voiceover',
+      limitations: 'Channel profile self report',
+      confidence: 'LOW',
+      severity: 'warning',
+      policyArea: 'ORIGINAL CONTRIBUTION',
+      category: 'original_contribution',
+      timestampSeconds: 0
+    };
+    assert.strictEqual(policyIntelligenceEngine.classifyMediaFindingDomain(issueDeclaredNarration), 'audio', '5.7 declared_narration_unverified classifies as audio');
+    assert.strictEqual(policyIntelligenceEngine.getResponsibleDetectorKey(issueDeclaredNarration), 'audio_silence_volume', '5.7 declared_narration_unverified maps to audio_silence_volume');
+
+    const issueThumbFileSize: TopIssue = {
+      id: 'issue_thumb_size',
+      domain: 'thumbnail',
+      type: 'thumbnail_file_size',
+      what: '🟡 Thumbnail Size Exceeds Limit',
+      where: 'Thumbnail file size',
+      why: 'File exceeds 2 MB.',
+      fix: 'Compress image.',
+      evidence: 'fs:stat_file_size',
+      context: 'File size exceeded',
+      recommendedAction: 'Compress thumbnail',
+      limitations: 'Filesystem stat',
+      confidence: 'HIGH',
+      severity: 'warning',
+      policyArea: 'THUMBNAIL INTEGRITY',
+      category: 'thumbnail_integrity',
+      timestampSeconds: 0
+    };
+    assert.strictEqual(policyIntelligenceEngine.getResponsibleDetectorKey(issueThumbFileSize), 'thumbnail_geometry', '5.7 thumbnail_file_size maps to thumbnail_geometry');
+    console.log('  ✅ PASS: 5.7 Visual, audio, and thumbnail findings correctly mapped despite misleading evidence text');
+
+    // 5.8 An unknown Finding type cannot be resolved by guessing its detector
+    const issueUnknownType: TopIssue = {
+      id: 'issue_unknown_signal',
+      domain: 'video_audio',
+      type: 'unrecognized_custom_anomaly_type' as any,
+      what: '🟡 Unknown Anomaly Flag',
+      where: '00:05–00:10',
+      why: 'Unrecognized anomaly.',
+      fix: 'Manual inspection.',
+      evidence: 'custom_heuristic_unknown_engine',
+      context: 'Custom heuristic',
+      recommendedAction: 'Manual inspection',
+      limitations: 'Unknown detector',
+      confidence: 'LOW',
+      severity: 'warning',
+      policyArea: 'UNKNOWN' as any,
+      category: 'original_contribution',
+      timestampSeconds: 5
+    };
+    assert.strictEqual(policyIntelligenceEngine.classifyMediaFindingDomain(issueUnknownType), 'unknown', '5.8 Unknown finding type domain classifies as unknown');
+    assert.strictEqual(policyIntelligenceEngine.getResponsibleDetectorKey(issueUnknownType), null, '5.8 getResponsibleDetectorKey returns null for unknown finding');
+
+    const comp5_8 = policyIntelligenceEngine.generateComparison({
+      ...baseReport,
+      topIssues: [issueUnknownType]
+    }, {
+      ...baseReport,
+      topIssues: [],
+      domainReports: {
+        ...baseReport.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      },
+      detectors: {
+        video_repeated_footage: { detectorName: 'video_repeated_footage', version: '1.0.0', status: 'NO_SIGNAL_DETECTED', executionDurationMs: 40 } as any,
+        audio_silence_volume: { detectorName: 'audio_silence_volume', version: '1.0.0', status: 'NO_SIGNAL_DETECTED', executionDurationMs: 40 } as any
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+    });
+    assert.strictEqual(comp5_8.resolvedIssues.length, 0, '5.8 Unknown finding type cannot be resolved by guessing detector');
+    assert(comp5_8.notVerifiedIssues!.some(i => i.includes('unable to safely determine responsible detector')), '5.8 Reason clearly states undetermined responsible detector');
+    console.log('  ✅ PASS: 5.8 Unknown finding types fail closed without guessing responsible detector');
+
+    // 5.9 Existing valid resolution, persistent Finding, new Finding, identical-media, failed-scan, and truncated-media cases continue to behave correctly
+    // 5.9a Valid resolution
+    const comp5_9_valid = policyIntelligenceEngine.generateComparison(baselineRepVisual, {
+      ...baselineRepVisual,
+      topIssues: [],
+      detectors: {
+        video_repeated_footage: { detectorName: 'video_repeated_footage', version: '1.0.0', status: 'NO_SIGNAL_DETECTED', executionDurationMs: 90, confidence: 0.95 } as any
+      },
+      domainReports: {
+        ...baselineRepVisual.domainReports,
+        video_audio: { domain: 'video_audio', domainLabel: 'V&A', status: 'NO_MAJOR_RISK_SIGNALS_DETECTED', summary: 'Clean', findingsCount: 0, confidence: 'HIGH', limitations: 'Clean' }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+    });
+    assert.strictEqual(comp5_9_valid.resolvedIssues.length, 1, '5.9a Valid resolution correctly recorded');
+
+    // 5.9b Persistent Finding
+    const comp5_9_persist = policyIntelligenceEngine.generateComparison(baselineRepVisual, {
+      ...baselineRepVisual,
+      topIssues: [{ ...baselineRepVisual.topIssues[0], id: 'new_id_same_issue' }]
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'b'.repeat(64) } }
+    });
+    assert.strictEqual(comp5_9_persist.remainingIssues.length, 1, '5.9b Persistent finding correctly tracked');
+    assert.strictEqual(comp5_9_persist.resolvedIssues.length, 0, '5.9b Persistent finding is not marked resolved');
+
+    // 5.9c New Finding
+    const comp5_9_new = policyIntelligenceEngine.generateComparison(baselineRepVisual, {
+      ...baselineRepVisual,
+      topIssues: [
+        ...baselineRepVisual.topIssues,
+        {
+          id: 'brand_new_issue',
+          domain: 'title',
+          type: 'sensitive_title_term',
+          what: '🟡 Title Phrase Scrutiny: "Secret"',
+          where: 'Title',
+          why: 'Sensationalism',
+          fix: 'Revise title',
+          evidence: 'nlp:lexicon',
+          context: 'Metadata',
+          recommendedAction: 'Revise',
+          limitations: 'Lexicon lookup',
+          confidence: 'HIGH',
+          severity: 'warning',
+          policyArea: 'METADATA COHERENCE',
+          category: 'metadata_coherence',
+          timestampSeconds: 0
+        }
+      ]
+    });
+    assert.strictEqual(comp5_9_new.newIssues!.length, 1, '5.9c New finding recognized');
+
+    // 5.9d Identical media
+    const comp5_9_identical = policyIntelligenceEngine.generateComparison(baselineRepVisual, {
+      ...baselineRepVisual,
+      topIssues: [],
+      detectors: {
+        video_repeated_footage: { detectorName: 'video_repeated_footage', version: '1.0.0', status: 'NO_SIGNAL_DETECTED', executionDurationMs: 90, confidence: 0.95 } as any
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'c'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'c'.repeat(64) } } // Matching SHA!
+    });
+    assert.strictEqual(comp5_9_identical.resolvedIssues.length, 0, '5.9d Identical media cannot resolve finding');
+    assert(comp5_9_identical.notVerifiedIssues!.some(i => i.includes('byte-for-byte identical')), '5.9d Documents identical media reason');
+
+    // 5.9e Failed scan
+    const comp5_9_failed = policyIntelligenceEngine.generateComparison(baselineRepVisual, {
+      ...baselineRepVisual,
+      topIssues: []
+    }, {
+      isRevisedFailed: true
+    });
+    assert.strictEqual(comp5_9_failed.resolvedIssues.length, 0, '5.9e Failed scan cannot resolve finding');
+    assert(comp5_9_failed.notVerifiedIssues!.some(i => i.includes('revised scan job failed')), '5.9e Documents failed job reason');
+
+    // 5.9f Truncated media
+    const comp5_9_truncated = policyIntelligenceEngine.generateComparison(baselineRepVisual, {
+      ...baselineRepVisual,
+      topIssues: [],
+      detectors: {
+        video_repeated_footage: { detectorName: 'video_repeated_footage', version: '1.0.0', status: 'NO_SIGNAL_DETECTED', executionDurationMs: 90, confidence: 0.95 } as any
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, durationSeconds: 5, sha256: 'b'.repeat(64) } } // Finding spans to 8s!
+    });
+    assert.strictEqual(comp5_9_truncated.resolvedIssues.length, 0, '5.9f Truncated media cannot resolve finding');
+    assert(comp5_9_truncated.notVerifiedIssues!.some(i => i.includes('shorter than baseline issue timestamp')), '5.9f Documents truncated duration reason');
+    console.log('  ✅ PASS: 5.9 Valid resolution, persistence, new findings, identical media, failed scan, and truncated media contracts preserved');
+
     console.log('\n======================================================');
     console.log('✅ ALL EVIDENCE INTEGRITY & REGRESSION TESTS PASSED');
     console.log('======================================================');
