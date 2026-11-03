@@ -1713,7 +1713,555 @@ export async function runEvidenceIntegrityRegressionTests() {
     });
     assert.strictEqual(comp5_9_truncated.resolvedIssues.length, 0, '5.9f Truncated media cannot resolve finding');
     assert(comp5_9_truncated.notVerifiedIssues!.some(i => i.includes('shorter than baseline issue timestamp')), '5.9f Documents truncated duration reason');
-    console.log('  ✅ PASS: 5.9 Valid resolution, persistence, new findings, identical media, failed scan, and truncated media contracts preserved');
+    // =========================================================================
+    // [6. RE-SCAN INTEGRITY & DETECTOR REGISTRY SUITE: 18 HARDENING REGRESSION CASES]
+    // =========================================================================
+    console.log('\n[6. Re-scan Integrity & Detector Registry Hardening Suite (18 Cases)]');
+
+    const baselineRepVideo: RiskReport = {
+      ...baseReport,
+      topIssues: [
+        {
+          id: 'issue_case_rep_vid',
+          domain: 'video_audio',
+          type: 'repeated_visual_footage',
+          what: '🟡 Repeated Visual Footage (95% match)',
+          where: '00:02–00:08',
+          why: 'Repeats frames from earlier segment.',
+          fix: 'Trim redundant video frames.',
+          evidence: 'video_processor:perceptual_hash_comparator',
+          context: 'Frame redundancy detected',
+          recommendedAction: 'Trim redundant video frames',
+          limitations: 'Local analysis only',
+          confidence: 'HIGH',
+          severity: 'warning',
+          policyArea: 'REUSED CONTENT',
+          category: 'reused_content',
+          timestampSeconds: 2
+        }
+      ]
+    };
+
+    const dummyMetaRev: MediaMetadata = {
+      ...dummyMeta,
+      sha256: 'f'.repeat(64),
+      durationSeconds: 30
+    };
+
+    const cleanDomainVA = {
+      video_audio: {
+        domain: 'video_audio' as const,
+        domainLabel: 'Video & Audio Evidence',
+        status: 'NO_MAJOR_RISK_SIGNALS_DETECTED' as const,
+        summary: 'Clean media stream',
+        findingsCount: 0,
+        confidence: 'HIGH' as const,
+        limitations: 'Clean'
+      }
+    };
+
+    // Case 1: Valid detector with sufficient evidence -> RESOLVED
+    const s6CompCase1 = policyIntelligenceEngine.generateComparison(baselineRepVideo, {
+      ...baselineRepVideo,
+      topIssues: [],
+      domainReports: { ...baselineRepVideo.domainReports, ...cleanDomainVA },
+      detectors: {
+        video_repeated_footage: {
+          detectorName: 'perceptual_hash_comparator',
+          version: '1.0.0',
+          status: 'NO_SIGNAL_DETECTED',
+          executionDurationMs: 65,
+          confidence: 0.95
+        }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: dummyMetaRev }
+    });
+    assert.strictEqual(s6CompCase1.resolvedIssues.length, 1, 'Case 1: Valid detector with sufficient evidence resolves issue');
+    assert.strictEqual(s6CompCase1.notVerifiedIssues?.length || 0, 0, 'Case 1: Zero unverified issues on valid resolution');
+    console.log('  ✅ PASS: Case 1: Detector with valid identity and clean evidence verifiably resolves');
+
+    // Case 2: Missing Detector record -> NOT VERIFIED
+    const s6CompCase2 = policyIntelligenceEngine.generateComparison(baselineRepVideo, {
+      ...baselineRepVideo,
+      topIssues: [],
+      domainReports: { ...baselineRepVideo.domainReports, ...cleanDomainVA },
+      detectors: {}
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: dummyMetaRev }
+    });
+    assert.strictEqual(s6CompCase2.resolvedIssues.length, 0, 'Case 2: Missing detector record cannot resolve');
+    assert(s6CompCase2.notVerifiedIssues!.some(i => i.includes('execution record is missing from revised scan')), 'Case 2: Reason states execution record missing');
+    console.log('  ✅ PASS: Case 2: Missing detector record fails closed to NOT VERIFIED');
+
+    // Case 3: Missing detectorName -> NOT VERIFIED
+    const s6CompCase3 = policyIntelligenceEngine.generateComparison(baselineRepVideo, {
+      ...baselineRepVideo,
+      topIssues: [],
+      domainReports: { ...baselineRepVideo.domainReports, ...cleanDomainVA },
+      detectors: {
+        video_repeated_footage: {
+          detectorName: '' as any, // Missing/empty detectorName
+          version: '1.0.0',
+          status: 'NO_SIGNAL_DETECTED',
+          executionDurationMs: 50
+        }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: dummyMetaRev }
+    });
+    assert.strictEqual(s6CompCase3.resolvedIssues.length, 0, 'Case 3: Missing detectorName cannot resolve');
+    assert(s6CompCase3.notVerifiedIssues!.some(i => i.includes('missing detectorName') || i.includes('execution record is missing')), 'Case 3: Reason states missing detectorName');
+    console.log('  ✅ PASS: Case 3: Missing detectorName in record fails closed to NOT VERIFIED');
+
+    // Case 4: Detector identity does not match Registry -> NOT VERIFIED
+    const s6CompCase4_mismatch = policyIntelligenceEngine.generateComparison(baselineRepVideo, {
+      ...baselineRepVideo,
+      topIssues: [],
+      domainReports: { ...baselineRepVideo.domainReports, ...cleanDomainVA },
+      detectors: {
+        video_repeated_footage: {
+          detectorName: 'unregistered_external_matcher', // Not in registry!
+          version: '1.0.0',
+          status: 'NO_SIGNAL_DETECTED',
+          executionDurationMs: 50
+        }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: dummyMetaRev }
+    });
+    assert.strictEqual(s6CompCase4_mismatch.resolvedIssues.length, 0, 'Case 4: Unmatched detector identity cannot resolve');
+    assert(s6CompCase4_mismatch.notVerifiedIssues!.some(i => i.includes('unapproved detector identity') || i.includes('execution record is missing')), 'Case 4: Reason states unapproved identity');
+    console.log('  ✅ PASS: Case 4: Detector identity not matching Registry fails closed to NOT VERIFIED');
+
+    // Case 5: Detector using an allowed alias -> RESOLVED
+    const s6CompCase5_alias = policyIntelligenceEngine.generateComparison(baselineRepVideo, {
+      ...baselineRepVideo,
+      topIssues: [],
+      domainReports: { ...baselineRepVideo.domainReports, ...cleanDomainVA },
+      detectors: {
+        custom_detector_key: {
+          detectorName: 'perceptual_hash_comparator', // Canonical alias for video_repeated_footage
+          version: '1.0.0',
+          status: 'NO_SIGNAL_DETECTED',
+          executionDurationMs: 50
+        }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: dummyMetaRev }
+    });
+    assert.strictEqual(s6CompCase5_alias.resolvedIssues.length, 1, 'Case 5: Allowed alias verifies resolution');
+    assert.strictEqual(s6CompCase5_alias.notVerifiedIssues?.length || 0, 0, 'Case 5: Zero unverified issues on allowed alias');
+    console.log('  ✅ PASS: Case 5: Detector using allowed Registry alias resolves correctly');
+
+    // Case 6: Unapproved alias -> NOT VERIFIED
+    const s6CompCase6_unapproved = policyIntelligenceEngine.generateComparison(baselineRepVideo, {
+      ...baselineRepVideo,
+      topIssues: [],
+      domainReports: { ...baselineRepVideo.domainReports, ...cleanDomainVA },
+      detectors: {
+        custom_key: {
+          detectorName: 'unapproved_frame_differencing_tool',
+          version: '1.0.0',
+          status: 'NO_SIGNAL_DETECTED',
+          executionDurationMs: 50
+        }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: dummyMetaRev }
+    });
+    assert.strictEqual(s6CompCase6_unapproved.resolvedIssues.length, 0, 'Case 6: Unapproved alias cannot resolve');
+    assert(s6CompCase6_unapproved.notVerifiedIssues!.some(i => i.includes('execution record is missing from revised scan')), 'Case 6: Unapproved alias rejected');
+    console.log('  ✅ PASS: Case 6: Unapproved alias rejected and fails closed to NOT VERIFIED');
+
+    // Case 7: Valid success statuses for both Risk Signal and Measurement detectors -> RESOLVED
+    // 7a: Risk signal detector with NO_SIGNAL_DETECTED
+    const s6CompCase7a = policyIntelligenceEngine.generateComparison(baselineRepVideo, {
+      ...baselineRepVideo,
+      topIssues: [],
+      domainReports: { ...baselineRepVideo.domainReports, ...cleanDomainVA },
+      detectors: {
+        video_repeated_footage: {
+          detectorName: 'video_repeated_footage',
+          version: '1.0.0',
+          status: 'NO_SIGNAL_DETECTED',
+          executionDurationMs: 40
+        }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: dummyMetaRev }
+    });
+    assert.strictEqual(s6CompCase7a.resolvedIssues.length, 1, 'Case 7a: Risk detector with NO_SIGNAL_DETECTED resolves');
+
+    // 7b: Measurement detector (thumbnail_geometry) with DETECTED
+    const baselineThumbGeo: RiskReport = {
+      ...baseReport,
+      topIssues: [
+        {
+          id: 'issue_thumb_aspect',
+          domain: 'thumbnail',
+          type: 'thumbnail_aspect_ratio',
+          what: '🟡 Non-Standard Thumbnail Aspect Ratio (1:1)',
+          where: 'Thumbnail dimensions',
+          why: 'Non-16:9 layout',
+          fix: 'Resize to 16:9',
+          evidence: 'ffprobe:dimensions',
+          context: 'Display',
+          recommendedAction: 'Fix aspect ratio',
+          confidence: 'HIGH',
+          severity: 'warning',
+          policyArea: 'THUMBNAIL INTEGRITY',
+          category: 'thumbnail_integrity',
+          timestampSeconds: 0,
+          limitations: 'Dimensions verified'
+        }
+      ]
+    };
+    const s6CompCase7b = policyIntelligenceEngine.generateComparison(baselineThumbGeo, {
+      ...baselineThumbGeo,
+      topIssues: [],
+      domainReports: {
+        ...baselineThumbGeo.domainReports,
+        thumbnail: {
+          domain: 'thumbnail',
+          domainLabel: 'Thumbnail Analysis',
+          status: 'NO_MAJOR_RISK_SIGNALS_DETECTED',
+          summary: '16:9 layout verified',
+          findingsCount: 0,
+          confidence: 'HIGH',
+          limitations: 'Clean'
+        }
+      },
+      detectors: {
+        thumbnail_geometry: {
+          detectorName: 'ffprobe_stream_geometry',
+          version: '1.0.0',
+          status: 'DETECTED',
+          executionDurationMs: 20
+        }
+      }
+    });
+    assert.strictEqual(s6CompCase7b.resolvedIssues.length, 1, 'Case 7b: Measurement detector with DETECTED resolves');
+    console.log('  ✅ PASS: Case 7: Valid success statuses for both Risk and Measurement detectors resolve');
+
+    // Case 8: Detector status NOT_ASSESSED -> NOT VERIFIED
+    const s6CompCase8_na = policyIntelligenceEngine.generateComparison(baselineRepVideo, {
+      ...baselineRepVideo,
+      topIssues: [],
+      domainReports: { ...baselineRepVideo.domainReports, ...cleanDomainVA },
+      detectors: {
+        video_repeated_footage: {
+          detectorName: 'video_repeated_footage',
+          version: '1.0.0',
+          status: 'NOT_ASSESSED',
+          executionDurationMs: 0
+        }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: dummyMetaRev }
+    });
+    assert.strictEqual(s6CompCase8_na.resolvedIssues.length, 0, 'Case 8: NOT_ASSESSED cannot resolve');
+    assert(s6CompCase8_na.notVerifiedIssues!.some(i => i.includes('NOT_ASSESSED')), 'Case 8: Documents NOT_ASSESSED');
+    console.log('  ✅ PASS: Case 8: Detector status NOT_ASSESSED fails closed to NOT VERIFIED');
+
+    // Case 9: Detector status ANALYSIS_UNAVAILABLE -> NOT VERIFIED
+    const s6CompCase9_au = policyIntelligenceEngine.generateComparison(baselineRepVideo, {
+      ...baselineRepVideo,
+      topIssues: [],
+      domainReports: { ...baselineRepVideo.domainReports, ...cleanDomainVA },
+      detectors: {
+        video_repeated_footage: {
+          detectorName: 'video_repeated_footage',
+          version: '1.0.0',
+          status: 'ANALYSIS_UNAVAILABLE',
+          executionDurationMs: 5
+        }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: dummyMetaRev }
+    });
+    assert.strictEqual(s6CompCase9_au.resolvedIssues.length, 0, 'Case 9: ANALYSIS_UNAVAILABLE cannot resolve');
+    assert(s6CompCase9_au.notVerifiedIssues!.some(i => i.includes('ANALYSIS_UNAVAILABLE')), 'Case 9: Documents ANALYSIS_UNAVAILABLE');
+    console.log('  ✅ PASS: Case 9: Detector status ANALYSIS_UNAVAILABLE fails closed to NOT VERIFIED');
+
+    // Case 10: Detector status NOT_PROVIDED -> NOT VERIFIED
+    const s6CompCase10_np = policyIntelligenceEngine.generateComparison(baselineRepVideo, {
+      ...baselineRepVideo,
+      topIssues: [],
+      domainReports: { ...baselineRepVideo.domainReports, ...cleanDomainVA },
+      detectors: {
+        video_repeated_footage: {
+          detectorName: 'video_repeated_footage',
+          version: '1.0.0',
+          status: 'NOT_PROVIDED',
+          executionDurationMs: 0
+        }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: dummyMetaRev }
+    });
+    assert.strictEqual(s6CompCase10_np.resolvedIssues.length, 0, 'Case 10: NOT_PROVIDED cannot resolve');
+    assert(s6CompCase10_np.notVerifiedIssues!.some(i => i.includes('NOT_PROVIDED')), 'Case 10: Documents NOT_PROVIDED');
+    console.log('  ✅ PASS: Case 10: Detector status NOT_PROVIDED fails closed to NOT VERIFIED');
+
+    // Case 11: Detector status INSUFFICIENT_EVIDENCE -> NOT VERIFIED
+    const s6CompCase11_ie = policyIntelligenceEngine.generateComparison(baselineRepVideo, {
+      ...baselineRepVideo,
+      topIssues: [],
+      domainReports: { ...baselineRepVideo.domainReports, ...cleanDomainVA },
+      detectors: {
+        video_repeated_footage: {
+          detectorName: 'video_repeated_footage',
+          version: '1.0.0',
+          status: 'INSUFFICIENT_EVIDENCE',
+          executionDurationMs: 15
+        }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: dummyMetaRev }
+    });
+    assert.strictEqual(s6CompCase11_ie.resolvedIssues.length, 0, 'Case 11: INSUFFICIENT_EVIDENCE cannot resolve');
+    assert(s6CompCase11_ie.notVerifiedIssues!.some(i => i.includes('INSUFFICIENT_EVIDENCE')), 'Case 11: Documents INSUFFICIENT_EVIDENCE');
+    console.log('  ✅ PASS: Case 11: Detector status INSUFFICIENT_EVIDENCE fails closed to NOT VERIFIED');
+
+    // Case 12: Detector status ERROR -> NOT VERIFIED
+    const s6CompCase12_err = policyIntelligenceEngine.generateComparison(baselineRepVideo, {
+      ...baselineRepVideo,
+      topIssues: [],
+      domainReports: { ...baselineRepVideo.domainReports, ...cleanDomainVA },
+      detectors: {
+        video_repeated_footage: {
+          detectorName: 'video_repeated_footage',
+          version: '1.0.0',
+          status: 'ERROR' as any,
+          failureReason: 'GPU execution crashed with code 139',
+          executionDurationMs: 12
+        }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: dummyMetaRev }
+    });
+    assert.strictEqual(s6CompCase12_err.resolvedIssues.length, 0, 'Case 12: ERROR status cannot resolve');
+    assert(s6CompCase12_err.notVerifiedIssues!.some(i => i.includes('ERROR')), 'Case 12: Documents ERROR');
+    console.log('  ✅ PASS: Case 12: Detector status ERROR fails closed to NOT VERIFIED');
+
+    // Case 13: Risk Signal Detector still reporting DETECTED -> NOT VERIFIED
+    const s6CompCase13_det = policyIntelligenceEngine.generateComparison(baselineRepVideo, {
+      ...baselineRepVideo,
+      topIssues: [], // Finding omitted from topIssues, but detector still reports DETECTED
+      domainReports: { ...baselineRepVideo.domainReports, ...cleanDomainVA },
+      detectors: {
+        video_repeated_footage: {
+          detectorName: 'video_repeated_footage',
+          version: '1.0.0',
+          status: 'DETECTED',
+          executionDurationMs: 40
+        }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: dummyMetaRev }
+    });
+    assert.strictEqual(s6CompCase13_det.resolvedIssues.length, 0, 'Case 13: Risk detector reporting DETECTED cannot resolve');
+    assert(s6CompCase13_det.notVerifiedIssues!.some(i => i.includes('detected active risk signals (DETECTED)')), 'Case 13: Documents detected active risk signals');
+    console.log('  ✅ PASS: Case 13: Risk Signal Detector reporting DETECTED fails closed to NOT VERIFIED');
+
+    // Case 14: Detector status is unknown -> NOT VERIFIED
+    const s6CompCase14_unk = policyIntelligenceEngine.generateComparison(baselineRepVideo, {
+      ...baselineRepVideo,
+      topIssues: [],
+      domainReports: { ...baselineRepVideo.domainReports, ...cleanDomainVA },
+      detectors: {
+        video_repeated_footage: {
+          detectorName: 'video_repeated_footage',
+          version: '1.0.0',
+          status: 'UNREGISTERED_SUCCESS_STATUS' as any, // Not in allowlist!
+          executionDurationMs: 40
+        }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: dummyMetaRev }
+    });
+    assert.strictEqual(s6CompCase14_unk.resolvedIssues.length, 0, 'Case 14: Unknown status cannot resolve');
+    assert(s6CompCase14_unk.notVerifiedIssues!.some(i => i.includes('non-verifiable or unknown status')), 'Case 14: Documents non-verifiable or unknown status');
+    console.log('  ✅ PASS: Case 14: Unknown detector status fails closed to NOT VERIFIED');
+
+    // Case 15: Detector status is missing or empty -> NOT VERIFIED
+    const s6CompCase15_missing = policyIntelligenceEngine.generateComparison(baselineRepVideo, {
+      ...baselineRepVideo,
+      topIssues: [],
+      domainReports: { ...baselineRepVideo.domainReports, ...cleanDomainVA },
+      detectors: {
+        video_repeated_footage: {
+          detectorName: 'video_repeated_footage',
+          version: '1.0.0',
+          status: '' as any, // Empty status
+          executionDurationMs: 40
+        }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: dummyMetaRev }
+    });
+    assert.strictEqual(s6CompCase15_missing.resolvedIssues.length, 0, 'Case 15: Missing status cannot resolve');
+    assert(s6CompCase15_missing.notVerifiedIssues!.some(i => i.includes('execution status is missing or undefined')), 'Case 15: Documents missing status');
+    console.log('  ✅ PASS: Case 15: Missing/empty detector status fails closed to NOT VERIFIED');
+
+    // Case 16: Legacy Report with evaluatedPoliciesCount -> MUST NOT BYPASS VERIFICATION
+    const baselineWithEvalPolicies: any = {
+      ...baselineRepVideo,
+      evaluatedPoliciesCount: 5
+    };
+    const revisedWithEvalPolicies: any = {
+      ...baselineRepVideo,
+      topIssues: [],
+      evaluatedPoliciesCount: 5,
+      domainReports: { ...baselineRepVideo.domainReports, ...cleanDomainVA },
+      detectors: {} // Detectors omitted!
+    };
+    const s6CompCase16 = policyIntelligenceEngine.generateComparison(
+      baselineWithEvalPolicies,
+      revisedWithEvalPolicies,
+      {
+        originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+        revisedScanRecord: { status: 'COMPLETED', metadata: dummyMetaRev }
+      }
+    );
+    assert.strictEqual(s6CompCase16.resolvedIssues.length, 0, 'Case 16: evaluatedPoliciesCount in report does NOT bypass verification');
+    assert(s6CompCase16.notVerifiedIssues!.some(i => i.includes('execution record is missing from revised scan')), 'Case 16: Missing detectors fail closed even with evaluatedPoliciesCount');
+    console.log('  ✅ PASS: Case 16: Legacy report with evaluatedPoliciesCount does NOT bypass detector verification');
+
+    // Case 17: Production Verification must not be bypassed by report fields -> NOT VERIFIED
+    const baselineInjectedFields: any = {
+      ...baselineRepVideo,
+      evaluatedPoliciesCount: 10,
+      isLegacyTestFixture: true,
+      bypassDetectorChecks: true
+    };
+    const revisedInjectedFields: any = {
+      ...baselineRepVideo,
+      topIssues: [],
+      evaluatedPoliciesCount: 10,
+      isLegacyTestFixture: true,
+      bypassDetectorChecks: true,
+      domainReports: { ...baselineRepVideo.domainReports, ...cleanDomainVA },
+      detectors: {} // No real detector evidence
+    };
+    // Standard production options (JobOrchestrator never passes test-only options)
+    const s6CompCase17_prod = policyIntelligenceEngine.generateComparison(
+      baselineInjectedFields,
+      revisedInjectedFields,
+      {
+        originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+        revisedScanRecord: { status: 'COMPLETED', metadata: dummyMetaRev }
+      }
+    );
+    assert.strictEqual(s6CompCase17_prod.resolvedIssues.length, 0, 'Case 17: Production path cannot be bypassed by injected report fields');
+    assert(s6CompCase17_prod.notVerifiedIssues!.some(i => i.includes('execution record is missing from revised scan')), 'Case 17: Production path strictly fails closed');
+    console.log('  ✅ PASS: Case 17: Production verification cannot be bypassed by report fields');
+
+    // Case 18: Audio Transcription passes Registry Verification with matching Canonical Identity
+    const baselineAudioTrans: RiskReport = {
+      ...baseReport,
+      topIssues: [
+        {
+          id: 'issue_audio_untranscribed',
+          domain: 'video_audio',
+          type: 'untranscribed_speech',
+          what: '🟡 Untranscribed Spoken Commentary',
+          where: '00:00–00:30',
+          why: 'Audio contains speech but local transcript is missing.',
+          fix: 'Run STT model to produce verified transcript.',
+          evidence: 'audio_processor:transcription_unavailable',
+          context: 'Speech transcription check',
+          recommendedAction: 'Transcribe spoken audio',
+          limitations: 'STT model required',
+          confidence: 'HIGH',
+          severity: 'warning',
+          policyArea: 'ORIGINAL CONTRIBUTION',
+          category: 'original_contribution',
+          timestampSeconds: 0
+        }
+      ]
+    };
+
+    // 18a: Canonical identity 'local_speech_to_text_adapter' -> RESOLVED
+    const s6CompCase18_canonical = policyIntelligenceEngine.generateComparison(baselineAudioTrans, {
+      ...baselineAudioTrans,
+      topIssues: [],
+      domainReports: { ...baselineAudioTrans.domainReports, ...cleanDomainVA },
+      detectors: {
+        audio_transcription: {
+          detectorName: 'local_speech_to_text_adapter', // Canonical identity from audioProcessor
+          version: '1.0.0',
+          status: 'DETECTED', // Speech transcribed successfully
+          executionDurationMs: 120,
+          confidence: 0.90
+        }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: dummyMetaRev }
+    });
+    assert.strictEqual(s6CompCase18_canonical.resolvedIssues.length, 1, 'Case 18a: Canonical STT identity verifies resolution');
+    assert.strictEqual(s6CompCase18_canonical.notVerifiedIssues?.length || 0, 0, 'Case 18a: Zero unverified issues on canonical identity');
+
+    // 18b: Allowed alias 'local_whisper_stt' -> RESOLVED
+    const s6CompCase18_alias = policyIntelligenceEngine.generateComparison(baselineAudioTrans, {
+      ...baselineAudioTrans,
+      topIssues: [],
+      domainReports: { ...baselineAudioTrans.domainReports, ...cleanDomainVA },
+      detectors: {
+        audio_transcription: {
+          detectorName: 'local_whisper_stt', // Allowed alias
+          version: '1.0.0',
+          status: 'DETECTED',
+          executionDurationMs: 120,
+          confidence: 0.90
+        }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: dummyMetaRev }
+    });
+    assert.strictEqual(s6CompCase18_alias.resolvedIssues.length, 1, 'Case 18b: Allowed STT alias verifies resolution');
+
+    // 18c: Unregistered STT detector name -> NOT VERIFIED
+    const s6CompCase18_unapproved = policyIntelligenceEngine.generateComparison(baselineAudioTrans, {
+      ...baselineAudioTrans,
+      topIssues: [],
+      domainReports: { ...baselineAudioTrans.domainReports, ...cleanDomainVA },
+      detectors: {
+        audio_transcription: {
+          detectorName: 'unregistered_external_stt_tool', // Unregistered name!
+          version: '1.0.0',
+          status: 'DETECTED',
+          executionDurationMs: 120,
+          confidence: 0.90
+        }
+      }
+    }, {
+      originalScanRecord: { status: 'COMPLETED', metadata: { ...dummyMeta, sha256: 'a'.repeat(64) } },
+      revisedScanRecord: { status: 'COMPLETED', metadata: dummyMetaRev }
+    });
+    assert.strictEqual(s6CompCase18_unapproved.resolvedIssues.length, 0, 'Case 18c: Unregistered STT detector cannot resolve');
+    assert(s6CompCase18_unapproved.notVerifiedIssues!.some(i => i.includes('unapproved detector identity') || i.includes('execution record is missing')), 'Case 18c: Documents unapproved identity');
+    console.log('  ✅ PASS: Case 18: Audio Transcription verified via canonical identity & allowed alias; unapproved fails closed');
+
+
 
     console.log('\n======================================================');
     console.log('✅ ALL EVIDENCE INTEGRITY & REGRESSION TESTS PASSED');

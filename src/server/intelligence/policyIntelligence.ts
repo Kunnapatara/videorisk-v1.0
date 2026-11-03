@@ -61,7 +61,7 @@ export class PolicyIntelligenceEngine {
     audio_repeated_segments: ['audio_repeated_segments', 'subband_spectral_audio_fingerprint'],
     audio_speech_activity: ['audio_speech_activity', 'acoustic_energy_modulation'],
     audio_music_detection: ['audio_music_detection', 'music_classification_analyzer'],
-    audio_transcription: ['audio_transcription', 'local_whisper_stt'],
+    audio_transcription: ['audio_transcription', 'local_speech_to_text_adapter', 'local_whisper_stt'],
     thumbnail_geometry: ['thumbnail_geometry', 'ffprobe_stream_geometry'],
     thumbnail_luminance: ['thumbnail_luminance', 'ffmpeg_signalstats_yavg'],
     thumbnail_ocr: ['thumbnail_ocr', 'local_ocr_adapter'],
@@ -74,7 +74,6 @@ export class PolicyIntelligenceEngine {
     'video_template_heuristic',
     'audio_repeated_segments',
     'audio_music_detection',
-    'audio_transcription',
     'thumbnail_ocr',
     'thumbnail_contrast'
   ]);
@@ -1350,6 +1349,9 @@ export interface ComparisonOptions {
       if (type === 'thumbnail_ocr_claim' || type === 'thumbnail_text') {
         return 'thumbnail_ocr';
       }
+      if (type === 'thumbnail_contrast' || type === 'thumbnail_low_contrast') {
+        return 'thumbnail_contrast';
+      }
 
       const ev = (issue.evidence || '').toLowerCase();
       if (ev.includes('stream_geometry') || ev.includes('ffprobe:dimensions') || ev.includes('ffprobe') || ev.includes('file_size') || ev.includes('stat_file_size')) {
@@ -1360,6 +1362,9 @@ export interface ComparisonOptions {
       }
       if (ev.includes('ocr') || ev.includes('text_detect')) {
         return 'thumbnail_ocr';
+      }
+      if (ev.includes('contrast_evaluator') || ev.includes('overlay_contrast') || ev.includes('text_overlay_contrast')) {
+        return 'thumbnail_contrast';
       }
 
       return null;
@@ -1515,56 +1520,103 @@ export interface ComparisonOptions {
         return { verifiable: false, reason: 'unable to safely determine responsible detector for finding' };
       }
 
-      // Preserve valid legacy/test scenarios only when they cannot be mistaken for a production verification
+      // Fail-closed detector verification:
+      // Report fields (e.g. evaluatedPoliciesCount) MUST NEVER authorize a bypass.
+      // Explicit test-only injection is permitted ONLY when explicitly flagged in test options AND executing under an active test environment.
+      const isTestEnv = (
+        process.env.NODE_ENV !== 'production' &&
+        (process.env.NODE_ENV === 'test' ||
+         process.env.VIDEORISK_TEST_RUN === 'true' ||
+         Boolean(process.env.npm_lifecycle_script?.includes('tests/')) ||
+         Boolean(process.argv && process.argv.some(arg => arg.includes('.test.') || arg.includes('/tests/') || arg.endsWith('test.ts'))))
+      );
       const isLegacyTestFixture = Boolean(
-        (originalReport as any)?.evaluatedPoliciesCount !== undefined ||
-        (revisedReport as any)?.evaluatedPoliciesCount !== undefined
+        options?._testOnlyLegacyFixture === true && isTestEnv
       );
 
       if (!isLegacyTestFixture) {
         const revDetectors = revisedReport.detectors;
         const allowedNames = PolicyIntelligenceEngine.DETECTOR_NAME_MAPPINGS[responsibleKey] || [responsibleKey];
 
-        let detectorReport: DetectorReport | undefined;
-
-        if (revDetectors && typeof revDetectors === 'object' && Object.keys(revDetectors).length > 0) {
-          const byKey = revDetectors[responsibleKey];
-          if (byKey && typeof byKey === 'object') {
-            // Must not declare an unrelated detector name
-            if (!byKey.detectorName || allowedNames.includes(byKey.detectorName)) {
-              detectorReport = byKey;
-            }
-          }
-
-          if (!detectorReport) {
-            detectorReport = Object.values(revDetectors).find(d => 
-              d && typeof d === 'object' && d.detectorName && allowedNames.includes(d.detectorName)
-            );
-          }
-        }
-
-        if (!detectorReport) {
+        if (!revDetectors || typeof revDetectors !== 'object' || Object.keys(revDetectors).length === 0) {
           return { verifiable: false, reason: `responsible detector (${responsibleKey}) execution record is missing from revised scan` };
         }
 
-        if (detectorReport.status === 'NOT_ASSESSED') {
+        // 1. Identify responsible detector candidate
+        // A detector record MUST specify a valid non-empty string detectorName that belongs to allowedNames.
+        // It must NOT be accepted simply because it is located at the registry key if detectorName is missing or unapproved.
+        let detectorReport: DetectorReport | undefined;
+
+        const byKey = revDetectors[responsibleKey];
+        if (byKey && typeof byKey === 'object') {
+          if (byKey.detectorName && typeof byKey.detectorName === 'string' && allowedNames.includes(byKey.detectorName.trim())) {
+            detectorReport = byKey;
+          }
+        }
+
+        // If not matched under primary key, check alternate entries with matching allowed detectorName
+        if (!detectorReport) {
+          detectorReport = Object.values(revDetectors).find(d => 
+            d && typeof d === 'object' && typeof d.detectorName === 'string' && allowedNames.includes(d.detectorName.trim())
+          );
+        }
+
+        if (!detectorReport) {
+          const hasRecordWithoutName = Boolean(byKey && typeof byKey === 'object' && (!byKey.detectorName || typeof byKey.detectorName !== 'string' || byKey.detectorName.trim() === ''));
+          const hasUnapprovedName = Boolean(byKey && typeof byKey === 'object' && byKey.detectorName && !allowedNames.includes(byKey.detectorName.trim()));
+          const reasonDetail = hasRecordWithoutName
+            ? ': missing detectorName'
+            : (hasUnapprovedName ? `: unapproved detector identity "${byKey.detectorName}"` : '');
+          return { 
+            verifiable: false, 
+            reason: `responsible detector (${responsibleKey}) execution record is missing from revised scan${reasonDetail}` 
+          };
+        }
+
+        // 2. Validate detector status exists and is non-empty
+        const rawStatus = detectorReport.status;
+        if (!rawStatus || typeof rawStatus !== 'string' || (rawStatus as string).trim() === '') {
+          return { 
+            verifiable: false, 
+            reason: `responsible detector (${responsibleKey}) execution status is missing or undefined in revised scan` 
+          };
+        }
+
+        // 3. Explicitly fail closed on known failure/unavailable/incomplete execution statuses
+        if (rawStatus === 'NOT_ASSESSED') {
           return { verifiable: false, reason: `responsible detector (${responsibleKey}) was not assessed (NOT_ASSESSED) in revised scan` };
         }
-        if (detectorReport.status === 'ANALYSIS_UNAVAILABLE') {
+        if (rawStatus === 'ANALYSIS_UNAVAILABLE') {
           return { verifiable: false, reason: `analysis for responsible detector (${responsibleKey}) was unavailable (ANALYSIS_UNAVAILABLE) in revised scan` };
         }
-        if (detectorReport.status === 'NOT_PROVIDED') {
+        if (rawStatus === 'NOT_PROVIDED') {
           return { verifiable: false, reason: `responsible detector (${responsibleKey}) was not provided (NOT_PROVIDED) in revised scan` };
         }
-        if (detectorReport.status === 'INSUFFICIENT_EVIDENCE') {
+        if (rawStatus === 'INSUFFICIENT_EVIDENCE') {
           return { verifiable: false, reason: `responsible detector (${responsibleKey}) reported insufficient evidence (INSUFFICIENT_EVIDENCE) in revised scan` };
         }
-        if ((detectorReport.status as string) === 'ERROR' || detectorReport.failureReason) {
+        if ((rawStatus as string) === 'ERROR' || detectorReport.failureReason) {
           return { verifiable: false, reason: `responsible detector (${responsibleKey}) encountered an execution error (ERROR): ${detectorReport.failureReason || 'execution failure'}` };
         }
 
-        if (PolicyIntelligenceEngine.RISK_SIGNAL_DETECTORS.has(responsibleKey) && detectorReport.status === 'DETECTED') {
+        // 4. For Risk Signal Detectors: 'DETECTED' means active risk signal was found!
+        // A risk detector reporting DETECTED cannot verify that the risk is resolved.
+        if (PolicyIntelligenceEngine.RISK_SIGNAL_DETECTORS.has(responsibleKey) && rawStatus === 'DETECTED') {
           return { verifiable: false, reason: `responsible detector (${responsibleKey}) detected active risk signals (DETECTED) in revised scan; resolution cannot be verified` };
+        }
+
+        // 5. Strict Allowlist of successful verification statuses
+        // Risk signal detectors must explicitly confirm clean absence of risk signals: ['NO_SIGNAL_DETECTED'].
+        // Non-risk signal / measurement detectors confirm successful measurement execution: ['DETECTED', 'NO_SIGNAL_DETECTED'].
+        const allowedStatuses = PolicyIntelligenceEngine.RISK_SIGNAL_DETECTORS.has(responsibleKey)
+          ? ['NO_SIGNAL_DETECTED']
+          : ['DETECTED', 'NO_SIGNAL_DETECTED'];
+
+        if (!allowedStatuses.includes(rawStatus)) {
+          return { 
+            verifiable: false, 
+            reason: `responsible detector (${responsibleKey}) reported non-verifiable or unknown status (${rawStatus}) in revised scan` 
+          };
         }
       }
     }
@@ -1756,6 +1808,32 @@ export interface ComparisonOptions {
       mediaIdentity
     };
   }
+
+  /**
+   * Test-only helper to run comparisons for legacy mock test fixtures without instrumented detector records.
+   * STRICTLY rejected in non-test production environments.
+   */
+  public generateComparisonForLegacyTestFixture(
+    originalReport: RiskReport,
+    revisedReport: RiskReport,
+    options?: ComparisonOptions
+  ): ReScanComparison {
+    const isTestEnv = (
+      process.env.NODE_ENV !== 'production' &&
+      (process.env.NODE_ENV === 'test' ||
+       process.env.VIDEORISK_TEST_RUN === 'true' ||
+       Boolean(process.env.npm_lifecycle_script?.includes('tests/')) ||
+       Boolean(process.argv && process.argv.some(arg => arg.includes('.test.') || arg.includes('/tests/') || arg.endsWith('test.ts'))))
+    );
+    if (!isTestEnv) {
+      throw new Error('generateComparisonForLegacyTestFixture is forbidden in production environments');
+    }
+    return this.generateComparison(originalReport, revisedReport, {
+      ...options,
+      _testOnlyLegacyFixture: true
+    });
+  }
 }
+
 
 export const policyIntelligenceEngine = new PolicyIntelligenceEngine();

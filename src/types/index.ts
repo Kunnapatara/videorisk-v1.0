@@ -370,7 +370,13 @@ export interface ComparisonOptions {
   revisedScanRecord?: { status?: string; error?: string; metadata?: MediaMetadata };
   originalScanRecord?: { status?: string; error?: string; metadata?: MediaMetadata };
   skippedDomains?: EvidenceDomain[];
+  /**
+   * Explicit test-only injection for legacy test suites that do not instrument real detector pipelines.
+   * Production execution path in JobOrchestrator never provides this option.
+   */
+  _testOnlyLegacyFixture?: boolean;
 }
+
 
 export interface UserAccount {
   id: string;

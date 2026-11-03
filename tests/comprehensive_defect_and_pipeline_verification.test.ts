@@ -871,7 +871,7 @@ export async function runComprehensiveDefectAndPipelineTests() {
       }
     };
 
-    const mixedComp = policyIntelligenceEngine.generateComparison(multiBaseline as RiskReport, mixedRevised as RiskReport, {
+    const mixedComp = policyIntelligenceEngine.generateComparisonForLegacyTestFixture(multiBaseline as RiskReport, mixedRevised as RiskReport, {
       originalScanRecord: { status: 'COMPLETED', metadata: { durationSeconds: 10, originalSize: 1000, videoCodec: 'h264' } as any },
       revisedScanRecord: { status: 'COMPLETED', metadata: { durationSeconds: 10, originalSize: 1000, videoCodec: 'h264' } as any }
     });

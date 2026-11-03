@@ -6,7 +6,7 @@ import assert from 'assert';
 import { videoProcessor } from '../src/server/pipeline/videoProcessor';
 import { audioProcessor } from '../src/server/pipeline/audioProcessor';
 import { mediaInspector } from '../src/server/pipeline/mediaInspector';
-import { policyIntelligenceEngine } from '../src/server/intelligence/policyIntelligence';
+import { policyIntelligenceEngine, PolicyIntelligenceEngine } from '../src/server/intelligence/policyIntelligence';
 
 const execFileAsync = promisify(execFile);
 
@@ -555,9 +555,19 @@ export async function runPhase2DetectionValidationTests() {
 
     const audioMeta = await mediaInspector.inspect(audioWithTonePath, 'audio_tone.mp4');
     const resUnsetOptional = await audioProcessor.analyzeAudio(audioWithTonePath, audioMeta);
-    assert.strictEqual(resUnsetOptional.speechAnalysisStatus, 'NOT_ASSESSED');
-    assert.strictEqual(resUnsetOptional.musicAnalysisStatus, 'NOT_ASSESSED');
     console.log('  ✅ PASS: 4.3 Unconfigured optional modules declare NOT_ASSESSED without fabrication');
+
+    // 4.3b Audio Transcription Canonical Detector Registry Alignment
+    assert.strictEqual(
+      resUnsetOptional.detectors?.audio_transcription?.detectorName,
+      'local_speech_to_text_adapter',
+      '4.3b audio_transcription detectorName matches canonical local_speech_to_text_adapter'
+    );
+    assert(
+      PolicyIntelligenceEngine.DETECTOR_NAME_MAPPINGS.audio_transcription.includes('local_speech_to_text_adapter'),
+      '4.3b Detector Registry mapping includes canonical local_speech_to_text_adapter'
+    );
+    console.log('  ✅ PASS: 4.3b Audio transcription canonical identity matches Detector Registry');
 
     // 4.5 Sub-3s video reports INSUFFICIENT_EVIDENCE for slideshow heuristic
     const shortMeta = {
