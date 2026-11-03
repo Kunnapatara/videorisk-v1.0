@@ -45,6 +45,7 @@ async function main() {
     const { runPhase2DetectionValidationTests } = await import('./phase2_detection_validation.test');
     const { runPhase3ChannelIntelligenceTests } = await import('./phase3_channel_intelligence.test');
     const { runEvidenceIntegrityRegressionTests } = await import('./evidence_integrity_regression.test');
+    const { runGroundTruthBenchmark } = await import('./ground_truth_benchmark');
 
     // Narrowly scoped cleanup of test-specific rate limits (never deletes real/unrelated records)
     await storage.rateLimits.clearRateLimits?.();
@@ -105,6 +106,9 @@ async function main() {
 
     // Run Suite 19: Evidence Integrity & Regression Verification
     await runEvidenceIntegrityRegressionTests();
+
+    // Run Suite 20: Ground-Truth Benchmark & Evidence Validation
+    await runGroundTruthBenchmark();
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log(`\n🎉 ALL AUTOMATED VERIFICATION SUITES COMPLETED SUCCESSFULLY in ${elapsed}s!`);

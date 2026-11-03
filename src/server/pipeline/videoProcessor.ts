@@ -382,11 +382,45 @@ export class VideoProcessor {
         // 1. High correlation (ncc >= 0.86)
         // 2. High gradient agreement (gradMatchRatio >= 0.85)
         // 3. Compatible color palette (colorDiff <= 0.22, accommodating lighting adjustments)
-        const isDuplicate = ncc >= 0.86 && gradMatchRatio >= 0.85 && colorDiff <= 0.22;
+        let isDuplicate = ncc >= 0.86 && gradMatchRatio >= 0.85 && colorDiff <= 0.22;
+        let matchedSim = isDuplicate ? Math.max(compositeSim, rawRmsSim) : compositeSim;
+
+        // If not matched canonically, evaluate horizontal reflection (common video reuse/evasion mirror transform)
+        if (!isDuplicate && colorDiff <= 0.22) {
+          let nccMirrorSum = 0;
+          for (let y = 0; y < 8; y++) {
+            const yOff = y * 8;
+            for (let x = 0; x < 8; x++) {
+              nccMirrorSum += (f1.luminance[yOff + x] - f1.meanY) * (f2.luminance[yOff + (7 - x)] - f2.meanY);
+            }
+          }
+          const nccMirror = nccMirrorSum / (64 * Math.max(0.1, f1.stdDevY * f2.stdDevY));
+
+          if (nccMirror >= 0.86) {
+            let gradMirrorMatches = 0;
+            for (let y = 0; y < 8; y++) {
+              // Horizontal gradients: x in [0..6] maps to mirrorX = 6 - x with inverted gradient direction
+              for (let x = 0; x < 7; x++) {
+                const mirrorH = !f2.hGradients[y * 7 + (6 - x)];
+                if (f1.hGradients[y * 7 + x] === mirrorH) gradMirrorMatches++;
+              }
+              // Vertical gradients: x in [0..7] maps to mirrorX = 7 - x with same vertical gradient direction
+              for (let x = 0; x < 8; x++) {
+                if (f1.vGradients[y * 8 + x] === f2.vGradients[y * 8 + (7 - x)]) gradMirrorMatches++;
+              }
+            }
+            const gradMirrorMatchRatio = gradMirrorMatches / 112;
+            if (gradMirrorMatchRatio >= 0.85) {
+              isDuplicate = true;
+              const compositeMirrorSim = 0.50 * Math.max(0, nccMirror) + 0.30 * gradMirrorMatchRatio + 0.20 * colorSim;
+              matchedSim = compositeMirrorSim;
+            }
+          }
+        }
 
         return {
           isDuplicate,
-          similarity: parseFloat(Math.max(0, Math.min(1.0, isDuplicate ? Math.max(compositeSim, rawRmsSim) : compositeSim)).toFixed(3))
+          similarity: parseFloat(Math.max(0, Math.min(1.0, matchedSim)).toFixed(3))
         };
       };
 

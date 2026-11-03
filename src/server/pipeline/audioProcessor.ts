@@ -1106,7 +1106,7 @@ export class AudioProcessor {
           const end = parseFloat(m[2]);
           if (Number.isFinite(end) && end >= lastStart) {
             totalSilenceDuration += (end - lastStart);
-            segments.push({ start: Math.round(lastStart), end: Math.round(end), type: 'silence' });
+            segments.push({ start: parseFloat(lastStart.toFixed(2)), end: parseFloat(end.toFixed(2)), type: 'silence' });
           }
           lastStart = null;
         }

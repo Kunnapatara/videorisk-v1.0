@@ -298,7 +298,7 @@ export async function runPhase2DetectionValidationTests() {
         specificity: parseFloat(spec.toFixed(3)),
         avgExecutionMs: avgMs,
         totalFrames: rPos1.frames + rPos2.frames + rNeg.frames,
-        findings: 'Known architectural boundary: 8x8 spatial gradient dHash assumes canonical orientation; hflip/vflip inverts gradient direction.'
+        findings: 'Horizontal reflection awareness enables detection of hflip repeats; vertical inversion (vflip) remains an architectural boundary.'
       });
       console.log(`  Mirror/Flip Result: TP=${tp}, FN=${fn}, TN=${tn}, FP=${fp} | Precision=${(prec*100).toFixed(1)}%, Recall=${(rec*100).toFixed(1)}%, F1=${(f1*100).toFixed(1)}%`);
     }
