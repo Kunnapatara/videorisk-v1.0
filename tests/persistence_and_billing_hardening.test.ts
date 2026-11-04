@@ -367,6 +367,45 @@ export async function runPersistenceAndBillingHardeningTests() {
     assert(userRefreshed?.creditsRemaining === 40, '6.6 User account creditsRemaining is 40');
     assert(sumDelta === userRefreshed?.creditsRemaining, `6.6 Ledger sum (${sumDelta}) matches user balance (${userRefreshed?.creditsRemaining})`);
 
+    // ---------------------------------------------------------
+    // 7. BACKUP, ISOLATED RESTORE & READINESS VERIFICATION
+    // ---------------------------------------------------------
+    console.log('\n[7. Backup, Isolated Restore & Operational Readiness]');
+
+    // 7.1 Liveness endpoint returns 200 and uptime
+    const livenessRes = await fetch(`${baseUrl}/health/liveness`);
+    assert(livenessRes.status === 200, '7.1 Liveness endpoint returns 200 OK');
+    const livenessData = await livenessRes.json();
+    assert(livenessData.status === 'ok' && typeof livenessData.uptimeSeconds === 'number', '7.1 Liveness response contains status and uptime');
+
+    // 7.2 Readiness endpoint returns healthy status for test/dev environment
+    const readinessRes = await fetch(`${baseUrl}/health/readiness`);
+    assert(readinessRes.status === 200, '7.2 Readiness endpoint returns 200 OK');
+    const readinessData = await readinessRes.json();
+    assert(readinessData.status === 'ready', '7.2 Readiness status is ready');
+    assert(readinessData.checks?.database?.status === 'healthy', '7.2 Database check is healthy');
+    assert(readinessData.checks?.storage?.status === 'healthy', '7.2 Storage check is healthy');
+
+    // 7.3 Database backup generation
+    if (storage.createBackup && storage.restoreBackup) {
+      const backupTargetDir = path.resolve(os.tmpdir(), `vrisk_backups_${Date.now()}`);
+      const backupResult = await storage.createBackup(backupTargetDir);
+      assert(fs.existsSync(backupResult.backupPath), '7.3 Backup file exists on disk');
+      assert(backupResult.sizeBytes > 0, '7.3 Backup file size is greater than 0');
+
+      // 7.4 Isolated restore and integrity verification
+      const isolatedRestoreTarget = path.resolve(os.tmpdir(), `vrisk_restored_${Date.now()}.db`);
+      const restoreResult = await storage.restoreBackup(backupResult.backupPath, isolatedRestoreTarget);
+      assert(restoreResult.restored === true, '7.4 Isolated restore succeeded with verified integrity');
+      assert(restoreResult.recordCounts.users >= 1, '7.4 Restored database contains verified user records');
+      assert(restoreResult.recordCounts.creditTransactions >= 1, '7.4 Restored database contains verified credit ledger records');
+
+      // Cleanup temp backup files
+      if (fs.existsSync(backupResult.backupPath)) fs.unlinkSync(backupResult.backupPath);
+      if (fs.existsSync(isolatedRestoreTarget)) fs.unlinkSync(isolatedRestoreTarget);
+      if (fs.existsSync(backupTargetDir)) fs.rmdirSync(backupTargetDir);
+    }
+
     console.log(`\n======================================================`);
     console.log(`TEST SUITE 3 COMPLETE: ${passed}/${total} assertions passed!`);
     console.log(`======================================================\n`);

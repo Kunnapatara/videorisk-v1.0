@@ -36,6 +36,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg
 
+      - name: Validate environment and plan configuration
+        run: npx tsx scripts/validate-env.ts --mode=ci
+
       - name: Run automated verification tests
         run: npm test
 

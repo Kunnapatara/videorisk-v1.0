@@ -24,7 +24,7 @@ export interface ValidationIssue {
 }
 
 export interface ValidationSummary {
-  mode: 'production' | 'test' | 'development';
+  mode: 'production' | 'test' | 'development' | 'ci';
   valid: boolean;
   errorsCount: number;
   warningsCount: number;
@@ -54,7 +54,7 @@ export function maskSecret(secret?: string | null): string {
  * Validates billing environment configuration
  */
 export function validateBillingConfiguration(
-  mode: 'production' | 'test' | 'development' = 'production',
+  mode: 'production' | 'test' | 'development' | 'ci' = 'production',
   env: NodeJS.ProcessEnv = process.env
 ): ValidationSummary {
   const issues: ValidationIssue[] = [];
@@ -77,6 +77,12 @@ export function validateBillingConfiguration(
         type: 'ERROR',
         variable: 'STRIPE_SECRET_KEY',
         message: 'Missing Stripe test secret key (expected sk_test_... or rk_test_...).',
+      });
+    } else if (mode === 'ci') {
+      issues.push({
+        type: 'INFO',
+        variable: 'STRIPE_SECRET_KEY',
+        message: 'CI environment validation: STRIPE_SECRET_KEY not set in CI runner. Static price mappings and plan contracts validated.',
       });
     } else {
       issues.push({
@@ -282,16 +288,18 @@ export async function runValidatorCli(
 ): Promise<number> {
   const args = cliArgs || process.argv.slice(2);
   const env = cliEnv || process.env;
-  let mode: 'production' | 'test' | 'development' = 'production';
+  let mode: 'production' | 'test' | 'development' | 'ci' = 'production';
 
   for (const arg of args) {
     if (arg === '--mode=production') mode = 'production';
     if (arg === '--mode=test') mode = 'test';
     if (arg === '--mode=development') mode = 'development';
+    if (arg === '--mode=ci') mode = 'ci';
   }
 
   if (!args.some((a) => a.startsWith('--mode='))) {
-    if (env.NODE_ENV === 'test') mode = 'test';
+    if (env.CI === 'true') mode = 'ci';
+    else if (env.NODE_ENV === 'test') mode = 'test';
     else if (env.NODE_ENV === 'development') mode = 'development';
     else mode = 'production';
   }

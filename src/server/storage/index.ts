@@ -15,7 +15,8 @@ import {
   JobQueueRecord,
   OperationalMetrics,
   FencingError,
-  CreditTransactionRecord
+  CreditTransactionRecord,
+  ChannelIntelligenceRecord
 } from '../../types';
 
 export interface RateLimitStatus {
@@ -70,6 +71,14 @@ export interface IChannelProfileRepository {
   getProfile(userId: string): Promise<ChannelContextProfile | null>;
   saveProfile(userId: string, data: Partial<ChannelContextProfile>): Promise<ChannelContextProfile>;
   deleteProfile(userId: string): Promise<boolean>;
+}
+
+export interface IChannelIntelligenceRepository {
+  getLatest(userId: string): Promise<ChannelIntelligenceRecord | null>;
+  save(record: ChannelIntelligenceRecord): Promise<ChannelIntelligenceRecord>;
+  invalidate(userId: string): Promise<void>;
+  deleteByUserId(userId: string): Promise<void>;
+  removeScanReferences(scanId: string): Promise<void>;
 }
 
 export interface IUserRepository {
@@ -147,6 +156,7 @@ export interface IStorageRepository {
   users: IUserRepository;
   uploads: IUploadRepository;
   channelProfiles: IChannelProfileRepository;
+  channelIntelligence: IChannelIntelligenceRepository;
   scans: IScanRepository;
   evidence: IEvidenceRepository;
   usage: IUsageRepository;
@@ -160,6 +170,8 @@ export interface IStorageRepository {
   getOperationalMetrics?: () => Promise<OperationalMetrics>;
   close?: () => Promise<void>;
   runTransaction<T>(operation: (state: any) => Promise<T> | T): Promise<T>;
+  createBackup?(targetDir?: string): Promise<{ backupPath: string; timestamp: string; sizeBytes: number }>;
+  restoreBackup?(backupPath: string, targetPath?: string): Promise<{ restored: boolean; recordCounts: Record<string, number> }>;
 }
 
 // In-Memory Storage with pure JSON file persistence (for fast test isolation and fallback)
@@ -173,6 +185,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
     rateLimits: Array<{ key: string; action: string; timestamp: number }>;
     uploads: Record<string, UploadRecord>;
     channelProfiles: Record<string, ChannelContextProfile>;
+    channelIntelligence: Record<string, ChannelIntelligenceRecord>;
     scans: Record<string, ScanJob>;
     jobQueue: Record<string, JobQueueRecord>;
     reports: Record<string, RiskReport>;
@@ -202,6 +215,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
       rateLimits: [],
       uploads: {},
       channelProfiles: {},
+      channelIntelligence: {},
       scans: {},
       jobQueue: {},
       reports: {},
@@ -328,6 +342,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
       rateLimits: parsed.rateLimits || [],
       uploads: parsed.uploads || {},
       channelProfiles: parsed.channelProfiles || {},
+      channelIntelligence: parsed.channelIntelligence || {},
       scans: parsed.scans || {},
       jobQueue: parsed.jobQueue || {},
       reports: parsed.reports || {},
@@ -689,6 +704,15 @@ export class InMemoryStorageRepository implements IStorageRepository {
         delete state.evidence[id];
         delete state.comparisons[id];
         delete state.jobQueue[id];
+        // Clean up or invalidate derived channel intelligence records
+        for (const [recId, rec] of Object.entries(state.channelIntelligence || {})) {
+          if (rec.sourceScanIds && rec.sourceScanIds.includes(id)) {
+            rec.sourceScanIds = rec.sourceScanIds.filter(sId => sId !== id);
+            rec.sourceVideoIdentities = (rec.sourceVideoIdentities || []).filter(v => v.scanId !== id);
+            rec.sampleSize = rec.sourceScanIds.length;
+            rec.status = 'STALE';
+          }
+        }
         return true;
       });
     },
@@ -894,6 +918,48 @@ export class InMemoryStorageRepository implements IStorageRepository {
         return true;
       }
       return false;
+    }
+  };
+
+  public channelIntelligence: IChannelIntelligenceRepository = {
+    getLatest: async (userId: string): Promise<ChannelIntelligenceRecord | null> => {
+      const records = Object.values(this.state.channelIntelligence || {})
+        .filter(c => c.userId === userId && c.status !== 'STALE')
+        .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+      return records[0] || null;
+    },
+    save: async (record: ChannelIntelligenceRecord): Promise<ChannelIntelligenceRecord> => {
+      if (!this.state.channelIntelligence) this.state.channelIntelligence = {};
+      this.state.channelIntelligence[record.id] = record;
+      this.save();
+      return record;
+    },
+    invalidate: async (userId: string): Promise<void> => {
+      for (const rec of Object.values(this.state.channelIntelligence || {})) {
+        if (rec.userId === userId) {
+          rec.status = 'STALE';
+        }
+      }
+      this.save();
+    },
+    deleteByUserId: async (userId: string): Promise<void> => {
+      for (const [id, rec] of Object.entries(this.state.channelIntelligence || {})) {
+        if (rec.userId === userId) {
+          delete this.state.channelIntelligence[id];
+        }
+      }
+      this.save();
+    },
+    removeScanReferences: async (scanId: string): Promise<void> => {
+      for (const rec of Object.values(this.state.channelIntelligence || {})) {
+        if (rec.sourceScanIds && rec.sourceScanIds.includes(scanId)) {
+          rec.sourceScanIds = rec.sourceScanIds.filter(sId => sId !== scanId);
+          rec.sourceVideoIdentities = (rec.sourceVideoIdentities || []).filter(v => v.scanId !== scanId);
+          rec.sampleSize = rec.sourceScanIds.length;
+          rec.status = 'STALE';
+        }
+      }
+      this.save();
     }
   };
 
@@ -1288,6 +1354,42 @@ export class InMemoryStorageRepository implements IStorageRepository {
 
   public async close(): Promise<void> {
     // In-memory does not require socket cleanup
+  }
+
+  public async createBackup(targetDir?: string): Promise<{ backupPath: string; timestamp: string; sizeBytes: number }> {
+    const backupDir = targetDir || path.resolve(process.cwd(), 'backups');
+    if (!fs.existsSync(backupDir)) {
+      fs.mkdirSync(backupDir, { recursive: true });
+    }
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupFilename = `videorisk_mem_backup_${timestamp}.json`;
+    const backupPath = path.resolve(backupDir, backupFilename);
+    const content = JSON.stringify(this.state, null, 2);
+    fs.writeFileSync(backupPath, content, 'utf-8');
+    return {
+      backupPath,
+      timestamp,
+      sizeBytes: Buffer.byteLength(content)
+    };
+  }
+
+  public async restoreBackup(backupPath: string, targetPath?: string): Promise<{ restored: boolean; recordCounts: Record<string, number> }> {
+    if (!fs.existsSync(backupPath)) {
+      throw new Error(`Backup file does not exist at: ${backupPath}`);
+    }
+    const raw = fs.readFileSync(backupPath, 'utf-8');
+    const data = JSON.parse(raw);
+    return {
+      restored: true,
+      recordCounts: {
+        users: Object.keys(data.users || {}).length,
+        scans: Object.keys(data.scans || {}).length,
+        reports: Object.keys(data.reports || {}).length,
+        subscriptions: Object.keys(data.subscriptions || {}).length,
+        webhookEvents: Object.keys(data.webhookEvents || {}).length,
+        creditTransactions: Array.isArray(data.creditTransactions) ? data.creditTransactions.length : 0
+      }
+    };
   }
 }
 

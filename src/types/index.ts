@@ -223,7 +223,11 @@ export type CrossVideoPatternType =
   | 'recurring_metadata_coherence'
   | 'repeated_reused_signal'
   | 'recurring_silence'
-  | 'consistent_originality';
+  | 'consistent_originality'
+  | 'cross_video_repeated_footage'
+  | 'repeated_intro_outro'
+  | 'repeated_audio_pattern'
+  | 'repeated_tags';
 
 export interface CrossVideoPattern {
   id: string;
@@ -239,6 +243,121 @@ export interface CrossVideoPattern {
   confidence?: ConfidenceLevel;
   limitations?: string;
   disclaimer: string;
+  // Prompt Set 4 enhancements:
+  distinctVideosCount?: number;
+  distinctOccurrencesCount?: number;
+  sourceScanIds?: string[];
+  occurrenceIntervals?: Array<{
+    scanId: string;
+    videoTitle?: string;
+    timestampStart: number;
+    timestampEnd: number;
+    timestampLabel: string;
+    evidenceId?: string;
+  }>;
+  firstObservedAt?: string;
+  lastObservedAt?: string;
+  algorithmVersion?: string;
+  measurementDetails?: Record<string, any>;
+  patternStatus?: 'OBSERVED' | 'VERIFIED' | 'UNVERIFIED' | 'RESOLVED' | 'INCONCLUSIVE';
+  evidenceStrength?: 'STRONG' | 'MODERATE' | 'HEURISTIC' | 'DESCRIPTIVE';
+  whatObserved?: string;
+  whatEstablished?: string;
+  whatRemainsUnknown?: string;
+  recommendedAction?: string;
+}
+
+export type CrossVideoComparisonType = 
+  | 'visual_segment'
+  | 'visual_frame'
+  | 'intro_outro'
+  | 'static_template'
+  | 'audio_spectral'
+  | 'audio_repetition'
+  | 'metadata_parity'
+  | 'series_branding';
+
+export type CrossVideoComparisonStatus = 
+  | 'MATCH_CONFIRMED'
+  | 'SIMILAR_INCONCLUSIVE'
+  | 'NO_MATCH'
+  | 'UNAVAILABLE_MISSING_EVIDENCE'
+  | 'UNVERIFIED';
+
+export interface CrossVideoComparisonItem {
+  id: string;
+  type: CrossVideoComparisonType;
+  scanIdA: string;
+  scanIdB: string;
+  videoTitleA?: string;
+  videoTitleB?: string;
+  evidenceRefA?: string;
+  evidenceRefB?: string;
+  intervalA?: { start: number; end: number; label: string };
+  intervalB?: { start: number; end: number; label: string };
+  algorithm: string;
+  algorithmVersion: string;
+  decisionThreshold: number;
+  measuredSimilarity: number;
+  status: CrossVideoComparisonStatus;
+  evidenceStrength: 'STRONG' | 'MODERATE' | 'HEURISTIC' | 'DESCRIPTIVE';
+  limitations: string;
+  explanation: string;
+  createdAt: string;
+}
+
+export type TemporalPatternStatus = 
+  | 'NEWLY_OBSERVED'
+  | 'PERSISTING'
+  | 'RESOLVED_WITH_EVIDENCE'
+  | 'CHANGE_NOT_VERIFIED'
+  | 'COMPARISON_UNAVAILABLE';
+
+export interface TemporalPatternItem {
+  patternId: string;
+  patternType: string;
+  label: string;
+  priorScanId: string;
+  latestScanId: string;
+  status: TemporalPatternStatus;
+  priorEvidenceRef?: string;
+  latestEvidenceRef?: string;
+  priorTimestamp?: string;
+  latestTimestamp?: string;
+  reason: string;
+  detectorVersionMatch: boolean;
+  mediaIdentityMatch?: boolean;
+}
+
+export interface TemporalAnalysisResult {
+  scopeId: string;
+  priorScanId: string;
+  latestScanId: string;
+  priorMediaSha256?: string;
+  latestMediaSha256?: string;
+  isIdenticalMedia: boolean;
+  temporalPatterns: TemporalPatternItem[];
+  summary: string;
+  limitations: string;
+}
+
+export interface StoredVisualSignature {
+  timestamp: number;
+  hGrad: string; // 56 bits hex
+  vGrad: string; // 56 bits hex
+  meanY: number;
+  stdDevY: number;
+  meanR: number;
+  meanG: number;
+  meanB: number;
+}
+
+export interface StoredAudioSignature {
+  sec: number;
+  duration: number;
+  rms: number;
+  zcr: number;
+  spectralProfile: number[]; // 16 subbands
 }
 
 export type ChannelIntelligenceCoverageStatus = 
@@ -261,13 +380,56 @@ export interface ChannelCoverageDetail {
   dataRequirements?: string;
 }
 
-export interface ChannelPatternsResponse {
+export interface ChannelIntelligenceRecord {
+  id: string;
+  userId: string;
+  scopeId: string; // e.g. userId or channelProfileId
+  version: number;
+  status: 'COMPLETED' | 'INSUFFICIENT_DATA' | 'FAILED' | 'STALE';
   sampleSize: number;
+  sourceScanIds: string[];
+  sourceVideoIdentities: Array<{
+    scanId: string;
+    videoTitle: string;
+    videoFilename: string;
+    sha256?: string;
+    durationSeconds?: number;
+    createdAt?: string;
+  }>;
   patterns: CrossVideoPattern[];
+  crossVideoComparisons?: CrossVideoComparisonItem[];
+  temporalAnalysis?: TemporalAnalysisResult | null;
   coverage: ChannelCoverageReport;
   coverageDetails?: Record<keyof ChannelCoverageReport, ChannelCoverageDetail>;
   disclaimer: string;
   mandatoryCoverageStatement: string;
+  limitations?: string;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ChannelPatternsResponse {
+  id?: string;
+  version?: number;
+  status?: string;
+  sampleSize: number;
+  patterns: CrossVideoPattern[];
+  crossVideoComparisons?: CrossVideoComparisonItem[];
+  temporalAnalysis?: TemporalAnalysisResult | null;
+  sourceVideoIdentities?: Array<{
+    scanId: string;
+    videoTitle: string;
+    videoFilename: string;
+    sha256?: string;
+    durationSeconds?: number;
+  }>;
+  coverage: ChannelCoverageReport;
+  coverageDetails?: Record<keyof ChannelCoverageReport, ChannelCoverageDetail>;
+  disclaimer: string;
+  mandatoryCoverageStatement: string;
+  limitations?: string;
+  updatedAt?: string;
 }
 
 export interface RiskReport {

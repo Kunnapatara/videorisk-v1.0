@@ -77,9 +77,26 @@ async function startServer() {
     });
   });
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`[VideoRisk Server] Running at http://0.0.0.0:${PORT}`);
   });
+
+  // Graceful shutdown handling for operational restarts and deployments
+  const gracefulShutdown = (signal: string) => {
+    console.log(`[VideoRisk Server] Received ${signal}. Initiating graceful shutdown...`);
+    server.close(() => {
+      console.log('[VideoRisk Server] HTTP server closed cleanly.');
+      process.exit(0);
+    });
+    // Force shutdown after 10 seconds if lingering sockets exist
+    setTimeout(() => {
+      console.error('[VideoRisk Server] Graceful shutdown timed out after 10s. Forcing exit.');
+      process.exit(1);
+    }, 10000).unref();
+  };
+
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 }
 
 // Start server when executed directly as entrypoint

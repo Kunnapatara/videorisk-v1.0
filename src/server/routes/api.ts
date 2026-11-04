@@ -12,6 +12,7 @@ import { thumbnailInspector } from '../pipeline/thumbnailInspector';
 import { creditService } from '../services/creditService';
 import { billingService, ALLOWED_PAID_PLANS } from '../services/billingService';
 import { ensureDemoFixtures, getDemoFixture } from '../fixtures/demoMedia';
+import { channelIntelligenceEngine } from '../intelligence/channelIntelligence';
 import { ScanJob, ScanMode, UserAccount, CrossVideoPattern, ChannelCoverageReport, ChannelCoverageDetail, ChannelPatternsResponse } from '../../types';
 
 export const apiRouter = Router();
@@ -1169,11 +1170,76 @@ export const validateRescanAuthorization: RequestHandler = async (req, res, next
   }
 };
 
-// 1. Clean Health Endpoint (Public)
+// 1. Process Liveness & Service Readiness Endpoints (Public)
 apiRouter.get('/health', (req: Request, res: Response) => {
   res.json({
     status: 'ok',
     service: 'VideoRisk'
+  });
+});
+
+apiRouter.get('/health/liveness', (req: Request, res: Response) => {
+  res.json({
+    status: 'ok',
+    uptimeSeconds: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString()
+  });
+});
+
+apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
+  const checks: Record<string, { status: 'healthy' | 'degraded' | 'unhealthy'; message?: string }> = {};
+  let isReady = true;
+
+  // 1. Storage repository check
+  try {
+    if ((storage as any).db && typeof (storage as any).db.prepare === 'function') {
+      const row = (storage as any).db.prepare('SELECT 1 as alive;').get();
+      if (row && row.alive === 1) {
+        checks.database = { status: 'healthy' };
+      } else {
+        checks.database = { status: 'unhealthy', message: 'Database returned unexpected ping result.' };
+        isReady = false;
+      }
+    } else {
+      checks.database = { status: 'healthy', message: 'In-memory storage ready.' };
+    }
+  } catch (err: any) {
+    checks.database = { status: 'unhealthy', message: 'Database query execution failed.' };
+    isReady = false;
+  }
+
+  // 2. Billing gateway readiness check (non-disclosing)
+  const isProd = process.env.NODE_ENV === 'production' || process.env.PAYMENT_MODE === 'production' || process.env.PAYMENT_MODE === 'live';
+  if (isProd) {
+    const hasSecretKey = Boolean(process.env.STRIPE_SECRET_KEY && process.env.STRIPE_SECRET_KEY.trim());
+    const hasWebhookSecret = Boolean(process.env.STRIPE_WEBHOOK_SECRET && process.env.STRIPE_WEBHOOK_SECRET.trim());
+    if (hasSecretKey && hasWebhookSecret) {
+      checks.billing = { status: 'healthy' };
+    } else {
+      checks.billing = { status: 'degraded', message: 'Production billing credentials incomplete.' };
+    }
+  } else {
+    checks.billing = { status: 'healthy', message: 'Test/dev billing ready.' };
+  }
+
+  // 3. Media storage write readiness
+  try {
+    if (fs.existsSync(uploadDir)) {
+      checks.storage = { status: 'healthy' };
+    } else {
+      checks.storage = { status: 'unhealthy', message: 'Uploads directory not accessible.' };
+      isReady = false;
+    }
+  } catch {
+    checks.storage = { status: 'unhealthy', message: 'Filesystem check failed.' };
+    isReady = false;
+  }
+
+  const statusCode = isReady ? 200 : 503;
+  res.status(statusCode).json({
+    status: isReady ? 'ready' : 'not_ready',
+    checks,
+    timestamp: new Date().toISOString()
   });
 });
 
@@ -1859,258 +1925,130 @@ apiRouter.delete('/channel/profile', async (req: Request, res: Response) => {
   }
 });
 
-// 6b. Cross-Video Recurring Patterns (Scoped strictly to user's authorized scan history)
+// 6b. Cross-Video Recurring Patterns (Scoped strictly to user's authorized scan history, backed by persistent Channel Intelligence)
 apiRouter.get('/channel/patterns', async (req: Request, res: Response) => {
   try {
     const user = await requireAuth(req, res);
     if (!user) return;
 
-    const userScans = await storage.scans.getAllScans(user.id);
-    
-    // Strict integrity: only include unique, completed scans belonging to the authenticated user
-    const seenScanIds = new Set<string>();
-    const completedScans: ScanJob[] = [];
-    for (const s of userScans) {
-      if (s.status === 'COMPLETED' && !seenScanIds.has(s.id)) {
-        seenScanIds.add(s.id);
-        completedScans.push(s);
-      }
-    }
+    const recompute = req.query.recompute === 'true' || req.query.refresh === 'true';
+    const record = await channelIntelligenceEngine.aggregateChannelIntelligence(user.id, { recompute });
 
-    const sampleSize = completedScans.length;
-
-    // Explicit Capability Coverage Reporting
-    const coverage: ChannelCoverageReport = {
-      titleMetadata: 'AVAILABLE',
-      introOutro: 'NOT_AVAILABLE',
-      crossVideoFootage: 'NOT_AVAILABLE',
-      audioPatterns: 'NOT_AVAILABLE',
-      originalContribution: 'INSUFFICIENT_EVIDENCE'
+    // Format response matching ChannelPatternsResponse contract
+    const response: ChannelPatternsResponse = {
+      id: record.id,
+      version: record.version,
+      status: record.status,
+      sampleSize: record.sampleSize,
+      patterns: record.patterns,
+      crossVideoComparisons: record.crossVideoComparisons,
+      temporalAnalysis: record.temporalAnalysis,
+      sourceVideoIdentities: record.sourceVideoIdentities,
+      coverage: record.coverage,
+      coverageDetails: record.coverageDetails,
+      disclaimer: record.disclaimer,
+      mandatoryCoverageStatement: record.mandatoryCoverageStatement,
+      limitations: record.limitations,
+      updatedAt: record.updatedAt
     };
 
-    const coverageDetails: Record<keyof ChannelCoverageReport, ChannelCoverageDetail> = {
-      titleMetadata: {
-        status: 'AVAILABLE',
-        reason: 'Evaluates persisted video titles, descriptions, tags, and metadata coherence findings across completed scans in your account.',
-        dataRequirements: 'Requires at least 2 completed video scans with metadata.'
-      },
-      introOutro: {
-        status: 'NOT_AVAILABLE',
-        reason: 'VideoProcessor perceptual frame signatures are transient in-memory structures and are not stored in the database after job execution. Cross-scan intro/outro comparison requires persistent structural frame signatures.',
-        dataRequirements: 'Requires persistent cross-video visual signature index.'
-      },
-      crossVideoFootage: {
-        status: 'NOT_AVAILABLE',
-        reason: 'Production VideoProcessor evaluates intra-video repeated footage only. Cross-video visual comparison across distinct uploads is not currently persisted.',
-        dataRequirements: 'Requires persistent visual signature hashing across scans.'
-      },
-      audioPatterns: {
-        status: 'NOT_AVAILABLE',
-        reason: 'Audio processing buffers and acoustic energy measurements are transient. Unconfigured STT or music classification cannot be used to infer audio pattern recurrence across scans.',
-        dataRequirements: 'Requires configured speech transcription and acoustic fingerprint persistence.'
-      },
-      originalContribution: {
-        status: 'INSUFFICIENT_EVIDENCE',
-        reason: 'Automated transcript and original contribution measurement is not established for uploaded videos. VideoRisk preserves null rather than fabricating an arbitrary original contribution score.',
-        dataRequirements: 'Requires verified spoken dialogue transcript analysis and verified third-party source attribution.'
-      }
-    };
-
-    const MANDATORY_COVERAGE_STATEMENT = 
-      'Channel insights are based only on videos uploaded and analyzed in your VideoRisk account. This is not a complete audit of all videos on your YouTube channel.';
-
-    // Insufficient sample size check: requires at least 2 completed scans
-    if (sampleSize < 2) {
-      return res.json({
-        sampleSize,
-        patterns: [],
-        coverage,
-        coverageDetails,
-        disclaimer: MANDATORY_COVERAGE_STATEMENT,
-        mandatoryCoverageStatement: MANDATORY_COVERAGE_STATEMENT
-      });
-    }
-
-    const patterns: CrossVideoPattern[] = [];
-
-    // -------------------------------------------------------------------------
-    // 1. EXACT REPEATED TITLES
-    // -------------------------------------------------------------------------
-    const titleGroups = new Map<string, ScanJob[]>();
-    for (const s of completedScans) {
-      const rawTitle = (s.videoTitle || '').trim();
-      if (!rawTitle) continue;
-      const normalizedTitle = rawTitle.toLowerCase().replace(/\s+/g, ' ');
-      const existing = titleGroups.get(normalizedTitle) || [];
-      existing.push(s);
-      titleGroups.set(normalizedTitle, existing);
-    }
-
-    for (const [normTitle, group] of titleGroups.entries()) {
-      if (group.length >= 2) {
-        const affectedCount = group.length;
-        const frequency = parseFloat(((affectedCount / sampleSize) * 100).toFixed(0));
-        const sampleOriginalTitle = group[0].videoTitle;
-        patterns.push({
-          id: `pat_title_exact_${Buffer.from(normTitle).toString('base64url').substring(0, 16)}`,
-          patternType: 'exact_repeated_title',
-          label: `Identical Video Titles (${affectedCount} videos)`,
-          severity: 'warning',
-          sampleSize,
-          affectedScansCount: affectedCount,
-          frequency,
-          evidenceReferences: group.map(g => g.id),
-          explanation: `${affectedCount} of ${sampleSize} analyzed videos share the exact title: "${sampleOriginalTitle}". Re-uploading identical titles can confuse audience search indexing and trigger platform spam or duplicate metadata filters.`,
-          recommendation: 'Ensure each uploaded video features a distinct, descriptive title accurately reflecting its specific focus.',
-          confidence: 'HIGH',
-          limitations: 'Evaluates exact normalized text parity across stored scan titles.',
-          disclaimer: MANDATORY_COVERAGE_STATEMENT
-        });
-      }
-    }
-
-    // -------------------------------------------------------------------------
-    // 2. SERIES / EPISODIC TITLE TEMPLATES (Observation, NOT a policy violation)
-    // -------------------------------------------------------------------------
-    // Identify series patterns like "Topic - Episode 1", "Show Part 2", "Series #3", or "Episode 1: Tech Review"
-    const seriesPrefixRegex = /^(.*?)(?:[\s\-_|:]*(?:ep(?:isode)?|part|vol(?:ume)?|#)\s*\d+.*)$/i;
-    const seriesLeadingRegex = /^(?:(?:ep(?:isode)?|part|vol(?:ume)?|#)\s*\d+[\s\-_|:]*)(.*?)$/i;
-    const seriesGroups = new Map<string, ScanJob[]>();
-
-    for (const s of completedScans) {
-      const rawTitle = (s.videoTitle || '').trim();
-      const matchPrefix = seriesPrefixRegex.exec(rawTitle);
-      const matchLeading = seriesLeadingRegex.exec(rawTitle);
-
-      let seriesKey: string | null = null;
-      if (matchPrefix && matchPrefix[1] && matchPrefix[1].trim().length >= 3) {
-        seriesKey = matchPrefix[1].trim().toLowerCase();
-      } else if (matchLeading && matchLeading[1] && matchLeading[1].trim().length >= 3) {
-        seriesKey = matchLeading[1].trim().toLowerCase();
-      } else if (matchLeading) {
-        seriesKey = 'episodic_format';
-      }
-
-      if (seriesKey) {
-        const existing = seriesGroups.get(seriesKey) || [];
-        existing.push(s);
-        seriesGroups.set(seriesKey, existing);
-      }
-    }
-
-    for (const [prefix, group] of seriesGroups.entries()) {
-      // Only report if there are at least 2 videos in the series and they are NOT already flagged as identical titles
-      const distinctTitles = new Set(group.map(g => (g.videoTitle || '').trim().toLowerCase()));
-      if (group.length >= 2 && distinctTitles.size >= 2) {
-        const affectedCount = group.length;
-        const frequency = parseFloat(((affectedCount / sampleSize) * 100).toFixed(0));
-        const sampleSeriesTitle = group[0].videoTitle;
-        patterns.push({
-          id: `pat_title_series_${Buffer.from(prefix).toString('base64url').substring(0, 16)}`,
-          patternType: 'series_title_template',
-          label: `Consistent Series Title Formatting`,
-          severity: 'info',
-          sampleSize,
-          affectedScansCount: affectedCount,
-          frequency,
-          evidenceReferences: group.map(g => g.id),
-          explanation: `${affectedCount} of ${sampleSize} analyzed videos follow a structured episodic or series naming template (e.g., "${sampleSeriesTitle}"). This is a standard episodic series format.`,
-          recommendation: 'Maintain episodic branding while highlighting the episode-specific topic or guest name to maximize search discoverability.',
-          confidence: 'HIGH',
-          limitations: 'Recognizes serial numbering and common episodic naming prefixes.',
-          disclaimer: MANDATORY_COVERAGE_STATEMENT
-        });
-      }
-    }
-
-    // -------------------------------------------------------------------------
-    // 3. IDENTICAL VIDEO DESCRIPTIONS
-    // -------------------------------------------------------------------------
-    const descGroups = new Map<string, ScanJob[]>();
-    for (const s of completedScans) {
-      const rawDesc = (s.videoDescription || '').trim();
-      if (!rawDesc || rawDesc.length < 25) continue; // Skip empty or trivial descriptions
-      const normDesc = rawDesc.toLowerCase().replace(/\s+/g, ' ');
-      const existing = descGroups.get(normDesc) || [];
-      existing.push(s);
-      descGroups.set(normDesc, existing);
-    }
-
-    for (const [normDesc, group] of descGroups.entries()) {
-      if (group.length >= 2) {
-        const affectedCount = group.length;
-        const frequency = parseFloat(((affectedCount / sampleSize) * 100).toFixed(0));
-        patterns.push({
-          id: `pat_desc_exact_${Buffer.from(normDesc).toString('base64url').substring(0, 16)}`,
-          patternType: 'repeated_description',
-          label: `Identical Video Descriptions (${affectedCount} videos)`,
-          severity: 'info',
-          sampleSize,
-          affectedScansCount: affectedCount,
-          frequency,
-          evidenceReferences: group.map(g => g.id),
-          explanation: `${affectedCount} of ${sampleSize} analyzed videos share identical description text. While boilerplate channel links and disclaimers are standard, unique video descriptions provide essential context for search indexing.`,
-          recommendation: 'Include 1–2 paragraphs of unique summary describing the specific topics and takeaways of each video alongside your standard channel links.',
-          confidence: 'HIGH',
-          limitations: 'Evaluates exact text parity across saved video descriptions.',
-          disclaimer: MANDATORY_COVERAGE_STATEMENT
-        });
-      }
-    }
-
-    // -------------------------------------------------------------------------
-    // 4. RECURRING TITLE-TO-CONTENT COHERENCE GAPS
-    // -------------------------------------------------------------------------
-    let titleMismatchCount = 0;
-    const mismatchScanRefs: string[] = [];
-
-    for (const s of completedScans) {
-      const report = await storage.scans.getReport(s.id);
-      if (report && Array.isArray(report.topIssues)) {
-        const hasMismatch = report.topIssues.some(i => 
-          (i.domain === 'title' && (i.category === 'metadata_coherence' || i.type === 'title_content_mismatch')) ||
-          i.type === 'title_duration_mismatch'
-        );
-        if (hasMismatch) {
-          titleMismatchCount++;
-          mismatchScanRefs.push(s.id);
-        }
-      }
-    }
-
-    if (titleMismatchCount >= 2) {
-      const frequency = parseFloat(((titleMismatchCount / sampleSize) * 100).toFixed(0));
-      patterns.push({
-        id: 'pat_metadata_gap',
-        patternType: 'title_content_mismatch',
-        label: 'Recurring Title-to-Content Pacing Gap',
-        severity: 'warning',
-        sampleSize,
-        affectedScansCount: titleMismatchCount,
-        frequency,
-        evidenceReferences: mismatchScanRefs,
-        explanation: `In ${titleMismatchCount} of ${sampleSize} analyzed videos, title promises differed from opening segment pacing or detected content structure.`,
-        recommendation: 'Ensure opening hooks immediately address the subject introduced in the title to maintain audience trust and retention.',
-        confidence: 'MEDIUM',
-        limitations: 'Derived from automated title lexicon matching against initial scene transitions and metadata.',
-        disclaimer: MANDATORY_COVERAGE_STATEMENT
-      });
-    }
-
-    // Strict integrity: originalContributionRatio is NOT measured when reliable transcript evidence is unavailable.
-    // It remains null / INSUFFICIENT_EVIDENCE. No pattern is fabricated from null or acoustic energy.
-
-    res.json({
-      sampleSize,
-      patterns,
-      coverage,
-      coverageDetails,
-      disclaimer: MANDATORY_COVERAGE_STATEMENT,
-      mandatoryCoverageStatement: MANDATORY_COVERAGE_STATEMENT
-    });
+    res.json(response);
   } catch (err: any) {
     console.error('[API] Failed to compute cross-video patterns:', err);
     res.status(500).json({ error: 'Failed to compute cross-video patterns.' });
+  }
+});
+
+// 6c. Full Persistent Channel Intelligence Record
+apiRouter.get('/channel/intelligence', async (req: Request, res: Response) => {
+  try {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+
+    const recompute = req.query.recompute === 'true' || req.query.refresh === 'true';
+    const record = await channelIntelligenceEngine.aggregateChannelIntelligence(user.id, { recompute });
+    res.json(record);
+  } catch (err: any) {
+    console.error('[API] Failed to retrieve channel intelligence:', err);
+    res.status(500).json({ error: 'Failed to retrieve channel intelligence.' });
+  }
+});
+
+// 6d. Cross-Video Comparison between two specific authorized scans
+apiRouter.get('/channel/comparison', async (req: Request, res: Response) => {
+  try {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+
+    const { scanA: scanIdA, scanB: scanIdB } = req.query;
+    if (!scanIdA || typeof scanIdA !== 'string' || !scanIdB || typeof scanIdB !== 'string') {
+      return res.status(400).json({ error: 'Query parameters "scanA" and "scanB" are required.' });
+    }
+
+    // Tenant isolation: fetch both scans and verify ownership server-side
+    const scanA = await storage.scans.getScan(scanIdA);
+    const scanB = await storage.scans.getScan(scanIdB);
+
+    // Fail closed: if either scan is missing or belongs to another user, return 404 without leaking existence
+    if (!scanA || scanA.userId !== user.id || !scanB || scanB.userId !== user.id) {
+      return res.status(404).json({ error: 'One or more requested scans could not be found.' });
+    }
+
+    const reportA = await storage.scans.getReport(scanA.id);
+    const reportB = await storage.scans.getReport(scanB.id);
+
+    const visRes = channelIntelligenceEngine.compareVisualSignatures(scanA, scanB, reportA, reportB);
+    const audRes = channelIntelligenceEngine.compareAudioSignatures(scanA, scanB, reportA, reportB);
+
+    const allComparisons = [...visRes.comparisons, ...audRes.comparisons];
+    const overallStatus = allComparisons.some(c => c.status === 'MATCH_CONFIRMED')
+      ? 'MATCH_CONFIRMED'
+      : (allComparisons.some(c => c.status === 'SIMILAR_INCONCLUSIVE') ? 'SIMILAR_INCONCLUSIVE' : 'NO_MATCH');
+
+    res.json({
+      scanIdA,
+      scanIdB,
+      videoTitleA: scanA.videoTitle,
+      videoTitleB: scanB.videoTitle,
+      status: overallStatus,
+      comparisons: allComparisons,
+      visualStatus: visRes.status,
+      audioStatus: audRes.status,
+      limitations: [visRes.limitations, audRes.limitations].filter(Boolean).join(' ')
+    });
+  } catch (err: any) {
+    console.error('[API] Failed to compare scans:', err);
+    res.status(500).json({ error: 'Failed to execute cross-video comparison.' });
+  }
+});
+
+// 6e. Temporal Pattern Evolution between two scans
+apiRouter.get('/channel/temporal', async (req: Request, res: Response) => {
+  try {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+
+    const { priorScanId, latestScanId } = req.query;
+    if (!priorScanId || typeof priorScanId !== 'string' || !latestScanId || typeof latestScanId !== 'string') {
+      return res.status(400).json({ error: 'Query parameters "priorScanId" and "latestScanId" are required.' });
+    }
+
+    // Tenant isolation: verify ownership of both scans
+    const priorScan = await storage.scans.getScan(priorScanId);
+    const latestScan = await storage.scans.getScan(latestScanId);
+
+    if (!priorScan || priorScan.userId !== user.id || !latestScan || latestScan.userId !== user.id) {
+      return res.status(404).json({ error: 'One or more requested scans could not be found.' });
+    }
+
+    const priorReport = await storage.scans.getReport(priorScan.id);
+    const latestReport = await storage.scans.getReport(latestScan.id);
+
+    const temporalResult = channelIntelligenceEngine.computeTemporalChanges(priorScan, latestScan, priorReport, latestReport);
+    res.json(temporalResult);
+  } catch (err: any) {
+    console.error('[API] Failed to compute temporal comparison:', err);
+    res.status(500).json({ error: 'Failed to compute temporal comparison.' });
   }
 });
 

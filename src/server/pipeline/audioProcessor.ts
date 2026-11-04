@@ -1295,7 +1295,14 @@ export class AudioProcessor {
             budgetExceeded: isRepetitionBudgetExceeded,
             limitReached: repDetails.limitReached || (pcmExtraction.chunksLimitExceeded ? 'CHUNK_LIMIT' : undefined),
             chunksEvaluated: repDetails.chunksEvaluated,
-            totalChunks: pcmExtraction.chunksLimitExceeded ? Math.ceil(pcmExtraction.totalAudioSeconds) : repDetails.totalChunks
+            totalChunks: pcmExtraction.chunksLimitExceeded ? Math.ceil(pcmExtraction.totalAudioSeconds) : repDetails.totalChunks,
+            audioSignatures: (pcmExtraction.chunkSignatures || []).map(c => ({
+              sec: c.sec,
+              duration: c.duration,
+              rms: parseFloat(c.rms.toFixed(1)),
+              zcr: Math.round(c.zcr),
+              spectralProfile: c.spectralProfile.map(v => parseFloat(v.toFixed(3)))
+            }))
           }
         }
       };

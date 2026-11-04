@@ -602,7 +602,29 @@ export class VideoProcessor {
         : (templateRepetitions.length > 0 ? 'DETECTED' : 'NO_SIGNAL_DETECTED');
 
       const repetitionDurationMs = Date.now() - repetitionStart;
-      const totalVideoAnalysisMs = Date.now() - startTime;
+      const bitsToHex = (bits: boolean[]): string => {
+        let hex = '';
+        for (let b = 0; b < bits.length; b += 4) {
+          let nibble = 0;
+          if (bits[b]) nibble |= 8;
+          if (bits[b + 1]) nibble |= 4;
+          if (bits[b + 2]) nibble |= 2;
+          if (bits[b + 3]) nibble |= 1;
+          hex += nibble.toString(16);
+        }
+        return hex;
+      };
+
+      const compactVisualSignatures = frameSignatures.map(f => ({
+        timestamp: parseFloat((f.index * sampleInterval).toFixed(2)),
+        hGrad: bitsToHex(f.hGradients),
+        vGrad: bitsToHex(f.vGradients),
+        meanY: parseFloat(f.meanY.toFixed(1)),
+        stdDevY: parseFloat(f.stdDevY.toFixed(1)),
+        meanR: Math.round(f.meanR),
+        meanG: Math.round(f.meanG),
+        meanB: Math.round(f.meanB)
+      }));
 
       const detectors: Record<string, DetectorReport> = {
         video_scene_cut: {
@@ -619,7 +641,11 @@ export class VideoProcessor {
           status: repeatedFootageStatus,
           executionDurationMs: repetitionDurationMs,
           confidence: consolidatedRepeats.length > 0 ? consolidatedRepeats[0].confidence : 0.92,
-          limitations: 'Analyzes within-video non-adjacent frame repetition using 8x8 perceptual similarity; does not query external copyright or third-party databases.'
+          limitations: 'Analyzes within-video non-adjacent frame repetition using 8x8 perceptual similarity; does not query external copyright or third-party databases.',
+          details: {
+            visualSignatures: compactVisualSignatures,
+            repeatedSegmentsCount: consolidatedRepeats.length
+          }
         },
         video_slideshow_heuristic: {
           detectorName: 'intra_scene_invariance_heuristic',

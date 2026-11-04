@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import crypto from 'crypto';
 import {
   ScanJob,
@@ -17,7 +18,8 @@ import {
   JobQueueRecord,
   OperationalMetrics,
   FencingError,
-  CreditTransactionRecord
+  CreditTransactionRecord,
+  ChannelIntelligenceRecord
 } from '../../types';
 import {
   IStorageRepository,
@@ -28,6 +30,7 @@ import {
   IUploadRepository,
   IBillingRepository,
   IChannelProfileRepository,
+  IChannelIntelligenceRepository,
   IPasswordResetRepository,
   IJobQueueRepository,
   IRateLimitRepository,
@@ -505,6 +508,47 @@ export class SqliteStorageRepository implements IStorageRepository {
       } catch (err) {
         this.db.exec('ROLLBACK;');
         throw new Error(`Failed to apply migration 4: ${err}`);
+      }
+    }
+
+    // Migration 5: Persistent Channel Intelligence & Cross-Video Patterns
+    if (!appliedVersions.has(5)) {
+      this.db.exec('BEGIN IMMEDIATE;');
+      try {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS channel_intelligence (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            scope_id TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL,
+            sample_size INTEGER NOT NULL DEFAULT 0,
+            source_scan_ids_json TEXT NOT NULL,
+            source_video_identities_json TEXT NOT NULL,
+            patterns_json TEXT NOT NULL,
+            comparisons_json TEXT NOT NULL,
+            temporal_analysis_json TEXT,
+            coverage_json TEXT NOT NULL,
+            coverage_details_json TEXT NOT NULL,
+            disclaimer TEXT NOT NULL,
+            mandatory_coverage_statement TEXT NOT NULL,
+            limitations TEXT,
+            error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_channel_intelligence_user ON channel_intelligence(user_id);
+          CREATE INDEX IF NOT EXISTS idx_channel_intelligence_scope ON channel_intelligence(scope_id);
+          CREATE INDEX IF NOT EXISTS idx_scans_user_status ON scans(user_id, status);
+        `);
+        this.db.exec(`
+          INSERT INTO schema_migrations (version, name, applied_at)
+          VALUES (5, '005_channel_intelligence_persistence', datetime('now'));
+        `);
+        this.db.exec('COMMIT;');
+      } catch (err) {
+        this.db.exec('ROLLBACK;');
+        throw new Error(`Failed to apply migration 5: ${err}`);
       }
     }
   }
@@ -1239,6 +1283,7 @@ export class SqliteStorageRepository implements IStorageRepository {
     },
 
     deleteScan: async (id: string): Promise<boolean> => {
+      await this.channelIntelligence.removeScanReferences(id);
       const res = this.db.prepare('DELETE FROM scans WHERE id = ?').run(id);
       return Number(res.changes) > 0;
     },
@@ -1663,6 +1708,129 @@ export class SqliteStorageRepository implements IStorageRepository {
   };
 
   // -------------------------------------------------------------
+  // CHANNEL INTELLIGENCE REPOSITORY
+  // -------------------------------------------------------------
+  public channelIntelligence: IChannelIntelligenceRepository = {
+    getLatest: async (userId: string): Promise<ChannelIntelligenceRecord | null> => {
+      const row = this.db.prepare(`
+        SELECT * FROM channel_intelligence 
+        WHERE user_id = ? AND status != 'STALE'
+        ORDER BY updated_at DESC LIMIT 1
+      `).get(userId) as any;
+      if (!row) return null;
+      return this.mapChannelIntelligence(row);
+    },
+
+    save: async (record: ChannelIntelligenceRecord): Promise<ChannelIntelligenceRecord> => {
+      return await this.runTransaction(db => {
+        db.prepare(`
+          INSERT INTO channel_intelligence (
+            id, user_id, scope_id, version, status, sample_size,
+            source_scan_ids_json, source_video_identities_json,
+            patterns_json, comparisons_json, temporal_analysis_json,
+            coverage_json, coverage_details_json, disclaimer, mandatory_coverage_statement,
+            limitations, error, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            version = excluded.version,
+            status = excluded.status,
+            sample_size = excluded.sample_size,
+            source_scan_ids_json = excluded.source_scan_ids_json,
+            source_video_identities_json = excluded.source_video_identities_json,
+            patterns_json = excluded.patterns_json,
+            comparisons_json = excluded.comparisons_json,
+            temporal_analysis_json = excluded.temporal_analysis_json,
+            coverage_json = excluded.coverage_json,
+            coverage_details_json = excluded.coverage_details_json,
+            disclaimer = excluded.disclaimer,
+            mandatory_coverage_statement = excluded.mandatory_coverage_statement,
+            limitations = excluded.limitations,
+            error = excluded.error,
+            updated_at = excluded.updated_at
+        `).run(
+          record.id,
+          record.userId,
+          record.scopeId,
+          record.version,
+          record.status,
+          record.sampleSize,
+          JSON.stringify(record.sourceScanIds || []),
+          JSON.stringify(record.sourceVideoIdentities || []),
+          JSON.stringify(record.patterns || []),
+          JSON.stringify(record.crossVideoComparisons || []),
+          record.temporalAnalysis ? JSON.stringify(record.temporalAnalysis) : null,
+          JSON.stringify(record.coverage),
+          JSON.stringify(record.coverageDetails || {}),
+          record.disclaimer,
+          record.mandatoryCoverageStatement,
+          record.limitations || null,
+          record.error || null,
+          record.createdAt || new Date().toISOString(),
+          record.updatedAt || new Date().toISOString()
+        );
+        return record;
+      });
+    },
+
+    invalidate: async (userId: string): Promise<void> => {
+      this.db.prepare(`
+        UPDATE channel_intelligence 
+        SET status = 'STALE', updated_at = ?
+        WHERE user_id = ?
+      `).run(new Date().toISOString(), userId);
+    },
+
+    deleteByUserId: async (userId: string): Promise<void> => {
+      this.db.prepare('DELETE FROM channel_intelligence WHERE user_id = ?').run(userId);
+    },
+
+    removeScanReferences: async (scanId: string): Promise<void> => {
+      const rows = this.db.prepare(`
+        SELECT id, source_scan_ids_json 
+        FROM channel_intelligence 
+        WHERE source_scan_ids_json LIKE ?
+      `).all(`%"${scanId}"%`) as any[];
+
+      const now = new Date().toISOString();
+      for (const row of rows) {
+        let scanIds: string[] = [];
+        try { scanIds = JSON.parse(row.source_scan_ids_json); } catch {}
+        if (scanIds.includes(scanId)) {
+          this.db.prepare(`
+            UPDATE channel_intelligence 
+            SET status = 'STALE', updated_at = ?
+            WHERE id = ?
+          `).run(now, row.id);
+        }
+      }
+    }
+  };
+
+  private mapChannelIntelligence(row: any): ChannelIntelligenceRecord {
+    return {
+      id: row.id,
+      userId: row.user_id,
+      scopeId: row.scope_id,
+      version: Number(row.version),
+      status: row.status,
+      sampleSize: Number(row.sample_size),
+      sourceScanIds: JSON.parse(row.source_scan_ids_json || '[]'),
+      sourceVideoIdentities: JSON.parse(row.source_video_identities_json || '[]'),
+      patterns: JSON.parse(row.patterns_json || '[]'),
+      crossVideoComparisons: JSON.parse(row.comparisons_json || '[]'),
+      temporalAnalysis: row.temporal_analysis_json ? JSON.parse(row.temporal_analysis_json) : null,
+      coverage: JSON.parse(row.coverage_json),
+      coverageDetails: JSON.parse(row.coverage_details_json || '{}'),
+      disclaimer: row.disclaimer,
+      mandatoryCoverageStatement: row.mandatory_coverage_statement,
+      limitations: row.limitations || undefined,
+      error: row.error || undefined,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    };
+  }
+
+  // -------------------------------------------------------------
   // UPLOADS REPOSITORY
   // -------------------------------------------------------------
   public uploads: IUploadRepository = {
@@ -1871,6 +2039,80 @@ export class SqliteStorageRepository implements IStorageRepository {
         policy: reportCount > 0 ? Math.round(policyMs / reportCount) : 0
       }
     };
+  }
+
+  /**
+   * Creates a consistent, durable backup of the SQLite database.
+   * Uses SQLite VACUUM INTO to safely snapshot active databases even under WAL mode.
+   */
+  public async createBackup(targetDir?: string): Promise<{ backupPath: string; timestamp: string; sizeBytes: number }> {
+    const backupDir = targetDir || path.resolve(process.cwd(), 'backups');
+    if (!fs.existsSync(backupDir)) {
+      fs.mkdirSync(backupDir, { recursive: true });
+    }
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupFilename = `videorisk_backup_${timestamp}.db`;
+    const backupPath = path.resolve(backupDir, backupFilename);
+
+    // VACUUM INTO creates a pristine, consistent copy of the database without holding long exclusive locks
+    // or copying inconsistent WAL pages.
+    this.db.exec(`VACUUM INTO '${backupPath}';`);
+
+    const stats = fs.statSync(backupPath);
+    return {
+      backupPath,
+      timestamp,
+      sizeBytes: stats.size
+    };
+  }
+
+  /**
+   * Verifies and restores a backup file into an isolated destination path.
+   * Performs integrity check and migration validation on the restored database.
+   */
+  public async restoreBackup(backupPath: string, targetPath?: string): Promise<{ restored: boolean; recordCounts: Record<string, number> }> {
+    if (!fs.existsSync(backupPath)) {
+      throw new Error(`Backup file does not exist at: ${backupPath}`);
+    }
+
+    const destPath = targetPath || path.resolve(os.tmpdir(), `videorisk_restored_${Date.now()}.db`);
+    const destDir = path.dirname(destPath);
+    if (!fs.existsSync(destDir)) {
+      fs.mkdirSync(destDir, { recursive: true });
+    }
+
+    fs.copyFileSync(backupPath, destPath);
+
+    // Open isolated test connection to verify integrity
+    const restoredDb = new DatabaseSync(destPath);
+    try {
+      const integrityCheck = (restoredDb.prepare('PRAGMA integrity_check;').get() as any)?.integrity_check;
+      if (integrityCheck !== 'ok') {
+        throw new Error(`Restored database integrity check failed: ${integrityCheck}`);
+      }
+
+      const usersCount = (restoredDb.prepare('SELECT COUNT(*) as c FROM users;').get() as any)?.c || 0;
+      const scansCount = (restoredDb.prepare('SELECT COUNT(*) as c FROM scans;').get() as any)?.c || 0;
+      const reportsCount = (restoredDb.prepare('SELECT COUNT(*) as c FROM reports;').get() as any)?.c || 0;
+      const subscriptionsCount = (restoredDb.prepare('SELECT COUNT(*) as c FROM subscriptions;').get() as any)?.c || 0;
+      const webhookEventsCount = (restoredDb.prepare('SELECT COUNT(*) as c FROM webhook_events;').get() as any)?.c || 0;
+      const creditTransactionsCount = (restoredDb.prepare('SELECT COUNT(*) as c FROM credit_transactions;').get() as any)?.c || 0;
+
+      return {
+        restored: true,
+        recordCounts: {
+          users: usersCount,
+          scans: scansCount,
+          reports: reportsCount,
+          subscriptions: subscriptionsCount,
+          webhookEvents: webhookEventsCount,
+          creditTransactions: creditTransactionsCount
+        }
+      };
+    } finally {
+      restoredDb.close();
+    }
   }
 }
 
