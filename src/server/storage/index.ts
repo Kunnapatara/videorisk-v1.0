@@ -16,8 +16,10 @@ import {
   OperationalMetrics,
   FencingError,
   CreditTransactionRecord,
-  ChannelIntelligenceRecord
+  ChannelIntelligenceRecord,
+  PlanDetails
 } from '../../types';
+import { OFFICIAL_PRICING_PLANS } from './pricingCatalogue';
 
 export interface RateLimitStatus {
   allowed: boolean;
@@ -142,7 +144,7 @@ export interface IUploadRepository {
 }
 
 export interface IBillingRepository {
-  getPlans(): Promise<any[]>;
+  getPlans(): Promise<PlanDetails[]>;
   isEventProcessed(eventId: string): Promise<boolean>;
   markEventProcessed(record: WebhookEventRecord): Promise<void>;
   saveSubscription(sub: SubscriptionRecord): Promise<void>;
@@ -766,87 +768,8 @@ export class InMemoryStorageRepository implements IStorageRepository {
   };
 
   public billing: IBillingRepository = {
-    getPlans: async () => {
-      return [
-        {
-          id: 'free',
-          name: 'Free Trial',
-          priceUsd: 0,
-          period: 'one-time',
-          credits: 10,
-          costPerMinuteStandard: 'Free (10 mins)',
-          features: [
-            'Up to 1080p Full HD scans',
-            'Standard Scan engine',
-            'Full evidence timeline',
-            'Explainable risk report',
-            '10 total input minutes'
-          ]
-        },
-        {
-          id: 'creator',
-          name: 'Creator',
-          priceUsd: 9,
-          period: 'month',
-          credits: 30,
-          costPerMinuteStandard: '$0.30 / min',
-          features: [
-            '30 input minutes per month',
-            'Standard & Deep Scan modes',
-            '4K with 1080p proxy decode',
-            'Re-scan comparison engine',
-            'Exportable PDF & JSON reports',
-            'Metadata coherence analysis'
-          ],
-          highlight: true
-        },
-        {
-          id: 'pro',
-          name: 'Pro Studio',
-          priceUsd: 19,
-          period: 'month',
-          credits: 75,
-          costPerMinuteStandard: '$0.25 / min',
-          features: [
-            '75 input minutes per month',
-            'Prioritized analysis queue',
-            'Deep cross-segment pattern audit',
-            'Unlimited re-scan comparisons',
-            'AI disclosure flag check',
-            'Advertiser-friendly deep flags'
-          ]
-        },
-        {
-          id: 'agency',
-          name: 'Agency & MCN',
-          priceUsd: 99,
-          period: 'month',
-          credits: 600,
-          costPerMinuteStandard: '$0.16 / min',
-          features: [
-            '600 input minutes per month',
-            'Multiple channel workflows',
-            'Bulk upload analysis',
-            'Dedicated processing throughput',
-            'Direct developer API access',
-            'Priority support'
-          ]
-        },
-        {
-          id: 'audit_once',
-          name: 'One-time Audit',
-          priceUsd: 29,
-          period: 'one-time',
-          credits: 60,
-          costPerMinuteStandard: '$0.48 / min',
-          features: [
-            '60 input minutes (never expires)',
-            'Standard or Deep scan',
-            'Full fix recommendations',
-            'Includes 2 re-scan comparisons'
-          ]
-        }
-      ];
+    getPlans: async (): Promise<PlanDetails[]> => {
+      return [...OFFICIAL_PRICING_PLANS];
     },
 
     isEventProcessed: async (eventId: string) => {

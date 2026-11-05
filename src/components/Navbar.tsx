@@ -150,7 +150,7 @@ export const Navbar: React.FC<NavbarProps> = ({
           >
             <span className="text-stone-400">Credits:</span>
             <span className="font-bold text-emerald-400 font-mono">
-              {user?.creditsRemaining ?? 0}m
+              {user?.creditsRemaining ?? 0}
             </span>
           </button>
 
@@ -170,9 +170,11 @@ export const Navbar: React.FC<NavbarProps> = ({
           <button
             onClick={() => handleNavClick('pricing')}
             className="flex items-center gap-1 px-2.5 py-1 bg-stone-900 rounded-lg border border-stone-800 text-xs text-stone-300"
+            title="View credits"
           >
+            <span className="text-stone-400 text-[10px]">Credits:</span>
             <span className="font-bold text-emerald-400 font-mono text-xs">
-              {user?.creditsRemaining ?? 0}m
+              {user?.creditsRemaining ?? 0}
             </span>
           </button>
 
@@ -208,7 +210,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                 <div className="flex items-center gap-1.5 text-[10px] text-stone-400 mt-0.5">
                   <span className="uppercase font-semibold text-rose-400">{user?.plan || 'Free'} Plan</span>
                   <span>·</span>
-                  <span className="text-emerald-400 font-bold">{user?.creditsRemaining ?? 0} mins left</span>
+                  <span className="text-emerald-400 font-bold">{user?.creditsRemaining ?? 0} credits</span>
                 </div>
               </div>
             </div>

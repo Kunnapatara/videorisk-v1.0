@@ -543,7 +543,7 @@ export interface ComparisonOptions {
 export interface UserAccount {
   id: string;
   email: string;
-  plan: 'free' | 'creator' | 'pro' | 'agency';
+  plan: 'free' | 'creator' | 'pro' | 'agency' | 'audit_once';
   creditsRemaining: number;
   creditsUsedTotal: number;
   totalScansCount: number;
@@ -663,4 +663,6 @@ export interface PlanDetails {
   costPerMinuteStandard: string;
   features: string[];
   highlight?: boolean;
+  description?: string;
+  targetAudience?: string;
 }

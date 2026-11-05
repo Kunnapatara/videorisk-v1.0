@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   ShieldCheck, 
   Video, 
@@ -14,25 +14,46 @@ import {
   BookOpen,
   Sliders,
   Check,
-  Sparkles
+  Sparkles,
+  CreditCard
 } from 'lucide-react';
-import { UserAccount } from '../types';
+import { UserAccount, PlanDetails } from '../types';
 
 interface HomeViewProps {
   user?: UserAccount | null;
+  plans?: PlanDetails[];
   onStartUpload: () => void;
   onExplorePricing: () => void;
   onTryDemo: () => void;
   onOpenRegister?: () => void;
+  onSelectPlan?: (planId: string) => void;
 }
 
 export const HomeView: React.FC<HomeViewProps> = ({ 
   user,
+  plans: propPlans,
   onStartUpload, 
   onExplorePricing, 
   onTryDemo,
-  onOpenRegister
+  onOpenRegister,
+  onSelectPlan
 }) => {
+  const [plans, setPlans] = useState<PlanDetails[]>(propPlans || []);
+
+  useEffect(() => {
+    if (propPlans && propPlans.length > 0) {
+      setPlans(propPlans);
+      return;
+    }
+    fetch('/api/plans')
+      .then(r => r.json())
+      .then(data => {
+        if (Array.isArray(data) && data.length > 0) {
+          setPlans(data);
+        }
+      })
+      .catch(() => {});
+  }, [propPlans]);
   return (
     <div className="space-y-16 sm:space-y-20 pb-20">
       {/* 1. HERO SECTION */}
@@ -453,6 +474,126 @@ export const HomeView: React.FC<HomeViewProps> = ({
               *VideoRisk findings are assessments to inform your decisions. Only the relevant platform can make its own final policy, copyright, and monetization decisions.*
             </p>
           </div>
+        </div>
+      </section>
+
+      {/* COMPACT PRICING OVERVIEW SECTION */}
+      <section className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 space-y-8">
+        <div className="text-center max-w-3xl mx-auto space-y-3">
+          <span className="text-xs uppercase tracking-wider text-rose-600 font-extrabold bg-rose-50 border border-rose-200 px-3 py-1 rounded-full shadow-2xs">
+            Simple & Transparent Pricing
+          </span>
+          <h2 className="text-2xl sm:text-3xl font-extrabold text-stone-900 tracking-tight">
+            Plans for Every Publishing Cadence
+          </h2>
+          <p className="text-xs sm:text-sm text-stone-600 max-w-xl mx-auto leading-relaxed">
+            Get started with 10 free credits upon account creation. Paid memberships start at just $9/month. 
+            Standard Scan uses 1 credit/min; Deep Scan uses 2 credits/min.
+          </p>
+        </div>
+
+        {/* 5 Compact Plan Cards Grid */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
+          {plans.map((p) => {
+            const isCurrent = user?.plan === p.id;
+            const isOneTime = p.period === 'one-time';
+
+            return (
+              <div
+                key={p.id}
+                className={`bg-white rounded-2xl p-5 border flex flex-col justify-between transition-all duration-150 ${
+                  p.highlight
+                    ? 'border-rose-500 ring-2 ring-rose-500/20 shadow-md'
+                    : 'border-stone-200 shadow-xs hover:border-stone-300 hover:shadow-sm'
+                }`}
+              >
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <h3 className="font-bold text-base text-stone-900">{p.name}</h3>
+                    {p.highlight ? (
+                      <span className="text-[10px] uppercase font-extrabold text-rose-600 bg-rose-50 border border-rose-200 px-2 py-0.5 rounded-full">
+                        Popular
+                      </span>
+                    ) : isOneTime ? (
+                      <span className="text-[10px] font-semibold text-stone-600 bg-stone-100 border border-stone-200 px-2 py-0.5 rounded-full">
+                        One-Time
+                      </span>
+                    ) : null}
+                  </div>
+
+                  <div className="flex items-baseline gap-1 mt-1">
+                    <span className="text-2xl font-black text-stone-900 tracking-tight">
+                      ${p.priceUsd}
+                    </span>
+                    <span className="text-[11px] text-stone-500 font-medium">
+                      /{p.period === 'month' ? 'month' : 'one-time'}
+                    </span>
+                  </div>
+
+                  {/* Credits & Inspection Capacity */}
+                  <div className="mt-3 py-2 px-2.5 bg-stone-50 rounded-xl border border-stone-100 space-y-1 text-xs">
+                    <div className="flex items-center justify-between">
+                      <span className="text-stone-500 font-medium text-[11px]">Credit Allocation</span>
+                      <strong className="text-stone-900 font-extrabold font-mono text-xs">{p.credits} credits</strong>
+                    </div>
+                    <div className="text-[11px] text-stone-600">
+                      Standard: <span className="font-semibold text-stone-900">{p.credits} min</span>
+                    </div>
+                    <div className="text-[11px] text-stone-600">
+                      Deep: <span className="font-semibold text-stone-900">
+                        {p.id === 'pro' ? '37 min (+1 credit)' : `${Math.floor(p.credits / 2)} min`}
+                      </span>
+                    </div>
+                  </div>
+
+                  <p className="text-[11px] text-stone-500 mt-2.5 leading-relaxed line-clamp-2">
+                    {p.description || (p.features && p.features[0])}
+                  </p>
+                </div>
+
+                <div className="pt-4 mt-4 border-t border-stone-100">
+                  <button
+                    onClick={() => {
+                      if (p.id === 'free' && !user && onOpenRegister) {
+                        onOpenRegister();
+                      } else if (onSelectPlan) {
+                        onSelectPlan(p.id);
+                      } else {
+                        onExplorePricing();
+                      }
+                    }}
+                    className={`w-full py-2 px-3 text-xs font-bold rounded-xl transition-all flex items-center justify-center gap-1 shadow-2xs ${
+                      isCurrent
+                        ? 'bg-stone-100 text-stone-700 border border-stone-200'
+                        : p.highlight
+                          ? 'bg-rose-600 hover:bg-rose-500 text-white'
+                          : 'bg-stone-900 hover:bg-stone-850 text-white'
+                    }`}
+                  >
+                    {isCurrent ? (
+                      'Current Plan'
+                    ) : p.id === 'free' ? (
+                      !user ? 'Get Started Free' : 'Free Trial'
+                    ) : p.period === 'one-time' ? (
+                      `Buy $${p.priceUsd} One-Time`
+                    ) : (
+                      `Subscribe · $${p.priceUsd}/mo`
+                    )}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="text-center pt-2">
+          <button
+            onClick={onExplorePricing}
+            className="inline-flex items-center gap-2 px-6 py-3 bg-stone-900 hover:bg-stone-800 active:scale-98 text-white font-bold text-xs rounded-xl shadow-xs transition-all"
+          >
+            <span>View All Plans & Credit Details</span>
+            <ArrowRight className="w-4 h-4 text-rose-400" />
+          </button>
         </div>
       </section>
 

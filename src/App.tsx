@@ -18,11 +18,11 @@ export function App() {
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const [authModalInitialMode, setAuthModalInitialMode] = useState<'account' | 'login' | 'register' | 'switch' | 'forgot' | 'reset'>('login');
 
-  // Active scan state
   const [activeScanId, setActiveScanId] = useState<string | null>(null);
   const [activeScan, setActiveScan] = useState<ScanJob | null>(null);
   const [activeReport, setActiveReport] = useState<RiskReport | null>(null);
   const [activeComparison, setActiveComparison] = useState<ReScanComparison | null>(null);
+  const [intendedPlanId, setIntendedPlanId] = useState<string | null>(null);
 
   // Re-scan trigger parent ID
   const [rescanParentId, setRescanParentId] = useState<string | undefined>(undefined);
@@ -162,6 +162,10 @@ export function App() {
               setAuthModalInitialMode('register');
               setAuthModalOpen(true);
             }}
+            onSelectPlan={(planId) => {
+              setIntendedPlanId(planId);
+              setActiveTab('pricing');
+            }}
           />
         )}
 
@@ -247,6 +251,17 @@ export function App() {
                 setRescanParentId(undefined);
                 setActiveTab('upload');
               }}
+              onOpenAuth={(mode, planId) => {
+                setAuthModalInitialMode(mode || 'login');
+                setIntendedPlanId(planId || null);
+                setAuthModalOpen(true);
+              }}
+              selectedPlanIdFromNavigation={intendedPlanId}
+              onClearSelectedPlanFromNavigation={() => setIntendedPlanId(null)}
+              onOpenAccountModal={() => {
+                setAuthModalInitialMode('account');
+                setAuthModalOpen(true);
+              }}
             />
           </div>
         )}
@@ -257,6 +272,15 @@ export function App() {
         currentUser={user}
         isOpen={authModalOpen}
         initialMode={authModalInitialMode}
+        intendedPlanId={intendedPlanId}
+        onIntendedPlanConfirmed={(planId) => {
+          setIntendedPlanId(planId);
+          setActiveTab('pricing');
+        }}
+        onExplorePricing={() => {
+          setAuthModalOpen(false);
+          setActiveTab('pricing');
+        }}
         onClose={() => setAuthModalOpen(false)}
         onUserChanged={handleUserChanged}
       />

@@ -261,34 +261,106 @@ export const UploadModal: React.FC<UploadModalProps> = ({
 
       <form onSubmit={handleStartRealScan} className="p-6 sm:p-8 space-y-6">
         {uploadError && (
-          <div className="p-4 bg-rose-50 border border-rose-200 rounded-xl text-rose-900 text-xs flex items-start gap-3">
-            <AlertCircle className="w-4 h-4 mt-0.5 shrink-0 text-rose-600" />
-            <div>
-              <p className="font-bold text-sm">Unable to process video</p>
-              <p className="mt-0.5">{uploadError}</p>
+          <div className="p-4 bg-rose-50 border border-rose-200 rounded-xl text-rose-900 text-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+            <div className="flex items-start gap-3">
+              <AlertCircle className="w-5 h-5 mt-0.5 shrink-0 text-rose-600" />
+              <div>
+                <p className="font-bold text-sm">Unable to process video</p>
+                <p className="mt-0.5">{uploadError}</p>
+              </div>
             </div>
+            {uploadError.toLowerCase().includes('insufficient credits') && onExplorePricing && (
+              <div className="flex flex-wrap items-center gap-2 shrink-0 pt-2 sm:pt-0">
+                <button
+                  type="button"
+                  onClick={onExplorePricing}
+                  className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-semibold rounded-lg text-xs transition-colors shadow-2xs"
+                >
+                  Upgrade Plan
+                </button>
+                <button
+                  type="button"
+                  onClick={onExplorePricing}
+                  className="px-3 py-1.5 bg-stone-800 hover:bg-stone-700 text-stone-100 font-semibold rounded-lg text-xs transition-colors"
+                >
+                  Purchase One-Time Credits
+                </button>
+              </div>
+            )}
           </div>
         )}
 
+        {/* Insufficient Credit Guidance: Zero Balance */}
         {user && user.creditsRemaining <= 0 && (
-          <div className="p-4 bg-amber-50 border border-amber-200 rounded-xl text-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-amber-900">
+          <div className="p-4 bg-amber-50 border border-amber-200 rounded-xl text-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-amber-900 shadow-2xs">
             <div className="flex items-start gap-2.5">
-              <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+              <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
               <div>
-                <p className="font-bold text-sm text-amber-950">Insufficient Credit Balance</p>
-                <p className="mt-0.5 text-amber-800">
-                  You currently have 0 credits. Video risk analysis and sample evaluation require an active credit balance.
+                <p className="font-bold text-sm text-amber-950">Insufficient Credit Balance (0 Credits)</p>
+                <p className="mt-0.5 text-amber-800 leading-relaxed">
+                  You currently have 0 credits in your account. Video risk analysis requires available credits (1 credit/minute for Standard Scan, 2 credits/minute for Deep Scan). Choose a subscription plan or top up with one-time credits to start inspecting your videos.
                 </p>
               </div>
             </div>
             {onExplorePricing && (
-              <button
-                type="button"
-                onClick={onExplorePricing}
-                className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-semibold rounded-lg text-xs shrink-0 transition-colors shadow-2xs"
-              >
-                View Credit Plans
-              </button>
+              <div className="flex flex-wrap items-center gap-2 shrink-0 pt-2 sm:pt-0">
+                <button
+                  type="button"
+                  onClick={onExplorePricing}
+                  className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-semibold rounded-lg text-xs transition-colors shadow-2xs"
+                >
+                  View Credit Plans
+                </button>
+                <button
+                  type="button"
+                  onClick={onExplorePricing}
+                  className="px-3 py-1.5 bg-stone-800 hover:bg-stone-700 text-stone-100 font-semibold rounded-lg text-xs transition-colors"
+                >
+                  Upgrade Plan
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Insufficient Credit Guidance: Calculated Shortfall */}
+        {user && user.creditsRemaining > 0 && calculateRequiredCredits() !== null && user.creditsRemaining < (calculateRequiredCredits() || 0) && (
+          <div className="p-4 bg-amber-50 border border-amber-300 rounded-xl text-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-amber-950 shadow-2xs">
+            <div className="flex items-start gap-2.5">
+              <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-bold text-sm text-amber-950">
+                  Credit Shortfall: {(calculateRequiredCredits() || 0) - user.creditsRemaining} Credit(s) Needed
+                </p>
+                <p className="mt-1 text-amber-900 leading-relaxed">
+                  Your video requires <strong className="font-bold">{calculateRequiredCredits()} credits</strong> for {scanMode === 'deep' ? 'Deep Scan (2 credits/min)' : 'Standard Scan (1 credit/min)'}, but your account has only <strong className="font-bold">{user.creditsRemaining} credit(s)</strong> available. Choose a plan or purchase additional credits to continue.
+                </p>
+              </div>
+            </div>
+            {onExplorePricing && (
+              <div className="flex flex-wrap items-center gap-2 shrink-0 pt-2 sm:pt-0">
+                <button
+                  type="button"
+                  onClick={onExplorePricing}
+                  className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white font-semibold rounded-lg text-xs transition-colors shadow-2xs"
+                >
+                  Upgrade Plan
+                </button>
+                <button
+                  type="button"
+                  onClick={onExplorePricing}
+                  className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-semibold rounded-lg text-xs transition-colors shadow-2xs"
+                >
+                  Purchase One-Time Credits
+                </button>
+                <button
+                  type="button"
+                  onClick={onExplorePricing}
+                  className="px-3 py-1.5 bg-stone-100 hover:bg-stone-200 text-stone-800 font-semibold rounded-lg text-xs border border-stone-300 transition-colors"
+                >
+                  View Credit Plans
+                </button>
+              </div>
             )}
           </div>
         )}
@@ -378,7 +450,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
                 <span className="text-stone-500 block text-[11px]">Credits Required</span>
                 {calculateRequiredCredits() !== null ? (
                   <span className="font-extrabold text-rose-600 font-mono">
-                    {calculateRequiredCredits()} mins (preliminary)
+                    {calculateRequiredCredits()} credit(s)
                   </span>
                 ) : (
                   <span className="font-semibold text-stone-600 italic">
@@ -387,8 +459,8 @@ export const UploadModal: React.FC<UploadModalProps> = ({
                 )}
               </div>
             </div>
-            <p className="text-[10px] text-stone-400">
-              *Preliminary estimate based on browser decoding. The server calculates authoritative duration and billing upon media inspection.*
+            <p className="text-[10px] text-stone-500 leading-normal">
+              *Standard Scan uses 1 credit per input minute. Deep Scan uses 2 credits per input minute. Partial input minutes are rounded up to the next whole minute. Final credit deduction is determined authoritatively by the server upon media inspection.*
             </p>
           </div>
         )}
@@ -548,7 +620,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
           <div className="text-xs text-stone-600 flex items-center gap-1.5">
             <span>Available credits:</span>
             <strong className="text-emerald-700 font-mono text-sm font-bold">
-              {user?.creditsRemaining ?? 0} mins
+              {user?.creditsRemaining ?? 0} credits
             </strong>
           </div>
 
@@ -560,25 +632,47 @@ export const UploadModal: React.FC<UploadModalProps> = ({
             >
               Cancel
             </button>
-            <button
-              type="submit"
-              disabled={isUploading || !file}
-              className={`flex-1 sm:flex-initial px-6 py-2.5 text-white text-xs font-bold rounded-lg flex items-center justify-center gap-2 transition-all shadow-sm ${
-                isUploading || !file ? 'bg-rose-300 cursor-not-allowed' : 'bg-rose-600 hover:bg-rose-500 active:scale-98'
-              }`}
-            >
-              {isUploading ? (
-                <>
-                  <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                  <span>Uploading and inspecting media...</span>
-                </>
-              ) : (
-                <>
-                  <Play className="w-3.5 h-3.5 fill-current" />
-                  <span>Start Pre-Publish Risk Analysis</span>
-                </>
-              )}
-            </button>
+            {(() => {
+              const reqCredits = calculateRequiredCredits();
+              const hasShortfall = user !== null && reqCredits !== null && user.creditsRemaining < reqCredits;
+              const hasZeroCredits = user !== null && user.creditsRemaining <= 0;
+              const isBlocked = isUploading || !file || hasShortfall || hasZeroCredits;
+
+              return (
+                <button
+                  type="submit"
+                  disabled={isBlocked}
+                  title={
+                    hasZeroCredits 
+                      ? 'You have 0 credits. Upgrade or purchase credits to analyze videos.' 
+                      : hasShortfall 
+                        ? `Video requires ${reqCredits} credits, but you only have ${user?.creditsRemaining ?? 0}. Top up to proceed.` 
+                        : undefined
+                  }
+                  className={`flex-1 sm:flex-initial px-6 py-2.5 text-white text-xs font-bold rounded-lg flex items-center justify-center gap-2 transition-all shadow-sm ${
+                    isBlocked 
+                      ? 'bg-stone-300 text-stone-500 cursor-not-allowed' 
+                      : 'bg-rose-600 hover:bg-rose-500 active:scale-98'
+                  }`}
+                >
+                  {isUploading ? (
+                    <>
+                      <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                      <span>Uploading and inspecting media...</span>
+                    </>
+                  ) : hasZeroCredits ? (
+                    <span>Insufficient Credits (0 Available)</span>
+                  ) : hasShortfall ? (
+                    <span>Insufficient Credits ({reqCredits} Needed)</span>
+                  ) : (
+                    <>
+                      <Play className="w-3.5 h-3.5 fill-current" />
+                      <span>Start Pre-Publish Risk Analysis</span>
+                    </>
+                  )}
+                </button>
+              );
+            })()}
           </div>
         </div>
 

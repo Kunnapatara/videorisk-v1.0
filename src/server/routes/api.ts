@@ -1785,6 +1785,65 @@ apiRouter.get('/billing/plans', async (req: Request, res: Response) => {
   }
 });
 
+// Authenticated user billing & subscription summary
+apiRouter.get('/billing/summary', async (req: Request, res: Response) => {
+  try {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+
+    const subscriptions = await storage.billing.getSubscriptionsByUserId(user.id);
+    const sortedSubs = [...subscriptions].sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+    const latestSub = sortedSubs[0] || null;
+
+    res.json({
+      user: sanitizeUser(user),
+      email: user.email,
+      plan: user.plan,
+      creditsRemaining: user.creditsRemaining,
+      creditsUsedTotal: user.creditsUsedTotal,
+      totalScansCount: user.totalScansCount,
+      subscription: latestSub ? {
+        id: latestSub.id,
+        planId: latestSub.planId,
+        status: latestSub.status,
+        currentPeriodEnd: latestSub.currentPeriodEnd || null,
+        createdAt: latestSub.createdAt
+      } : null,
+      isRecurring: user.plan !== 'free' && user.plan !== 'audit_once' && !!latestSub && (latestSub.status === 'active' || latestSub.status === 'trialing'),
+      hasStripeCustomer: !!user.stripeCustomerId,
+    });
+  } catch (err: any) {
+    console.error('[API] Failed to retrieve billing summary:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve billing summary.' });
+  }
+});
+
+// Authenticated user credit transaction audit history
+apiRouter.get('/billing/transactions', async (req: Request, res: Response) => {
+  try {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+
+    const txs = await storage.billing.getCreditTransactions(user.id);
+    // Sort newest first for user convenience
+    const sortedTxs = [...txs].sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+
+    res.json({
+      transactions: sortedTxs.map(t => ({
+        id: t.id,
+        delta: t.delta,
+        balanceAfter: t.balanceAfter,
+        type: t.type,
+        referenceId: t.referenceId || null,
+        createdAt: t.createdAt
+      }))
+    });
+  } catch (err: any) {
+    console.error('[API] Failed to retrieve credit transactions:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve credit transaction history.' });
+  }
+});
+
 // 5. Upload & Pre-inspection (Protected)
 apiRouter.post(
   '/uploads',

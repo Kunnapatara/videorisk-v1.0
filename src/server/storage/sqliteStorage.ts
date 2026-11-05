@@ -19,8 +19,10 @@ import {
   OperationalMetrics,
   FencingError,
   CreditTransactionRecord,
-  ChannelIntelligenceRecord
+  ChannelIntelligenceRecord,
+  PlanDetails
 } from '../../types';
+import { OFFICIAL_PRICING_PLANS } from './pricingCatalogue';
 import {
   IStorageRepository,
   IUserRepository,
@@ -1886,7 +1888,7 @@ export class SqliteStorageRepository implements IStorageRepository {
   // BILLING REPOSITORY
   // -------------------------------------------------------------
   public billing: IBillingRepository = {
-    getPlans: async () => [],
+    getPlans: async (): Promise<PlanDetails[]> => [...OFFICIAL_PRICING_PLANS],
 
     isEventProcessed: async (eventId: string): Promise<boolean> => {
       const row = this.db.prepare('SELECT event_id FROM webhook_events WHERE event_id = ?').get(eventId);

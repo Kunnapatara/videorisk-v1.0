@@ -1,0 +1,741 @@
+# VideoRisk v1.0 — Complete Pricing Cards, Registration Journey, Account Billing UI & Credit-Aware Upgrade Flow
+
+## Objective
+
+Inspect, implement, and verify a complete customer-facing pricing and membership experience for VideoRisk v1.0.
+
+The objective is to make all five pricing options easy to understand, improve the registration-to-purchase journey, and provide clear account and billing information.
+
+This is a production-oriented implementation task, not a UI-only redesign.
+
+**Repository:** https://github.com/Kunnapatara/videorisk-v1.0
+
+**Inspected baseline:** `main` at commit `b4d1c44069d55f4af8988484b01c5f9b800668d9`
+
+Before changing any code, inspect the latest repository state and identify any changes made after this baseline.
+
+---
+
+# 1. Mandatory Architecture and Compatibility Requirements
+
+The existing application already contains authentication, credit management, Stripe Checkout, Stripe webhooks, subscription records, and a Customer Portal integration.
+
+Preserve these existing systems.
+
+Do not replace, bypass, or unnecessarily redesign them.
+
+### Critical finding: Pricing data inconsistency between storage adapters
+
+The existing implementation has two different pricing data behaviors:
+
+- `InMemoryStorageRepository.billing.getPlans()` contains the five pricing plans.
+- `SqliteStorageRepository.billing.getPlans()` currently returns an empty array.
+- `initializeDefaultStorage()` uses SQLite by default unless `STORAGE_ENGINE=memory` is configured.
+- Both `/api/plans` and `/api/billing/plans` retrieve plans through `storage.billing.getPlans()`.
+
+This means the default SQLite-backed application may return an empty pricing catalogue.
+
+**Required implementation:**
+
+1. Establish one authoritative server-side pricing catalogue shared by both storage adapters.
+2. Both SQLite and In-memory storage must return exactly the same five plans.
+3. The frontend must retrieve pricing information from the existing server API.
+4. Do not hardcode independent prices or credit allocations in frontend components.
+5. Preserve the existing plan IDs used by billing:
+   - `free`
+   - `creator`
+   - `pro`
+   - `agency`
+   - `audit_once`
+6. Preserve existing Stripe Price ID mappings and the current billing configuration.
+7. Do not change payment amounts, credit allocations, subscription intervals, or checkout modes without an explicit requirement.
+8. If a shared pricing configuration module is necessary, introduce it in a way that does not create circular imports or disrupt existing storage initialization.
+
+Verify that the pricing API returns all five plans under both storage adapters.
+
+---
+
+# 2. Official VideoRisk Pricing Catalogue
+
+Implement the following five pricing cards using these exact commercial terms.
+
+All prices are in USD.
+
+## Plan 1 — Free
+
+**Price:** $0
+
+**Billing:** One-time free registration benefit.
+
+**Credit allocation:** 10 credits, granted automatically when a new account is successfully registered.
+
+Included usage:
+
+- Standard Scan: 10 input minutes.
+- Deep Scan: 5 input minutes.
+- Suitable for trying VideoRisk and reviewing a sample risk report.
+- No payment required to create a free account.
+
+Important rules:
+
+- The free trial is available only once per account.
+- Registration already grants the 10 initial credits.
+- Do not require newly registered users to click another claim button.
+- Do not grant additional free credits through a duplicate frontend action.
+- Display the Free plan as the current plan when applicable.
+
+Suggested card description:
+
+"Explore VideoRisk, test the scanning workflow, and understand your first pre-publish risk report."
+
+Suggested CTA:
+- Guest: `Get Started Free`
+- Authenticated Free user: `Current Plan`
+- Previously claimed Free trial: `Free Trial Already Used`
+
+## Plan 2 — Creator
+
+**Price:** $9 / month
+
+**Credit allocation:** 30 credits per monthly billing cycle.
+
+Included usage:
+
+- Standard Scan: 30 input minutes.
+- Deep Scan: 15 input minutes.
+- Standard and Deep Scan modes.
+- Suitable for creators who publish videos occasionally.
+
+Suggested card description:
+
+"For individual creators who need reliable pre-publish video checks from time to time."
+
+Suggested CTA:
+`Subscribe — $9/month`
+
+## Plan 3 — Pro
+
+**Price:** $19 / month
+
+**Credit allocation:** 75 credits per monthly billing cycle.
+
+Included usage:
+
+- Standard Scan: 75 input minutes.
+- Deep Scan: 37 complete input minutes, with 1 credit remaining.
+- Standard and Deep Scan modes.
+- Suitable for creators who publish content regularly.
+
+Suggested card description:
+
+"For active creators who regularly publish videos and need more detailed pre-publish analysis."
+
+Suggested CTA:
+`Subscribe — $19/month`
+
+Do not round 37.5 Deep Scan minutes up to 38. The correct maximum is 37 complete minutes with 1 credit remaining.
+
+## Plan 4 — Agency / MCN
+
+**Price:** $99 / month
+
+**Credit allocation:** 600 credits per monthly billing cycle.
+
+Included usage:
+
+- Standard Scan: 600 input minutes.
+- Deep Scan: 300 input minutes.
+- Suitable for agencies and Multi-Channel Networks managing multiple channels.
+
+Suggested card description:
+
+"For agencies and MCNs managing multiple creators, channels, and video publishing workflows."
+
+Suggested CTA:
+`Subscribe — $99/month`
+
+Do not promise additional features, unlimited usage, team seats, or API capacity unless those capabilities are actually implemented and available in the existing application.
+
+## Plan 5 — Audit Once
+
+**Price:** $29 / purchase
+
+**Billing:** One-time payment. Not a recurring subscription.
+
+**Credit allocation:** 60 credits.
+
+Included usage:
+
+- Standard Scan: 60 input minutes.
+- Deep Scan: 30 input minutes.
+- Suitable for users who need occasional video inspections without a monthly subscription.
+
+Suggested card description:
+
+"For creators who only need occasional video risk inspections without a recurring monthly commitment."
+
+Suggested CTA:
+`Purchase — $29 One-Time`
+
+Clearly distinguish this product from recurring monthly memberships.
+
+Do not create a recurring Stripe subscription for `audit_once`.
+
+---
+
+# 3. Credit Calculation and Display Rules
+
+The existing `creditService.ts` defines:
+
+- Standard Scan: 1 credit per input minute.
+- Deep Scan: 2 credits per input minute.
+- Minimum billing duration: 1 minute.
+- Partial minutes are rounded up using `Math.ceil(durationSeconds / 60)`.
+
+Preserve this calculation.
+
+The pricing interface must distinguish between:
+
+**Credits** — the actual account balance and amount deducted by the system.
+
+**Input Minutes** — the approximate video duration that can be inspected with a particular scan mode.
+
+Never label credits as minutes without explaining the conversion.
+
+Display the following comparison clearly:
+
+| Plan | Credits | Standard Scan | Deep Scan |
+|---|---:|---:|---:|
+| Free | 10 | 10 min | 5 min |
+| Creator | 30 | 30 min | 15 min |
+| Pro | 75 | 75 min | 37 min + 1 credit remaining |
+| Agency / MCN | 600 | 600 min | 300 min |
+| Audit Once | 60 | 60 min | 30 min |
+
+Add a concise explanation:
+
+"Standard Scan uses 1 credit per input minute. Deep Scan uses 2 credits per input minute. Partial input minutes are rounded up to the next whole minute."
+
+Make the distinction visible on desktop and mobile.
+
+Do not alter server-side credit calculations to accommodate frontend display requirements.
+
+---
+
+# 4. Page 1 — Home / Landing Page
+
+Improve the existing `HomeView.tsx`.
+
+Keep the existing hero, product positioning, upload workflow, and Demo Scan functionality.
+
+Add a compact pricing overview section.
+
+The section should:
+
+- Introduce the Free plan.
+- Show the starting paid price of $9/month.
+- Briefly show Creator, Pro, Agency / MCN, and Audit Once.
+- Display the corresponding credit allocations.
+- Clearly distinguish monthly plans from the one-time purchase.
+- Include a `View All Plans` button that navigates to the existing Pricing page.
+
+Do not duplicate the full pricing catalogue in a separate frontend data source.
+
+Use the same server-provided pricing data as the Pricing page.
+
+The existing `Get started for free · 10 credits` CTA must remain visible to unauthenticated visitors.
+
+Its registration behavior must remain connected to the existing authentication system.
+
+For authenticated users, do not display a registration CTA.
+
+Do not remove or redesign unrelated Home page functionality.
+
+---
+
+# 5. Page 2 — Pricing / Credits & Plans
+
+Improve the existing `PricingView.tsx`.
+
+This must become the authoritative customer-facing pricing comparison page.
+
+### Required content
+
+Display all five pricing cards with:
+
+- Plan name.
+- Exact USD price.
+- Billing interval.
+- Credit allocation.
+- Standard Scan minutes.
+- Deep Scan minutes.
+- Intended customer type.
+- Relevant features that actually exist in the application.
+- Clear purchase or registration CTA.
+- Current plan indicator when applicable.
+
+Use responsive cards:
+
+- Mobile: one column.
+- Tablet: two columns.
+- Desktop: three columns.
+- Wide desktop: five columns where layout permits.
+
+Maintain the existing VideoRisk visual identity.
+
+### Free plan behavior
+
+The existing registration API already creates a Free account with 10 initial credits.
+
+Do not make the user claim the same free allocation again.
+
+Remove or replace the misleading `Claim 10-Min Free Trial` button.
+
+Display an appropriate state depending on authentication and trial eligibility.
+
+### Guest plan selection
+
+Unauthenticated visitors must be able to browse the entire pricing catalogue.
+
+If a guest clicks `Get Started Free`, open the existing Register mode.
+
+If a guest clicks a paid plan CTA:
+
+1. Do not call `/api/billing/checkout` while unauthenticated.
+2. Do not allow an avoidable 401 response.
+3. Preserve the selected plan ID temporarily in frontend navigation state.
+4. Open the existing Register modal.
+5. After successful registration, restore the Pricing page.
+6. Show the selected plan and ask the user to confirm before initiating payment.
+7. Only then call the authenticated checkout endpoint.
+
+Do not store passwords, authentication tokens, or sensitive account information in browser storage to preserve a selected plan.
+
+If the registration process is canceled, allow the visitor to return to pricing without losing the ability to browse plans.
+
+### Authenticated plan selection
+
+For authenticated users:
+
+- Free users may browse paid plans and purchase them.
+- Existing paid users may access the existing subscription management flow.
+- Audit Once must initiate a one-time checkout.
+- Monthly plans must initiate recurring subscription checkout.
+- The current plan must be clearly identified.
+- Do not accidentally create duplicate subscriptions or duplicate credit grants.
+
+### Existing checkout integration
+
+Preserve:
+
+- `POST /api/billing/checkout`
+- `GET /api/billing/session-status`
+- `POST /api/billing/webhook`
+- `POST /api/billing/create-portal-session`
+- Existing Stripe signature verification.
+- Existing checkout ownership checks.
+- Existing idempotent payment and credit synchronization.
+
+Do not grant credits based on a frontend success message or query parameter.
+
+Credits and entitlements must only be updated after the existing trusted server-side payment verification process confirms the payment.
+
+---
+
+# 6. Page 3 — Register / Sign Up
+
+Improve the existing Register mode in `AuthModal.tsx`.
+
+Make the free registration benefit immediately understandable.
+
+Display:
+
+**Create Your Free VideoRisk Account**
+
+- Get 10 free credits automatically.
+- Standard Scan: up to 10 input minutes.
+- Deep Scan: up to 5 input minutes.
+- Try the risk analysis and review your report.
+- Upgrade whenever you need more credits.
+
+Display:
+
+"No payment card is required to create a free account."
+
+This statement applies to account registration only. Paid checkout must continue to use the configured Stripe payment flow.
+
+Update misleading wording such as:
+
+`Register & Claim 10 Minutes`
+
+to:
+
+`Create Free Account`
+
+The registration form must continue using the existing authentication API and validation.
+
+After successful registration:
+
+- Update the authenticated user state.
+- Display the actual 10-credit balance.
+- Close the modal or continue the selected-plan journey appropriately.
+- If the user arrived through a paid plan selection, restore that selection and request confirmation before checkout.
+- Do not issue the free allocation twice.
+
+Do not modify password hashing, session creation, authentication security, registration rate limits, or account ownership rules.
+
+---
+
+# 7. Page 4 — Account / Billing
+
+Improve the existing Account experience.
+
+The current account interface is located inside `AuthModal.tsx`. The Pricing page also contains subscription-management controls.
+
+Inspect the existing architecture before deciding whether to extend the Account modal or introduce a dedicated Account/Billing view.
+
+Do not create duplicate account state or duplicate billing logic.
+
+The authenticated account area should show:
+
+### Account overview
+
+- Account email.
+- Current plan.
+- Available credits.
+- Total scans.
+- Subscription status.
+
+### Subscription information
+
+Where verified subscription data is available, display:
+
+- Plan name.
+- Monthly or one-time billing type.
+- Current subscription status.
+- Current billing period end / next renewal date.
+- Cancellation status where applicable.
+
+Use the existing subscription records and Stripe data.
+
+The existing subscription storage contains `currentPeriodEnd`. Do not invent renewal dates when no verified value is available.
+
+For Free and Audit Once accounts, clearly indicate that there is no recurring monthly subscription.
+
+### Payment and credit history
+
+Provide a clear way to review:
+
+- Payment invoices and receipts.
+- Credit grants.
+- Credit deductions.
+- Relevant credit balance changes.
+
+Important:
+
+- Do not label internal credit transactions as Stripe payment invoices.
+- Use the existing Stripe Customer Portal for invoice and payment-method management where appropriate.
+- If an authenticated, user-scoped transaction-history endpoint is required, implement it using the existing billing repository and credit transaction records.
+- Ensure every history query is restricted to the authenticated account.
+- Never expose another user's billing or transaction information.
+
+### Subscription management
+
+Preserve and reuse:
+
+`POST /api/billing/create-portal-session`
+
+The existing Stripe Customer Portal should remain responsible for supported subscription management and cancellation operations.
+
+Do not implement a second independent cancellation or payment-method system.
+
+---
+
+# 8. Upload Page — Insufficient Credit and Upgrade Guidance
+
+Improve the existing `UploadModal.tsx`.
+
+The existing UI already displays an insufficient-credit warning when the account balance reaches zero.
+
+Extend this behavior so customers receive useful guidance before starting a scan.
+
+Display:
+
+- Available credits.
+- Estimated credits required for the selected video.
+- Selected scan mode.
+- Credit shortfall when applicable.
+- A clear explanation of why the scan cannot proceed.
+
+Example:
+
+"Your video requires 24 credits, but your account has only 10 credits available. Choose a plan or purchase additional credits to continue."
+
+Provide contextual actions:
+
+- `View Credit Plans`
+- `Upgrade Plan`
+- `Purchase One-Time Credits`
+
+The actions must navigate to the existing Pricing page.
+
+Preserve the selected video, scan mode, and relevant upload state when practical.
+
+If preserving the upload state across navigation would require unsafe or unreliable persistence, explain the limitation and implement a safe alternative.
+
+Most importantly:
+
+- The server remains authoritative for credit calculation.
+- The server remains authoritative for insufficient-credit rejection.
+- Frontend calculations are estimates for customer guidance only.
+- Do not allow a scan to proceed when the server-side credit check rejects it.
+- Do not deduct credits during pricing-page navigation.
+- Do not alter credit deduction, refund, or job-queue behavior.
+
+Also handle insufficient credits returned by the server even when the frontend initially estimated that the user had enough credits.
+
+---
+
+# 9. Account and Billing API Requirements
+
+Inspect existing API routes and storage interfaces before adding endpoints.
+
+Reuse existing endpoints wherever possible.
+
+Potential additions should be limited to genuine missing functionality, such as:
+
+- Authenticated billing summary.
+- Authenticated credit transaction history.
+
+Any new endpoint must:
+
+1. Require authentication.
+2. Derive the user ID from the authenticated session.
+3. Never trust a user ID supplied by the client as authorization.
+4. Return only the current user's records.
+5. Validate and normalize output.
+6. Handle missing subscription records safely.
+7. Preserve existing storage interfaces and transaction semantics.
+
+Do not expose Stripe secrets, raw payment payloads, internal database fields, or sensitive customer information.
+
+Do not change webhook processing or payment synchronization unless a specific defect is discovered and independently verified.
+
+---
+
+# 10. UI and Product Accuracy Requirements
+
+All customer-facing information must reflect implemented capabilities.
+
+Do not add unsupported claims such as:
+
+- Guaranteed YouTube monetization approval.
+- Guaranteed advertiser-friendly status.
+- Guaranteed YPP acceptance.
+- Unlimited scans.
+- Unlimited channels.
+- Features that are not implemented.
+- Guaranteed processing times.
+
+Keep the existing VideoRisk positioning:
+
+"Know the risk before you publish."
+
+Use clear and consistent terminology:
+
+- Credits = account balance.
+- Input minutes = video duration that can be inspected.
+- Standard Scan = 1 credit/minute.
+- Deep Scan = 2 credits/minute.
+- Monthly subscription = recurring monthly payment.
+- Audit Once = one-time payment, not a recurring subscription.
+
+Avoid using "minutes" as a substitute for "credits" in account balances, navigation badges, or billing information.
+
+---
+
+# 11. Implementation Scope and Safety
+
+Inspect the actual current implementation before editing.
+
+Likely relevant files include:
+
+- `src/App.tsx`
+- `src/components/HomeView.tsx`
+- `src/components/PricingView.tsx`
+- `src/components/AuthModal.tsx`
+- `src/components/Navbar.tsx`
+- `src/components/UploadModal.tsx`
+- `src/server/routes/api.ts`
+- `src/server/services/billingService.ts`
+- `src/server/services/creditService.ts`
+- `src/server/storage/index.ts`
+- `src/server/storage/sqliteStorage.ts`
+- `src/types.ts` or the actual shared type definition file.
+- Existing tests related to pricing, registration, billing, checkout, credit allocation, and storage adapters.
+
+You may add narrowly scoped files when required.
+
+Do not:
+
+- Rewrite the application architecture.
+- Replace SQLite or the current storage abstraction.
+- Replace Stripe.
+- Change the authentication model.
+- Change existing plan IDs.
+- Change existing Stripe Price ID environment variable names.
+- Change payment amounts or credit allocations.
+- Change the scan pipeline.
+- Change video-processing logic.
+- Change evidence, policy, risk, or report-generation behavior.
+- Delete existing features.
+- Replace working functionality with mock implementations.
+- Introduce a new database dependency solely for pricing UI.
+- Store authoritative billing state in the browser.
+
+Do not overwrite or restart existing work.
+
+---
+
+# 12. Required Tests and Verification
+
+Implement and run tests covering the complete pricing and purchase journey.
+
+### A. Pricing catalogue
+
+- SQLite returns all five plans.
+- In-memory storage returns the same five plans.
+- `/api/plans` returns all five plans.
+- `/api/billing/plans` returns the same catalogue.
+- Plan IDs, prices, billing periods, and credit allocations are correct.
+- Empty pricing data cannot silently produce a misleading empty production pricing page.
+
+### B. Registration
+
+- Guest can open the pricing page.
+- Guest can open Register from Home.
+- Registration creates an authenticated account.
+- New account receives exactly 10 initial credits.
+- Free trial cannot be claimed twice.
+- The UI does not attempt to grant the same initial credits again.
+- Registration works without initiating Stripe Checkout.
+
+### C. Guest paid-plan selection
+
+- Guest can select a paid plan.
+- The frontend does not call authenticated checkout before registration.
+- The selected plan is preserved safely.
+- Registration succeeds.
+- The user is returned to the correct pricing selection.
+- Checkout requires explicit user confirmation.
+- Checkout is initiated only after authentication.
+
+### D. Authenticated checkout
+
+- Creator creates a monthly checkout session.
+- Pro creates a monthly checkout session.
+- Agency creates a monthly checkout session.
+- Audit Once creates a one-time checkout session.
+- The correct plan ID reaches the backend.
+- Stripe Price ID mapping remains correct.
+- Payment verification remains server-side.
+- Duplicate webhooks do not duplicate credit grants.
+- Failed or canceled checkout does not grant credits.
+
+### E. Credit calculations
+
+Test at least:
+
+- 60-second Standard Scan = 1 credit.
+- 61-second Standard Scan = 2 credits.
+- 60-second Deep Scan = 2 credits.
+- 61-second Deep Scan = 4 credits.
+- Free = 10 Standard minutes / 5 Deep minutes.
+- Creator = 30 Standard minutes / 15 Deep minutes.
+- Pro = 75 Standard minutes / 37 complete Deep minutes with 1 credit remaining.
+- Agency = 600 Standard minutes / 300 Deep minutes.
+- Audit Once = 60 Standard minutes / 30 Deep minutes.
+
+### F. Account and Billing
+
+- User sees only their own account and billing data.
+- Subscription status is accurate.
+- Renewal date is shown only when verified.
+- One-time Audit Once is not presented as a monthly subscription.
+- Invoice management uses the existing Stripe Customer Portal.
+- Credit transaction history is user-scoped.
+- Missing billing records do not break the Account page.
+
+### G. Upload and insufficient credits
+
+- Zero-credit users see upgrade guidance.
+- Users with insufficient credits see the correct shortfall.
+- Scan mode changes update estimated credit requirements.
+- Server-side credit rejection is displayed correctly.
+- No credits are deducted simply by opening Pricing.
+- Existing upload, scan, refund, and queue behavior remains unchanged.
+
+### H. Regression and production checks
+
+Run the existing project test suite.
+
+Run:
+
+- TypeScript checks.
+- Lint.
+- Production build.
+- Relevant billing and storage integration tests.
+- Existing CI checks.
+
+Do not weaken tests, skip existing tests, or alter test expectations simply to obtain a passing result.
+
+If a test requires a live Stripe account or external infrastructure, clearly report it as not verified rather than claiming it passed.
+
+---
+
+# 13. Acceptance Criteria
+
+The work is complete only when:
+
+1. All five pricing cards display correctly on the Home pricing overview and the full Pricing page.
+2. Pricing data is consistent across SQLite and In-memory storage.
+3. Guest users can browse plans without authentication errors.
+4. Guest registration works and grants exactly 10 initial credits.
+5. A guest selecting a paid plan is routed through registration before checkout.
+6. Authenticated users can complete the existing Stripe Checkout flow.
+7. Monthly plans and one-time Audit Once retain their correct billing modes.
+8. Account/Billing shows accurate subscription and credit information.
+9. The Stripe Customer Portal remains functional.
+10. Upload displays useful insufficient-credit and upgrade guidance.
+11. Credit calculations and backend authorization remain unchanged and correct.
+12. Existing application functionality is preserved.
+13. All relevant tests pass.
+
+---
+
+# 14. Final Report Required
+
+After implementation, provide a factual completion report containing:
+
+1. Files inspected.
+2. Files changed.
+3. The root cause and resolution of the SQLite pricing catalogue issue.
+4. Screens and UI components updated.
+5. Guest registration and paid-plan selection behavior.
+6. Account/Billing functionality implemented.
+7. Upload credit-warning improvements.
+8. API changes, if any.
+9. Tests executed and their actual results.
+10. Build and CI results.
+11. Any remaining limitations or external verification requirements.
+
+Separate:
+
+- Implemented and verified.
+- Implemented but not fully verified.
+- Not implemented.
+- Blocked by external configuration or credentials.
+
+Do not claim successful live payments unless a real Stripe transaction has been completed and verified.
+
+**Final instruction:** Prioritize preserving the existing VideoRisk architecture and billing integrity. Deliver a coherent, fully functional customer journey rather than a cosmetic pricing-card redesign.
