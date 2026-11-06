@@ -282,11 +282,22 @@ export async function runSecurityRetentionAndE2ETests() {
     // Create temporary session for creatorUser
     const sessionToken = await storage.users.createSession(creatorUser.id);
 
+    // Ensure any background queue job for this test scan is concluded
+    const existingJob = await storage.queue.getJobByScanId(scanId);
+    if (existingJob && existingJob.status === 'RUNNING') {
+      try {
+        await storage.queue.completeJob(existingJob.id, existingJob.leaseToken || 'system_bypass');
+      } catch {}
+    }
+
     // Delete scan via API
     const deleteRes = await fetch(`${baseUrl}/scans/${scanId}`, {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${sessionToken}` }
     });
+    if (deleteRes.status !== 200) {
+      console.error('DELETE scan failed:', deleteRes.status, await deleteRes.text());
+    }
     assert(deleteRes.status === 200, 'DELETE /scans/:id returns 200 OK');
     const deleteData = await deleteRes.json();
     assert(deleteData.success === true, 'Scan successfully marked as deleted');
@@ -302,4 +313,14 @@ export async function runSecurityRetentionAndE2ETests() {
     server.close();
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
+}
+
+if (process.argv[1] && process.argv[1].includes('security_retention_and_e2e')) {
+  process.env.VIDEORISK_TEST_RUN = 'true';
+  runSecurityRetentionAndE2ETests()
+    .then(() => process.exit(0))
+    .catch((err) => {
+      console.error(err);
+      process.exit(1);
+    });
 }

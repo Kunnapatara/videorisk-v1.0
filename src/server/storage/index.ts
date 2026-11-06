@@ -848,14 +848,43 @@ export class InMemoryStorageRepository implements IStorageRepository {
     getLatest: async (userId: string): Promise<ChannelIntelligenceRecord | null> => {
       const records = Object.values(this.state.channelIntelligence || {})
         .filter(c => c.userId === userId && c.status !== 'STALE')
-        .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+        .sort((a, b) => (b.version - a.version) || (new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()));
       return records[0] || null;
     },
     save: async (record: ChannelIntelligenceRecord): Promise<ChannelIntelligenceRecord> => {
-      if (!this.state.channelIntelligence) this.state.channelIntelligence = {};
-      this.state.channelIntelligence[record.id] = record;
-      this.save();
-      return record;
+      return await this.runTransaction(async (state) => {
+        if (!state.channelIntelligence) state.channelIntelligence = {};
+
+        const existingRecords = Object.values(state.channelIntelligence)
+          .filter(c => c.userId === record.userId && c.status !== 'STALE')
+          .sort((a, b) => (b.version - a.version) || (new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()));
+        const current = existingRecords[0] || null;
+
+        // Reject stale version overwrite
+        if (current && current.version > record.version) {
+          return current;
+        }
+
+        // Monotonic version increment if collision
+        if (current && current.version === record.version && current.id !== record.id) {
+          record.version = current.version + 1;
+          record.id = `ch_intel_${record.userId}_v${record.version}`;
+        }
+
+        // Check if all sourceScanIds still exist, belong to user, and are completed
+        if (record.sourceScanIds && record.sourceScanIds.length > 0) {
+          const validScans = record.sourceScanIds.every(sId => {
+            const scan = state.scans[sId];
+            return scan && scan.userId === record.userId && scan.status === 'COMPLETED';
+          });
+          if (!validScans) {
+            record.status = 'STALE';
+          }
+        }
+
+        state.channelIntelligence[record.id] = record;
+        return record;
+      });
     },
     invalidate: async (userId: string): Promise<void> => {
       for (const rec of Object.values(this.state.channelIntelligence || {})) {

@@ -13,7 +13,7 @@ import { creditService } from '../services/creditService';
 import { billingService, ALLOWED_PAID_PLANS } from '../services/billingService';
 import { ensureDemoFixtures, getDemoFixture } from '../fixtures/demoMedia';
 import { channelIntelligenceEngine } from '../intelligence/channelIntelligence';
-import { ScanJob, ScanMode, UserAccount, CrossVideoPattern, ChannelCoverageReport, ChannelCoverageDetail, ChannelPatternsResponse } from '../../types';
+import { ScanJob, ScanMode, UserAccount, CrossVideoPattern, ChannelCoverageReport, ChannelCoverageDetail, ChannelPatternsResponse, CrossVideoComparisonStatus } from '../../types';
 
 export const apiRouter = Router();
 
@@ -2060,9 +2060,32 @@ apiRouter.get('/channel/comparison', async (req: Request, res: Response) => {
     const audRes = channelIntelligenceEngine.compareAudioSignatures(scanA, scanB, reportA, reportB);
 
     const allComparisons = [...visRes.comparisons, ...audRes.comparisons];
-    const overallStatus = allComparisons.some(c => c.status === 'MATCH_CONFIRMED')
-      ? 'MATCH_CONFIRMED'
-      : (allComparisons.some(c => c.status === 'SIMILAR_INCONCLUSIVE') ? 'SIMILAR_INCONCLUSIVE' : 'NO_MATCH');
+    const hasVideoA = Boolean(scanA.metadata?.width && scanA.metadata.width > 0);
+    const hasVideoB = Boolean(scanB.metadata?.width && scanB.metadata.width > 0);
+    const videoApplicable = hasVideoA && hasVideoB;
+
+    const hasAudioA = Boolean(scanA.metadata?.hasAudio);
+    const hasAudioB = Boolean(scanB.metadata?.hasAudio);
+    const audioApplicable = hasAudioA && hasAudioB;
+
+    let overallStatus: CrossVideoComparisonStatus;
+    if (allComparisons.some(c => c.status === 'MATCH_CONFIRMED')) {
+      overallStatus = 'MATCH_CONFIRMED';
+    } else if (allComparisons.some(c => c.status === 'SIMILAR_INCONCLUSIVE')) {
+      overallStatus = 'SIMILAR_INCONCLUSIVE';
+    } else if (visRes.status === 'UNAVAILABLE_MISSING_EVIDENCE' && audRes.status === 'UNAVAILABLE_MISSING_EVIDENCE') {
+      overallStatus = 'UNAVAILABLE_MISSING_EVIDENCE';
+    } else {
+      const visMissing = videoApplicable && visRes.status === 'UNAVAILABLE_MISSING_EVIDENCE';
+      const audMissing = audioApplicable && audRes.status === 'UNAVAILABLE_MISSING_EVIDENCE';
+      if (visMissing && audMissing) {
+        overallStatus = 'UNAVAILABLE_MISSING_EVIDENCE';
+      } else if (visMissing || audMissing) {
+        overallStatus = 'SIMILAR_INCONCLUSIVE';
+      } else {
+        overallStatus = 'NO_MATCH';
+      }
+    }
 
     res.json({
       scanIdA,

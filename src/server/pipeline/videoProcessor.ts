@@ -299,9 +299,10 @@ export class VideoProcessor {
         }
 
         // 56 vertical gradient comparisons: Y(x, y+1) > Y(x, y)
+        // Stored in row-major order: index = y * 8 + x (y in 0..6, x in 0..7)
         const vGradients: boolean[] = [];
-        for (let x = 0; x < 8; x++) {
-          for (let y = 0; y < 7; y++) {
+        for (let y = 0; y < 7; y++) {
+          for (let x = 0; x < 8; x++) {
             vGradients.push(lum[(y + 1) * 8 + x] > lum[y * 8 + x]);
           }
         }
@@ -398,13 +399,15 @@ export class VideoProcessor {
 
           if (nccMirror >= 0.86) {
             let gradMirrorMatches = 0;
+            // Horizontal gradients: y in [0..7], x in [0..6] maps to mirrorX = 6 - x with inverted gradient direction
             for (let y = 0; y < 8; y++) {
-              // Horizontal gradients: x in [0..6] maps to mirrorX = 6 - x with inverted gradient direction
               for (let x = 0; x < 7; x++) {
                 const mirrorH = !f2.hGradients[y * 7 + (6 - x)];
                 if (f1.hGradients[y * 7 + x] === mirrorH) gradMirrorMatches++;
               }
-              // Vertical gradients: x in [0..7] maps to mirrorX = 7 - x with same vertical gradient direction
+            }
+            // Vertical gradients: y in [0..6], x in [0..7] maps to mirrorX = 7 - x with same vertical gradient direction
+            for (let y = 0; y < 7; y++) {
               for (let x = 0; x < 8; x++) {
                 if (f1.vGradients[y * 8 + x] === f2.vGradients[y * 8 + (7 - x)]) gradMirrorMatches++;
               }

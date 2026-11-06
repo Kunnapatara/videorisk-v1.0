@@ -1408,25 +1408,29 @@ export interface ComparisonOptions {
    * Determines if a domain detector in the revised scan has sufficient evidence
    * and completed execution to legitimately verify the absence/resolution of an issue.
    */
-  private canVerifyResolution(
+  /**
+   * Determines if a domain detector in the revised scan has sufficient evidence
+   * and completed execution to legitimately verify the absence/resolution of an issue.
+   */
+  public canVerifyResolution(
     domain: EvidenceDomain,
     originalReport: RiskReport,
     revisedReport: RiskReport,
     options?: ComparisonOptions,
     origIssue?: TopIssue
-  ): { verifiable: boolean; reason?: string } {
+  ): { verifiable: boolean; reason?: string; detectorVersionMatch?: boolean } {
     // 1. Revised scan failure / incomplete check
     if (options?.isRevisedFailed) {
-      return { verifiable: false, reason: 'revised scan job failed' };
+      return { verifiable: false, reason: 'revised scan job failed', detectorVersionMatch: false };
     }
     if (options?.revisedScanRecord?.status === 'FAILED') {
-      return { verifiable: false, reason: 'revised scan status is FAILED' };
+      return { verifiable: false, reason: 'revised scan status is FAILED', detectorVersionMatch: false };
     }
     if (options?.revisedScanRecord && options.revisedScanRecord.status !== 'COMPLETED') {
-      return { verifiable: false, reason: `revised scan is not completed (status: ${options.revisedScanRecord.status})` };
+      return { verifiable: false, reason: `revised scan is not completed (status: ${options.revisedScanRecord.status})`, detectorVersionMatch: false };
     }
     if (options?.revisedScanRecord?.error) {
-      return { verifiable: false, reason: `revised scan error: ${options.revisedScanRecord.error}` };
+      return { verifiable: false, reason: `revised scan error: ${options.revisedScanRecord.error}`, detectorVersionMatch: false };
     }
 
     // 1b. Revised scan media validity check
@@ -1434,35 +1438,36 @@ export interface ComparisonOptions {
       // If options are provided (production & explicit options testing), revisedScanRecord & metadata are required
       if (options) {
         if (!options.revisedScanRecord) {
-          return { verifiable: false, reason: 'revised scan record unavailable to verify resolution' };
+          return { verifiable: false, reason: 'revised scan record unavailable to verify resolution', detectorVersionMatch: false };
         }
         if (!options.revisedScanRecord.metadata) {
-          return { verifiable: false, reason: 'revised media metadata unavailable to verify resolution' };
+          return { verifiable: false, reason: 'revised media metadata unavailable to verify resolution', detectorVersionMatch: false };
         }
       }
 
       const revMeta = options?.revisedScanRecord?.metadata;
       if (revMeta) {
         if (typeof revMeta.durationSeconds === 'number' && (revMeta.durationSeconds <= 0 || isNaN(revMeta.durationSeconds))) {
-          return { verifiable: false, reason: 'revised scan media has zero or invalid duration' };
+          return { verifiable: false, reason: 'revised scan media has zero or invalid duration', detectorVersionMatch: false };
         }
         if (typeof revMeta.originalSize === 'number' && revMeta.originalSize <= 0) {
-          return { verifiable: false, reason: 'revised scan media is empty (0 bytes)' };
+          return { verifiable: false, reason: 'revised scan media is empty (0 bytes)', detectorVersionMatch: false };
         }
-        if (this.isVisualFinding(origIssue) && (!revMeta.videoCodec || revMeta.width === 0)) {
-          return { verifiable: false, reason: 'revised scan contains no video stream to verify visual resolution' };
+        const hasVideoStream = Boolean((revMeta.width && revMeta.width > 0) || revMeta.videoCodec);
+        if (this.isVisualFinding(origIssue) && !hasVideoStream) {
+          return { verifiable: false, reason: 'revised scan contains no video stream to verify visual resolution', detectorVersionMatch: false };
         }
-        if (this.isAudioFinding(origIssue) && !revMeta.hasAudio) {
-          return { verifiable: false, reason: 'revised scan contains no audio track to verify audio issue resolution' };
+        if (this.isAudioFinding(origIssue) && !revMeta.hasAudio && !revMeta.audioCodec) {
+          return { verifiable: false, reason: 'revised scan contains no audio track to verify audio issue resolution', detectorVersionMatch: false };
         }
 
         const { start: findingStart, end: findingEnd } = this.getFindingTimeSpan(origIssue);
         const targetTimestamp = findingEnd > findingStart ? findingEnd : (typeof origIssue?.timestampSeconds === 'number' ? origIssue.timestampSeconds : findingStart);
         if (targetTimestamp > 0 && typeof revMeta.durationSeconds === 'number' && revMeta.durationSeconds < targetTimestamp) {
-          return { verifiable: false, reason: `revised scan media duration (${revMeta.durationSeconds}s) is shorter than baseline issue timestamp (${targetTimestamp}s)` };
+          return { verifiable: false, reason: `revised scan media duration (${revMeta.durationSeconds}s) is shorter than baseline issue timestamp (${targetTimestamp}s)`, detectorVersionMatch: false };
         }
         if (targetTimestamp === 0 && findingEnd > 0 && typeof revMeta.durationSeconds === 'number' && revMeta.durationSeconds < findingEnd) {
-          return { verifiable: false, reason: `revised scan media duration (${revMeta.durationSeconds}s) is shorter than baseline issue timestamp (${findingEnd}s)` };
+          return { verifiable: false, reason: `revised scan media duration (${revMeta.durationSeconds}s) is shorter than baseline issue timestamp (${findingEnd}s)`, detectorVersionMatch: false };
         }
 
         // Identical media file check: byte-for-byte identical files cannot resolve media-level defects
@@ -1470,7 +1475,7 @@ export interface ComparisonOptions {
         const revSha = revMeta.sha256;
         const isValidHex64 = (h?: string): boolean => typeof h === 'string' && /^[a-fA-F0-9]{64}$/.test(h.trim());
         if (isValidHex64(origSha) && isValidHex64(revSha) && origSha!.trim().toLowerCase() === revSha!.trim().toLowerCase()) {
-          return { verifiable: false, reason: 'revised media is byte-for-byte identical to baseline (matching SHA-256); media-level findings cannot be resolved without media modifications' };
+          return { verifiable: false, reason: 'revised media is byte-for-byte identical to baseline (matching SHA-256); media-level findings cannot be resolved without media modifications', detectorVersionMatch: false };
         }
       }
     }
@@ -1478,46 +1483,46 @@ export interface ComparisonOptions {
     // 2. Baseline scan completeness check
     const origDomain = originalReport?.domainReports?.[domain];
     if (!origDomain) {
-      return { verifiable: false, reason: 'baseline scan missing domain report' };
+      return { verifiable: false, reason: 'baseline scan missing domain report', detectorVersionMatch: false };
     }
     if (options?.originalScanRecord?.status === 'FAILED') {
-      return { verifiable: false, reason: 'baseline scan was incomplete/failed' };
+      return { verifiable: false, reason: 'baseline scan was incomplete/failed', detectorVersionMatch: false };
     }
     if (options?.originalScanRecord && options.originalScanRecord.status !== 'COMPLETED') {
-      return { verifiable: false, reason: 'baseline scan was incomplete/failed' };
+      return { verifiable: false, reason: 'baseline scan was incomplete/failed', detectorVersionMatch: false };
     }
 
     // 3. Skipped detector check
     if (options?.skippedDomains && options.skippedDomains.includes(domain)) {
-      return { verifiable: false, reason: `detector for ${domain} was skipped` };
+      return { verifiable: false, reason: `detector for ${domain} was skipped`, detectorVersionMatch: false };
     }
 
     // 4. Revised domain report status check
     const revDomain = revisedReport?.domainReports?.[domain];
     if (!revDomain) {
-      return { verifiable: false, reason: `revised scan missing domain assessment for ${domain}` };
+      return { verifiable: false, reason: `revised scan missing domain assessment for ${domain}`, detectorVersionMatch: false };
     }
     if (revDomain.status === 'NOT_PROVIDED') {
-      return { verifiable: false, reason: `detector for ${domain} was not provided in revised scan` };
+      return { verifiable: false, reason: `detector for ${domain} was not provided in revised scan`, detectorVersionMatch: false };
     }
     if (revDomain.status === 'NOT_ASSESSED') {
-      return { verifiable: false, reason: `detector for ${domain} was not assessed` };
+      return { verifiable: false, reason: `detector for ${domain} was not assessed`, detectorVersionMatch: false };
     }
     if (revDomain.status === 'ANALYSIS_UNAVAILABLE') {
-      return { verifiable: false, reason: `analysis for ${domain} was unavailable` };
+      return { verifiable: false, reason: `analysis for ${domain} was unavailable`, detectorVersionMatch: false };
     }
     if (revDomain.status === 'INSUFFICIENT_EVIDENCE') {
-      return { verifiable: false, reason: `detector for ${domain} reported insufficient evidence` };
+      return { verifiable: false, reason: `detector for ${domain} reported insufficient evidence`, detectorVersionMatch: false };
     }
     if ((revDomain.status as string) === 'ERROR') {
-      return { verifiable: false, reason: `detector for ${domain} encountered an execution error` };
+      return { verifiable: false, reason: `detector for ${domain} encountered an execution error`, detectorVersionMatch: false };
     }
 
     // 5. Detector-level verification for domains with instrumented detectors (video_audio, thumbnail)
     if ((domain === 'video_audio' || domain === 'thumbnail') && origIssue) {
       const responsibleKey = this.getResponsibleDetectorKey(origIssue);
       if (!responsibleKey) {
-        return { verifiable: false, reason: 'unable to safely determine responsible detector for finding' };
+        return { verifiable: false, reason: 'unable to safely determine responsible detector for finding', detectorVersionMatch: false };
       }
 
       // Fail-closed detector verification:
@@ -1526,9 +1531,9 @@ export interface ComparisonOptions {
       const isTestEnv = (
         process.env.NODE_ENV !== 'production' &&
         (process.env.NODE_ENV === 'test' ||
-         process.env.VIDEORISK_TEST_RUN === 'true' ||
-         Boolean(process.env.npm_lifecycle_script?.includes('tests/')) ||
-         Boolean(process.argv && process.argv.some(arg => arg.includes('.test.') || arg.includes('/tests/') || arg.endsWith('test.ts'))))
+         process.env.VIDEORISK_TEST_RUN === 'true') &&
+        Boolean(process.argv && process.argv.some(arg => arg.includes('.test.') || arg.includes('/tests/') || arg.endsWith('test.ts') || arg.includes('runAllTests'))) &&
+        !Boolean(process.argv && process.argv.some(arg => arg.includes('server.ts') || arg.includes('server.js')))
       );
       const isLegacyTestFixture = Boolean(
         options?._testOnlyLegacyFixture === true && isTestEnv
@@ -1539,12 +1544,10 @@ export interface ComparisonOptions {
         const allowedNames = PolicyIntelligenceEngine.DETECTOR_NAME_MAPPINGS[responsibleKey] || [responsibleKey];
 
         if (!revDetectors || typeof revDetectors !== 'object' || Object.keys(revDetectors).length === 0) {
-          return { verifiable: false, reason: `responsible detector (${responsibleKey}) execution record is missing from revised scan` };
+          return { verifiable: false, reason: `responsible detector (${responsibleKey}) execution record is missing from revised scan`, detectorVersionMatch: false };
         }
 
         // 1. Identify responsible detector candidate
-        // A detector record MUST specify a valid non-empty string detectorName that belongs to allowedNames.
-        // It must NOT be accepted simply because it is located at the registry key if detectorName is missing or unapproved.
         let detectorReport: DetectorReport | undefined;
 
         const byKey = revDetectors[responsibleKey];
@@ -1569,7 +1572,8 @@ export interface ComparisonOptions {
             : (hasUnapprovedName ? `: unapproved detector identity "${byKey.detectorName}"` : '');
           return { 
             verifiable: false, 
-            reason: `responsible detector (${responsibleKey}) execution record is missing from revised scan${reasonDetail}` 
+            reason: `responsible detector (${responsibleKey}) execution record is missing from revised scan${reasonDetail}`,
+            detectorVersionMatch: false
           };
         }
 
@@ -1578,34 +1582,70 @@ export interface ComparisonOptions {
         if (!rawStatus || typeof rawStatus !== 'string' || (rawStatus as string).trim() === '') {
           return { 
             verifiable: false, 
-            reason: `responsible detector (${responsibleKey}) execution status is missing or undefined in revised scan` 
+            reason: `responsible detector (${responsibleKey}) execution status is missing or undefined in revised scan`,
+            detectorVersionMatch: false
           };
         }
 
         // 3. Explicitly fail closed on known failure/unavailable/incomplete execution statuses
         if (rawStatus === 'NOT_ASSESSED') {
-          return { verifiable: false, reason: `responsible detector (${responsibleKey}) was not assessed (NOT_ASSESSED) in revised scan` };
+          return { verifiable: false, reason: `responsible detector (${responsibleKey}) was not assessed (NOT_ASSESSED) in revised scan`, detectorVersionMatch: false };
         }
         if (rawStatus === 'ANALYSIS_UNAVAILABLE') {
-          return { verifiable: false, reason: `analysis for responsible detector (${responsibleKey}) was unavailable (ANALYSIS_UNAVAILABLE) in revised scan` };
+          return { verifiable: false, reason: `analysis for responsible detector (${responsibleKey}) was unavailable (ANALYSIS_UNAVAILABLE) in revised scan`, detectorVersionMatch: false };
         }
         if (rawStatus === 'NOT_PROVIDED') {
-          return { verifiable: false, reason: `responsible detector (${responsibleKey}) was not provided (NOT_PROVIDED) in revised scan` };
+          return { verifiable: false, reason: `responsible detector (${responsibleKey}) was not provided (NOT_PROVIDED) in revised scan`, detectorVersionMatch: false };
         }
         if (rawStatus === 'INSUFFICIENT_EVIDENCE') {
-          return { verifiable: false, reason: `responsible detector (${responsibleKey}) reported insufficient evidence (INSUFFICIENT_EVIDENCE) in revised scan` };
+          return { verifiable: false, reason: `responsible detector (${responsibleKey}) reported insufficient evidence (INSUFFICIENT_EVIDENCE) in revised scan`, detectorVersionMatch: false };
         }
         if ((rawStatus as string) === 'ERROR' || detectorReport.failureReason) {
-          return { verifiable: false, reason: `responsible detector (${responsibleKey}) encountered an execution error (ERROR): ${detectorReport.failureReason || 'execution failure'}` };
+          return { verifiable: false, reason: `responsible detector (${responsibleKey}) encountered an execution error (ERROR): ${detectorReport.failureReason || 'execution failure'}`, detectorVersionMatch: false };
         }
 
-        // 4. For Risk Signal Detectors: 'DETECTED' means active risk signal was found!
+        // 4. Detector Version validation: verify compatibility when versioning is specified
+        const origDetectors = originalReport.detectors;
+        let origDetReport: DetectorReport | undefined;
+        if (origDetectors && typeof origDetectors === 'object') {
+          const origByKey = origDetectors[responsibleKey];
+          if (origByKey && typeof origByKey === 'object' && origByKey.detectorName && allowedNames.includes(origByKey.detectorName.trim())) {
+            origDetReport = origByKey;
+          } else {
+            origDetReport = Object.values(origDetectors).find(d =>
+              d && typeof d === 'object' && typeof d.detectorName === 'string' && allowedNames.includes(d.detectorName.trim())
+            );
+          }
+        }
+
+        let versionMatch = true;
+        if (detectorReport.version && typeof detectorReport.version === 'string' && detectorReport.version.trim() !== '') {
+          if (origDetReport?.version && typeof origDetReport.version === 'string' && origDetReport.version.trim() !== '') {
+            const origMajor = origDetReport.version.trim().split('.')[0];
+            const revMajor = detectorReport.version.trim().split('.')[0];
+            if (origMajor !== revMajor) {
+              return {
+                verifiable: false,
+                reason: `responsible detector (${responsibleKey}) major version mismatch (baseline: ${origDetReport.version}, revised: ${detectorReport.version})`,
+                detectorVersionMatch: false
+              };
+            }
+          }
+        } else if (origDetReport?.version && typeof origDetReport.version === 'string' && origDetReport.version.trim() !== '') {
+          return {
+            verifiable: false,
+            reason: `responsible detector (${responsibleKey}) version missing in revised scan (baseline required: ${origDetReport.version})`,
+            detectorVersionMatch: false
+          };
+        }
+
+        // 5. For Risk Signal Detectors: 'DETECTED' means active risk signal was found!
         // A risk detector reporting DETECTED cannot verify that the risk is resolved.
         if (PolicyIntelligenceEngine.RISK_SIGNAL_DETECTORS.has(responsibleKey) && rawStatus === 'DETECTED') {
-          return { verifiable: false, reason: `responsible detector (${responsibleKey}) detected active risk signals (DETECTED) in revised scan; resolution cannot be verified` };
+          return { verifiable: false, reason: `responsible detector (${responsibleKey}) detected active risk signals (DETECTED) in revised scan; resolution cannot be verified`, detectorVersionMatch: true };
         }
 
-        // 5. Strict Allowlist of successful verification statuses
+        // 6. Strict Allowlist of successful verification statuses
         // Risk signal detectors must explicitly confirm clean absence of risk signals: ['NO_SIGNAL_DETECTED'].
         // Non-risk signal / measurement detectors confirm successful measurement execution: ['DETECTED', 'NO_SIGNAL_DETECTED'].
         const allowedStatuses = PolicyIntelligenceEngine.RISK_SIGNAL_DETECTORS.has(responsibleKey)
@@ -1615,13 +1655,16 @@ export interface ComparisonOptions {
         if (!allowedStatuses.includes(rawStatus)) {
           return { 
             verifiable: false, 
-            reason: `responsible detector (${responsibleKey}) reported non-verifiable or unknown status (${rawStatus}) in revised scan` 
+            reason: `responsible detector (${responsibleKey}) reported non-verifiable or unknown status (${rawStatus}) in revised scan`,
+            detectorVersionMatch: true
           };
         }
+
+        return { verifiable: true, detectorVersionMatch: versionMatch };
       }
     }
 
-    return { verifiable: true };
+    return { verifiable: true, detectorVersionMatch: true };
   }
 
   /**
@@ -1821,9 +1864,9 @@ export interface ComparisonOptions {
     const isTestEnv = (
       process.env.NODE_ENV !== 'production' &&
       (process.env.NODE_ENV === 'test' ||
-       process.env.VIDEORISK_TEST_RUN === 'true' ||
-       Boolean(process.env.npm_lifecycle_script?.includes('tests/')) ||
-       Boolean(process.argv && process.argv.some(arg => arg.includes('.test.') || arg.includes('/tests/') || arg.endsWith('test.ts'))))
+       process.env.VIDEORISK_TEST_RUN === 'true') &&
+      Boolean(process.argv && process.argv.some(arg => arg.includes('.test.') || arg.includes('/tests/') || arg.endsWith('test.ts') || arg.includes('runAllTests'))) &&
+      !Boolean(process.argv && process.argv.some(arg => arg.includes('server.ts') || arg.includes('server.js')))
     );
     if (!isTestEnv) {
       throw new Error('generateComparisonForLegacyTestFixture is forbidden in production environments');

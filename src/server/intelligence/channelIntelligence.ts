@@ -12,9 +12,46 @@ import {
   ChannelIntelligenceRecord,
   ChannelPatternsResponse,
   StoredVisualSignature,
-  StoredAudioSignature
+  StoredAudioSignature,
+  DetectorReport
 } from '../../types';
 import { storage, IStorageRepository } from '../storage';
+import { policyIntelligenceEngine, PolicyIntelligenceEngine } from './policyIntelligence';
+
+export function countDistinctOccurrences(
+  comparisons: CrossVideoComparisonItem[],
+  scanIds: Iterable<string>
+): number {
+  let totalOccurrences = 0;
+  for (const sId of scanIds) {
+    const rawIntervals: Array<{ start: number; end: number }> = [];
+    for (const c of comparisons) {
+      if (c.scanIdA === sId && c.intervalA) {
+        rawIntervals.push({ start: c.intervalA.start, end: c.intervalA.end });
+      }
+      if (c.scanIdB === sId && c.intervalB) {
+        rawIntervals.push({ start: c.intervalB.start, end: c.intervalB.end });
+      }
+    }
+    if (rawIntervals.length === 0) continue;
+    rawIntervals.sort((a, b) => a.start - b.start);
+    const merged: Array<{ start: number; end: number }> = [];
+    for (const iv of rawIntervals) {
+      if (merged.length === 0) {
+        merged.push({ ...iv });
+      } else {
+        const last = merged[merged.length - 1];
+        if (iv.start <= last.end + 1.0) {
+          last.end = Math.max(last.end, iv.end);
+        } else {
+          merged.push({ ...iv });
+        }
+      }
+    }
+    totalOccurrences += merged.length;
+  }
+  return totalOccurrences;
+}
 
 export const MANDATORY_COVERAGE_STATEMENT = 
   'Channel insights are based only on videos uploaded and analyzed in your VideoRisk account. This is not a complete audit of all videos on your YouTube channel.';
@@ -474,6 +511,20 @@ export class ChannelIntelligenceEngine {
       );
 
       if (matchInLatest) {
+        // Find responsible detector and verify version compatibility
+        const respKey = policyIntelligenceEngine.getResponsibleDetectorKey(pIssue);
+        let versionMatch = true;
+        if (respKey && (pIssue.domain === 'video_audio' || pIssue.domain === 'thumbnail')) {
+          const allowed = PolicyIntelligenceEngine.DETECTOR_NAME_MAPPINGS[respKey] || [respKey];
+          const priorDet = priorReport.detectors?.[respKey] || Object.values(priorReport.detectors || {}).find(d => d?.detectorName && allowed.includes(d.detectorName.trim()));
+          const latestDet = latestReport.detectors?.[respKey] || Object.values(latestReport.detectors || {}).find(d => d?.detectorName && allowed.includes(d.detectorName.trim()));
+          if (priorDet?.version && latestDet?.version) {
+            versionMatch = priorDet.version.trim().split('.')[0] === latestDet.version.trim().split('.')[0];
+          } else if (!latestDet?.version) {
+            versionMatch = false;
+          }
+        }
+
         temporalPatterns.push({
           patternId: `temp_persist_${pIssue.id}`,
           patternType: pIssue.type || pIssue.category,
@@ -486,13 +537,36 @@ export class ChannelIntelligenceEngine {
           priorTimestamp: formatTime(pIssue.timestampSeconds),
           latestTimestamp: formatTime(matchInLatest.timestampSeconds),
           reason: 'Finding persists across both scans with active signal detection in latest report.',
-          detectorVersionMatch: true,
+          detectorVersionMatch: versionMatch,
           mediaIdentityMatch: isIdenticalMedia
         });
       } else {
-        // Missing from latest: check if resolution can be verified with evidence
-        // 1. If media is identical, fails closed!
-        if (isIdenticalMedia) {
+        // Missing from latest: check if resolution can be verified with evidence using shared validation
+        const verification = policyIntelligenceEngine.canVerifyResolution(
+          pIssue.domain,
+          priorReport,
+          latestReport,
+          {
+            originalScanRecord: priorScan,
+            revisedScanRecord: latestScan
+          },
+          pIssue
+        );
+
+        if (verification.verifiable) {
+          temporalPatterns.push({
+            patternId: `temp_resolved_${pIssue.id}`,
+            patternType: pIssue.type || pIssue.category,
+            label: pIssue.what,
+            priorScanId: priorScan.id,
+            latestScanId: latestScan.id,
+            status: 'RESOLVED_WITH_EVIDENCE',
+            priorEvidenceRef: pIssue.id,
+            reason: 'Prior finding no longer observed in revised media, supported by clean detector verification.',
+            detectorVersionMatch: verification.detectorVersionMatch ?? true,
+            mediaIdentityMatch: false
+          });
+        } else {
           temporalPatterns.push({
             patternId: `temp_unverified_${pIssue.id}`,
             patternType: pIssue.type || pIssue.category,
@@ -501,42 +575,12 @@ export class ChannelIntelligenceEngine {
             latestScanId: latestScan.id,
             status: 'CHANGE_NOT_VERIFIED',
             priorEvidenceRef: pIssue.id,
-            reason: 'Identical media file version (matching SHA-256) cannot verify content resolution.',
-            detectorVersionMatch: true,
-            mediaIdentityMatch: true
+            reason: isIdenticalMedia
+              ? 'Identical media file version (matching SHA-256) cannot verify content resolution.'
+              : (verification.reason || 'Resolution could not be certified due to insufficient evidence or unassessed detectors.'),
+            detectorVersionMatch: verification.detectorVersionMatch ?? false,
+            mediaIdentityMatch: isIdenticalMedia
           });
-        } else {
-          // Check detector status in latest report
-          const responsibleKey = pIssue.domain === 'video_audio' ? 'video_repeated_footage' : 'thumbnail_ocr';
-          const detector = latestReport.detectors?.[responsibleKey];
-
-          if (!detector || detector.status === 'NOT_ASSESSED' || detector.status === 'ANALYSIS_UNAVAILABLE') {
-            temporalPatterns.push({
-              patternId: `temp_unverified_${pIssue.id}`,
-              patternType: pIssue.type || pIssue.category,
-              label: pIssue.what,
-              priorScanId: priorScan.id,
-              latestScanId: latestScan.id,
-              status: 'CHANGE_NOT_VERIFIED',
-              priorEvidenceRef: pIssue.id,
-              reason: `Responsible detector (${responsibleKey}) was not assessed or unavailable in latest scan; resolution cannot be certified.`,
-              detectorVersionMatch: false,
-              mediaIdentityMatch: false
-            });
-          } else {
-            temporalPatterns.push({
-              patternId: `temp_resolved_${pIssue.id}`,
-              patternType: pIssue.type || pIssue.category,
-              label: pIssue.what,
-              priorScanId: priorScan.id,
-              latestScanId: latestScan.id,
-              status: 'RESOLVED_WITH_EVIDENCE',
-              priorEvidenceRef: pIssue.id,
-              reason: 'Prior finding no longer observed in revised media, supported by clean detector verification.',
-              detectorVersionMatch: true,
-              mediaIdentityMatch: false
-            });
-          }
         }
       }
     }
@@ -548,6 +592,14 @@ export class ChannelIntelligenceEngine {
         (pIssue.type === lIssue.type || pIssue.what.toLowerCase() === lIssue.what.toLowerCase())
       );
       if (!matchInPrior) {
+        const respKey = policyIntelligenceEngine.getResponsibleDetectorKey(lIssue);
+        let versionMatch = true;
+        if (respKey && (lIssue.domain === 'video_audio' || lIssue.domain === 'thumbnail')) {
+          const allowed = PolicyIntelligenceEngine.DETECTOR_NAME_MAPPINGS[respKey] || [respKey];
+          const det = latestReport.detectors?.[respKey] || Object.values(latestReport.detectors || {}).find(d => d?.detectorName && allowed.includes(d.detectorName.trim()));
+          versionMatch = Boolean(det?.version && typeof det.version === 'string' && det.version.trim() !== '');
+        }
+
         temporalPatterns.push({
           patternId: `temp_new_${lIssue.id}`,
           patternType: lIssue.type || lIssue.category,
@@ -558,7 +610,7 @@ export class ChannelIntelligenceEngine {
           latestEvidenceRef: lIssue.id,
           latestTimestamp: formatTime(lIssue.timestampSeconds),
           reason: 'New issue observed in latest scan that was not present in prior scan baseline.',
-          detectorVersionMatch: true,
+          detectorVersionMatch: versionMatch,
           mediaIdentityMatch: isIdenticalMedia
         });
       }
@@ -1006,6 +1058,10 @@ export class ChannelIntelligenceEngine {
       const affectedCount = visualMatchScanIds.size;
       const scanIds = Array.from(visualMatchScanIds);
       const frequency = parseFloat(((affectedCount / sampleSize) * 100).toFixed(0));
+      const affectedScans = completedScans.filter(s => visualMatchScanIds.has(s.id));
+      const distinctVideosCount = new Set(affectedScans.map(s => s.metadata?.sha256 || s.videoFilename || s.id)).size;
+      const matchingComparisons = crossVideoComparisons.filter(c => c.type === 'visual_segment' && c.status === 'MATCH_CONFIRMED');
+      const distinctOccurrencesCount = countDistinctOccurrences(matchingComparisons, visualMatchScanIds);
 
       patterns.push({
         id: 'pat_cross_video_visual_repeat',
@@ -1014,8 +1070,8 @@ export class ChannelIntelligenceEngine {
         severity: 'warning',
         sampleSize,
         affectedScansCount: affectedCount,
-        distinctVideosCount: affectedCount,
-        distinctOccurrencesCount: affectedCount,
+        distinctVideosCount,
+        distinctOccurrencesCount,
         frequency,
         sourceScanIds: scanIds,
         evidenceReferences: scanIds,
@@ -1039,6 +1095,10 @@ export class ChannelIntelligenceEngine {
       const affectedCount = introMatchScanIds.size;
       const scanIds = Array.from(introMatchScanIds);
       const frequency = parseFloat(((affectedCount / sampleSize) * 100).toFixed(0));
+      const affectedScans = completedScans.filter(s => introMatchScanIds.has(s.id));
+      const distinctVideosCount = new Set(affectedScans.map(s => s.metadata?.sha256 || s.videoFilename || s.id)).size;
+      const matchingComparisons = crossVideoComparisons.filter(c => c.type === 'intro_outro' && c.status === 'MATCH_CONFIRMED');
+      const distinctOccurrencesCount = countDistinctOccurrences(matchingComparisons, introMatchScanIds);
 
       patterns.push({
         id: 'pat_repeated_intro_outro',
@@ -1047,8 +1107,8 @@ export class ChannelIntelligenceEngine {
         severity: 'info',
         sampleSize,
         affectedScansCount: affectedCount,
-        distinctVideosCount: affectedCount,
-        distinctOccurrencesCount: affectedCount,
+        distinctVideosCount,
+        distinctOccurrencesCount,
         frequency,
         sourceScanIds: scanIds,
         evidenceReferences: scanIds,
@@ -1072,6 +1132,10 @@ export class ChannelIntelligenceEngine {
       const affectedCount = audioMatchScanIds.size;
       const scanIds = Array.from(audioMatchScanIds);
       const frequency = parseFloat(((affectedCount / sampleSize) * 100).toFixed(0));
+      const affectedScans = completedScans.filter(s => audioMatchScanIds.has(s.id));
+      const distinctVideosCount = new Set(affectedScans.map(s => s.metadata?.sha256 || s.videoFilename || s.id)).size;
+      const matchingComparisons = crossVideoComparisons.filter(c => (c.type === 'audio_repetition' || c.type === 'audio_spectral') && c.status === 'MATCH_CONFIRMED');
+      const distinctOccurrencesCount = countDistinctOccurrences(matchingComparisons, audioMatchScanIds);
 
       patterns.push({
         id: 'pat_cross_video_audio_repeat',
@@ -1080,8 +1144,8 @@ export class ChannelIntelligenceEngine {
         severity: 'info',
         sampleSize,
         affectedScansCount: affectedCount,
-        distinctVideosCount: affectedCount,
-        distinctOccurrencesCount: affectedCount,
+        distinctVideosCount,
+        distinctOccurrencesCount,
         frequency,
         sourceScanIds: scanIds,
         evidenceReferences: scanIds,

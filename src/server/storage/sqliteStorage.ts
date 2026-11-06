@@ -1717,7 +1717,7 @@ export class SqliteStorageRepository implements IStorageRepository {
       const row = this.db.prepare(`
         SELECT * FROM channel_intelligence 
         WHERE user_id = ? AND status != 'STALE'
-        ORDER BY updated_at DESC LIMIT 1
+        ORDER BY version DESC, updated_at DESC LIMIT 1
       `).get(userId) as any;
       if (!row) return null;
       return this.mapChannelIntelligence(row);
@@ -1725,6 +1725,37 @@ export class SqliteStorageRepository implements IStorageRepository {
 
     save: async (record: ChannelIntelligenceRecord): Promise<ChannelIntelligenceRecord> => {
       return await this.runTransaction(db => {
+        // Concurrency & version guard: check existing active record for user
+        const current = db.prepare(`
+          SELECT * FROM channel_intelligence
+          WHERE user_id = ? AND status != 'STALE'
+          ORDER BY version DESC, updated_at DESC LIMIT 1
+        `).get(record.userId) as any;
+
+        // If the database has a strictly newer version, do not overwrite with older data
+        if (current && Number(current.version) > record.version) {
+          return this.mapChannelIntelligence(current);
+        }
+
+        // If there is an existing record with the same version but different ID, increment version to ensure monotonicity
+        if (current && Number(current.version) === record.version && current.id !== record.id) {
+          record.version = Number(current.version) + 1;
+          record.id = `ch_intel_${record.userId}_v${record.version}`;
+        }
+
+        // Deleted/concurrent scan check: verify all sourceScanIds exist, belong to user, and are COMPLETED
+        if (record.sourceScanIds && record.sourceScanIds.length > 0) {
+          const placeholders = record.sourceScanIds.map(() => '?').join(',');
+          const activeScans = db.prepare(`
+            SELECT id FROM scans 
+            WHERE id IN (${placeholders}) AND user_id = ? AND status = 'COMPLETED'
+          `).all(...record.sourceScanIds, record.userId) as { id: string }[];
+          
+          if (activeScans.length < record.sourceScanIds.length) {
+            record.status = 'STALE';
+          }
+        }
+
         db.prepare(`
           INSERT INTO channel_intelligence (
             id, user_id, scope_id, version, status, sample_size,
@@ -1788,7 +1819,7 @@ export class SqliteStorageRepository implements IStorageRepository {
 
     removeScanReferences: async (scanId: string): Promise<void> => {
       const rows = this.db.prepare(`
-        SELECT id, source_scan_ids_json 
+        SELECT id, source_scan_ids_json, source_video_identities_json
         FROM channel_intelligence 
         WHERE source_scan_ids_json LIKE ?
       `).all(`%"${scanId}"%`) as any[];
@@ -1798,11 +1829,25 @@ export class SqliteStorageRepository implements IStorageRepository {
         let scanIds: string[] = [];
         try { scanIds = JSON.parse(row.source_scan_ids_json); } catch {}
         if (scanIds.includes(scanId)) {
+          const updatedScanIds = scanIds.filter(id => id !== scanId);
+          let identities: any[] = [];
+          try { identities = JSON.parse(row.source_video_identities_json || '[]'); } catch {}
+          const updatedIdentities = identities.filter(v => v.scanId !== scanId);
           this.db.prepare(`
             UPDATE channel_intelligence 
-            SET status = 'STALE', updated_at = ?
+            SET status = 'STALE',
+                source_scan_ids_json = ?,
+                source_video_identities_json = ?,
+                sample_size = ?,
+                updated_at = ?
             WHERE id = ?
-          `).run(now, row.id);
+          `).run(
+            JSON.stringify(updatedScanIds),
+            JSON.stringify(updatedIdentities),
+            updatedScanIds.length,
+            now, 
+            row.id
+          );
         }
       }
     }

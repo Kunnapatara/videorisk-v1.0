@@ -114,6 +114,10 @@ async function main() {
     // Run Suite 21: Customer-Facing Pricing & Membership Journey
     await runPricingAndMembershipJourneyTests();
 
+    // Run Suite 22: Phase 1–3 Integrity Enforcement (Re-scan, Concurrency, Gradient Mirroring)
+    const { runPhase123IntegrityEnforcementTests } = await import('./phase1_2_3_integrity_enforcement.test');
+    await runPhase123IntegrityEnforcementTests();
+
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log(`\n🎉 ALL AUTOMATED VERIFICATION SUITES COMPLETED SUCCESSFULLY in ${elapsed}s!`);
     process.exit(0);
