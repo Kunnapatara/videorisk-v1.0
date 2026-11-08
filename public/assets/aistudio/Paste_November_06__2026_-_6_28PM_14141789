@@ -1,0 +1,783 @@
+# VideoRisk v1.0 — Intelligence Completion (Phase 4–6)
+## Local Intelligence Validation, Full-video OCR & Evidence Integration
+
+**Repository:** `Kunnapatara/videorisk-v1.0`  
+**Target Branch:** `main`  
+**Audit Reference Commit:** `cbb21e24c6f8f9df5ad92cb8e5c67b0ecde3957f`
+
+---
+
+# 1. Mission
+
+Complete the existing VideoRisk v1.0 intelligence pipeline by implementing and validating the genuinely missing local intelligence capabilities, integrating their evidence into the existing Evidence Timeline and Policy Intelligence system, and verifying production and commercial readiness.
+
+The objective is to make the existing system more accurate, transparent, reproducible, and useful for real YouTube creators before publication.
+
+This is an extension and completion task, NOT a rewrite.
+
+Follow the existing architecture and development progress.
+
+**Core principle: Zero Loss of Development Progress.**
+
+Do not remove, replace, simplify, or redesign working functionality unless a specific defect makes it necessary and the reason is documented.
+
+# 2. Mandatory Starting Procedure — Repository Integrity
+
+Before modifying any file:
+
+1. Read the latest `main` branch and identify its actual HEAD commit.
+2. Verify whether the repository still contains the audited commit:
+   `cbb21e24c6f8f9df5ad92cb8e5c67b0ecde3957f`
+3. Inspect the Phase 1–3 changes introduced in and around that commit.
+4. Inspect the additional regression tests, including the current test runner and all registered suites.
+5. Inspect the current implementation of:
+   - `src/server/pipeline/thumbnailInspector.ts`
+   - `src/server/pipeline/audioProcessor.ts`
+   - Existing STT adapter and related configuration
+   - Existing video decoding, frame extraction, and scene-detection infrastructure
+   - Existing Detector Registry and Detector contracts
+   - Evidence Timeline
+   - Policy Intelligence
+   - Risk Report
+   - Re-scan verification
+   - Existing test suites
+6. Determine which Phase 1–3 fixes are already implemented and whether the current code preserves their intended behavior.
+
+## Phase 1–3 Protection Rules
+
+- Do NOT repeat Phase 1–3 work without evidence of a remaining defect.
+- Do NOT revert or overwrite the existing Phase 1–3 implementation.
+- Do NOT create duplicate implementations of functionality that already exists.
+- Do NOT modify working status logic merely to make it fit a new implementation.
+- If a Phase 1–3 regression or unresolved defect is found, document:
+  - File and function
+  - Reproduction steps
+  - Expected behavior
+  - Actual behavior
+  - Relevant test results
+  - Minimal proposed correction
+
+**Stop and report before making changes if a critical Phase 1–3 regression is discovered that could invalidate Phase 4–6 work.**
+
+Otherwise, preserve the existing implementation and continue.
+
+# 3. Global Engineering Constraints
+
+1. Extend existing architecture before considering new architecture.
+2. No destructive rewrites.
+3. No unnecessary dependencies.
+4. No fake detector results or fabricated confidence values.
+5. No hardcoded success states.
+6. No synthetic evidence presented as real processing evidence.
+7. No unsupported accuracy, detection, copyright, or YouTube policy claims.
+8. Preserve existing API contracts and user-facing functionality unless a change is necessary and documented.
+9. Preserve existing billing, pricing, credits, and entitlement behavior.
+10. Do not change plan prices, credit allocations, subscription rules, or payment-provider behavior as part of intelligence implementation.
+11. Preserve TypeScript type safety and existing error-handling conventions.
+12. All processing must have explicit resource bounds and failure handling.
+13. All partial or unavailable processing must be represented accurately.
+14. Every change must have regression tests.
+
+The product remains a pre-publish risk assessment tool, not an official YouTube decision engine, Content ID system, copyright clearance service, or guarantee of monetization.
+
+---
+
+# 4. Mandatory Detector Contract
+
+Every detector must provide the following fields through the existing architecture:
+
+- `executionStatus`
+- `evidence[]`
+- `provenance`
+- `coverage`
+- `limitations[]`
+
+Use the existing types where possible. Do not create duplicate contract types without a demonstrated need.
+
+## Required Execution Status Semantics
+
+Use consistent meanings for these statuses:
+
+| Status | Meaning |
+|---|---|
+| `NOT_ASSESSED` | The detector was not executed or was intentionally skipped. |
+| `ANALYSIS_UNAVAILABLE` | The detector could not execute because a dependency, runtime, input, or processing resource was unavailable. |
+| `INSUFFICIENT_EVIDENCE` | Processing occurred, but the available evidence cannot support a reliable conclusion. |
+| `DETECTED` | The detector found a signal supported by actual evidence. |
+| `NO_SIGNAL_DETECTED` | The detector completed sufficient processing coverage and found no relevant signal. |
+
+Important:
+
+- `ANALYSIS_UNAVAILABLE` must never become `NO_SIGNAL_DETECTED`.
+- `NOT_ASSESSED` must never be interpreted as a clean result.
+- `INSUFFICIENT_EVIDENCE` must not be interpreted as Low Risk.
+- Partial processing must not produce a definitive negative conclusion.
+- A detector may return `NO_SIGNAL_DETECTED` only when its declared coverage is sufficient for the specific detection objective.
+
+## Evidence Requirements
+
+Every evidence item should include, where applicable:
+
+- Evidence ID
+- Detector ID
+- Detector version
+- Evidence type
+- Observed value
+- Timestamp or time interval
+- Source file or frame reference
+- Confidence, only when genuinely measured or calculated
+- Provenance
+- Processing metadata
+- Limitations
+
+Do not fabricate fields that cannot be established.
+
+---
+
+# 5. Phase 4 — Local Intelligence Completion
+
+## 5.1 Thumbnail Intelligence
+
+**Existing implementation to extend:**
+
+`src/server/pipeline/thumbnailInspector.ts`
+
+Do not create a second Thumbnail Intelligence system.
+
+### Existing functionality to preserve
+
+- Image geometry and aspect ratio
+- File size and format inspection
+- Mean luminance analysis through FFmpeg
+- Optional OCR through Tesseract
+
+### Required completion
+
+1. Inspect the existing OCR implementation and actual Tesseract output.
+2. Where supported by the runtime, extract:
+   - Recognized text
+   - Text bounding boxes
+   - Actual OCR confidence
+   - OCR execution status
+3. Implement text contrast analysis using actual image regions and bounding boxes where technically supportable.
+4. Do not use image-wide mean luminance as a substitute for local text contrast.
+5. Only report `hasHighContrastText` when the required measurements are available.
+6. Only report `hasSensationalElements` when actual recognized text and a documented classification rule support the result.
+7. If a measurement cannot be performed, preserve an explicit unavailable or not-assessed state.
+
+### Critical confidence rule
+
+The existing hardcoded OCR confidence values, including values such as `0.90` or `0.88`, must not be presented as actual measured OCR confidence.
+
+Use genuine Tesseract confidence values when available. Otherwise, omit confidence or explicitly mark it unavailable.
+
+### Required tests
+
+- Valid image
+- Invalid image
+- Missing image
+- OCR disabled
+- Tesseract unavailable
+- No text detected
+- Text detected
+- Bounding-box extraction
+- Confidence extraction
+- Contrast measurement
+- Timeout and resource failure
+
+---
+
+## 5.2 Audio Intelligence
+
+**Existing implementation to extend:**
+
+`src/server/pipeline/audioProcessor.ts`
+
+Do not replace the existing Audio Intelligence pipeline.
+
+### Preserve existing capabilities
+
+- Audio extraction and analysis
+- Speech activity analysis
+- Silence detection
+- Volume analysis
+- Audio segment processing
+- Repeated audio detection
+- Existing transcript data structures
+
+### Required completion
+
+1. Audit the current audio pipeline before modifying it.
+2. Reuse existing extraction, segmentation, and analysis functions.
+3. Identify gaps between actual processing output and the detector contract.
+4. Add execution status, evidence, provenance, coverage, and limitations.
+5. Ensure processing failures are not interpreted as absence of audio signals.
+6. Ensure resource limits are reflected in actual coverage.
+
+### Resource-bound requirements
+
+Existing limits, including candidate-pair and comparison limits, must be preserved or changed only with documented justification.
+
+If a processing limit is reached:
+
+- Mark coverage as partial or incomplete.
+- Record the relevant limit.
+- Explain what was not processed.
+- Do not conclude `NO_SIGNAL_DETECTED` for the unprocessed portion.
+
+### Required tests
+
+- Audio present
+- No audio stream
+- Invalid media
+- Extraction failure
+- Silence
+- Low-volume audio
+- Speech present
+- Repeated audio
+- Processing limit reached
+- Timeout
+- Partial processing
+- Runtime failure
+
+---
+
+## 5.3 Real Whisper Runtime Integration
+
+**A working STT adapter is not sufficient. The actual runtime must be operational.**
+
+The existing adapter reads configuration such as `WHISPER_PATH` or `LOCAL_STT_PATH`, but an executable path alone does not prove that a compatible Whisper runtime exists or can produce usable transcripts.
+
+### Required work
+
+1. Inspect the current STT adapter and its command-line assumptions.
+2. Identify a real, maintainable local Whisper runtime compatible with the current Windows and deployment environments.
+3. Select and document the runtime and version.
+4. Confirm its actual command-line interface and output format.
+5. Implement the adapter to match the selected runtime's real contract.
+6. Parse genuine transcript text and timestamps from actual runtime output.
+7. Handle:
+   - Runtime not installed
+   - Model missing
+   - Invalid executable path
+   - Unsupported command-line arguments
+   - Invalid output
+   - Timeout
+   - Out-of-memory/resource exhaustion
+   - Empty transcript
+   - Partial transcript
+   - Process termination
+8. Apply configurable timeouts and resource limits.
+9. Do not silently substitute a different runtime or a mocked transcript.
+10. Clearly document installation, model acquisition, configuration, and execution requirements.
+
+### Language validation
+
+Validate both Thai and English.
+
+Include:
+
+- Short speech
+- Longer speech
+- Multiple speech segments
+- Silence
+- Speech with background noise
+- Timestamp extraction
+- Empty or incomplete output
+
+### Transcript evidence
+
+Transcript evidence must preserve:
+
+- Actual recognized text
+- Start and end timestamps
+- Runtime and model provenance
+- Execution status
+- Coverage
+- Limitations
+
+Do not claim transcript accuracy without reference transcripts and a defined evaluation method.
+
+---
+
+## 5.4 Full-video OCR — Actual Implementation Required
+
+**This is a mandatory capability, not a Detector Registry exercise.**
+
+The current source review did not identify a complete Full-video OCR pipeline. Thumbnail OCR does not satisfy this requirement.
+
+Implement actual OCR processing against video frames.
+
+### Required pipeline
+
+1. Reuse existing video decoding and frame extraction infrastructure.
+2. Reuse existing scene-detection infrastructure where appropriate.
+3. Select frames using a bounded, scene-aware sampling strategy.
+4. Run actual Tesseract OCR against the selected frames.
+5. Extract actual recognized text.
+6. Preserve timestamps and frame references.
+7. Deduplicate repeated text across adjacent frames.
+8. Filter obvious OCR noise without discarding valid evidence silently.
+9. Integrate the results into the existing Evidence Timeline.
+
+### Sampling requirements
+
+Do not OCR every video frame indiscriminately.
+
+Implement configurable limits for:
+
+- Maximum sampled frames
+- Sampling interval
+- Scene-based sampling
+- Maximum processing time
+- CPU and memory usage
+- Maximum text output
+- OCR execution timeout
+
+The sampling algorithm must be deterministic for the same input and configuration.
+
+### Coverage requirements
+
+Coverage must describe what was actually inspected.
+
+For example:
+
+- Total video duration
+- Frames selected
+- Frames successfully processed
+- Frames failed
+- Sampling interval
+- Scene coverage, if measurable
+- Processing time
+- Whether the video was completely or partially sampled
+
+Do not describe sampled-frame OCR as full-frame OCR.
+
+Do not claim complete video coverage if only selected frames were inspected.
+
+### Failure conditions
+
+Explicitly handle:
+
+- Invalid video
+- Unsupported video format
+- Missing video stream
+- Frame extraction failure
+- Tesseract unavailable
+- No text found
+- Timeout
+- Resource exhaustion
+- Partial processing
+
+### Required tests
+
+- Text visible throughout a video
+- Text appearing briefly
+- Text appearing at different timestamps
+- Repeated text across frames
+- Scene changes
+- No visible text
+- Low-resolution text
+- Invalid video
+- Frame extraction failure
+- Partial sampling
+- Sampling limit reached
+- OCR runtime unavailable
+
+Synthetic video fixtures may be used for automated tests, but must not be presented as real-world accuracy evidence.
+
+---
+
+## 5.5 Evidence Timeline and Policy Intelligence Integration
+
+Integrate the completed intelligence outputs into the existing system.
+
+Do not create a parallel Evidence Timeline or duplicate Policy Intelligence architecture.
+
+### Required integration
+
+1. Thumbnail OCR evidence must be available to the existing Evidence Timeline.
+2. Thumbnail contrast evidence must only appear when genuinely measured.
+3. Audio and speech evidence must preserve actual timestamps or intervals.
+4. Whisper transcript segments must appear as timestamped evidence.
+5. Full-video OCR results must appear as timestamped frame evidence.
+6. Detector provenance and version must propagate into the evidence records.
+7. Coverage and limitations must remain visible to downstream consumers.
+8. Policy Intelligence must consume supported evidence without inventing policy violations.
+9. Risk explanations must distinguish:
+   - Observed technical signal
+   - Supporting evidence
+   - Applicable policy interpretation
+   - Uncertainty or limitation
+10. Existing risk states and re-scan behavior must remain compatible.
+
+### Critical policy rule
+
+A technical detection is not automatically a YouTube policy violation.
+
+For example:
+
+- OCR text detection does not automatically establish misleading metadata.
+- Audio detection does not automatically establish copyright infringement.
+- Repeated audio does not automatically establish reused content.
+- A transcript does not automatically establish a policy violation.
+
+Policy conclusions must be linked to documented rules and supporting evidence.
+
+---
+
+# 6. Phase 5 — Full E2E and Accuracy Validation
+
+## 6.1 Test layers
+
+Maintain separate test categories:
+
+**A. Unit Tests**
+- Individual detector functions
+- Parsing and classification
+- Status semantics
+- Evidence validation
+- Coverage calculation
+
+**B. Integration Tests**
+- Real pipeline-to-detector execution
+- Detector-to-Evidence Timeline integration
+- Evidence-to-Policy Intelligence integration
+- Transcript and OCR timestamp propagation
+- Error and partial-processing propagation
+
+**C. Synthetic Media Tests**
+- Programmatically generated test videos, images, and audio
+- Known expected text and timestamps
+- Deterministic regression scenarios
+
+**D. Real File Execution Tests**
+- Actual media files processed by the real installed runtime
+- Real FFmpeg execution
+- Real Tesseract execution
+- Real Whisper runtime execution
+- Actual output captured and inspected
+
+Do not combine these categories into one undifferentiated passing-test count.
+
+## 6.2 Mandatory Real File Execution Evidence
+
+**Real File Execution Evidence is mandatory and must be reported separately from Synthetic Tests.**
+
+A mock, stub, fixture-only test, mocked executable, or fabricated JSON response does not qualify.
+
+For each real-file execution, record:
+
+| Field | Required information |
+|---|---|
+| Test ID | Unique test identifier |
+| Input | Actual media file identifier or filename |
+| Media properties | Format, duration, resolution, audio properties |
+| Runtime | Actual FFmpeg, Tesseract, and Whisper runtime versions used |
+| Configuration | Relevant sampling and resource limits |
+| Execution | Actual command or execution path |
+| Result | Actual output and detector status |
+| Evidence | Transcript text, OCR text, timestamps, or other observable output |
+| Coverage | What was processed and what was not |
+| Limitations | Errors, omissions, or uncertainty |
+| Reproducibility | Instructions to reproduce the run |
+
+Do not expose private media contents or secrets in logs.
+
+If actual media files or runtimes are unavailable in the current environment:
+
+- Report `NOT EXECUTED`.
+- State exactly what is missing.
+- Provide the exact commands and environment setup required for execution.
+- Do not mark the real-file validation complete.
+- Do not substitute synthetic tests and claim equivalent proof.
+
+## 6.3 Accuracy Evaluation
+
+Where reference annotations exist, calculate appropriate metrics:
+
+- OCR: character error rate or word error rate
+- STT: word error rate and character error rate
+- Timestamp accuracy: measured against reference intervals
+- Detection: precision, recall, and F1 only when a valid labeled dataset exists
+
+Report sample size and dataset composition.
+
+Do not invent benchmark values or claim general real-world accuracy from a small synthetic dataset.
+
+---
+
+# 7. Phase 6 — Production and Commercial Verification
+
+This phase verifies the existing application and payment architecture. It does not authorize a pricing or business-model redesign.
+
+### 7.1 Production Readiness
+
+Inspect and verify:
+
+- Production database connection
+- Database schema and migration readiness
+- Persistent storage
+- Upload directory existence and actual writeability
+- File size and upload limits
+- FFmpeg availability
+- Tesseract availability
+- Whisper runtime availability
+- Processing timeouts
+- CPU and memory limits
+- Job failure recovery
+- Logging and error reporting
+- Health and readiness checks
+
+### 7.2 Existing Readiness Issues to Recheck
+
+Previously identified concerns must be checked against current code before changes:
+
+1. `/health/readiness` may report in-memory storage as healthy when no database object is configured.
+2. Missing Stripe credentials may mark billing degraded without necessarily setting `isReady=false`.
+3. Upload storage checks may verify directory existence without verifying actual writeability.
+4. `scripts/validate-env.ts` exists, but startup integration must be verified.
+5. Production database connection and schema readiness must be demonstrated.
+
+Do not assume these defects still exist. Verify first and report current behavior.
+
+### 7.3 Stripe and Commercial Verification
+
+Inspect the existing implementation and preserve the established commercial model.
+
+Verify in Stripe Test Mode:
+
+- Checkout session creation
+- Successful payment
+- Webhook signature verification
+- Webhook idempotency
+- Subscription activation
+- Subscription renewal
+- Cancellation
+- One-time payment
+- Credit grant
+- Refund
+- Credit reversal or adjustment
+- Customer Portal
+- Entitlement enforcement
+- Account isolation
+- Duplicate and out-of-order webhook handling
+
+Do not use live payments.
+
+Do not modify plan prices, credit allocations, subscription rules, or billing entitlements.
+
+Do not claim payment readiness based only on unit tests or mocked Stripe responses.
+
+If Stripe Test Mode credentials are unavailable, report the exact unverified flows.
+
+### 7.4 Storage and Recovery
+
+Verify:
+
+- Actual write/read/delete operations in the configured upload storage
+- Database persistence across application restarts
+- Backup procedure
+- Restore procedure
+- Recovery behavior after interrupted processing
+
+Do not delete user data or production data as part of testing.
+
+---
+
+# 8. Regression and Compatibility Requirements
+
+Preserve and verify:
+
+- Existing Phase 1–3 fixes
+- Existing Detector Registry
+- Existing Risk Report
+- Existing Evidence Timeline
+- Existing Re-scan verification
+- Existing API contracts
+- Existing UI functionality
+- Existing authentication and account isolation
+- Existing credits and entitlements
+- Existing pricing and billing rules
+
+Retain the existing risk states:
+
+- Low Risk
+- Needs Review
+- High Risk
+
+Retain the existing re-scan semantics:
+
+- Resolved
+- Still Present
+- New
+- NOT VERIFIED
+
+A re-scan must not report Resolved unless the relevant evidence has actually been reprocessed and the resolution can be verified.
+
+Preserve the existing Sample Scan and Demo Scan credit behavior and copy requirements. Do not introduce misleading statements that a sample or demo consumes credits when it does not.
+
+---
+
+# 9. Required Implementation Workflow
+
+Work in the following order:
+
+1. Repository Integrity and Phase 1–3 verification.
+2. Existing architecture and detector contract audit.
+3. Thumbnail Intelligence completion.
+4. Audio Intelligence completion.
+5. Real Whisper Runtime integration.
+6. Full-video OCR implementation.
+7. Evidence Timeline integration.
+8. Policy Intelligence integration.
+9. Unit and integration tests.
+10. Synthetic media validation.
+11. Real File Execution validation.
+12. Production readiness audit.
+13. Stripe Test Mode verification.
+14. Final regression tests and implementation report.
+
+Do not silently skip a step.
+
+If a step cannot be completed because of a missing external dependency, runtime, credential, media file, or environment capability, mark it explicitly as blocked or not executed.
+
+Do not replace a blocked real execution step with a mock and report it as completed.
+
+---
+
+# 10. Final Deliverables — Mandatory
+
+Provide a final report containing:
+
+## A. Repository Integrity
+- Starting HEAD commit
+- Final changed files
+- Confirmation that Phase 1–3 work was preserved
+- Any Phase 1–3 defects discovered
+
+## B. Implementation Summary
+For each capability:
+- What already existed
+- What was missing
+- What was implemented
+- Files changed
+- Known limitations
+
+## C. Detector Verification Matrix
+
+| Detector | Execution Status | Evidence | Provenance | Coverage | Limitations |
+|---|---|---|---|---|---|
+
+Include every detector changed or added.
+
+## D. Test Results
+
+Report separately:
+
+- Unit tests
+- Integration tests
+- Synthetic media tests
+- Real File Execution tests
+- Regression tests
+- Build
+- Lint
+- Type checking
+
+For every test category, provide:
+- Exact command
+- Actual execution result
+- Passed count
+- Failed count
+- Skipped count
+- Not executed count
+- Relevant logs or test output
+
+Never report a test as passed if it was not actually executed.
+
+## E. Real File Execution Evidence
+
+Provide the actual execution records required in Phase 5.
+
+Clearly separate:
+- Executed successfully
+- Executed with partial coverage
+- Failed
+- Not executed
+
+## F. Production and Payment Verification
+
+Report each item as:
+- VERIFIED
+- FAILED
+- BLOCKED
+- NOT EXECUTED
+
+Include evidence and remaining dependencies.
+
+## G. Remaining Work
+
+List all unresolved technical, runtime, accuracy, operational, and commercial blockers.
+
+Distinguish between:
+- Implemented
+- Tested synthetically
+- Verified using real files
+- Verified in integration
+- Verified in production-like environment
+- Not verified
+
+## H. Final Readiness Assessment
+
+Give separate assessments for:
+
+1. Local Intelligence
+2. Full-video OCR
+3. Evidence and Policy Integration
+4. Real File Execution
+5. Production Readiness
+6. Payment Readiness
+7. Overall Commercial Readiness
+
+Explain each assessment using evidence, not subjective optimism.
+
+---
+
+# 11. Git and Deployment Restrictions
+
+- Do not push to `main`.
+- Do not deploy.
+- Do not run live payment transactions.
+- Do not delete production data.
+- Do not change production secrets.
+- Do not make irreversible infrastructure changes.
+- Do not commit unless explicitly authorized.
+
+You may create a local working branch if the environment supports it, but preserve the original branch and working tree.
+
+If changes are implemented, provide the resulting diff and commit SHA only if an authorized commit was actually created.
+
+---
+
+# 12. Definition of Done
+
+Phase 4–6 is complete only when:
+
+1. Existing Phase 1–3 work is preserved.
+2. Thumbnail and Audio Intelligence are extended rather than duplicated.
+3. A real Whisper runtime successfully processes actual audio.
+4. Full-video OCR genuinely processes selected video frames.
+5. OCR and transcript evidence enter the existing Evidence Timeline.
+6. Policy Intelligence uses supported evidence without inventing policy conclusions.
+7. Detector status, evidence, provenance, coverage, and limitations are consistent.
+8. Synthetic tests pass and are reported separately.
+9. Real File Execution Evidence exists and is independently reported.
+10. Production readiness checks are verified.
+11. Stripe Test Mode flows are verified, or remaining blockers are explicitly documented.
+12. Regression tests confirm that existing functionality remains intact.
+
+**Important final rule: A successful build, a green synthetic test suite, a populated Detector Registry, or a mocked runtime does not prove that VideoRisk intelligence works on real media.**
+
+The objective is demonstrable, reproducible capability—not merely additional code or passing mock tests.
+
+Begin with the read-only repository audit. Report the starting commit, existing Phase 1–3 verification, and implementation gaps before modifying code.

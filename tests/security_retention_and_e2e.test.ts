@@ -286,7 +286,7 @@ export async function runSecurityRetentionAndE2ETests() {
     const existingJob = await storage.queue.getJobByScanId(scanId);
     if (existingJob && existingJob.status === 'RUNNING') {
       try {
-        await storage.queue.completeJob(existingJob.id, existingJob.leaseToken || 'system_bypass');
+        await storage.queue.completeJob(existingJob.id, existingJob.lockedBy || undefined, existingJob.leaseToken || 'system_bypass');
       } catch {}
     }
 
