@@ -260,8 +260,21 @@ export class ThumbnailInspector {
           detectorName: 'local_ocr_adapter',
           version: '1.0.0',
           status: ocrResult.status,
+          executionStatus: ocrResult.status === 'DETECTED' ? 'SUCCESS' : (ocrResult.status === 'NO_SIGNAL_DETECTED' ? 'SUCCESS' : (ocrResult.status === 'ANALYSIS_UNAVAILABLE' ? 'UNAVAILABLE' : 'SKIPPED')),
           executionDurationMs: ocrResult.executionDurationMs,
           confidence: ocrResult.confidence,
+          provenance: {
+            detectorName: 'local_ocr_adapter',
+            engine: ocrResult.ocrEngine || 'Tesseract OCR 5.3.0',
+            version: '1.0.0',
+            sourceFile: 'thumbnailInspector.ts',
+            method: 'tsv_word_bounding_box_extraction'
+          },
+          coverage: {
+            expectedScope: `Single image canvas (${width}x${height})`,
+            inspectedScope: ocrResult.status === 'NOT_ASSESSED' || ocrResult.status === 'ANALYSIS_UNAVAILABLE' ? '0%' : '100% canvas area',
+            coverageRatio: ocrResult.status === 'NOT_ASSESSED' || ocrResult.status === 'ANALYSIS_UNAVAILABLE' ? 0 : 1.0
+          },
           limitations: ocrResult.limitations,
           failureReason: ocrResult.failureReason,
           details: {
@@ -274,7 +287,20 @@ export class ThumbnailInspector {
           detectorName: 'text_overlay_contrast_evaluator',
           version: '1.0.0',
           status: contrastAnalysisStatus,
+          executionStatus: 'SKIPPED',
           executionDurationMs: 0,
+          provenance: {
+            detectorName: 'text_overlay_contrast_evaluator',
+            version: '1.0.0',
+            sourceFile: 'thumbnailInspector.ts',
+            method: 'wcag_text_overlay_segmentation'
+          },
+          coverage: {
+            expectedScope: 'Text bounding-box localized contrast against background pixels',
+            inspectedScope: 'Unassessed (requires dedicated contrast evaluator)',
+            coverageRatio: 0,
+            partialReason: 'Text overlay bounding-box segmentation and localized WCAG contrast measurement are not assessed.'
+          },
           limitations: 'Text overlay bounding-box segmentation and localized WCAG contrast measurement are not assessed.'
         }
       };

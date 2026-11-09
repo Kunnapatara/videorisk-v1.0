@@ -58,7 +58,7 @@ export interface DetectorReport {
   failureReason?: string;
   details?: Record<string, any>;
   // Phase 4–5 Detector Execution Contract extensions
-  executionStatus?: 'SUCCESS' | 'PARTIAL' | 'UNAVAILABLE' | 'FAILED' | 'SKIPPED' | DetectorExecutionStatus;
+  executionStatus?: 'SUCCESS' | 'SUCCESS_WITH_SIGNAL' | 'NO_SIGNAL_DETECTED' | 'PARTIAL' | 'UNAVAILABLE' | 'FAILED' | 'SKIPPED' | DetectorExecutionStatus;
   provenance?: {
     detectorName: string;
     engine?: string;
@@ -245,6 +245,18 @@ export interface VideoOcrResult {
   executionDurationMs: number;
   detectedFrames: VideoFrameOcrItem[];
   allExtractedText: string[];
+  // Granular timeline and execution metrics
+  executionStatus?: 'SUCCESS_WITH_SIGNAL' | 'NO_SIGNAL_DETECTED' | 'PARTIAL' | 'FAILED' | 'UNAVAILABLE' | 'NOT_ASSESSED';
+  timelineCoverageRatio?: number;
+  samplingCoverageRatio?: number;
+  ocrExecutionSuccessRatio?: number;
+  framesTargeted?: number;
+  framesExtracted?: number;
+  framesAttempted?: number;
+  framesSucceeded?: number;
+  framesFailed?: number;
+  framesSkipped?: number;
+  isPartial?: boolean;
 }
 
 export interface ChannelContextProfile {

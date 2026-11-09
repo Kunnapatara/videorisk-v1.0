@@ -1005,16 +1005,41 @@ export class VideoProcessor {
 
     // Bounded configuration limits
     const maxFrames = Math.max(1, Math.min(60, options?.maxFrames || 15));
-    const sampleInterval = Math.max(1, options?.sampleIntervalSeconds || (dur <= 15 ? 1 : Math.ceil(dur / maxFrames)));
     const timeoutMs = options?.timeoutMs || 45000;
     const langs = options?.languages || 'eng+tha';
 
-    // Calculate candidate timestamps
+    // Calculate candidate timestamps distributed deterministically across the entire duration [0, dur]
     const candidateTimestamps: number[] = [];
-    for (let t = 0; t < dur && candidateTimestamps.length < maxFrames; t += sampleInterval) {
-      candidateTimestamps.push(parseFloat(t.toFixed(2)));
+    if (dur <= 1.0) {
+      candidateTimestamps.push(0);
+    } else if (options?.sampleIntervalSeconds && options.sampleIntervalSeconds > 0) {
+      // If caller explicitly provides a sample interval, step through duration bounded by maxFrames
+      for (let t = 0; t < dur && candidateTimestamps.length < maxFrames; t += options.sampleIntervalSeconds) {
+        candidateTimestamps.push(parseFloat(t.toFixed(2)));
+      }
+    } else {
+      // Deterministic timeline-wide sampling covering beginning, middle, and end portions
+      const targetCount = Math.min(maxFrames, Math.max(1, Math.ceil(dur)));
+      if (targetCount === 1) {
+        candidateTimestamps.push(0);
+      } else {
+        const step = (dur - 0.1) / (targetCount - 1);
+        for (let i = 0; i < targetCount; i++) {
+          const t = Math.min(dur - 0.05, Math.max(0, i * step));
+          const rounded = parseFloat(t.toFixed(2));
+          if (!candidateTimestamps.includes(rounded)) {
+            candidateTimestamps.push(rounded);
+          }
+        }
+      }
     }
+
+    if (candidateTimestamps.length === 0) {
+      candidateTimestamps.push(0);
+    }
+    candidateTimestamps.sort((a, b) => a - b);
     const totalCandidateFrames = candidateTimestamps.length;
+    const framesTargeted = totalCandidateFrames;
 
     const uniqueOcrDir = `video_ocr_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
     const tempOcrDir = path.resolve(process.cwd(), 'uploads', 'ocr_frames', uniqueOcrDir);
@@ -1026,9 +1051,12 @@ export class VideoProcessor {
 
       // Extract candidate frames to disk via FFmpeg
       const extractedFrames: Array<{ timestamp: number; index: number; filePath: string }> = [];
+      let extractionTimeouts = false;
+
       for (let i = 0; i < candidateTimestamps.length; i++) {
         // Enforce overall processing timeout
         if (Date.now() - startTime >= timeoutMs) {
+          extractionTimeouts = true;
           break;
         }
 
@@ -1054,12 +1082,25 @@ export class VideoProcessor {
         }
       }
 
-      if (extractedFrames.length === 0) {
+      const framesExtracted = extractedFrames.length;
+
+      if (framesExtracted === 0) {
         return {
           status: 'ANALYSIS_UNAVAILABLE',
+          executionStatus: 'UNAVAILABLE',
           framesInspected: 0,
           totalCandidateFrames,
           coverageRatio: 0,
+          timelineCoverageRatio: 0,
+          samplingCoverageRatio: 0,
+          ocrExecutionSuccessRatio: 0,
+          framesTargeted,
+          framesExtracted: 0,
+          framesAttempted: 0,
+          framesSucceeded: 0,
+          framesFailed: 0,
+          framesSkipped: totalCandidateFrames,
+          isPartial: true,
           limitations: 'Failed to extract video frames for OCR analysis.',
           failureReason: 'FFmpeg frame extraction yielded 0 readable candidate frames.',
           executionDurationMs: Date.now() - startTime,
@@ -1072,14 +1113,22 @@ export class VideoProcessor {
       const detectedFrames: import('../../types').VideoFrameOcrItem[] = [];
       const allExtractedTextSet = new Set<string>();
       let previousFrameText = '';
+      let framesAttempted = 0;
+      let framesSucceeded = 0;
+      let framesFailed = 0;
+      const ocrErrors: string[] = [];
+      let executionTimedOut = extractionTimeouts;
 
       for (const ef of extractedFrames) {
         if (Date.now() - startTime >= timeoutMs) {
+          executionTimedOut = true;
           break;
         }
 
+        framesAttempted++;
         try {
           const { stdout } = await execFileAsync(executable, [ef.filePath, 'stdout', '-l', langs, 'tsv'], { timeout: 15000 });
+          framesSucceeded++;
           const rawTsv = (stdout || '').trim();
           const lines = rawTsv.split('\n');
           const boundingBoxes: import('../../types').OcrBoundingBox[] = [];
@@ -1130,32 +1179,84 @@ export class VideoProcessor {
             }
             previousFrameText = frameText;
           }
-        } catch {
-          // Individual frame OCR failure tolerated
+        } catch (ocrErr: any) {
+          framesFailed++;
+          ocrErrors.push(`Frame @ ${ef.timestamp}s: ${ocrErr?.message || ocrErr}`);
         }
       }
 
-      const framesInspected = extractedFrames.length;
-      const coverageRatio = parseFloat((framesInspected / Math.max(1, totalCandidateFrames)).toFixed(2));
-      const isPartial = framesInspected < totalCandidateFrames || Date.now() - startTime >= timeoutMs;
+      const framesSkipped = framesTargeted - framesAttempted;
+      const samplingCoverageRatio = parseFloat((framesSucceeded / Math.max(1, framesTargeted)).toFixed(3));
+      const ocrExecutionSuccessRatio = framesAttempted > 0 ? parseFloat((framesSucceeded / framesAttempted).toFixed(3)) : 0;
 
+      // Timeline coverage: span of successfully inspected intervals relative to duration
+      let timelineCoverageRatio = 0;
+      if (framesSucceeded > 0 && dur > 0) {
+        const inspectedTimes = extractedFrames.slice(0, framesSucceeded).map(f => f.timestamp);
+        const minTime = Math.min(...inspectedTimes);
+        const maxTime = Math.max(...inspectedTimes);
+        const timelineSpan = Math.max(0.1, (maxTime - minTime) + (dur / Math.max(1, framesTargeted)));
+        timelineCoverageRatio = parseFloat(Math.min(1.0, timelineSpan / dur).toFixed(3));
+      }
+
+      // Backward compatible coverageRatio represents true sampling coverage
+      const coverageRatio = samplingCoverageRatio;
+      const isPartial = framesSucceeded < framesTargeted || executionTimedOut;
+
+      // Semantic status classification:
+      // SUCCESS_WITH_SIGNAL: all required work succeeded AND text was detected
+      // NO_SIGNAL_DETECTED: all required work succeeded AND no text was detected
+      // PARTIAL: some OCR frames succeeded but others failed or timed out
+      // FAILED: all attempted OCR failed or 0 frames succeeded
+      // UNAVAILABLE: executable missing/unusable
+      let executionStatus: 'SUCCESS_WITH_SIGNAL' | 'NO_SIGNAL_DETECTED' | 'PARTIAL' | 'FAILED' | 'UNAVAILABLE' | 'NOT_ASSESSED';
       let status: import('../../types').DetectorExecutionStatus;
-      if (detectedFrames.length > 0) {
+
+      if (framesAttempted === 0 || framesSucceeded === 0) {
+        executionStatus = 'FAILED';
+        status = 'INSUFFICIENT_EVIDENCE';
+      } else if (isPartial) {
+        executionStatus = 'PARTIAL';
+        status = detectedFrames.length > 0 ? 'DETECTED' : 'INSUFFICIENT_EVIDENCE';
+      } else if (detectedFrames.length > 0) {
+        executionStatus = 'SUCCESS_WITH_SIGNAL';
         status = 'DETECTED';
       } else {
+        executionStatus = 'NO_SIGNAL_DETECTED';
         status = 'NO_SIGNAL_DETECTED';
       }
 
-      const limitations = isPartial
-        ? `Sampled ${framesInspected} of ${totalCandidateFrames} candidate frames (${Math.round(coverageRatio * 100)}% coverage) due to execution budget limits. Text on uninspected frames was not evaluated.`
-        : `Sampled ${framesInspected} video frames deterministically across the timeline via local Tesseract OCR.`;
+      let limitations: string;
+      if (executionStatus === 'FAILED') {
+        limitations = `OCR execution failed for all ${framesAttempted} attempted frame(s). No visual text signals could be assessed.`;
+      } else if (isPartial) {
+        limitations = `Sampled and completed OCR on ${framesSucceeded} of ${framesTargeted} target frames (${Math.round(samplingCoverageRatio * 100)}% sampling coverage, ${Math.round(timelineCoverageRatio * 100)}% timeline span) due to ${executionTimedOut ? 'timeout' : 'frame processing error'}. Text on uninspected portions was not evaluated.`;
+      } else {
+        limitations = `Sampled ${framesSucceeded} video frames deterministically across the entire ${Math.round(dur)}s timeline (${Math.round(samplingCoverageRatio * 100)}% sampling coverage) via local Tesseract OCR.`;
+      }
+
+      const failureReason = ocrErrors.length > 0
+        ? `OCR encountered errors on ${framesFailed} frame(s): ${ocrErrors.slice(0, 3).join('; ')}`
+        : (executionTimedOut ? `OCR execution timed out after ${timeoutMs}ms` : undefined);
 
       return {
         status,
-        framesInspected,
+        executionStatus,
+        framesInspected: framesSucceeded,
         totalCandidateFrames,
         coverageRatio,
+        timelineCoverageRatio,
+        samplingCoverageRatio,
+        ocrExecutionSuccessRatio,
+        framesTargeted,
+        framesExtracted,
+        framesAttempted,
+        framesSucceeded,
+        framesFailed,
+        framesSkipped,
+        isPartial,
         limitations,
+        failureReason,
         executionDurationMs: Date.now() - startTime,
         detectedFrames,
         allExtractedText: Array.from(allExtractedTextSet)

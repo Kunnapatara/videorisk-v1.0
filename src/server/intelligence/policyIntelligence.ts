@@ -371,6 +371,27 @@ export class PolicyIntelligenceEngine {
           recommendedAction: 'Ensure on-screen visual text accurately reflects video content and creator intent.'
         });
       }
+    } else if (videoResult.videoOcr && (videoResult.videoOcr.isPartial || videoResult.videoOcr.executionStatus === 'PARTIAL' || videoResult.videoOcr.executionStatus === 'FAILED')) {
+      addItem({
+        domain: 'video_audio',
+        start: 0,
+        end: dur,
+        assetLocation: 'Full video timeline',
+        type: 'video_ocr_partial_or_failed',
+        category: 'metadata_coherence',
+        severity: 'info',
+        confidence: 0.85,
+        confidenceLevel: 'MEDIUM',
+        uncertaintyReason: videoResult.videoOcr.executionStatus === 'FAILED' ? 'ANALYZER_UNAVAILABLE' : 'INSUFFICIENT_EVIDENCE',
+        evidenceStatus: 'OBSERVED',
+        provenance: 'tesseract_ocr:pipeline_supervisor',
+        source: 'video_ocr_status',
+        label: `ℹ️ Video OCR Execution Status: ${videoResult.videoOcr.executionStatus || 'PARTIAL'}`,
+        details: videoResult.videoOcr.limitations || 'Full-video OCR execution was partial or encountered frame errors.',
+        contextualInterpretation: 'Visual text analysis was incomplete across some or all frames; visual text on uninspected segments remains unverified.',
+        limitations: videoResult.videoOcr.limitations,
+        recommendedAction: 'Check on-screen text manually if critical text or disclosures appear in the video.'
+      });
     }
 
     // Within-Video Repeated Audio Segments

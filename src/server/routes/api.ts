@@ -1187,57 +1187,109 @@ apiRouter.get('/health/liveness', (req: Request, res: Response) => {
 });
 
 apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
-  const checks: Record<string, { status: 'healthy' | 'degraded' | 'unhealthy'; message?: string }> = {};
-  let isReady = true;
+  const checks: Record<string, { status: 'healthy' | 'degraded' | 'unhealthy'; message?: string; details?: any }> = {};
+  let isCoreReady = true;
 
-  // 1. Storage repository check
+  // 1. Storage repository & persistence mode check
   try {
     if ((storage as any).db && typeof (storage as any).db.prepare === 'function') {
       const row = (storage as any).db.prepare('SELECT 1 as alive;').get();
       if (row && row.alive === 1) {
-        checks.database = { status: 'healthy' };
+        const dbPath = (storage as any).dbPath || 'sqlite.db';
+        const isMemory = dbPath === ':memory:' || String(dbPath).includes('mode=memory');
+        checks.database = {
+          status: 'healthy',
+          message: isMemory ? 'Operational in in-memory mode (non-persistent storage).' : 'SQLite database connected and persistent.',
+          details: { storageMode: isMemory ? 'memory' : 'file', path: isMemory ? ':memory:' : path.basename(dbPath) }
+        };
       } else {
         checks.database = { status: 'unhealthy', message: 'Database returned unexpected ping result.' };
-        isReady = false;
+        isCoreReady = false;
       }
     } else {
-      checks.database = { status: 'healthy', message: 'In-memory storage ready.' };
+      checks.database = { status: 'healthy', message: 'In-memory storage ready.', details: { storageMode: 'in_memory_mock' } };
     }
   } catch (err: any) {
     checks.database = { status: 'unhealthy', message: 'Database query execution failed.' };
-    isReady = false;
+    isCoreReady = false;
   }
 
-  // 2. Billing gateway readiness check (non-disclosing)
-  const isProd = process.env.NODE_ENV === 'production' || process.env.PAYMENT_MODE === 'production' || process.env.PAYMENT_MODE === 'live';
-  if (isProd) {
-    const hasSecretKey = Boolean(process.env.STRIPE_SECRET_KEY && process.env.STRIPE_SECRET_KEY.trim());
-    const hasWebhookSecret = Boolean(process.env.STRIPE_WEBHOOK_SECRET && process.env.STRIPE_WEBHOOK_SECRET.trim());
-    if (hasSecretKey && hasWebhookSecret) {
-      checks.billing = { status: 'healthy' };
-    } else {
-      checks.billing = { status: 'degraded', message: 'Production billing credentials incomplete.' };
-    }
-  } else {
-    checks.billing = { status: 'healthy', message: 'Test/dev billing ready.' };
-  }
-
-  // 3. Media storage write readiness
+  // 2. Upload storage writeability probe (safe temporary file write & cleanup)
+  const probeFile = path.join(uploadDir, `.probe_${Date.now()}_${Math.random().toString(36).substring(2, 8)}.tmp`);
   try {
-    if (fs.existsSync(uploadDir)) {
-      checks.storage = { status: 'healthy' };
-    } else {
-      checks.storage = { status: 'unhealthy', message: 'Uploads directory not accessible.' };
-      isReady = false;
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
     }
-  } catch {
-    checks.storage = { status: 'unhealthy', message: 'Filesystem check failed.' };
-    isReady = false;
+    fs.writeFileSync(probeFile, 'probe_test', { encoding: 'utf8' });
+    fs.unlinkSync(probeFile);
+    checks.storage = { status: 'healthy', message: 'Upload storage is writable and accessible.' };
+  } catch (err: any) {
+    // Attempt cleanup if file was created before failure
+    try {
+      if (fs.existsSync(probeFile)) fs.unlinkSync(probeFile);
+    } catch {}
+    checks.storage = { status: 'unhealthy', message: 'Upload storage writeability probe failed: directory is not writable.' };
+    isCoreReady = false;
   }
 
+  // 3. Billing gateway readiness check (non-disclosing, format-validated)
+  const isProd = process.env.NODE_ENV === 'production' || process.env.PAYMENT_MODE === 'production' || process.env.PAYMENT_MODE === 'live';
+  const rawKey = process.env.STRIPE_SECRET_KEY ? process.env.STRIPE_SECRET_KEY.trim() : '';
+  const rawWebhook = process.env.STRIPE_WEBHOOK_SECRET ? process.env.STRIPE_WEBHOOK_SECRET.trim() : '';
+
+  const hasSecretKey = rawKey.length > 0;
+  const hasWebhookSecret = rawWebhook.length > 0;
+  const isKeyLive = rawKey.startsWith('sk_live_') || rawKey.startsWith('rk_live_');
+  const isKeyTest = rawKey.startsWith('sk_test_') || rawKey.startsWith('rk_test_');
+  const isWebhookFormatValid = rawWebhook.startsWith('whsec_') || rawWebhook.length >= 16;
+  const isKeyFormatValid = isKeyLive || isKeyTest;
+
+  let billingStatus: 'healthy' | 'degraded' | 'unhealthy' = 'healthy';
+  let billingMessage = 'Billing operational.';
+  const billingMode = isKeyLive ? 'live' : (isKeyTest ? 'test' : (hasSecretKey ? 'custom' : 'disabled'));
+
+  if (!hasSecretKey && !hasWebhookSecret) {
+    billingStatus = isProd ? 'degraded' : 'healthy';
+    billingMessage = isProd
+      ? 'Stripe billing credentials unconfigured in production environment.'
+      : 'Stripe credentials unconfigured; running in free/simulation billing mode.';
+  } else if (!hasSecretKey || !hasWebhookSecret) {
+    billingStatus = 'degraded';
+    billingMessage = 'Partial billing configuration: both STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET are required for complete checkout & webhook processing.';
+  } else if (!isKeyFormatValid) {
+    billingStatus = 'degraded';
+    billingMessage = 'Malformed STRIPE_SECRET_KEY (expected sk_live_... or sk_test_...).';
+  } else if (!isWebhookFormatValid) {
+    billingStatus = 'degraded';
+    billingMessage = 'Malformed STRIPE_WEBHOOK_SECRET (expected whsec_...).';
+  } else if (isProd && !isKeyLive) {
+    billingStatus = 'degraded';
+    billingMessage = 'Production requires Stripe live credentials (sk_live_...), but test key was detected.';
+  } else {
+    billingStatus = 'healthy';
+    billingMessage = `Stripe billing ready in ${billingMode} mode.`;
+  }
+
+  checks.billing = {
+    status: billingStatus,
+    message: billingMessage,
+    details: {
+      mode: billingMode,
+      checkoutAvailable: hasSecretKey && isKeyFormatValid,
+      webhooksAvailable: hasWebhookSecret && isWebhookFormatValid
+    }
+  };
+
+  // Overall readiness logic:
+  // Core readiness (database + writeable storage) must be healthy for app to serve requests.
+  // In production, degraded billing does not bring down core application if optional/unconfigured.
+  const isReady = isCoreReady && (isProd ? (checks.billing.status !== 'unhealthy') : true);
   const statusCode = isReady ? 200 : 503;
+
   res.status(statusCode).json({
     status: isReady ? 'ready' : 'not_ready',
+    coreReadiness: isCoreReady ? 'healthy' : 'unhealthy',
+    billingReadiness: checks.billing.status,
     checks,
     timestamp: new Date().toISOString()
   });

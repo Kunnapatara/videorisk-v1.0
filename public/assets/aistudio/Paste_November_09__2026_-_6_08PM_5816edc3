@@ -1,0 +1,778 @@
+# Phase 4–6 Final Integrity Remediation — Full Timeline Coverage, Real Whisper Runtime & Production Readiness
+
+## ROLE
+
+Act as a Senior Software Engineer, Backend Architect, Computer Vision Engineer, Test Engineer, and Production Reliability Engineer.
+
+Your task is to perform a controlled, evidence-driven remediation of the existing VideoRisk v1.0 codebase.
+
+This is a remediation task, NOT a rewrite, redesign, or replacement of the existing system.
+
+Repository:
+`https://github.com/Kunnapatara/videorisk-v1.0`
+
+Baseline commit identified during the previous repository audit:
+
+`faa964e61e13acab057a81f9a82481fe3e9fac51`
+
+Before making changes, inspect the actual current repository HEAD and working tree. The baseline commit above is a reference, not permission to overwrite newer work.
+
+---
+
+# 1. NON-NEGOTIABLE DEVELOPMENT RULES
+
+1. Preserve all existing development progress.
+2. Preserve Phase 1–3 implementations and behavior.
+3. Preserve all 22 existing Master Test Runner suites.
+4. Preserve the dedicated Phase 4–6 test suite.
+5. Do not remove, weaken, skip, mock away, or silently alter existing tests to obtain passing results.
+6. Do not replace working implementations with simplified placeholders.
+7. Do not perform a destructive rewrite of the architecture.
+8. Do not change existing public API contracts unless strictly necessary. If a change is required, maintain backward compatibility where possible and document it.
+9. Reuse existing types, services, pipeline stages, and configuration conventions wherever practical.
+10. Do not introduce unnecessary paid APIs or external services.
+11. Do not expose API keys, secrets, private media, or customer data in logs or test reports.
+12. Do not commit, push, deploy, or execute live financial transactions.
+13. Do not claim tests, builds, integrations, or runtime verification succeeded unless they were actually executed and their results were observed.
+14. Do not fabricate test results, coverage percentages, runtime versions, or production readiness.
+15. Keep changes limited to the scope of this remediation.
+
+If the repository has changed since the baseline commit, preserve all newer legitimate changes.
+
+**Primary principle: Zero Loss of Development Progress.**
+
+---
+
+# 2. INITIAL REPOSITORY INSPECTION
+
+Before editing anything:
+
+1. Identify the actual current HEAD commit.
+2. Inspect the working tree and any uncommitted changes.
+3. Inspect the current implementation of:
+   - `src/server/pipeline/videoProcessor.ts`
+   - `src/server/pipeline/thumbnailInspector.ts`
+   - `src/server/pipeline/audioProcessor.ts`
+   - `src/server/pipeline/jobOrchestrator.ts`
+   - `src/server/intelligence/policyIntelligence.ts`
+   - `src/server/routes/api.ts`
+   - `src/server/services/billingService.ts`
+   - `src/server.ts`
+   - `src/types/index.ts`
+   - `tests/runAllTests.ts`
+   - `tests/phase4_6_gap_closure.test.ts`
+4. Inspect all directly related tests, configuration, environment variables, and runtime dependencies.
+5. Identify existing interfaces and call paths before modifying them.
+
+Produce a concise internal implementation plan based on the actual code. Do not assume the previous audit describes code that has not changed.
+
+---
+
+# 3. FULL-VIDEO OCR — TRUE TIMELINE COVERAGE
+
+## Problem to resolve
+
+The previous audit identified that Full-video OCR sampling starts at the beginning of the video and increments using a fixed interval until the maximum frame count is reached.
+
+Existing configuration observed:
+
+- Standard: maximum 15 frames, 4-second interval.
+- Deep: maximum 30 frames, 2-second interval.
+
+This means a long video may only be inspected during its opening section.
+
+The existing coverage calculation may also report 100% because it compares inspected frames against an already capped candidate list rather than the actual video timeline.
+
+This behavior must be corrected.
+
+## Required implementation
+
+### 3.1 Timeline-wide sampling
+
+Implement deterministic sampling distributed across the entire video duration.
+
+Requirements:
+
+- Sampling must cover the beginning, middle, and end of the video.
+- Samples must not be concentrated only in the first 60 seconds.
+- The selected timestamps must be distributed across the actual duration.
+- Preserve Standard and Deep modes and their resource limits.
+- Preserve existing maximum frame counts unless a justified compatibility change is necessary.
+- Handle short videos, long videos, zero-duration media, invalid duration metadata, and frame extraction failures.
+- Avoid duplicate timestamps and out-of-range timestamps.
+- Ensure the final timestamp does not exceed the video duration.
+- Use a deterministic algorithm so identical input and configuration produce predictable sampling locations.
+
+If the project already has scene detection or an adaptive sampling mechanism, integrate it without making the system dependent on an unavailable external service.
+
+If scene-aware sampling is not available, use a deterministic full-duration sampling strategy and document the limitation.
+
+### 3.2 Sampling strategy
+
+The algorithm must explicitly distinguish:
+
+- Video duration.
+- Target sampling timestamps.
+- Candidate frames.
+- Successfully extracted frames.
+- Frames submitted to OCR.
+- Successfully processed OCR frames.
+- Failed OCR frames.
+- Skipped frames.
+
+Do not treat these quantities as interchangeable.
+
+A frame that was extracted but never processed by OCR must not count as an OCR-successful frame.
+
+### 3.3 Coverage calculation
+
+Replace the current misleading coverage calculation.
+
+Coverage must represent actual inspection of the video timeline, not the percentage of a capped candidate list that was processed.
+
+Requirements:
+
+- Define precisely what coverage means.
+- Calculate coverage using the actual video duration and actual inspected timeline intervals.
+- Account for unsuccessful extraction and OCR operations.
+- Do not report 100% when only a small opening section was inspected.
+- Do not report 100% when required OCR operations failed.
+- Distinguish sampling coverage from OCR execution success.
+- Expose the relevant counts and metrics in the pipeline result.
+
+Where appropriate, report:
+
+- `timelineCoverageRatio`
+- `samplingCoverageRatio`
+- `ocrExecutionSuccessRatio`
+- `framesTargeted`
+- `framesExtracted`
+- `framesAttempted`
+- `framesSucceeded`
+- `framesFailed`
+- `framesSkipped`
+
+Use existing naming conventions if equivalent fields already exist. Avoid creating duplicate or contradictory fields.
+
+Do not use a single percentage to imply that every frame in the video was inspected. This is sampled analysis, not exhaustive frame-by-frame analysis.
+
+### 3.4 Timeout and partial execution
+
+When the OCR operation reaches a timeout:
+
+- Preserve completed results.
+- Record the timeout explicitly.
+- Mark the execution as partial or failed as appropriate.
+- Do not silently treat unprocessed frames as successful.
+- Do not return a clean no-signal result when the inspection was incomplete.
+
+---
+
+# 4. OCR FAILURE CLASSIFICATION — PREVENT FALSE CLEAN RESULTS
+
+## Critical integrity requirement
+
+The system must never convert an OCR execution failure into a clean result.
+
+In particular:
+
+`NO_SIGNAL_DETECTED` must only be returned when the required OCR processing completed successfully and no relevant text was detected in the inspected samples.
+
+Implement explicit status handling.
+
+At minimum, distinguish the following semantic states, reusing existing enums or types where possible:
+
+- `SUCCESS_WITH_SIGNAL`
+- `NO_SIGNAL_DETECTED`
+- `PARTIAL`
+- `FAILED`
+- `UNAVAILABLE`
+- `NOT_ASSESSED`
+
+These names are semantic requirements. Adapt the actual enum names to existing project conventions rather than introducing unnecessary incompatible values.
+
+### Required behavior
+
+| Situation | Expected interpretation |
+|---|---|
+| All required OCR work succeeds and text is detected | Signal detected |
+| All required OCR work succeeds and no text is detected | NO_SIGNAL_DETECTED |
+| Some OCR frames fail but other frames succeed | PARTIAL |
+| All OCR attempts fail | FAILED |
+| OCR executable or dependency unavailable | UNAVAILABLE |
+| Analysis was not performed | NOT_ASSESSED |
+| Timeout prevents completion | PARTIAL or FAILED, with explicit timeout evidence |
+
+Additional rules:
+
+1. OCR errors must be accumulated and reflected in the final result.
+2. A caught exception must not disappear from the final execution report.
+3. A missing OCR result must not be interpreted as an empty OCR result.
+4. Partial results must not be promoted to clean results.
+5. Error information must be useful for debugging without exposing sensitive information.
+6. The risk engine must respect the distinction between no signal and incomplete analysis.
+
+Review other OCR result consumers to ensure they do not accidentally treat PARTIAL, FAILED, or UNAVAILABLE as clean evidence.
+
+---
+
+# 5. REAL WHISPER RUNTIME — INSTALLABLE AND TESTABLE
+
+## Problem to resolve
+
+The existing audio processor has a Whisper-style CLI adapter using:
+
+- `WHISPER_PATH`
+- `LOCAL_STT_PATH`
+- JSON output parsing
+- Text and segment extraction
+
+However, the existence of an adapter and a mock shell script does not establish that a real Whisper runtime works.
+
+## Required implementation
+
+### 5.1 Choose an actual supported runtime
+
+Inspect the current project dependencies and deployment constraints.
+
+Select a real, installable local Whisper-compatible runtime.
+
+The implementation must specify:
+
+- Runtime name.
+- Runtime version.
+- Installation instructions.
+- Required model.
+- Model acquisition instructions.
+- Expected executable path.
+- Exact CLI arguments.
+- Expected JSON output schema.
+- Supported languages.
+- CPU/GPU execution behavior.
+- Timeout and resource controls.
+
+Do not assume that different Whisper implementations share identical CLI arguments.
+
+Do not create an adapter that merely assumes a binary exists.
+
+### 5.2 Runtime validation
+
+Implement a runtime validation mechanism that can establish:
+
+- Whether the configured executable exists.
+- Whether it can be executed.
+- Whether its version or supported command can be identified.
+- Whether the required model is installed or accessible.
+- Whether the selected runtime supports the expected command contract.
+- Whether required output can be parsed correctly.
+
+Do not report the runtime as available merely because an environment variable is populated.
+
+If runtime validation cannot be completed, report the actual limitation.
+
+### 5.3 Audio processing behavior
+
+Preserve the existing audio processing architecture.
+
+Ensure:
+
+- Valid input media is handled correctly.
+- Temporary files are cleaned up safely.
+- Timeouts are enforced.
+- Process failures are reported.
+- Invalid JSON is not treated as successful transcription.
+- Empty transcription is distinguishable from execution failure.
+- Segment timestamps are validated.
+- Thai and English transcription are supported when the selected model/runtime supports them.
+- Language detection or configured language behavior is documented accurately.
+
+### 5.4 Real runtime tests
+
+Retain existing adapter unit tests.
+
+Add tests for:
+
+- Missing executable.
+- Non-executable binary.
+- Unsupported CLI arguments.
+- Missing model.
+- Invalid JSON.
+- Invalid segment timestamps.
+- Empty transcription.
+- Process crash.
+- Timeout.
+- Partial or truncated output.
+
+Where the environment permits, perform a real Whisper runtime smoke test using actual Thai and English audio samples.
+
+Use short, non-sensitive test samples.
+
+A mock executable may test the adapter contract, but it must never be described as a real Whisper runtime test.
+
+If the actual runtime or model cannot be installed in the current environment, clearly separate:
+
+- Tests completed.
+- Tests requiring a runtime installation.
+- Tests requiring a model download.
+- Tests not executed.
+
+Do not fabricate transcription results.
+
+---
+
+# 6. THUMBNAIL CONTRAST ANALYSIS
+
+## Problem to resolve
+
+The previous audit found:
+
+- `hasHighContrastText` remains `null`.
+- `contrastAnalysisStatus` remains `NOT_ASSESSED`.
+
+Do not leave a capability looking implemented when it is not.
+
+### Required decision
+
+Inspect the existing thumbnail analysis architecture.
+
+If a reliable local contrast measurement can be implemented without unnecessary dependencies:
+
+1. Implement measurable contrast analysis.
+2. Define the actual metric and threshold.
+3. Explain how text regions are evaluated.
+4. Handle missing text regions and invalid images.
+5. Ensure the result does not imply a visual judgment that the algorithm cannot support.
+6. Add unit tests for high contrast, low contrast, no text, invalid image, and unavailable analysis.
+
+If a reliable implementation cannot be completed:
+
+- Keep the capability explicitly `NOT_IMPLEMENTED` or the closest truthful existing status.
+- Do not populate `hasHighContrastText` with invented values.
+- Do not claim contrast detection is operational.
+- Document the exact limitation and the work still required.
+
+Do not implement a superficial brightness check and label it text contrast detection.
+
+---
+
+# 7. ENFORCE THE DETECTOR CONTRACT THROUGH THE PIPELINE
+
+## Problem to resolve
+
+The existing `DetectorReport` type includes optional fields such as:
+
+- `executionStatus`
+- `provenance`
+- `coverage`
+
+However, the Full-video OCR report does not consistently populate these fields.
+
+Extending a type is not the same as enforcing the contract.
+
+### Required implementation
+
+Inspect the existing detector contracts and establish one consistent representation across the pipeline.
+
+Every executed detector must report, where applicable:
+
+1. Detector identity.
+2. Execution status.
+3. Provenance.
+4. Start and completion information or duration.
+5. Coverage information.
+6. Findings or evidence.
+7. Limitations.
+8. Failure reason when execution fails.
+
+Requirements:
+
+- Populate the contract consistently in Full-video OCR.
+- Review Thumbnail OCR and Audio/STT for equivalent inconsistencies.
+- Preserve backward compatibility where possible.
+- Avoid duplicate sources of truth.
+- Do not fabricate coverage.
+- Do not classify execution failure as a successful detector result.
+- Do not convert missing evidence into negative evidence.
+- Ensure `jobOrchestrator.ts` passes the correct execution state to `policyIntelligence.ts`.
+- Ensure `policyIntelligence.ts` interprets incomplete detector execution correctly.
+- Ensure Evidence Timeline preserves timestamp, confidence, provenance, and execution state where available.
+
+Do not automatically make `video_ocr` a risk signal merely because it detects text. Text detection is evidence; risk classification must remain a separate policy decision.
+
+---
+
+# 8. ADD REGRESSION TESTS FOR THE IDENTIFIED DEFECTS
+
+Preserve the existing tests and add targeted regression tests.
+
+## 8.1 Full-video OCR timeline tests
+
+Add tests proving:
+
+- A 10-minute video receives sampling timestamps across its full duration.
+- A 30-minute video receives sampling timestamps across its full duration.
+- Sampling includes early, middle, and late portions.
+- Sampling is deterministic.
+- Sampling respects the maximum frame count.
+- Timestamps are unique and within valid bounds.
+- Short videos are handled correctly.
+- Invalid duration is handled safely.
+
+## 8.2 Coverage tests
+
+Add tests proving:
+
+- Inspecting only the first 60 seconds of a 10-minute video cannot produce 100% timeline coverage.
+- Extracted frames are not counted as OCR-successful frames.
+- Failed OCR attempts reduce execution success.
+- Skipped frames are not counted as successful.
+- Coverage is not calculated from a capped candidate-frame list.
+- A complete successful sample can report its actual sampling coverage without claiming exhaustive video inspection.
+
+## 8.3 Failure-state tests
+
+Add tests proving:
+
+- One OCR failure among successful frames results in PARTIAL where appropriate.
+- All OCR attempts failing results in FAILED.
+- Missing Tesseract results in UNAVAILABLE.
+- Timeout cannot produce NO_SIGNAL_DETECTED.
+- Missing OCR output cannot be interpreted as an empty successful result.
+- NO_SIGNAL_DETECTED is only possible after all required OCR work succeeds.
+
+## 8.4 Whisper runtime tests
+
+Add all failure cases described in Section 5.
+
+Retain existing mock-based adapter tests but label their scope accurately.
+
+## 8.5 Detector contract tests
+
+Test that:
+
+- Detector execution status is populated.
+- Provenance is preserved.
+- Coverage is populated only when measurable.
+- Failures propagate through the Job Orchestrator.
+- Evidence Timeline does not discard execution failures.
+- Policy Intelligence does not treat incomplete OCR as a clean negative result.
+
+## 8.6 Thumbnail contrast tests
+
+Add tests for whichever implementation decision is made in Section 6.
+
+## 8.7 Production readiness tests
+
+Add tests for Section 9.
+
+All regression tests must be deterministic and isolated.
+
+Do not depend on internet access for ordinary unit tests.
+
+Do not require large model downloads in the normal Master Test Runner.
+
+Use separate, explicitly documented integration or smoke-test commands for tests requiring external runtimes or model files.
+
+---
+
+# 9. PRODUCTION READINESS PROBE — PRESERVE EXISTING BILLING
+
+## Critical constraint
+
+Improve the readiness probe without rewriting or replacing the existing billing architecture.
+
+Preserve existing:
+
+- Stripe Checkout implementation.
+- Stripe webhook signature verification.
+- Webhook event idempotency.
+- Subscription lifecycle logic.
+- Existing billing records and database schema unless a migration is strictly necessary.
+- Existing API contracts where possible.
+
+Relevant files include:
+
+- `src/server/routes/api.ts`
+- `src/server/services/billingService.ts`
+- `src/server.ts`
+
+### 9.1 Database readiness
+
+Inspect the current SQLite/database readiness logic.
+
+Requirements:
+
+- Verify actual database connectivity.
+- Do not automatically report an in-memory database as production-ready without clearly identifying its storage mode.
+- Distinguish operational health from production persistence readiness.
+- Preserve legitimate development/test configurations.
+
+### 9.2 Upload storage readiness
+
+The previous implementation used directory existence as a readiness indicator.
+
+Directory existence alone does not prove that the application can write files.
+
+Implement a safe writeability probe:
+
+- Confirm the expected directory exists or can be created.
+- Verify write permission using a uniquely named temporary probe file.
+- Verify the file can be removed.
+- Clean up safely, including when an error occurs.
+- Do not overwrite user files.
+- Do not expose private paths unnecessarily.
+- Return a meaningful status and sanitized failure reason.
+
+If storage is intentionally read-only, report that honestly.
+
+### 9.3 Stripe billing readiness
+
+The previous implementation checks whether:
+
+- `STRIPE_SECRET_KEY`
+- `STRIPE_WEBHOOK_SECRET`
+
+are populated.
+
+However, missing Stripe configuration can result in a degraded billing status while the overall readiness endpoint still reports `ready`.
+
+Correct this inconsistency without breaking existing billing behavior.
+
+Requirements:
+
+1. Validate that required Stripe configuration is present.
+2. Validate the configured key format/environment as far as safely possible without exposing secrets.
+3. Distinguish Stripe Test Mode from Live Mode.
+4. Distinguish billing readiness from core application readiness.
+5. Clearly expose whether Checkout and webhook processing can operate.
+6. Do not report billing as ready solely because environment variables are non-empty.
+7. Do not falsely report the entire application as unavailable if the core application is healthy but optional billing is intentionally disabled.
+8. Define and document the readiness semantics explicitly.
+
+Use clear, structured component statuses such as:
+
+- Core application.
+- Database.
+- Upload storage.
+- Billing.
+- Overall readiness.
+
+Choose final overall readiness behavior based on the actual production architecture and document the decision.
+
+### 9.4 Startup validation
+
+Inspect `src/server.ts` and existing configuration validation.
+
+Ensure required production configuration is validated during startup or before the corresponding service is enabled.
+
+Do not prevent legitimate local development or unit-test operation.
+
+Do not silently skip validation in production.
+
+### 9.5 Billing regression tests
+
+Add tests proving:
+
+- Missing Stripe credentials are reported accurately.
+- Malformed or incompatible configuration is reported accurately.
+- Test Mode and Live Mode are distinguishable.
+- Core application health is not confused with billing health.
+- Existing Checkout behavior remains intact.
+- Existing webhook signature verification remains intact.
+- Existing webhook idempotency remains intact.
+- Existing subscription behavior is not unintentionally changed.
+
+Use Stripe Test Mode or mocks for automated tests.
+
+Do not create real charges, subscriptions, refunds, or customer transactions.
+
+---
+
+# 10. MASTER TEST RUNNER AND PHASE 1–3 PRESERVATION
+
+This requirement is mandatory.
+
+The existing `tests/runAllTests.ts` contains 22 registered test suite calls.
+
+Preserve all 22 existing suites.
+
+The dedicated `tests/phase4_6_gap_closure.test.ts` is a separate test suite and must remain available.
+
+### Required test execution
+
+Run and report separately:
+
+1. Existing Master Test Runner — all 22 registered suites.
+2. Dedicated Phase 4–6 suite.
+3. New targeted regression tests.
+4. TypeScript type checking.
+5. Lint.
+6. Production build.
+
+Do not silently merge or remove tests.
+
+If the dedicated Phase 4–6 suite is added to the Master Test Runner, explicitly document the change and verify that the original 22 suites remain intact. Prefer preserving the existing 22-suite runner unchanged and running the dedicated suite separately unless there is a strong architectural reason to integrate it.
+
+### Phase 1–3 regression
+
+Verify that the remediation does not break:
+
+- Existing Phase 1–3 behavior.
+- Existing API contracts.
+- Existing risk classification.
+- Existing Evidence Timeline behavior.
+- Existing billing logic.
+- Existing database behavior.
+- Existing frontend integration.
+
+If a regression occurs, fix it without weakening previous tests.
+
+---
+
+# 11. DOCUMENTATION AND CONFIGURATION
+
+Update only relevant documentation.
+
+Provide:
+
+1. Full-video OCR sampling methodology.
+2. Coverage definitions and limitations.
+3. OCR execution-state semantics.
+4. Whisper runtime installation instructions.
+5. Model installation and configuration instructions.
+6. Supported language limitations.
+7. Thumbnail contrast implementation status.
+8. Detector contract documentation.
+9. Production readiness semantics.
+10. Environment variable documentation.
+11. Exact test commands, including separate integration/smoke-test commands.
+
+Do not claim that a runtime is installed on every deployment unless deployment configuration actually guarantees it.
+
+Do not place API keys or secrets in documentation.
+
+---
+
+# 12. ACCEPTANCE CRITERIA
+
+The remediation is complete only when the following criteria are satisfied.
+
+| Area | Acceptance criteria |
+|---|---|
+| Full-video OCR | Sampling is distributed across the actual video timeline |
+| Coverage | Cannot report misleading 100% coverage from a capped candidate list |
+| OCR failures | Failed, partial, unavailable, and successful execution are distinguishable |
+| False clean result | OCR failure or timeout cannot produce NO_SIGNAL_DETECTED |
+| Whisper | Real runtime and model requirements are documented and validated |
+| Whisper tests | Mock adapter tests are distinguished from actual runtime tests |
+| Thumbnail contrast | Implemented and tested, or explicitly reported as NOT_IMPLEMENTED |
+| Detector contract | Execution status, provenance, and measurable coverage propagate consistently |
+| Evidence Timeline | Incomplete execution and failure information are preserved |
+| Regression tests | All identified defects have dedicated regression tests |
+| Readiness | Database, storage, billing, and overall readiness are accurately represented |
+| Billing | Existing Stripe Checkout, webhook verification, idempotency, and subscription logic are preserved |
+| Master tests | All original 22 registered suites remain intact |
+| Phase 4–6 tests | Dedicated test suite remains intact and is executed separately |
+| Phase 1–3 | No regressions |
+| Build | Type checking, lint, and production build results are reported honestly |
+
+Do not declare this task complete merely because the code compiles.
+
+Do not declare production-ready without the relevant operational evidence.
+
+---
+
+# 13. FINAL REPORT REQUIRED
+
+When implementation is finished, provide a structured report with the following sections.
+
+## A. Repository baseline
+- Actual starting HEAD.
+- Working tree status.
+- Files changed.
+- Whether any pre-existing user changes were preserved.
+
+## B. Remediation results
+For each of the eight requested areas:
+- Original defect.
+- Root cause.
+- Implementation performed.
+- Files changed.
+- Evidence that the fix works.
+- Remaining limitations.
+
+## C. OCR verification
+Show actual sample timestamps for representative 10-minute and 30-minute test videos.
+
+Show:
+- Targeted frames.
+- Extracted frames.
+- OCR attempts.
+- Successful OCR frames.
+- Failed OCR frames.
+- Coverage calculations.
+- Final execution status.
+
+Use actual test output, not invented examples presented as execution evidence.
+
+## D. Whisper verification
+Report:
+- Runtime name and version.
+- Model.
+- Installation status.
+- CLI validation result.
+- Thai sample test result.
+- English sample test result.
+- Tests not executed and why.
+
+Clearly distinguish mock tests from real runtime tests.
+
+## E. Test results
+Report exact counts and outcomes for:
+- Original 22 Master Test Runner suites.
+- Dedicated Phase 4–6 suite.
+- New regression tests.
+- Type checking.
+- Lint.
+- Production build.
+
+Include actual commands and relevant output.
+
+## F. Billing and readiness
+Report:
+- Database status.
+- Upload storage writeability status.
+- Core application readiness.
+- Stripe billing readiness.
+- Test Mode/Live Mode identification.
+- Checkout/webhook/idempotency regression results.
+
+## G. Final status
+
+Choose exactly one:
+
+- `REMEDIATION COMPLETE — VERIFIED`
+- `REMEDIATION PARTIALLY COMPLETE — VERIFICATION REQUIRED`
+- `REMEDIATION BLOCKED`
+
+Explain the reason with evidence.
+
+## H. Remaining work
+
+List only work that is genuinely incomplete or could not be verified.
+
+Do not hide limitations.
+
+---
+
+# FINAL EXECUTION INSTRUCTION
+
+Execute this remediation against the existing project, not a new replacement project.
+
+Prioritize correctness of evidence, execution status, and production readiness over cosmetic changes.
+
+Preserve the existing development progress and all original test coverage.
+
+If a task cannot be completed because the required runtime, model, environment, or external service is unavailable, implement the safe parts, report the blocker, and do not simulate success.
+
+**The objective is to make VideoRisk report what it actually inspected, what it successfully analyzed, what failed, and what remains unverified — without producing false confidence.**
