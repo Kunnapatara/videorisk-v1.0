@@ -65,7 +65,8 @@ export class PolicyIntelligenceEngine {
     thumbnail_geometry: ['thumbnail_geometry', 'ffprobe_stream_geometry'],
     thumbnail_luminance: ['thumbnail_luminance', 'ffmpeg_signalstats_yavg'],
     thumbnail_ocr: ['thumbnail_ocr', 'local_ocr_adapter'],
-    thumbnail_contrast: ['thumbnail_contrast', 'text_overlay_contrast_evaluator']
+    thumbnail_contrast: ['thumbnail_contrast', 'text_overlay_contrast_evaluator'],
+    video_ocr: ['video_ocr', 'full_video_ocr_adapter', 'tesseract_video_ocr']
   };
 
   public static readonly RISK_SIGNAL_DETECTORS = new Set([
@@ -342,6 +343,32 @@ export class PolicyIntelligenceEngine {
           details: `Recurring visual sequence identified between ${this.formatTimestamp(tmpl.start)}–${this.formatTimestamp(tmpl.end)}.`,
           contextualInterpretation: 'Consistent bumpers, logos, or intro/outro cards establish channel branding.',
           recommendedAction: 'Ensure recurring bumpers do not dominate video duration.'
+        });
+      }
+    }
+
+    // Full-Video On-Screen OCR Text Detection Integration (Phase 4.3 & Phase 5)
+    if (videoResult.videoOcr && videoResult.videoOcr.status === 'DETECTED' && videoResult.videoOcr.detectedFrames && videoResult.videoOcr.detectedFrames.length > 0) {
+      for (const ocrFrame of videoResult.videoOcr.detectedFrames) {
+        addItem({
+          domain: 'video_audio',
+          start: ocrFrame.timestamp,
+          end: Math.min(dur, ocrFrame.timestamp + 1.0),
+          assetLocation: this.formatTimestamp(ocrFrame.timestamp),
+          type: 'video_text_overlay',
+          category: 'metadata_coherence',
+          severity: 'info',
+          confidence: ocrFrame.confidence,
+          confidenceLevel: ocrFrame.confidence >= 0.8 ? 'HIGH' : ocrFrame.confidence >= 0.5 ? 'MEDIUM' : 'LOW',
+          uncertaintyReason: 'NONE',
+          evidenceStatus: 'VERIFIED',
+          provenance: 'tesseract_ocr:full_video_frame',
+          source: 'video_frame_ocr',
+          label: 'ℹ️ On-Screen Visual Text Detected',
+          details: `Text detected on video frame at ${this.formatTimestamp(ocrFrame.timestamp)}: "${ocrFrame.text.substring(0, 80)}${ocrFrame.text.length > 80 ? '...' : ''}" (Confidence: ${Math.round(ocrFrame.confidence * 100)}%).`,
+          contextualInterpretation: 'On-screen visual text provides viewer context, tutorial steps, or subtitle annotations.',
+          limitations: videoResult.videoOcr.limitations,
+          recommendedAction: 'Ensure on-screen visual text accurately reflects video content and creator intent.'
         });
       }
     }

@@ -52,6 +52,7 @@ export interface VideoAnalysisResult {
   repeatedFootageStatus?: DetectorExecutionStatus | DomainAssessmentStatus;
   templateAnalysisStatus?: DetectorExecutionStatus | DomainAssessmentStatus;
   detectors?: Record<string, DetectorReport>;
+  videoOcr?: import('../../types').VideoOcrResult;
 }
 
 export interface AdaptiveAnalysisResult extends VideoAnalysisResult {
@@ -922,6 +923,253 @@ export class VideoProcessor {
       candidateOverheadMs,
       adaptiveExtractionStatus
     };
+  }
+
+  /**
+   * Phase 4.3 Full-video OCR implementation:
+   * Deterministically samples frames from video, extracts high-res candidate frames using FFmpeg,
+   * executes local Tesseract OCR on extracted frames, parses TSV bounding boxes & genuine confidence,
+   * deduplicates repeated text across frames, and enforces bounded execution limits.
+   */
+  public async performVideoOcr(
+    videoPath: string,
+    metadata: MediaMetadata,
+    options?: {
+      maxFrames?: number;
+      sampleIntervalSeconds?: number;
+      timeoutMs?: number;
+      languages?: string;
+    }
+  ): Promise<import('../../types').VideoOcrResult> {
+    const startTime = Date.now();
+    const dur = Math.max(0.1, metadata.durationSeconds || 0.1);
+
+    if (!fs.existsSync(videoPath)) {
+      return {
+        status: 'ANALYSIS_UNAVAILABLE',
+        framesInspected: 0,
+        totalCandidateFrames: 0,
+        coverageRatio: 0,
+        limitations: 'Video file does not exist on disk.',
+        failureReason: `Video media file not found at ${path.basename(videoPath)}`,
+        executionDurationMs: 0,
+        detectedFrames: [],
+        allExtractedText: []
+      };
+    }
+
+    if (!metadata.videoCodec || metadata.width === 0) {
+      return {
+        status: 'NOT_PROVIDED',
+        framesInspected: 0,
+        totalCandidateFrames: 0,
+        coverageRatio: 0,
+        limitations: 'Container does not contain an active visual video stream.',
+        executionDurationMs: 0,
+        detectedFrames: [],
+        allExtractedText: []
+      };
+    }
+
+    // Determine tesseract binary
+    const tesseractPath = process.env.TESSERACT_PATH;
+    let executable: string | null = null;
+    if (tesseractPath && fs.existsSync(tesseractPath)) {
+      executable = tesseractPath;
+    } else if (tesseractPath) {
+      return {
+        status: 'ANALYSIS_UNAVAILABLE',
+        framesInspected: 0,
+        totalCandidateFrames: 0,
+        coverageRatio: 0,
+        limitations: 'OCR engine path configured but executable is missing on disk.',
+        failureReason: `Configured TESSERACT_PATH not found at ${tesseractPath}`,
+        executionDurationMs: Date.now() - startTime,
+        detectedFrames: [],
+        allExtractedText: []
+      };
+    }
+
+    if (!executable) {
+      return {
+        status: 'NOT_ASSESSED',
+        framesInspected: 0,
+        totalCandidateFrames: 0,
+        coverageRatio: 0,
+        limitations: 'Local visual OCR engine (TESSERACT_PATH) not configured or installed. Full-video on-screen text overlays are not assessed.',
+        executionDurationMs: 0,
+        detectedFrames: [],
+        allExtractedText: []
+      };
+    }
+
+    // Bounded configuration limits
+    const maxFrames = Math.max(1, Math.min(60, options?.maxFrames || 15));
+    const sampleInterval = Math.max(1, options?.sampleIntervalSeconds || (dur <= 15 ? 1 : Math.ceil(dur / maxFrames)));
+    const timeoutMs = options?.timeoutMs || 45000;
+    const langs = options?.languages || 'eng+tha';
+
+    // Calculate candidate timestamps
+    const candidateTimestamps: number[] = [];
+    for (let t = 0; t < dur && candidateTimestamps.length < maxFrames; t += sampleInterval) {
+      candidateTimestamps.push(parseFloat(t.toFixed(2)));
+    }
+    const totalCandidateFrames = candidateTimestamps.length;
+
+    const uniqueOcrDir = `video_ocr_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+    const tempOcrDir = path.resolve(process.cwd(), 'uploads', 'ocr_frames', uniqueOcrDir);
+
+    try {
+      if (!fs.existsSync(tempOcrDir)) {
+        fs.mkdirSync(tempOcrDir, { recursive: true });
+      }
+
+      // Extract candidate frames to disk via FFmpeg
+      const extractedFrames: Array<{ timestamp: number; index: number; filePath: string }> = [];
+      for (let i = 0; i < candidateTimestamps.length; i++) {
+        // Enforce overall processing timeout
+        if (Date.now() - startTime >= timeoutMs) {
+          break;
+        }
+
+        const ts = candidateTimestamps[i];
+        const outName = `frame_${i.toString().padStart(3, '0')}.png`;
+        const outPath = path.join(tempOcrDir, outName);
+
+        try {
+          await execFileAsync('ffmpeg', [
+            '-y',
+            '-ss', String(ts),
+            '-i', videoPath,
+            '-vframes', '1',
+            '-vf', 'scale=640:-2', // Standardize frame resolution for bounded OCR processing
+            outPath
+          ], { timeout: 10000 });
+
+          if (fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
+            extractedFrames.push({ timestamp: ts, index: i, filePath: outPath });
+          }
+        } catch {
+          // Skip frame extraction error for individual frame gracefully
+        }
+      }
+
+      if (extractedFrames.length === 0) {
+        return {
+          status: 'ANALYSIS_UNAVAILABLE',
+          framesInspected: 0,
+          totalCandidateFrames,
+          coverageRatio: 0,
+          limitations: 'Failed to extract video frames for OCR analysis.',
+          failureReason: 'FFmpeg frame extraction yielded 0 readable candidate frames.',
+          executionDurationMs: Date.now() - startTime,
+          detectedFrames: [],
+          allExtractedText: []
+        };
+      }
+
+      // Run Tesseract OCR on extracted frames
+      const detectedFrames: import('../../types').VideoFrameOcrItem[] = [];
+      const allExtractedTextSet = new Set<string>();
+      let previousFrameText = '';
+
+      for (const ef of extractedFrames) {
+        if (Date.now() - startTime >= timeoutMs) {
+          break;
+        }
+
+        try {
+          const { stdout } = await execFileAsync(executable, [ef.filePath, 'stdout', '-l', langs, 'tsv'], { timeout: 15000 });
+          const rawTsv = (stdout || '').trim();
+          const lines = rawTsv.split('\n');
+          const boundingBoxes: import('../../types').OcrBoundingBox[] = [];
+          const words: string[] = [];
+          let totalConf = 0;
+          let count = 0;
+
+          for (let l = 1; l < lines.length; l++) {
+            const parts = lines[l].split('\t');
+            if (parts.length >= 12) {
+              const conf = parseFloat(parts[10]);
+              const wText = parts[11]?.trim() || '';
+              const left = parseInt(parts[6], 10) || 0;
+              const top = parseInt(parts[7], 10) || 0;
+              const w = parseInt(parts[8], 10) || 0;
+              const h = parseInt(parts[9], 10) || 0;
+
+              if (wText.length > 0 && Number.isFinite(conf) && conf >= 0) {
+                words.push(wText);
+                totalConf += conf;
+                count++;
+                boundingBoxes.push({
+                  text: wText,
+                  confidence: parseFloat((conf / 100).toFixed(3)),
+                  left,
+                  top,
+                  width: w,
+                  height: h
+                });
+              }
+            }
+          }
+
+          const frameText = words.join(' ').trim();
+          if (frameText.length > 0) {
+            // Deduplicate identical repeated text across immediately consecutive sampled frames
+            const avgConf = parseFloat((totalConf / (count * 100)).toFixed(3));
+            if (frameText !== previousFrameText) {
+              detectedFrames.push({
+                timestamp: ef.timestamp,
+                frameIndex: ef.index,
+                frameFile: path.basename(ef.filePath),
+                text: frameText,
+                confidence: avgConf,
+                boundingBoxes
+              });
+              allExtractedTextSet.add(frameText);
+            }
+            previousFrameText = frameText;
+          }
+        } catch {
+          // Individual frame OCR failure tolerated
+        }
+      }
+
+      const framesInspected = extractedFrames.length;
+      const coverageRatio = parseFloat((framesInspected / Math.max(1, totalCandidateFrames)).toFixed(2));
+      const isPartial = framesInspected < totalCandidateFrames || Date.now() - startTime >= timeoutMs;
+
+      let status: import('../../types').DetectorExecutionStatus;
+      if (detectedFrames.length > 0) {
+        status = 'DETECTED';
+      } else {
+        status = 'NO_SIGNAL_DETECTED';
+      }
+
+      const limitations = isPartial
+        ? `Sampled ${framesInspected} of ${totalCandidateFrames} candidate frames (${Math.round(coverageRatio * 100)}% coverage) due to execution budget limits. Text on uninspected frames was not evaluated.`
+        : `Sampled ${framesInspected} video frames deterministically across the timeline via local Tesseract OCR.`;
+
+      return {
+        status,
+        framesInspected,
+        totalCandidateFrames,
+        coverageRatio,
+        limitations,
+        executionDurationMs: Date.now() - startTime,
+        detectedFrames,
+        allExtractedText: Array.from(allExtractedTextSet)
+      };
+    } finally {
+      // Safe cleanup of temporary OCR frame directory
+      try {
+        if (fs.existsSync(tempOcrDir)) {
+          await fs.promises.rm(tempOcrDir, { recursive: true, force: true });
+        }
+      } catch {
+        // Ignore cleanup error
+      }
+    }
   }
 
   /**

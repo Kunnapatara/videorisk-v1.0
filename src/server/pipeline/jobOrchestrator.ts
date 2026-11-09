@@ -322,6 +322,35 @@ export class JobOrchestrator {
       const videoStart = Date.now();
       const videoResult = await videoProcessor.analyzeVideo(proxyPath, metadata, scan.scanMode);
       tempFramesDirToClean = videoResult.tempFramesDir;
+
+      // Execute Full-Video OCR (Phase 4.3) on sampled frames if video stream is present
+      try {
+        const videoOcr = await videoProcessor.performVideoOcr(proxyPath, metadata, {
+          maxFrames: scan.scanMode === 'deep' ? 30 : 15,
+          sampleIntervalSeconds: scan.scanMode === 'deep' ? 2 : 4
+        });
+        videoResult.videoOcr = videoOcr;
+        if (!videoResult.detectors) {
+          videoResult.detectors = {};
+        }
+        videoResult.detectors.video_ocr = {
+          detectorName: 'full_video_ocr_adapter',
+          version: '1.0.0',
+          status: videoOcr.status,
+          executionDurationMs: videoOcr.executionDurationMs,
+          limitations: videoOcr.limitations,
+          failureReason: videoOcr.failureReason,
+          details: {
+            framesInspected: videoOcr.framesInspected,
+            totalCandidateFrames: videoOcr.totalCandidateFrames,
+            coverageRatio: videoOcr.coverageRatio,
+            detectedFramesCount: videoOcr.detectedFrames.length
+          }
+        };
+      } catch (ocrErr: any) {
+        console.warn('[JobOrchestrator] Video OCR analysis warning:', ocrErr);
+      }
+
       const videoMs = Date.now() - videoStart;
 
       await this.sleep(300);

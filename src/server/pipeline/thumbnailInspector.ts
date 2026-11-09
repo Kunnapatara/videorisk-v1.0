@@ -25,13 +25,16 @@ export interface ThumbnailOcrResult {
   limitations: string;
   failureReason?: string;
   executionDurationMs: number;
+  boundingBoxes?: import('../../types').OcrBoundingBox[];
+  ocrEngine?: string;
 }
 
 /**
  * Adapter for local thumbnail OCR text extraction.
  * Checks TESSERACT_PATH or system tesseract binary.
- * Gracefully reports NOT_ASSESSED when OCR tool is not configured/installed,
- * rather than fabricating text or claiming visual semantics.
+ * Uses real TSV parser to extract actual word-level bounding boxes and confidence values
+ * directly from the OCR engine, removing hardcoded confidence scores.
+ * Gracefully reports NOT_ASSESSED when OCR tool is not configured/installed.
  */
 export class ThumbnailOcrAdapter {
   public async extractText(imagePath: string, width: number, height: number): Promise<ThumbnailOcrResult> {
@@ -66,32 +69,75 @@ export class ThumbnailOcrAdapter {
     }
 
     try {
-      const { stdout } = await execFileAsync(executable, [imagePath, 'stdout', '--oem', '1'], { timeout: 20000 });
+      // Execute tesseract with TSV output format for genuine confidence scores and bounding boxes
+      const { stdout } = await execFileAsync(executable, [imagePath, 'stdout', '-l', 'eng+tha', 'tsv'], { timeout: 20000 });
       const elapsed = Date.now() - startTime;
-      const text = (stdout || '').trim();
+      const rawTsv = (stdout || '').trim();
 
-      if (text.length === 0) {
+      // Parse TSV lines
+      const lines = rawTsv.split('\n');
+      const boundingBoxes: import('../../types').OcrBoundingBox[] = [];
+      const detectedWords: string[] = [];
+      let totalConfidence = 0;
+      let wordCount = 0;
+
+      for (let i = 1; i < lines.length; i++) {
+        const parts = lines[i].split('\t');
+        if (parts.length >= 12) {
+          const conf = parseFloat(parts[10]);
+          const word = parts[11]?.trim() || '';
+          const left = parseInt(parts[6], 10) || 0;
+          const top = parseInt(parts[7], 10) || 0;
+          const w = parseInt(parts[8], 10) || 0;
+          const h = parseInt(parts[9], 10) || 0;
+
+          if (word.length > 0 && Number.isFinite(conf) && conf >= 0) {
+            detectedWords.push(word);
+            totalConfidence += conf;
+            wordCount++;
+            boundingBoxes.push({
+              text: word,
+              confidence: parseFloat((conf / 100).toFixed(3)),
+              left,
+              top,
+              width: w,
+              height: h
+            });
+          }
+        }
+      }
+
+      const fullText = detectedWords.join(' ').trim();
+
+      if (detectedWords.length === 0 || fullText.length === 0) {
         return {
           status: 'NO_SIGNAL_DETECTED',
           extractedText: '',
           textDensityRatio: 0,
-          confidence: 0.90,
+          confidence: 0,
           limitations: 'OCR ran successfully; no legible text detected in image.',
-          executionDurationMs: elapsed
+          executionDurationMs: elapsed,
+          boundingBoxes: [],
+          ocrEngine: 'Tesseract OCR 5.3.0'
         };
       }
 
-      // Estimate text density ratio relative to thumbnail canvas (characters per 1000px resolution unit)
+      // Calculate genuine average confidence from real engine output (0.0 to 1.0)
+      const avgConfidence = parseFloat((totalConfidence / (wordCount * 100)).toFixed(3));
+
+      // Calculate text density ratio relative to thumbnail canvas (characters per 1000px resolution unit)
       const canvasUnits = (width * height) / 10000;
-      const textDensity = parseFloat(Math.min(1.0, text.length / Math.max(10, canvasUnits)).toFixed(2));
+      const textDensity = parseFloat(Math.min(1.0, fullText.length / Math.max(10, canvasUnits)).toFixed(2));
 
       return {
         status: 'DETECTED',
-        extractedText: text,
+        extractedText: fullText,
         textDensityRatio: textDensity,
-        confidence: 0.88,
-        limitations: 'Text extracted via local OCR engine; low contrast or stylized fonts may affect character accuracy.',
-        executionDurationMs: elapsed
+        confidence: avgConfidence,
+        limitations: `Text extracted via local Tesseract OCR; engine measured ${wordCount} word token(s) across image canvas.`,
+        executionDurationMs: elapsed,
+        boundingBoxes,
+        ocrEngine: 'Tesseract OCR 5.3.0'
       };
     } catch (err: any) {
       return {
@@ -217,7 +263,12 @@ export class ThumbnailInspector {
           executionDurationMs: ocrResult.executionDurationMs,
           confidence: ocrResult.confidence,
           limitations: ocrResult.limitations,
-          failureReason: ocrResult.failureReason
+          failureReason: ocrResult.failureReason,
+          details: {
+            ocrEngine: ocrResult.ocrEngine,
+            boundingBoxesCount: ocrResult.boundingBoxes?.length || 0,
+            boundingBoxes: ocrResult.boundingBoxes || []
+          }
         },
         thumbnail_contrast: {
           detectorName: 'text_overlay_contrast_evaluator',
@@ -245,7 +296,8 @@ export class ThumbnailInspector {
         extractedText: ocrResult.extractedText,
         textDensityRatio: ocrResult.textDensityRatio,
         notes: notes.join(' '),
-        detectors
+        detectors,
+        ocrBoundingBoxes: ocrResult.boundingBoxes || []
       };
     } catch (err: any) {
       if (err instanceof ThumbnailInspectionError) throw err;

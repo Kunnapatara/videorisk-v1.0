@@ -57,6 +57,22 @@ export interface DetectorReport {
   limitations?: string;
   failureReason?: string;
   details?: Record<string, any>;
+  // Phase 4–5 Detector Execution Contract extensions
+  executionStatus?: 'SUCCESS' | 'PARTIAL' | 'UNAVAILABLE' | 'FAILED' | 'SKIPPED' | DetectorExecutionStatus;
+  provenance?: {
+    detectorName: string;
+    engine?: string;
+    version?: string;
+    sourceFile?: string;
+    method?: string;
+  };
+  coverage?: {
+    expectedScope?: string;
+    inspectedScope?: string;
+    coverageRatio?: number;
+    partialReason?: string;
+    limitsReached?: string[];
+  };
 }
 
 export type EvidenceStatus = 'VERIFIED' | 'OBSERVED' | 'INSUFFICIENT_EVIDENCE' | 'NOT_ASSESSED';
@@ -198,6 +214,37 @@ export interface ThumbnailMetadata {
   textDensityRatio?: number | null;
   notes?: string;
   detectors?: Record<string, DetectorReport>;
+  ocrBoundingBoxes?: OcrBoundingBox[];
+}
+
+export interface OcrBoundingBox {
+  text: string;
+  confidence: number;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+export interface VideoFrameOcrItem {
+  timestamp: number;
+  frameIndex: number;
+  frameFile: string;
+  text: string;
+  confidence: number;
+  boundingBoxes: OcrBoundingBox[];
+}
+
+export interface VideoOcrResult {
+  status: DetectorExecutionStatus;
+  framesInspected: number;
+  totalCandidateFrames: number;
+  coverageRatio: number;
+  limitations: string;
+  failureReason?: string;
+  executionDurationMs: number;
+  detectedFrames: VideoFrameOcrItem[];
+  allExtractedText: string[];
 }
 
 export interface ChannelContextProfile {
