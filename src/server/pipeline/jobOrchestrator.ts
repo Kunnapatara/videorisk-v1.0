@@ -325,9 +325,9 @@ export class JobOrchestrator {
 
       // Execute Full-Video OCR (Phase 4.3) on sampled frames if video stream is present
       try {
+        // Timeline-wide sampling: do not pass sampleIntervalSeconds so samples distribute across [0, dur]
         const videoOcr = await videoProcessor.performVideoOcr(proxyPath, metadata, {
-          maxFrames: scan.scanMode === 'deep' ? 30 : 15,
-          sampleIntervalSeconds: scan.scanMode === 'deep' ? 2 : 4
+          maxFrames: scan.scanMode === 'deep' ? 30 : 15
         });
         videoResult.videoOcr = videoOcr;
         if (!videoResult.detectors) {
@@ -337,9 +337,10 @@ export class JobOrchestrator {
           detectorName: 'full_video_ocr_adapter',
           version: '1.0.0',
           status: videoOcr.status,
-          executionStatus: videoOcr.executionStatus || (videoOcr.status === 'DETECTED' ? 'SUCCESS' : (videoOcr.status === 'NO_SIGNAL_DETECTED' ? 'SUCCESS' : (videoOcr.isPartial ? 'PARTIAL' : 'FAILED'))),
+          executionStatus: videoOcr.executionStatus ?? (videoOcr.status === 'DETECTED' ? 'SUCCESS' : (videoOcr.status === 'NO_SIGNAL_DETECTED' ? 'SUCCESS' : (videoOcr.isPartial ? 'PARTIAL' : 'FAILED'))),
           executionDurationMs: videoOcr.executionDurationMs,
-          confidence: videoOcr.detectedFrames.length > 0 ? (videoOcr.detectedFrames[0]?.confidence || 0.85) : 0.90,
+          // Preserve 0 and authentic confidence: only provide confidence when evidence is detected
+          confidence: videoOcr.detectedFrames.length > 0 ? (videoOcr.detectedFrames[0]?.confidence ?? 0.85) : 0,
           provenance: {
             detectorName: 'full_video_ocr_adapter',
             engine: 'Tesseract OCR 5.3.0',
@@ -351,21 +352,21 @@ export class JobOrchestrator {
             expectedScope: `Full video timeline (${Math.round(metadata.durationSeconds)}s, up to ${scan.scanMode === 'deep' ? 30 : 15} frames)`,
             inspectedScope: `${videoOcr.framesInspected} frames successfully assessed`,
             coverageRatio: videoOcr.coverageRatio,
-            partialReason: videoOcr.isPartial ? videoOcr.failureReason || 'Partial sampling bounds reached' : undefined,
+            partialReason: videoOcr.isPartial ? (videoOcr.failureReason ?? 'Partial sampling bounds reached') : undefined,
             limitsReached: videoOcr.isPartial ? ['FRAME_BUDGET_OR_TIMEOUT'] : []
           },
           limitations: videoOcr.limitations,
           failureReason: videoOcr.failureReason,
           details: {
-            framesTargeted: videoOcr.framesTargeted || videoOcr.totalCandidateFrames,
-            framesExtracted: videoOcr.framesExtracted || videoOcr.framesInspected,
-            framesAttempted: videoOcr.framesAttempted || videoOcr.framesInspected,
-            framesSucceeded: videoOcr.framesSucceeded || videoOcr.framesInspected,
-            framesFailed: videoOcr.framesFailed || 0,
-            framesSkipped: videoOcr.framesSkipped || 0,
-            timelineCoverageRatio: videoOcr.timelineCoverageRatio || videoOcr.coverageRatio,
-            samplingCoverageRatio: videoOcr.samplingCoverageRatio || videoOcr.coverageRatio,
-            ocrExecutionSuccessRatio: videoOcr.ocrExecutionSuccessRatio || 1.0,
+            framesTargeted: videoOcr.framesTargeted ?? videoOcr.totalCandidateFrames,
+            framesExtracted: videoOcr.framesExtracted ?? videoOcr.framesInspected,
+            framesAttempted: videoOcr.framesAttempted ?? videoOcr.framesInspected,
+            framesSucceeded: videoOcr.framesSucceeded ?? videoOcr.framesInspected,
+            framesFailed: videoOcr.framesFailed ?? 0,
+            framesSkipped: videoOcr.framesSkipped ?? 0,
+            timelineCoverageRatio: videoOcr.timelineCoverageRatio ?? videoOcr.coverageRatio,
+            samplingCoverageRatio: videoOcr.samplingCoverageRatio ?? videoOcr.coverageRatio,
+            ocrExecutionSuccessRatio: videoOcr.ocrExecutionSuccessRatio ?? 0,
             framesInspected: videoOcr.framesInspected,
             totalCandidateFrames: videoOcr.totalCandidateFrames,
             coverageRatio: videoOcr.coverageRatio,

@@ -1191,23 +1191,45 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
   let isCoreReady = true;
 
   // 1. Storage repository & persistence mode check
+  const isProd = process.env.NODE_ENV === 'production' || process.env.PAYMENT_MODE === 'production' || process.env.PAYMENT_MODE === 'live';
+
   try {
     if ((storage as any).db && typeof (storage as any).db.prepare === 'function') {
       const row = (storage as any).db.prepare('SELECT 1 as alive;').get();
       if (row && row.alive === 1) {
         const dbPath = (storage as any).dbPath || 'sqlite.db';
         const isMemory = dbPath === ':memory:' || String(dbPath).includes('mode=memory');
-        checks.database = {
-          status: 'healthy',
-          message: isMemory ? 'Operational in in-memory mode (non-persistent storage).' : 'SQLite database connected and persistent.',
-          details: { storageMode: isMemory ? 'memory' : 'file', path: isMemory ? ':memory:' : path.basename(dbPath) }
-        };
+
+        if (isProd && isMemory) {
+          // In production, an in-memory SQLite database does not survive restarts and fails readiness
+          checks.database = {
+            status: 'unhealthy',
+            message: 'In-memory database detected in production. Production strictly requires persistent file-based or external storage.',
+            details: { storageMode: 'memory', path: ':memory:' }
+          };
+          isCoreReady = false;
+        } else {
+          checks.database = {
+            status: 'healthy',
+            message: isMemory ? 'Operational in in-memory mode (development/test non-persistent storage).' : 'SQLite database connected and persistent.',
+            details: { storageMode: isMemory ? 'memory' : 'file', path: isMemory ? ':memory:' : path.basename(dbPath) }
+          };
+        }
       } else {
         checks.database = { status: 'unhealthy', message: 'Database returned unexpected ping result.' };
         isCoreReady = false;
       }
     } else {
-      checks.database = { status: 'healthy', message: 'In-memory storage ready.', details: { storageMode: 'in_memory_mock' } };
+      if (isProd) {
+        checks.database = {
+          status: 'unhealthy',
+          message: 'In-memory mock storage detected in production. Production strictly requires persistent storage.',
+          details: { storageMode: 'in_memory_mock' }
+        };
+        isCoreReady = false;
+      } else {
+        checks.database = { status: 'healthy', message: 'In-memory storage ready for development/test.', details: { storageMode: 'in_memory_mock' } };
+      }
     }
   } catch (err: any) {
     checks.database = { status: 'unhealthy', message: 'Database query execution failed.' };
@@ -1233,15 +1255,15 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
   }
 
   // 3. Billing gateway readiness check (non-disclosing, format-validated)
-  const isProd = process.env.NODE_ENV === 'production' || process.env.PAYMENT_MODE === 'production' || process.env.PAYMENT_MODE === 'live';
   const rawKey = process.env.STRIPE_SECRET_KEY ? process.env.STRIPE_SECRET_KEY.trim() : '';
   const rawWebhook = process.env.STRIPE_WEBHOOK_SECRET ? process.env.STRIPE_WEBHOOK_SECRET.trim() : '';
 
   const hasSecretKey = rawKey.length > 0;
   const hasWebhookSecret = rawWebhook.length > 0;
-  const isKeyLive = rawKey.startsWith('sk_live_') || rawKey.startsWith('rk_live_');
-  const isKeyTest = rawKey.startsWith('sk_test_') || rawKey.startsWith('rk_test_');
-  const isWebhookFormatValid = rawWebhook.startsWith('whsec_') || rawWebhook.length >= 16;
+  const isKeyLive = /^sk_live_[a-zA-Z0-9]{20,}$/.test(rawKey) || /^rk_live_[a-zA-Z0-9]{20,}$/.test(rawKey);
+  const isKeyTest = /^sk_test_[a-zA-Z0-9]{20,}$/.test(rawKey) || /^rk_test_[a-zA-Z0-9]{20,}$/.test(rawKey);
+  // Stripe webhook secrets strictly match whsec_[a-zA-Z0-9]{24,}
+  const isWebhookFormatValid = /^whsec_[a-zA-Z0-9]{24,}$/.test(rawWebhook);
   const isKeyFormatValid = isKeyLive || isKeyTest;
 
   let billingStatus: 'healthy' | 'degraded' | 'unhealthy' = 'healthy';
@@ -1261,7 +1283,7 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
     billingMessage = 'Malformed STRIPE_SECRET_KEY (expected sk_live_... or sk_test_...).';
   } else if (!isWebhookFormatValid) {
     billingStatus = 'degraded';
-    billingMessage = 'Malformed STRIPE_WEBHOOK_SECRET (expected whsec_...).';
+    billingMessage = 'Malformed STRIPE_WEBHOOK_SECRET (expected whsec_... format).';
   } else if (isProd && !isKeyLive) {
     billingStatus = 'degraded';
     billingMessage = 'Production requires Stripe live credentials (sk_live_...), but test key was detected.';

@@ -67,6 +67,130 @@ export interface AdaptiveAnalysisResult extends VideoAnalysisResult {
   adaptiveExtractionStatus: 'SUCCESS' | 'PARTIAL' | 'FAILED' | 'SKIPPED_NO_CANDIDATES';
 }
 
+/**
+ * Deterministic OCR sampling function used across production orchestration and regression suites.
+ * Samples timestamps distributed across the entire media duration [0, durationSeconds] (start, middle, end).
+ * Avoids duplicate timestamps, guarantees timestamps <= durationSeconds, and handles short media gracefully.
+ */
+export function calculateOcrSamplingTimestamps(
+  durationSeconds: number,
+  maxFrames: number = 15,
+  sampleIntervalSeconds?: number
+): number[] {
+  const dur = Math.max(0.1, durationSeconds || 0.1);
+  const maxF = Math.max(1, Math.min(60, maxFrames));
+  const candidateTimestamps: number[] = [];
+
+  if (dur <= 1.0) {
+    return [0];
+  }
+
+  if (sampleIntervalSeconds && sampleIntervalSeconds > 0) {
+    for (let t = 0; t < dur && candidateTimestamps.length < maxF; t += sampleIntervalSeconds) {
+      candidateTimestamps.push(parseFloat(t.toFixed(2)));
+    }
+  } else {
+    const targetCount = Math.min(maxF, Math.max(1, Math.ceil(dur)));
+    if (targetCount === 1) {
+      candidateTimestamps.push(0);
+    } else {
+      const step = (dur - 0.1) / (targetCount - 1);
+      for (let i = 0; i < targetCount; i++) {
+        const t = Math.min(dur - 0.05, Math.max(0, i * step));
+        const rounded = parseFloat(t.toFixed(2));
+        if (!candidateTimestamps.includes(rounded)) {
+          candidateTimestamps.push(rounded);
+        }
+      }
+    }
+  }
+
+  if (candidateTimestamps.length === 0) {
+    candidateTimestamps.push(0);
+  }
+  return candidateTimestamps.sort((a, b) => a - b);
+}
+
+/**
+ * Validates Tesseract TSV output structure before accepting OCR results.
+ * Verifies header format, column structure (level, conf, text), and parsing usability.
+ */
+export function validateTesseractTsv(stdout: string): {
+  isValid: boolean;
+  error?: string;
+  boundingBoxes: import('../../types').OcrBoundingBox[];
+  words: string[];
+  totalConf: number;
+  wordCount: number;
+} {
+  const rawTsv = (stdout || '').trim();
+  if (!rawTsv) {
+    return { isValid: false, error: 'Empty TSV output from Tesseract', boundingBoxes: [], words: [], totalConf: 0, wordCount: 0 };
+  }
+
+  const lines = rawTsv.split('\n');
+  if (lines.length < 1) {
+    return { isValid: false, error: 'TSV contains no lines', boundingBoxes: [], words: [], totalConf: 0, wordCount: 0 };
+  }
+
+  const header = lines[0].split('\t');
+  // Expected standard tsv columns: level, page_num, block_num, par_num, line_num, word_num, left, top, width, height, conf, text
+  const requiredColumns = ['level', 'left', 'top', 'width', 'height', 'conf', 'text'];
+  const hasRequiredHeaders = requiredColumns.every(col => header.some(h => h.trim().toLowerCase() === col));
+
+  if (!hasRequiredHeaders) {
+    return { isValid: false, error: 'Malformed TSV header: missing required columns', boundingBoxes: [], words: [], totalConf: 0, wordCount: 0 };
+  }
+
+  const leftIdx = header.findIndex(h => h.trim().toLowerCase() === 'left');
+  const topIdx = header.findIndex(h => h.trim().toLowerCase() === 'top');
+  const widthIdx = header.findIndex(h => h.trim().toLowerCase() === 'width');
+  const heightIdx = header.findIndex(h => h.trim().toLowerCase() === 'height');
+  const confIdx = header.findIndex(h => h.trim().toLowerCase() === 'conf');
+  const textIdx = header.findIndex(h => h.trim().toLowerCase() === 'text');
+
+  const boundingBoxes: import('../../types').OcrBoundingBox[] = [];
+  const words: string[] = [];
+  let totalConf = 0;
+  let wordCount = 0;
+
+  for (let l = 1; l < lines.length; l++) {
+    const line = lines[l].trim();
+    if (!line) continue;
+    const parts = lines[l].split('\t');
+    if (parts.length >= header.length) {
+      const conf = parseFloat(parts[confIdx]);
+      const wText = parts[textIdx]?.trim() || '';
+      const left = parseInt(parts[leftIdx], 10) || 0;
+      const top = parseInt(parts[topIdx], 10) || 0;
+      const w = parseInt(parts[widthIdx], 10) || 0;
+      const h = parseInt(parts[heightIdx], 10) || 0;
+
+      if (wText.length > 0 && Number.isFinite(conf) && conf >= 0) {
+        words.push(wText);
+        totalConf += conf;
+        wordCount++;
+        boundingBoxes.push({
+          text: wText,
+          confidence: parseFloat((conf / 100).toFixed(3)),
+          left,
+          top,
+          width: w,
+          height: h
+        });
+      }
+    }
+  }
+
+  return {
+    isValid: true,
+    boundingBoxes,
+    words,
+    totalConf,
+    wordCount
+  };
+}
+
 export class VideoProcessor {
   /**
    * Samples visual frames and performs:
@@ -1009,35 +1133,7 @@ export class VideoProcessor {
     const langs = options?.languages || 'eng+tha';
 
     // Calculate candidate timestamps distributed deterministically across the entire duration [0, dur]
-    const candidateTimestamps: number[] = [];
-    if (dur <= 1.0) {
-      candidateTimestamps.push(0);
-    } else if (options?.sampleIntervalSeconds && options.sampleIntervalSeconds > 0) {
-      // If caller explicitly provides a sample interval, step through duration bounded by maxFrames
-      for (let t = 0; t < dur && candidateTimestamps.length < maxFrames; t += options.sampleIntervalSeconds) {
-        candidateTimestamps.push(parseFloat(t.toFixed(2)));
-      }
-    } else {
-      // Deterministic timeline-wide sampling covering beginning, middle, and end portions
-      const targetCount = Math.min(maxFrames, Math.max(1, Math.ceil(dur)));
-      if (targetCount === 1) {
-        candidateTimestamps.push(0);
-      } else {
-        const step = (dur - 0.1) / (targetCount - 1);
-        for (let i = 0; i < targetCount; i++) {
-          const t = Math.min(dur - 0.05, Math.max(0, i * step));
-          const rounded = parseFloat(t.toFixed(2));
-          if (!candidateTimestamps.includes(rounded)) {
-            candidateTimestamps.push(rounded);
-          }
-        }
-      }
-    }
-
-    if (candidateTimestamps.length === 0) {
-      candidateTimestamps.push(0);
-    }
-    candidateTimestamps.sort((a, b) => a - b);
+    const candidateTimestamps = calculateOcrSamplingTimestamps(dur, maxFrames, options?.sampleIntervalSeconds);
     const totalCandidateFrames = candidateTimestamps.length;
     const framesTargeted = totalCandidateFrames;
 
@@ -1119,6 +1215,8 @@ export class VideoProcessor {
       const ocrErrors: string[] = [];
       let executionTimedOut = extractionTimeouts;
 
+      const succeededTimestamps: number[] = [];
+
       for (const ef of extractedFrames) {
         if (Date.now() - startTime >= timeoutMs) {
           executionTimedOut = true;
@@ -1128,44 +1226,23 @@ export class VideoProcessor {
         framesAttempted++;
         try {
           const { stdout } = await execFileAsync(executable, [ef.filePath, 'stdout', '-l', langs, 'tsv'], { timeout: 15000 });
-          framesSucceeded++;
-          const rawTsv = (stdout || '').trim();
-          const lines = rawTsv.split('\n');
-          const boundingBoxes: import('../../types').OcrBoundingBox[] = [];
-          const words: string[] = [];
-          let totalConf = 0;
-          let count = 0;
 
-          for (let l = 1; l < lines.length; l++) {
-            const parts = lines[l].split('\t');
-            if (parts.length >= 12) {
-              const conf = parseFloat(parts[10]);
-              const wText = parts[11]?.trim() || '';
-              const left = parseInt(parts[6], 10) || 0;
-              const top = parseInt(parts[7], 10) || 0;
-              const w = parseInt(parts[8], 10) || 0;
-              const h = parseInt(parts[9], 10) || 0;
-
-              if (wText.length > 0 && Number.isFinite(conf) && conf >= 0) {
-                words.push(wText);
-                totalConf += conf;
-                count++;
-                boundingBoxes.push({
-                  text: wText,
-                  confidence: parseFloat((conf / 100).toFixed(3)),
-                  left,
-                  top,
-                  width: w,
-                  height: h
-                });
-              }
-            }
+          // Strict TSV structural validation: verify header, columns, and parsing usability
+          const tsvValidation = validateTesseractTsv(stdout || '');
+          if (!tsvValidation.isValid) {
+            framesFailed++;
+            ocrErrors.push(`Frame @ ${ef.timestamp}s: ${tsvValidation.error || 'Invalid TSV structure'}`);
+            continue;
           }
 
+          framesSucceeded++;
+          succeededTimestamps.push(ef.timestamp);
+
+          const { words, boundingBoxes, totalConf, wordCount } = tsvValidation;
           const frameText = words.join(' ').trim();
           if (frameText.length > 0) {
             // Deduplicate identical repeated text across immediately consecutive sampled frames
-            const avgConf = parseFloat((totalConf / (count * 100)).toFixed(3));
+            const avgConf = parseFloat((totalConf / (wordCount * 100)).toFixed(3));
             if (frameText !== previousFrameText) {
               detectedFrames.push({
                 timestamp: ef.timestamp,
@@ -1185,17 +1262,20 @@ export class VideoProcessor {
         }
       }
 
-      const framesSkipped = framesTargeted - framesAttempted;
+      const framesSkipped = Math.max(0, framesTargeted - framesAttempted);
+      // samplingCoverageRatio: proportion of planned samples that were successfully extracted and evaluated
       const samplingCoverageRatio = parseFloat((framesSucceeded / Math.max(1, framesTargeted)).toFixed(3));
+      // ocrExecutionSuccessRatio: proportion of attempted OCR evaluations that succeeded with valid TSV
       const ocrExecutionSuccessRatio = framesAttempted > 0 ? parseFloat((framesSucceeded / framesAttempted).toFixed(3)) : 0;
 
-      // Timeline coverage: span of successfully inspected intervals relative to duration
+      // Timeline coverage: calculated strictly from ACTUAL timestamps of successfully inspected frames
+      // Documentation: timelineCoverageRatio = [span between min and max succeeded timestamp + sample window] / dur
       let timelineCoverageRatio = 0;
-      if (framesSucceeded > 0 && dur > 0) {
-        const inspectedTimes = extractedFrames.slice(0, framesSucceeded).map(f => f.timestamp);
-        const minTime = Math.min(...inspectedTimes);
-        const maxTime = Math.max(...inspectedTimes);
-        const timelineSpan = Math.max(0.1, (maxTime - minTime) + (dur / Math.max(1, framesTargeted)));
+      if (succeededTimestamps.length > 0 && dur > 0) {
+        const minTime = Math.min(...succeededTimestamps);
+        const maxTime = Math.max(...succeededTimestamps);
+        const sampleWindow = dur / Math.max(1, framesTargeted);
+        const timelineSpan = Math.max(0.1, (maxTime - minTime) + sampleWindow);
         timelineCoverageRatio = parseFloat(Math.min(1.0, timelineSpan / dur).toFixed(3));
       }
 

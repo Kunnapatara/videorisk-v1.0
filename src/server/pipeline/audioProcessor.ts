@@ -157,6 +157,8 @@ export class SpeechTranscriptionAdapter {
     // Check version / help command to verify runtime
     let versionStr: string | undefined;
     let runtimeType: WhisperRuntimeValidation['runtimeType'] = 'whisper_cli';
+    let helpOrVersionSucceeded = false;
+
     try {
       const { stdout, stderr } = await execFileAsync(sttPath, ['--help'], { timeout: 10000 });
       const out = (stdout || '') + (stderr || '');
@@ -166,14 +168,33 @@ export class SpeechTranscriptionAdapter {
         runtimeType = 'openai_whisper';
       }
       versionStr = out.split('\n')[0]?.trim().substring(0, 100);
+      helpOrVersionSucceeded = true;
     } catch (procErr: any) {
       // If --help fails, check --version
       try {
-        const { stdout } = await execFileAsync(sttPath, ['--version'], { timeout: 10000 });
-        versionStr = (stdout || '').split('\n')[0]?.trim().substring(0, 100);
-      } catch {
-        // Tolerated: executable exists and has +x
-        versionStr = 'Custom executable';
+        const { stdout, stderr } = await execFileAsync(sttPath, ['--version'], { timeout: 10000 });
+        const out = (stdout || '') + (stderr || '');
+        if (out.includes('whisper.cpp')) {
+          runtimeType = 'whisper_cpp';
+        } else if (out.includes('whisper')) {
+          runtimeType = 'openai_whisper';
+        }
+        versionStr = out.split('\n')[0]?.trim().substring(0, 100);
+        helpOrVersionSucceeded = true;
+      } catch (verErr: any) {
+        // Both --help and --version failed: binary cannot be verified as functional Whisper CLI
+        return {
+          isConfigured: true,
+          executableFound: true,
+          executablePath: sttPath,
+          isExecutable: true,
+          modelConfigured: Boolean(modelPath),
+          modelFound,
+          runtimeType: 'unconfigured',
+          supportedLanguages: ['en', 'th'],
+          status: 'ERROR',
+          details: `STT executable at ${sttPath} failed both '--help' and '--version' checks: ${verErr?.message || verErr}`
+        };
       }
     }
 
@@ -195,9 +216,10 @@ export class SpeechTranscriptionAdapter {
 
   public async transcribe(videoPath: string, durationSeconds: number): Promise<LocalTranscriptionResult> {
     const startTime = Date.now();
-    const sttPath = process.env.WHISPER_PATH || process.env.LOCAL_STT_PATH;
 
-    if (!sttPath) {
+    // Enforce preflight runtime validation before transcription
+    const validation = await this.validateRuntime();
+    if (validation.status === 'UNCONFIGURED') {
       return {
         status: 'NOT_ASSESSED',
         limitations: 'Local speech-to-text executable (WHISPER_PATH or LOCAL_STT_PATH) not configured. Speech detection is acoustic-only without automated transcription.',
@@ -205,40 +227,45 @@ export class SpeechTranscriptionAdapter {
       };
     }
 
-    if (!fs.existsSync(sttPath)) {
+    if (validation.status !== 'READY') {
+      let failureReason = validation.details || 'Whisper runtime validation failed.';
+      if (validation.status === 'MISSING_EXECUTABLE') {
+        failureReason = `Configured STT executable not found at ${validation.executablePath}`;
+      } else if (validation.status === 'NON_EXECUTABLE') {
+        failureReason = `Configured STT binary at ${validation.executablePath} is not executable (lacks execution permissions)`;
+      } else if (validation.status === 'MISSING_MODEL') {
+        failureReason = `Configured WHISPER_MODEL_PATH not found on disk at ${validation.modelPath}`;
+      }
+
       return {
         status: 'ANALYSIS_UNAVAILABLE',
-        failureReason: `Configured STT executable not found at ${sttPath}`,
-        limitations: 'STT path was configured but executable is missing on disk.',
+        failureReason,
+        limitations: `Whisper runtime validation failed with status ${validation.status}.`,
         executionDurationMs: Date.now() - startTime
       };
     }
 
-    // Check file execution permissions
-    try {
-      fs.accessSync(sttPath, fs.constants.X_OK);
-    } catch {
-      return {
-        status: 'ANALYSIS_UNAVAILABLE',
-        failureReason: `Configured STT binary at ${sttPath} is not executable (lacks execution permissions)`,
-        limitations: 'STT binary exists on disk but lacks execute permissions.',
-        executionDurationMs: Date.now() - startTime
-      };
-    }
-
-    const modelPath = process.env.WHISPER_MODEL_PATH;
-    if (modelPath && !fs.existsSync(modelPath)) {
-      return {
-        status: 'ANALYSIS_UNAVAILABLE',
-        failureReason: `Configured WHISPER_MODEL_PATH not found on disk at ${modelPath}`,
-        limitations: 'Whisper runtime model file missing on disk.',
-        executionDurationMs: Date.now() - startTime
-      };
-    }
+    const sttPath = validation.executablePath!;
+    const modelPath = validation.modelPath;
 
     try {
+      // Build runtime-specific CLI argument list
+      let cliArgs: string[];
+      if (validation.runtimeType === 'whisper_cpp') {
+        cliArgs = ['-f', videoPath, '--output-json'];
+        if (modelPath) {
+          cliArgs.unshift('-m', modelPath);
+        }
+      } else {
+        // openai_whisper or generic whisper_cli
+        cliArgs = [videoPath, '--output_format', 'json'];
+        if (modelPath) {
+          cliArgs.push('--model', modelPath);
+        }
+      }
+
       // Execute local STT binary safely without shell expansion
-      const { stdout } = await execFileAsync(sttPath, [videoPath, '--output_format', 'json'], { timeout: 60000 });
+      const { stdout } = await execFileAsync(sttPath, cliArgs, { timeout: 60000 });
       const elapsed = Date.now() - startTime;
       const rawOutput = (stdout || '').trim();
 

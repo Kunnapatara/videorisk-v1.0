@@ -11,6 +11,9 @@
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "test": "DATABASE_PATH=data/videorisk_test.db tsx tests/runAllTests.ts",
+    "test:phase4-6": "DATABASE_PATH=data/videorisk_test.db tsx tests/phase4_6_gap_closure.test.ts",
+    "test:regression": "DATABASE_PATH=data/videorisk_test.db tsx tests/remediation_regression.test.ts",
+    "test:all": "DATABASE_PATH=data/videorisk_test.db tsx tests/runAllTests.ts && DATABASE_PATH=data/videorisk_test.db tsx tests/phase4_6_gap_closure.test.ts && DATABASE_PATH=data/videorisk_test.db tsx tests/remediation_regression.test.ts",
     "validate:env": "tsx scripts/validate-env.ts"
   },
   "dependencies": {
