@@ -118,6 +118,38 @@ export class SpeechTranscriptionAdapter {
       };
     }
 
+    // Check that path is a regular file, not a directory
+    try {
+      const fileStat = fs.statSync(sttPath);
+      if (!fileStat.isFile()) {
+        return {
+          isConfigured: true,
+          executableFound: true,
+          executablePath: sttPath,
+          isExecutable: false,
+          modelConfigured: Boolean(modelPath),
+          modelFound: false,
+          runtimeType: 'unconfigured',
+          supportedLanguages: ['en', 'th'],
+          status: 'NON_EXECUTABLE',
+          details: `Configured STT path at ${sttPath} is a directory, not an executable file.`
+        };
+      }
+    } catch (statErr: any) {
+      return {
+        isConfigured: true,
+        executableFound: false,
+        executablePath: sttPath,
+        isExecutable: false,
+        modelConfigured: Boolean(modelPath),
+        modelFound: false,
+        runtimeType: 'unconfigured',
+        supportedLanguages: ['en', 'th'],
+        status: 'MISSING_EXECUTABLE',
+        details: `Unable to inspect STT file at ${sttPath}: ${statErr?.message || statErr}`
+      };
+    }
+
     // Check file execution permissions
     try {
       fs.accessSync(sttPath, fs.constants.X_OK);
@@ -136,51 +168,33 @@ export class SpeechTranscriptionAdapter {
       };
     }
 
-    // Check model configuration if specified
-    const modelFound = Boolean(modelPath && fs.existsSync(modelPath));
-    if (modelPath && !modelFound) {
-      return {
-        isConfigured: true,
-        executableFound: true,
-        executablePath: sttPath,
-        isExecutable: true,
-        modelConfigured: true,
-        modelFound: false,
-        modelPath,
-        runtimeType: 'custom_adapter',
-        supportedLanguages: ['en', 'th'],
-        status: 'MISSING_MODEL',
-        details: `Configured WHISPER_MODEL_PATH not found at ${modelPath}`
-      };
-    }
+    // Helper to validate model file (exists, is regular file, size > 0)
+    const validateModelFile = (p?: string): { valid: boolean; reason?: string } => {
+      if (!p) return { valid: false, reason: 'Model path is not specified' };
+      try {
+        if (!fs.existsSync(p)) return { valid: false, reason: `Configured WHISPER_MODEL_PATH not found on disk at ${p}` };
+        const stat = fs.statSync(p);
+        if (!stat.isFile()) return { valid: false, reason: `Configured WHISPER_MODEL_PATH at ${p} is a directory, not a regular file` };
+        if (stat.size <= 0) return { valid: false, reason: `Configured WHISPER_MODEL_PATH at ${p} is an empty file (0 bytes)` };
+        return { valid: true };
+      } catch (err: any) {
+        return { valid: false, reason: `Failed to inspect model file at ${p}: ${err?.message || err}` };
+      }
+    };
 
-    // Check version / help command to verify runtime
+    // Check version / help command to verify runtime identity
     let versionStr: string | undefined;
     let runtimeType: WhisperRuntimeValidation['runtimeType'] = 'whisper_cli';
-    let helpOrVersionSucceeded = false;
+    let outputText = '';
 
     try {
       const { stdout, stderr } = await execFileAsync(sttPath, ['--help'], { timeout: 10000 });
-      const out = (stdout || '') + (stderr || '');
-      if (out.includes('whisper.cpp') || out.includes('main')) {
-        runtimeType = 'whisper_cpp';
-      } else if (out.includes('openai-whisper') || out.includes('whisper')) {
-        runtimeType = 'openai_whisper';
-      }
-      versionStr = out.split('\n')[0]?.trim().substring(0, 100);
-      helpOrVersionSucceeded = true;
+      outputText = (stdout || '') + (stderr || '');
     } catch (procErr: any) {
       // If --help fails, check --version
       try {
         const { stdout, stderr } = await execFileAsync(sttPath, ['--version'], { timeout: 10000 });
-        const out = (stdout || '') + (stderr || '');
-        if (out.includes('whisper.cpp')) {
-          runtimeType = 'whisper_cpp';
-        } else if (out.includes('whisper')) {
-          runtimeType = 'openai_whisper';
-        }
-        versionStr = out.split('\n')[0]?.trim().substring(0, 100);
-        helpOrVersionSucceeded = true;
+        outputText = (stdout || '') + (stderr || '');
       } catch (verErr: any) {
         // Both --help and --version failed: binary cannot be verified as functional Whisper CLI
         return {
@@ -189,7 +203,7 @@ export class SpeechTranscriptionAdapter {
           executablePath: sttPath,
           isExecutable: true,
           modelConfigured: Boolean(modelPath),
-          modelFound,
+          modelFound: false,
           runtimeType: 'unconfigured',
           supportedLanguages: ['en', 'th'],
           status: 'ERROR',
@@ -198,19 +212,91 @@ export class SpeechTranscriptionAdapter {
       }
     }
 
+    const lowerOutput = outputText.toLowerCase();
+    // Verify stdout/stderr actually mentions Whisper or expected usage patterns.
+    // Do not accept arbitrary binaries that happen to exit 0.
+    const hasWhisperMention = lowerOutput.includes('whisper');
+    const hasTranscriptionMention = lowerOutput.includes('transcript') || lowerOutput.includes('stt');
+    const basenameIsWhisperOrStt = path.basename(sttPath).toLowerCase().includes('whisper') || path.basename(sttPath).toLowerCase().includes('stt');
+
+    if (!hasWhisperMention && !hasTranscriptionMention && !basenameIsWhisperOrStt) {
+      return {
+        isConfigured: true,
+        executableFound: true,
+        executablePath: sttPath,
+        isExecutable: true,
+        modelConfigured: Boolean(modelPath),
+        modelFound: false,
+        runtimeType: 'unconfigured',
+        supportedLanguages: ['en', 'th'],
+        status: 'ERROR',
+        details: `Executable at ${sttPath} is not a recognizable Whisper runtime (output does not identify as whisper or speech-to-text).`
+      };
+    }
+
+    if (lowerOutput.includes('whisper.cpp') || (hasWhisperMention && (lowerOutput.includes('ggml') || lowerOutput.includes('-m model') || lowerOutput.includes('-m <model>')))) {
+      runtimeType = 'whisper_cpp';
+    } else if (lowerOutput.includes('openai-whisper') || (hasWhisperMention && (lowerOutput.includes('openai') || lowerOutput.includes('--output_format')))) {
+      runtimeType = 'openai_whisper';
+    } else {
+      runtimeType = 'whisper_cli';
+    }
+
+    versionStr = outputText.split('\n')[0]?.trim().substring(0, 100);
+
+    // Validate model requirements based on runtime type and configuration
+    const isModelConfigured = Boolean(modelPath);
+    let modelFound = false;
+
+    if (isModelConfigured) {
+      const modelCheck = validateModelFile(modelPath);
+      modelFound = modelCheck.valid;
+      if (!modelFound) {
+        return {
+          isConfigured: true,
+          executableFound: true,
+          executablePath: sttPath,
+          isExecutable: true,
+          version: versionStr,
+          modelConfigured: true,
+          modelFound: false,
+          modelPath,
+          runtimeType,
+          supportedLanguages: ['en', 'th'],
+          status: 'MISSING_MODEL',
+          details: modelCheck.reason || `Configured WHISPER_MODEL_PATH not found at ${modelPath}`
+        };
+      }
+    } else if (runtimeType === 'whisper_cpp') {
+      // whisper_cpp strictly requires a valid model file
+      return {
+        isConfigured: true,
+        executableFound: true,
+        executablePath: sttPath,
+        isExecutable: true,
+        version: versionStr,
+        modelConfigured: false,
+        modelFound: false,
+        runtimeType,
+        supportedLanguages: ['en', 'th'],
+        status: 'MISSING_MODEL',
+        details: 'whisper_cpp runtime strictly requires a model file via WHISPER_MODEL_PATH'
+      };
+    }
+
     return {
       isConfigured: true,
       executableFound: true,
       executablePath: sttPath,
       isExecutable: true,
       version: versionStr,
-      modelConfigured: Boolean(modelPath),
+      modelConfigured: isModelConfigured,
       modelFound,
       modelPath,
       runtimeType,
       supportedLanguages: ['en', 'th'],
       status: 'READY',
-      details: 'Whisper executable validated and operational.'
+      details: 'Whisper executable and model validated and operational.'
     };
   }
 
@@ -234,7 +320,7 @@ export class SpeechTranscriptionAdapter {
       } else if (validation.status === 'NON_EXECUTABLE') {
         failureReason = `Configured STT binary at ${validation.executablePath} is not executable (lacks execution permissions)`;
       } else if (validation.status === 'MISSING_MODEL') {
-        failureReason = `Configured WHISPER_MODEL_PATH not found on disk at ${validation.modelPath}`;
+        failureReason = validation.details || `Configured WHISPER_MODEL_PATH not found on disk at ${validation.modelPath}`;
       }
 
       return {

@@ -333,46 +333,7 @@ export class JobOrchestrator {
         if (!videoResult.detectors) {
           videoResult.detectors = {};
         }
-        videoResult.detectors.video_ocr = {
-          detectorName: 'full_video_ocr_adapter',
-          version: '1.0.0',
-          status: videoOcr.status,
-          executionStatus: videoOcr.executionStatus ?? (videoOcr.status === 'DETECTED' ? 'SUCCESS' : (videoOcr.status === 'NO_SIGNAL_DETECTED' ? 'SUCCESS' : (videoOcr.isPartial ? 'PARTIAL' : 'FAILED'))),
-          executionDurationMs: videoOcr.executionDurationMs,
-          // Preserve 0 and authentic confidence: only provide confidence when evidence is detected
-          confidence: videoOcr.detectedFrames.length > 0 ? (videoOcr.detectedFrames[0]?.confidence ?? 0.85) : 0,
-          provenance: {
-            detectorName: 'full_video_ocr_adapter',
-            engine: 'Tesseract OCR 5.3.0',
-            version: '1.0.0',
-            sourceFile: 'videoProcessor.ts',
-            method: 'deterministic_timeline_sampling_and_tsv_parser'
-          },
-          coverage: {
-            expectedScope: `Full video timeline (${Math.round(metadata.durationSeconds)}s, up to ${scan.scanMode === 'deep' ? 30 : 15} frames)`,
-            inspectedScope: `${videoOcr.framesInspected} frames successfully assessed`,
-            coverageRatio: videoOcr.coverageRatio,
-            partialReason: videoOcr.isPartial ? (videoOcr.failureReason ?? 'Partial sampling bounds reached') : undefined,
-            limitsReached: videoOcr.isPartial ? ['FRAME_BUDGET_OR_TIMEOUT'] : []
-          },
-          limitations: videoOcr.limitations,
-          failureReason: videoOcr.failureReason,
-          details: {
-            framesTargeted: videoOcr.framesTargeted ?? videoOcr.totalCandidateFrames,
-            framesExtracted: videoOcr.framesExtracted ?? videoOcr.framesInspected,
-            framesAttempted: videoOcr.framesAttempted ?? videoOcr.framesInspected,
-            framesSucceeded: videoOcr.framesSucceeded ?? videoOcr.framesInspected,
-            framesFailed: videoOcr.framesFailed ?? 0,
-            framesSkipped: videoOcr.framesSkipped ?? 0,
-            timelineCoverageRatio: videoOcr.timelineCoverageRatio ?? videoOcr.coverageRatio,
-            samplingCoverageRatio: videoOcr.samplingCoverageRatio ?? videoOcr.coverageRatio,
-            ocrExecutionSuccessRatio: videoOcr.ocrExecutionSuccessRatio ?? 0,
-            framesInspected: videoOcr.framesInspected,
-            totalCandidateFrames: videoOcr.totalCandidateFrames,
-            coverageRatio: videoOcr.coverageRatio,
-            detectedFramesCount: videoOcr.detectedFrames.length
-          }
-        };
+        videoResult.detectors.video_ocr = mapVideoOcrDetectorReport(videoOcr, metadata, scan.scanMode);
       } catch (ocrErr: any) {
         console.warn('[JobOrchestrator] Video OCR analysis warning:', ocrErr);
       }
@@ -516,6 +477,73 @@ export class JobOrchestrator {
       }
     }
   }
+}
+
+/**
+ * Authoritative production mapping function for Video OCR DetectorReport.
+ * Maps VideoOcrResult into a standardized DetectorReport without fabricating
+ * confidence defaults when detection or genuine confidence evidence is missing.
+ */
+export function mapVideoOcrDetectorReport(
+  videoOcr: import('../../types').VideoOcrResult,
+  metadata: import('../../types').MediaMetadata,
+  scanMode: import('../../types').ScanMode = 'standard'
+): import('../../types').DetectorReport {
+  // Genuine confidence extraction: strictly 0 when no frames detected or confidence is 0
+  let confidence = 0;
+  if (videoOcr.detectedFrames.length > 0) {
+    const rawConf = videoOcr.detectedFrames[0]?.confidence;
+    confidence = (typeof rawConf === 'number' && Number.isFinite(rawConf)) ? rawConf : 0;
+  }
+
+  const framesTargeted = videoOcr.framesTargeted ?? videoOcr.totalCandidateFrames;
+  const framesExtracted = videoOcr.framesExtracted ?? videoOcr.framesInspected;
+  const framesAttempted = videoOcr.framesAttempted ?? videoOcr.framesInspected;
+  const framesSucceeded = videoOcr.framesSucceeded ?? videoOcr.framesInspected;
+  const framesFailed = videoOcr.framesFailed ?? 0;
+  const framesSkipped = videoOcr.framesSkipped ?? 0;
+
+  return {
+    detectorName: 'full_video_ocr_adapter',
+    version: '1.0.0',
+    status: videoOcr.status,
+    executionStatus: videoOcr.executionStatus ?? (videoOcr.status === 'DETECTED' ? 'SUCCESS' : (videoOcr.status === 'NO_SIGNAL_DETECTED' ? 'SUCCESS' : (videoOcr.isPartial ? 'PARTIAL' : 'FAILED'))),
+    executionDurationMs: videoOcr.executionDurationMs,
+    confidence,
+    provenance: {
+      detectorName: 'full_video_ocr_adapter',
+      engine: 'Tesseract OCR 5.3.0',
+      version: '1.0.0',
+      sourceFile: 'videoProcessor.ts',
+      method: 'deterministic_timeline_sampling_and_tsv_parser'
+    },
+    coverage: {
+      expectedScope: `Full video timeline (${Math.round(metadata.durationSeconds)}s, up to ${scanMode === 'deep' ? 30 : 15} frames)`,
+      inspectedScope: `${videoOcr.framesInspected} frames successfully assessed`,
+      coverageRatio: videoOcr.coverageRatio,
+      partialReason: videoOcr.isPartial ? (videoOcr.failureReason ?? 'Partial sampling bounds reached') : undefined,
+      limitsReached: videoOcr.isPartial ? ['FRAME_BUDGET_OR_TIMEOUT'] : []
+    },
+    limitations: videoOcr.limitations,
+    failureReason: videoOcr.failureReason,
+    details: {
+      framesTargeted,
+      framesExtracted,
+      framesExtractionFailed: videoOcr.framesExtractionFailed ?? 0,
+      framesAttempted,
+      framesSucceeded,
+      framesFailed,
+      framesOcrFailed: videoOcr.framesOcrFailed ?? framesFailed,
+      framesSkipped,
+      timelineCoverageRatio: videoOcr.timelineCoverageRatio ?? videoOcr.coverageRatio,
+      samplingCoverageRatio: videoOcr.samplingCoverageRatio ?? videoOcr.coverageRatio,
+      ocrExecutionSuccessRatio: videoOcr.ocrExecutionSuccessRatio ?? 0,
+      framesInspected: videoOcr.framesInspected,
+      totalCandidateFrames: videoOcr.totalCandidateFrames,
+      coverageRatio: videoOcr.coverageRatio,
+      detectedFramesCount: videoOcr.detectedFrames.length
+    }
+  };
 }
 
 export const jobOrchestrator = new JobOrchestrator();

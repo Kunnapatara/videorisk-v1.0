@@ -252,9 +252,11 @@ export interface VideoOcrResult {
   ocrExecutionSuccessRatio?: number;
   framesTargeted?: number;
   framesExtracted?: number;
+  framesExtractionFailed?: number;
   framesAttempted?: number;
   framesSucceeded?: number;
   framesFailed?: number;
+  framesOcrFailed?: number;
   framesSkipped?: number;
   isPartial?: boolean;
 }

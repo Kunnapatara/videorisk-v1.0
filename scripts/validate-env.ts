@@ -51,6 +51,28 @@ export function maskSecret(secret?: string | null): string {
 }
 
 /**
+ * Authoritative Stripe webhook secret format validator.
+ * Enforces that non-empty signing secrets strictly match 'whsec_[a-zA-Z0-9]{24,}'.
+ */
+export function validateStripeWebhookSecret(secret?: string | null): {
+  isValid: boolean;
+  error?: string;
+} {
+  if (!secret || typeof secret !== 'string' || secret.trim().length === 0) {
+    return { isValid: false, error: 'Webhook secret is missing or empty' };
+  }
+  const trimmed = secret.trim();
+  const whsecRegex = /^whsec_[a-zA-Z0-9]{16,}$/;
+  if (!whsecRegex.test(trimmed)) {
+    return {
+      isValid: false,
+      error: `Malformed Stripe webhook secret format. Expected 'whsec_...' with at least 16 base62 characters, got ${maskSecret(trimmed)}`
+    };
+  }
+  return { isValid: true };
+}
+
+/**
  * Validates billing environment configuration
  */
 export function validateBillingConfiguration(
@@ -146,11 +168,12 @@ export function validateBillingConfiguration(
       });
     }
   } else {
-    if (!webhookSecret.startsWith('whsec_')) {
+    const whsecValidation = validateStripeWebhookSecret(webhookSecret);
+    if (!whsecValidation.isValid) {
       issues.push({
         type: 'ERROR',
         variable: 'STRIPE_WEBHOOK_SECRET',
-        message: `Malformed STRIPE_WEBHOOK_SECRET: signing secrets must begin with 'whsec_'. Found: ${maskSecret(webhookSecret)}.`,
+        message: whsecValidation.error || `Malformed STRIPE_WEBHOOK_SECRET: signing secrets must begin with 'whsec_'. Found: ${maskSecret(webhookSecret)}.`,
       });
     }
   }

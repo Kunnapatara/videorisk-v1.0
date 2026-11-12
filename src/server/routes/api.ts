@@ -13,6 +13,7 @@ import { creditService } from '../services/creditService';
 import { billingService, ALLOWED_PAID_PLANS } from '../services/billingService';
 import { ensureDemoFixtures, getDemoFixture } from '../fixtures/demoMedia';
 import { channelIntelligenceEngine } from '../intelligence/channelIntelligence';
+import { validateStripeWebhookSecret } from '../../../scripts/validate-env';
 import { ScanJob, ScanMode, UserAccount, CrossVideoPattern, ChannelCoverageReport, ChannelCoverageDetail, ChannelPatternsResponse, CrossVideoComparisonStatus } from '../../types';
 
 export const apiRouter = Router();
@@ -1262,8 +1263,9 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
   const hasWebhookSecret = rawWebhook.length > 0;
   const isKeyLive = /^sk_live_[a-zA-Z0-9]{20,}$/.test(rawKey) || /^rk_live_[a-zA-Z0-9]{20,}$/.test(rawKey);
   const isKeyTest = /^sk_test_[a-zA-Z0-9]{20,}$/.test(rawKey) || /^rk_test_[a-zA-Z0-9]{20,}$/.test(rawKey);
-  // Stripe webhook secrets strictly match whsec_[a-zA-Z0-9]{24,}
-  const isWebhookFormatValid = /^whsec_[a-zA-Z0-9]{24,}$/.test(rawWebhook);
+  // Authoritative Stripe webhook secret format validation via shared validator
+  const webhookValidation = validateStripeWebhookSecret(rawWebhook);
+  const isWebhookFormatValid = hasWebhookSecret && webhookValidation.isValid;
   const isKeyFormatValid = isKeyLive || isKeyTest;
 
   let billingStatus: 'healthy' | 'degraded' | 'unhealthy' = 'healthy';
