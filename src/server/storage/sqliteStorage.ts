@@ -20,7 +20,9 @@ import {
   FencingError,
   CreditTransactionRecord,
   ChannelIntelligenceRecord,
-  PlanDetails
+  PlanDetails,
+  StripePaymentRecord,
+  StripeRefundRecord
 } from '../../types';
 import { OFFICIAL_PRICING_PLANS } from './pricingCatalogue';
 import {
@@ -175,10 +177,155 @@ export class SqliteStorageRepository implements IStorageRepository {
       }
     });
 
+    const stripePaymentsProxy = new Proxy({}, {
+      get: (_target, prop: string) => {
+        if (typeof prop !== 'string') return undefined;
+        const row = this.db.prepare('SELECT * FROM stripe_payments WHERE id = ?').get(prop) as any;
+        if (!row) return undefined;
+        return {
+          id: row.id,
+          userId: row.user_id,
+          sessionId: row.session_id || undefined,
+          paymentIntentId: row.payment_intent_id || undefined,
+          chargeId: row.charge_id || undefined,
+          invoiceId: row.invoice_id || undefined,
+          subscriptionId: row.subscription_id || undefined,
+          customerId: row.customer_id || undefined,
+          planId: row.plan_id || undefined,
+          creditsGranted: Number(row.credits_granted || 0),
+          amountTotal: row.amount_total !== null && row.amount_total !== undefined ? Number(row.amount_total) : undefined,
+          currency: row.currency || undefined,
+          status: row.status,
+          createdAt: row.created_at,
+          updatedAt: row.updated_at
+        } as StripePaymentRecord;
+      },
+      set: (_target, prop: string, val: StripePaymentRecord) => {
+        this.db.prepare(`
+          INSERT INTO stripe_payments (
+            id, user_id, session_id, payment_intent_id, charge_id, invoice_id, subscription_id,
+            customer_id, plan_id, credits_granted, amount_total, currency, status, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            payment_intent_id = COALESCE(excluded.payment_intent_id, stripe_payments.payment_intent_id),
+            charge_id = COALESCE(excluded.charge_id, stripe_payments.charge_id),
+            invoice_id = COALESCE(excluded.invoice_id, stripe_payments.invoice_id),
+            subscription_id = COALESCE(excluded.subscription_id, stripe_payments.subscription_id),
+            customer_id = COALESCE(excluded.customer_id, stripe_payments.customer_id),
+            plan_id = COALESCE(excluded.plan_id, stripe_payments.plan_id),
+            credits_granted = MAX(stripe_payments.credits_granted, excluded.credits_granted),
+            amount_total = COALESCE(excluded.amount_total, stripe_payments.amount_total),
+            currency = COALESCE(excluded.currency, stripe_payments.currency),
+            status = excluded.status,
+            updated_at = excluded.updated_at
+        `).run(
+          prop,
+          val.userId,
+          val.sessionId || null,
+          val.paymentIntentId || null,
+          val.chargeId || null,
+          val.invoiceId || null,
+          val.subscriptionId || null,
+          val.customerId || null,
+          val.planId || null,
+          val.creditsGranted || 0,
+          val.amountTotal ?? null,
+          val.currency || null,
+          val.status || 'paid',
+          val.createdAt || new Date().toISOString(),
+          val.updatedAt || new Date().toISOString()
+        );
+        return true;
+      },
+      ownKeys: () => {
+        const rows = this.db.prepare('SELECT id FROM stripe_payments').all() as any[];
+        return rows.map(r => r.id);
+      },
+      getOwnPropertyDescriptor: () => ({ enumerable: true, configurable: true })
+    });
+
+    const stripeRefundsProxy = new Proxy({}, {
+      get: (_target, prop: string) => {
+        if (typeof prop !== 'string') return undefined;
+        const row = this.db.prepare('SELECT * FROM stripe_refunds WHERE refund_id = ?').get(prop) as any;
+        if (!row) return undefined;
+        return {
+          refundId: row.refund_id,
+          paymentId: row.payment_id || undefined,
+          userId: row.user_id || undefined,
+          chargeId: row.charge_id || undefined,
+          paymentIntentId: row.payment_intent_id || undefined,
+          invoiceId: row.invoice_id || undefined,
+          subscriptionId: row.subscription_id || undefined,
+          planId: row.plan_id || undefined,
+          amountRefunded: Number(row.amount_refunded || 0),
+          totalAmount: row.total_amount !== null && row.total_amount !== undefined ? Number(row.total_amount) : undefined,
+          isFullRefund: Boolean(row.is_full_refund),
+          status: row.status,
+          creditsAdjusted: Number(row.credits_adjusted || 0),
+          failureReason: row.failure_reason || undefined,
+          eventId: row.event_id,
+          createdAt: row.created_at,
+          updatedAt: row.updated_at
+        } as StripeRefundRecord;
+      },
+      set: (_target, prop: string, val: StripeRefundRecord) => {
+        this.db.prepare(`
+          INSERT INTO stripe_refunds (
+            refund_id, payment_id, user_id, charge_id, payment_intent_id, invoice_id, subscription_id,
+            plan_id, amount_refunded, total_amount, is_full_refund, status, credits_adjusted,
+            failure_reason, event_id, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(refund_id) DO UPDATE SET
+            payment_id = COALESCE(excluded.payment_id, stripe_refunds.payment_id),
+            user_id = COALESCE(excluded.user_id, stripe_refunds.user_id),
+            charge_id = COALESCE(excluded.charge_id, stripe_refunds.charge_id),
+            payment_intent_id = COALESCE(excluded.payment_intent_id, stripe_refunds.payment_intent_id),
+            invoice_id = COALESCE(excluded.invoice_id, stripe_refunds.invoice_id),
+            subscription_id = COALESCE(excluded.subscription_id, stripe_refunds.subscription_id),
+            plan_id = COALESCE(excluded.plan_id, stripe_refunds.plan_id),
+            amount_refunded = excluded.amount_refunded,
+            total_amount = COALESCE(excluded.total_amount, stripe_refunds.total_amount),
+            is_full_refund = excluded.is_full_refund,
+            status = excluded.status,
+            credits_adjusted = excluded.credits_adjusted,
+            failure_reason = COALESCE(excluded.failure_reason, stripe_refunds.failure_reason),
+            event_id = excluded.event_id,
+            updated_at = excluded.updated_at
+        `).run(
+          prop,
+          val.paymentId || null,
+          val.userId || null,
+          val.chargeId || null,
+          val.paymentIntentId || null,
+          val.invoiceId || null,
+          val.subscriptionId || null,
+          val.planId || null,
+          val.amountRefunded || 0,
+          val.totalAmount ?? null,
+          val.isFullRefund ? 1 : 0,
+          val.status,
+          val.creditsAdjusted || 0,
+          val.failureReason || null,
+          val.eventId,
+          val.createdAt || new Date().toISOString(),
+          val.updatedAt || new Date().toISOString()
+        );
+        return true;
+      },
+      ownKeys: () => {
+        const rows = this.db.prepare('SELECT refund_id FROM stripe_refunds').all() as any[];
+        return rows.map(r => r.refund_id);
+      },
+      getOwnPropertyDescriptor: () => ({ enumerable: true, configurable: true })
+    });
+
     const txContext: any = this.db;
     txContext.users = usersProxy;
     txContext.webhookEvents = webhookProxy;
     txContext.subscriptions = subscriptionsProxy;
+    txContext.stripePayments = stripePaymentsProxy;
+    txContext.stripeRefunds = stripeRefundsProxy;
 
     const flushMutations = () => {
       for (const [userId, user] of mutatedUsers.entries()) {
@@ -551,6 +698,66 @@ export class SqliteStorageRepository implements IStorageRepository {
       } catch (err) {
         this.db.exec('ROLLBACK;');
         throw new Error(`Failed to apply migration 5: ${err}`);
+      }
+    }
+
+    // Migration 6: Stripe Payment & Refund Correlation Tables
+    if (!appliedVersions.has(6)) {
+      this.db.exec('BEGIN IMMEDIATE;');
+      try {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS stripe_payments (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            session_id TEXT,
+            payment_intent_id TEXT,
+            charge_id TEXT,
+            invoice_id TEXT,
+            subscription_id TEXT,
+            customer_id TEXT,
+            plan_id TEXT,
+            credits_granted INTEGER NOT NULL DEFAULT 0,
+            amount_total INTEGER,
+            currency TEXT,
+            status TEXT NOT NULL DEFAULT 'paid',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_stripe_payments_pi ON stripe_payments(payment_intent_id);
+          CREATE INDEX IF NOT EXISTS idx_stripe_payments_charge ON stripe_payments(charge_id);
+          CREATE INDEX IF NOT EXISTS idx_stripe_payments_invoice ON stripe_payments(invoice_id);
+          CREATE INDEX IF NOT EXISTS idx_stripe_payments_user ON stripe_payments(user_id);
+
+          CREATE TABLE IF NOT EXISTS stripe_refunds (
+            refund_id TEXT PRIMARY KEY,
+            payment_id TEXT,
+            user_id TEXT,
+            charge_id TEXT,
+            payment_intent_id TEXT,
+            invoice_id TEXT,
+            subscription_id TEXT,
+            plan_id TEXT,
+            amount_refunded INTEGER NOT NULL DEFAULT 0,
+            total_amount INTEGER,
+            is_full_refund INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            credits_adjusted INTEGER NOT NULL DEFAULT 0,
+            failure_reason TEXT,
+            event_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_stripe_refunds_pi ON stripe_refunds(payment_intent_id);
+          CREATE INDEX IF NOT EXISTS idx_stripe_refunds_charge ON stripe_refunds(charge_id);
+          CREATE INDEX IF NOT EXISTS idx_stripe_refunds_user ON stripe_refunds(user_id);
+
+          INSERT INTO schema_migrations (version, name, applied_at)
+          VALUES (6, '006_stripe_payments_and_refunds', datetime('now'));
+        `);
+        this.db.exec('COMMIT;');
+      } catch (err) {
+        this.db.exec('ROLLBACK;');
+        throw new Error(`Failed to apply migration 6: ${err}`);
       }
     }
   }

@@ -61,6 +61,22 @@ export interface LocalTranscriptionResult {
   executionDurationMs: number;
 }
 
+export type WhisperDiagnosticCode =
+  | 'UNCONFIGURED'
+  | 'BINARY_NOT_FOUND'
+  | 'BINARY_NOT_EXECUTABLE'
+  | 'IDENTITY_PROBE_FAILED'
+  | 'IDENTITY_CONTRACT_MISMATCH'
+  | 'MODEL_NOT_CONFIGURED'
+  | 'MODEL_NOT_FOUND'
+  | 'MODEL_NOT_READABLE'
+  | 'MODEL_INCOMPATIBLE'
+  | 'TRANSCRIPTION_TIMEOUT'
+  | 'TRANSCRIPTION_FAILED'
+  | 'EMPTY_TRANSCRIPTION_OUTPUT'
+  | 'VERIFICATION_PASSED'
+  | 'READY';
+
 export interface WhisperRuntimeValidation {
   isConfigured: boolean;
   executableFound: boolean;
@@ -73,7 +89,19 @@ export interface WhisperRuntimeValidation {
   runtimeType: 'openai_whisper' | 'whisper_cpp' | 'unconfigured';
   supportedLanguages: string[];
   status: 'READY' | 'MISSING_EXECUTABLE' | 'NON_EXECUTABLE' | 'MISSING_MODEL' | 'UNCONFIGURED' | 'ERROR';
+  diagnosticCode?: WhisperDiagnosticCode;
   details?: string;
+}
+
+export interface WhisperCompatibilityResult {
+  compatible: boolean;
+  diagnosticCode: WhisperDiagnosticCode;
+  runtimeType: 'openai_whisper' | 'whisper_cpp' | 'unconfigured';
+  validation: WhisperRuntimeValidation;
+  transcriptText?: string;
+  segmentsCount?: number;
+  executionDurationMs: number;
+  details: string;
 }
 
 const VALID_GGML_GGUF_MAGICS = new Set<string>([
@@ -118,6 +146,7 @@ export class SpeechTranscriptionAdapter {
         runtimeType: 'unconfigured',
         supportedLanguages: ['en', 'th'],
         status: 'UNCONFIGURED',
+        diagnosticCode: 'UNCONFIGURED',
         details: 'Neither WHISPER_PATH nor LOCAL_STT_PATH is defined in the environment.'
       };
     }
@@ -133,6 +162,7 @@ export class SpeechTranscriptionAdapter {
         runtimeType: 'unconfigured',
         supportedLanguages: ['en', 'th'],
         status: 'MISSING_EXECUTABLE',
+        diagnosticCode: 'BINARY_NOT_FOUND',
         details: `Configured STT executable does not exist at ${sttPath}`
       };
     }
@@ -151,6 +181,7 @@ export class SpeechTranscriptionAdapter {
           runtimeType: 'unconfigured',
           supportedLanguages: ['en', 'th'],
           status: 'NON_EXECUTABLE',
+          diagnosticCode: 'BINARY_NOT_EXECUTABLE',
           details: `Configured STT path at ${sttPath} is a directory, not an executable file.`
         };
       }
@@ -165,6 +196,7 @@ export class SpeechTranscriptionAdapter {
         runtimeType: 'unconfigured',
         supportedLanguages: ['en', 'th'],
         status: 'MISSING_EXECUTABLE',
+        diagnosticCode: 'BINARY_NOT_FOUND',
         details: `Unable to inspect STT file at ${sttPath}: ${statErr?.message || statErr}`
       };
     }
@@ -183,6 +215,7 @@ export class SpeechTranscriptionAdapter {
         runtimeType: 'unconfigured',
         supportedLanguages: ['en', 'th'],
         status: 'NON_EXECUTABLE',
+        diagnosticCode: 'BINARY_NOT_EXECUTABLE',
         details: `Binary at ${sttPath} lacks execution permissions (X_OK).`
       };
     }
@@ -222,6 +255,7 @@ export class SpeechTranscriptionAdapter {
         runtimeType: 'unconfigured',
         supportedLanguages: ['en', 'th'],
         status: 'ERROR',
+        diagnosticCode: 'IDENTITY_PROBE_FAILED',
         details: `STT executable at ${sttPath} failed both '--help' and '--version' identity probes.`
       };
     }
@@ -260,6 +294,7 @@ export class SpeechTranscriptionAdapter {
         runtimeType: 'unconfigured',
         supportedLanguages: ['en', 'th'],
         status: 'ERROR',
+        diagnosticCode: 'IDENTITY_CONTRACT_MISMATCH',
         details: `Executable at ${sttPath} failed runtime identity verification: output from '--help'/'--version' does not match supported whisper_cpp or openai_whisper contracts.`
       };
     }
@@ -270,22 +305,50 @@ export class SpeechTranscriptionAdapter {
     const validateModelFile = (
       p: string,
       rt: 'whisper_cpp' | 'openai_whisper'
-    ): { valid: boolean; status?: 'MISSING_MODEL' | 'ERROR'; reason?: string } => {
+    ): { valid: boolean; status?: 'MISSING_MODEL' | 'ERROR'; diagnosticCode?: WhisperDiagnosticCode; reason?: string } => {
       try {
         if (!fs.existsSync(p)) {
-          return { valid: false, status: 'MISSING_MODEL', reason: `Configured WHISPER_MODEL_PATH not found on disk at ${p}` };
+          return {
+            valid: false,
+            status: 'MISSING_MODEL',
+            diagnosticCode: 'MODEL_NOT_FOUND',
+            reason: `Configured WHISPER_MODEL_PATH not found on disk at ${p}`
+          };
         }
         const stat = fs.statSync(p);
         if (!stat.isFile()) {
-          return { valid: false, status: 'MISSING_MODEL', reason: `Configured WHISPER_MODEL_PATH at ${p} is not a regular file` };
+          return {
+            valid: false,
+            status: 'MISSING_MODEL',
+            diagnosticCode: 'MODEL_INCOMPATIBLE',
+            reason: `Configured WHISPER_MODEL_PATH at ${p} is not a regular file`
+          };
+        }
+        if ((stat.mode & 0o444) === 0) {
+          return {
+            valid: false,
+            status: 'MISSING_MODEL',
+            diagnosticCode: 'MODEL_NOT_READABLE',
+            reason: `Configured WHISPER_MODEL_PATH at ${p} is not readable (no read permission bits set)`
+          };
         }
         try {
           fs.accessSync(p, fs.constants.R_OK);
         } catch {
-          return { valid: false, status: 'MISSING_MODEL', reason: `Configured WHISPER_MODEL_PATH at ${p} is not readable (R_OK check failed)` };
+          return {
+            valid: false,
+            status: 'MISSING_MODEL',
+            diagnosticCode: 'MODEL_NOT_READABLE',
+            reason: `Configured WHISPER_MODEL_PATH at ${p} is not readable (R_OK check failed)`
+          };
         }
         if (stat.size <= 0) {
-          return { valid: false, status: 'MISSING_MODEL', reason: `Configured WHISPER_MODEL_PATH at ${p} is an empty file (0 bytes)` };
+          return {
+            valid: false,
+            status: 'MISSING_MODEL',
+            diagnosticCode: 'MODEL_INCOMPATIBLE',
+            reason: `Configured WHISPER_MODEL_PATH at ${p} is an empty file (0 bytes)`
+          };
         }
 
         // Read header magic bytes to reject arbitrary non-model / corrupt files
@@ -299,7 +362,12 @@ export class SpeechTranscriptionAdapter {
         }
 
         if (bytesRead < 4) {
-          return { valid: false, status: 'ERROR', reason: `Model file at ${p} is truncated (${bytesRead} bytes) and cannot contain a valid model header.` };
+          return {
+            valid: false,
+            status: 'ERROR',
+            diagnosticCode: 'MODEL_INCOMPATIBLE',
+            reason: `Model file at ${p} is truncated (${bytesRead} bytes) and cannot contain a valid model header.`
+          };
         }
 
         const magic4 = headerBuf.subarray(0, 4).toString('ascii');
@@ -308,6 +376,7 @@ export class SpeechTranscriptionAdapter {
             return {
               valid: false,
               status: 'ERROR',
+              diagnosticCode: 'MODEL_INCOMPATIBLE',
               reason: `Model file at ${p} has unrecognized header signature; whisper_cpp requires a valid GGML or GGUF model binary.`
             };
           }
@@ -321,6 +390,7 @@ export class SpeechTranscriptionAdapter {
             return {
               valid: false,
               status: 'ERROR',
+              diagnosticCode: 'MODEL_INCOMPATIBLE',
               reason: `Model file at ${p} is not a valid PyTorch/OpenAI Whisper checkpoint (.pt ZIP or pickle header expected).`
             };
           }
@@ -328,7 +398,13 @@ export class SpeechTranscriptionAdapter {
 
         return { valid: true };
       } catch (err: any) {
-        return { valid: false, status: 'MISSING_MODEL', reason: `Failed to inspect model file at ${p}: ${err?.message || err}` };
+        const isAccessErr = err?.code === 'EACCES' || err?.code === 'EPERM';
+        return {
+          valid: false,
+          status: 'MISSING_MODEL',
+          diagnosticCode: isAccessErr ? 'MODEL_NOT_READABLE' : 'MODEL_NOT_FOUND',
+          reason: `Failed to inspect model file at ${p}: ${err?.message || err}`
+        };
       }
     };
 
@@ -348,6 +424,7 @@ export class SpeechTranscriptionAdapter {
           runtimeType,
           supportedLanguages: ['en', 'th'],
           status: 'MISSING_MODEL',
+          diagnosticCode: 'MODEL_NOT_CONFIGURED',
           details: 'whisper_cpp runtime strictly requires a valid GGML/GGUF model file via WHISPER_MODEL_PATH.'
         };
       }
@@ -365,13 +442,13 @@ export class SpeechTranscriptionAdapter {
           runtimeType,
           supportedLanguages: ['en', 'th'],
           status: modelCheck.status || 'MISSING_MODEL',
+          diagnosticCode: modelCheck.diagnosticCode || 'MODEL_INCOMPATIBLE',
           details: modelCheck.reason || `Invalid WHISPER_MODEL_PATH at ${modelPath}`
         };
       }
       modelFound = true;
     } else if (runtimeType === 'openai_whisper') {
       if (isModelConfigured && modelPath) {
-        // Accept either known OpenAI Whisper named tier (if user explicitly passes tier name via WHISPER_MODEL_PATH only? No: WHISPER_MODEL_PATH is a file path!)
         if (OPENAI_WHISPER_MODEL_NAMES.has(modelPath.trim())) {
           modelFound = true;
         } else {
@@ -389,6 +466,7 @@ export class SpeechTranscriptionAdapter {
               runtimeType,
               supportedLanguages: ['en', 'th'],
               status: modelCheck.status || 'MISSING_MODEL',
+              diagnosticCode: modelCheck.diagnosticCode || 'MODEL_INCOMPATIBLE',
               details: modelCheck.reason || `Invalid WHISPER_MODEL_PATH at ${modelPath}`
             };
           }
@@ -409,8 +487,247 @@ export class SpeechTranscriptionAdapter {
       runtimeType,
       supportedLanguages: ['en', 'th'],
       status: 'READY',
+      diagnosticCode: 'READY',
       details: `Verified ${runtimeType} executable and model requirements.`
     };
+  }
+
+  /**
+   * Executes an actual runtime compatibility smoke test against a configured Whisper binary + model
+   * using a short 16kHz mono PCM WAV audio fixture and verifies non-empty transcript output.
+   */
+  public async verifyRuntimeCompatibility(options?: {
+    audioFixturePath?: string;
+    timeoutMs?: number;
+  }): Promise<WhisperCompatibilityResult> {
+    const startTime = Date.now();
+    const timeoutMs = options?.timeoutMs ?? 20000;
+    const validation = await this.validateRuntime();
+
+    if (validation.status !== 'READY' || (validation.runtimeType !== 'whisper_cpp' && validation.runtimeType !== 'openai_whisper')) {
+      const code: WhisperDiagnosticCode =
+        validation.diagnosticCode ||
+        (validation.status === 'UNCONFIGURED'
+          ? 'UNCONFIGURED'
+          : validation.status === 'MISSING_EXECUTABLE'
+            ? 'BINARY_NOT_FOUND'
+            : validation.status === 'NON_EXECUTABLE'
+              ? 'BINARY_NOT_EXECUTABLE'
+              : validation.status === 'MISSING_MODEL'
+                ? 'MODEL_NOT_FOUND'
+                : 'IDENTITY_CONTRACT_MISMATCH');
+
+      return {
+        compatible: false,
+        diagnosticCode: code,
+        runtimeType: validation.runtimeType,
+        validation,
+        executionDurationMs: Date.now() - startTime,
+        details: validation.details || `Whisper runtime preflight failed with status ${validation.status}.`
+      };
+    }
+
+    const sttPath = validation.executablePath!;
+    const modelPath = validation.modelPath;
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vr_whisper_compat_'));
+
+    const buildMono16kWav = (destPath: string, durationSec: number = 1.2) => {
+      const sampleRate = 16000;
+      const numChannels = 1;
+      const bitsPerSample = 16;
+      const numSamples = Math.floor(sampleRate * durationSec);
+      const dataSize = numSamples * numChannels * (bitsPerSample / 8);
+      const buffer = Buffer.alloc(44 + dataSize);
+
+      buffer.write('RIFF', 0, 'ascii');
+      buffer.writeUInt32LE(36 + dataSize, 4);
+      buffer.write('WAVE', 8, 'ascii');
+      buffer.write('fmt ', 12, 'ascii');
+      buffer.writeUInt32LE(16, 16); // PCM subchunk size
+      buffer.writeUInt16LE(1, 20);  // AudioFormat = PCM (1)
+      buffer.writeUInt16LE(numChannels, 22);
+      buffer.writeUInt32LE(sampleRate, 24);
+      buffer.writeUInt32LE(sampleRate * numChannels * (bitsPerSample / 8), 28);
+      buffer.writeUInt16LE(numChannels * (bitsPerSample / 8), 32);
+      buffer.writeUInt16LE(bitsPerSample, 34);
+      buffer.write('data', 36, 'ascii');
+      buffer.writeUInt32LE(dataSize, 40);
+
+      for (let i = 0; i < numSamples; i++) {
+        const t = i / sampleRate;
+        const amp = Math.sin(2 * Math.PI * 440 * t) * 12000;
+        buffer.writeInt16LE(Math.round(amp), 44 + i * 2);
+      }
+      fs.writeFileSync(destPath, buffer);
+    };
+
+    try {
+      let fixturePath = options?.audioFixturePath;
+      if (!fixturePath || !fs.existsSync(fixturePath)) {
+        fixturePath = path.join(tmpDir, 'whisper_compat_16k.wav');
+        buildMono16kWav(fixturePath, 1.2);
+      }
+
+      const outPrefix = path.join(tmpDir, 'whisper_out');
+      const cliArgs: string[] = validation.runtimeType === 'whisper_cpp'
+        ? ['-m', modelPath!, '-f', fixturePath, '--output-json', '-of', outPrefix]
+        : [
+            fixturePath,
+            '--output_format', 'json',
+            '--output_dir', tmpDir,
+            ...(modelPath ? ['--model', modelPath] : [])
+          ];
+
+      let stdout = '';
+      let stderr = '';
+      try {
+        const res = await execFileAsync(sttPath, cliArgs, { timeout: timeoutMs });
+        stdout = res.stdout || '';
+        stderr = res.stderr || '';
+      } catch (execErr: any) {
+        const elapsed = Date.now() - startTime;
+        const combinedErr = `${execErr?.stderr || ''}\n${execErr?.message || ''}`.trim();
+        const isTimeout = Boolean(
+          execErr?.killed === true ||
+          execErr?.signal === 'SIGTERM' ||
+          execErr?.code === 'ETIMEDOUT' ||
+          /timed?\s*out/i.test(combinedErr)
+        );
+        if (isTimeout) {
+          return {
+            compatible: false,
+            diagnosticCode: 'TRANSCRIPTION_TIMEOUT',
+            runtimeType: validation.runtimeType,
+            validation,
+            executionDurationMs: elapsed,
+            details: `Whisper compatibility execution timed out after ${timeoutMs}ms.`
+          };
+        }
+
+        if (execErr?.code === 'ENOENT') {
+          return {
+            compatible: false,
+            diagnosticCode: 'BINARY_NOT_FOUND',
+            runtimeType: validation.runtimeType,
+            validation,
+            executionDurationMs: elapsed,
+            details: `Whisper executable became unavailable during execution.`
+          };
+        }
+
+        if (execErr?.code === 'EACCES' || execErr?.code === 'EPERM') {
+          return {
+            compatible: false,
+            diagnosticCode: 'BINARY_NOT_EXECUTABLE',
+            runtimeType: validation.runtimeType,
+            validation,
+            executionDurationMs: elapsed,
+            details: `Whisper executable failed permission check during execution.`
+          };
+        }
+
+        const isModelError = /invalid\s+model|failed\s+to\s+(init|initialize|load).*model|unknown\s+model|incompatible\s+model|corrupt(ed)?\s+model|ggml.*magic|unexpected\s+eof.*model/i.test(combinedErr);
+        return {
+          compatible: false,
+          diagnosticCode: isModelError ? 'MODEL_INCOMPATIBLE' : 'TRANSCRIPTION_FAILED',
+          runtimeType: validation.runtimeType,
+          validation,
+          executionDurationMs: elapsed,
+          details: combinedErr.split(/\r?\n/).filter(Boolean).slice(-2).join(' | ').slice(0, 220) || 'Whisper transcription execution failed.'
+        };
+      }
+
+      const elapsed = Date.now() - startTime;
+      const baseWav = path.basename(fixturePath, path.extname(fixturePath));
+      const candidateJsonPaths = [
+        `${outPrefix}.json`,
+        `${fixturePath}.json`,
+        path.join(tmpDir, `${path.basename(fixturePath)}.json`),
+        path.join(tmpDir, `${baseWav}.json`)
+      ];
+
+      let parsedPayload: any = null;
+      for (const jsonPath of candidateJsonPaths) {
+        if (fs.existsSync(jsonPath)) {
+          try {
+            const rawJson = fs.readFileSync(jsonPath, 'utf-8').trim();
+            if (rawJson) {
+              parsedPayload = JSON.parse(rawJson);
+              break;
+            }
+          } catch {
+            // Fall through to stdout inspection
+          }
+        }
+      }
+
+      const trimmedStdout = stdout.trim();
+      if (!parsedPayload && (trimmedStdout.startsWith('{') || trimmedStdout.startsWith('['))) {
+        try {
+          parsedPayload = JSON.parse(trimmedStdout);
+        } catch {
+          return {
+            compatible: false,
+            diagnosticCode: 'TRANSCRIPTION_FAILED',
+            runtimeType: validation.runtimeType,
+            validation,
+            executionDurationMs: elapsed,
+            details: 'Whisper executable produced malformed JSON output during compatibility probe.'
+          };
+        }
+      }
+
+      let extractedText = '';
+      let segmentsCount = 0;
+
+      if (parsedPayload && typeof parsedPayload === 'object' && !Array.isArray(parsedPayload)) {
+        const segList = Array.isArray(parsedPayload.segments)
+          ? parsedPayload.segments
+          : Array.isArray(parsedPayload.transcription)
+            ? parsedPayload.transcription
+            : [];
+        segmentsCount = segList.length;
+        const segText = segList
+          .map((s: any) => String(s?.text || '').trim())
+          .filter(Boolean)
+          .join(' ')
+          .trim();
+        const directText = typeof parsedPayload.text === 'string' ? parsedPayload.text.trim() : '';
+        extractedText = directText || segText;
+      } else if (trimmedStdout && !trimmedStdout.startsWith('{')) {
+        extractedText = trimmedStdout;
+      }
+
+      if (!extractedText) {
+        return {
+          compatible: false,
+          diagnosticCode: 'EMPTY_TRANSCRIPTION_OUTPUT',
+          runtimeType: validation.runtimeType,
+          validation,
+          executionDurationMs: elapsed,
+          details: `Whisper executable ran without error but produced empty transcription output.${stderr ? ' Check audio fixture or model configuration.' : ''}`
+        };
+      }
+
+      return {
+        compatible: true,
+        diagnosticCode: 'VERIFICATION_PASSED',
+        runtimeType: validation.runtimeType,
+        validation,
+        transcriptText: extractedText,
+        segmentsCount,
+        executionDurationMs: elapsed,
+        details: `Verified real ${validation.runtimeType} binary and model execution on 16kHz mono WAV fixture.`
+      };
+    } finally {
+      try {
+        if (fs.existsSync(tmpDir)) {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+      } catch {
+        // Ignore temp cleanup failures
+      }
+    }
   }
 
   public async transcribe(videoPath: string, durationSeconds: number): Promise<LocalTranscriptionResult> {

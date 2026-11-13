@@ -225,6 +225,73 @@ export function validateBillingConfiguration(
     });
   }
 
+  // 5. Application Origin & Redirect Security (APP_BASE_URL / ALLOWED_ORIGINS)
+  const appBaseUrl = (env.APP_BASE_URL || env.APP_URL || env.PUBLIC_APP_URL || '').trim();
+  const validateOriginString = (rawOrigin: string, varName: string) => {
+    if (!rawOrigin) return;
+    if (/\s/.test(rawOrigin) || rawOrigin.includes('\\') || rawOrigin.includes('@') || rawOrigin.startsWith('//')) {
+      issues.push({
+        type: 'ERROR',
+        variable: varName,
+        message: `Unsafe or malformed origin in ${varName}: userinfo (@), backslashes, whitespace, and protocol-relative URLs are forbidden.`,
+      });
+      return;
+    }
+    try {
+      const parsed = new URL(rawOrigin);
+      if (mode === 'production' && parsed.protocol !== 'https:') {
+        issues.push({
+          type: 'ERROR',
+          variable: varName,
+          message: `Insecure scheme '${parsed.protocol}' in ${varName}. Production strictly requires https:// origins.`,
+        });
+      } else if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+        issues.push({
+          type: 'ERROR',
+          variable: varName,
+          message: `Unsupported scheme '${parsed.protocol}' in ${varName}. Only http:// and https:// origins are allowed.`,
+        });
+      }
+    } catch {
+      issues.push({
+        type: 'ERROR',
+        variable: varName,
+        message: `Malformed URL syntax in ${varName}. Expected e.g. 'https://videorisk.com'.`,
+      });
+    }
+  };
+
+  if (!appBaseUrl) {
+    if (mode === 'production') {
+      issues.push({
+        type: 'WARNING',
+        variable: 'APP_BASE_URL',
+        message: 'APP_BASE_URL is not set. Production checkout & portal redirect origin resolution will fail closed until APP_BASE_URL is configured.',
+      });
+    } else if (mode === 'test') {
+      issues.push({
+        type: 'WARNING',
+        variable: 'APP_BASE_URL',
+        message: 'APP_BASE_URL not set in test mode; canonical fallback https://videorisk.com will be used.',
+      });
+    } else {
+      issues.push({
+        type: 'INFO',
+        variable: 'APP_BASE_URL',
+        message: 'APP_BASE_URL not set; non-production checkout origin defaults to https://videorisk.com unless overridden.',
+      });
+    }
+  } else {
+    validateOriginString(appBaseUrl, env.APP_BASE_URL ? 'APP_BASE_URL' : env.APP_URL ? 'APP_URL' : 'PUBLIC_APP_URL');
+  }
+
+  const allowedOriginsRaw = env.ALLOWED_ORIGINS?.trim() || '';
+  if (allowedOriginsRaw) {
+    for (const entry of allowedOriginsRaw.split(',').map((s) => s.trim()).filter(Boolean)) {
+      validateOriginString(entry, 'ALLOWED_ORIGINS');
+    }
+  }
+
   // 6. Media Access Token Secret Validation
   const mediaTokenSecret = env.MEDIA_TOKEN_SECRET?.trim() || '';
   if (!mediaTokenSecret) {

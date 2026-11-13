@@ -94,9 +94,11 @@ export function calculateOcrSamplingTimestamps(
     if (targetCount === 1) {
       candidateTimestamps.push(0);
     } else {
-      const step = (dur - 0.1) / (targetCount - 1);
+      const eofMargin = dur > 20 ? 1.0 : Math.min(0.15, dur * 0.05);
+      const spanEnd = Math.max(0.1, dur - eofMargin);
+      const step = spanEnd / (targetCount - 1);
       for (let i = 0; i < targetCount; i++) {
-        const t = Math.min(dur - 0.05, Math.max(0, i * step));
+        const t = Math.min(spanEnd, Math.max(0, i * step));
         const rounded = parseFloat(t.toFixed(2));
         if (!candidateTimestamps.includes(rounded)) {
           candidateTimestamps.push(rounded);
@@ -1308,6 +1310,7 @@ export class VideoProcessor {
       // Extract candidate frames to disk via FFmpeg with categorized failure diagnostics
       const extractedFrames: Array<{ timestamp: number; index: number; filePath: string }> = [];
       let extractionTimeouts = false;
+      let extractionBinaryUnusable = false;
       let framesExtractionFailed = 0;
 
       for (let i = 0; i < candidateTimestamps.length; i++) {
@@ -1359,29 +1362,40 @@ export class VideoProcessor {
           }
         } catch (extErr: any) {
           framesExtractionFailed++;
+          const errCodeStr = typeof extErr?.code === 'string' ? extErr.code : '';
+          const isMissingExecutable = errCodeStr === 'ENOENT';
+          const isNonExecutable = errCodeStr === 'EACCES' || errCodeStr === 'EPERM' || errCodeStr === 'EISDIR';
           const isTimeout = Boolean(
             extErr?.killed === true ||
             extErr?.signal === 'SIGTERM' ||
-            extErr?.code === 'ETIMEDOUT' ||
+            errCodeStr === 'ETIMEDOUT' ||
             /timed?\s*out/i.test(String(extErr?.message || ''))
           );
           const exitCode = typeof extErr?.code === 'number' ? extErr.code : null;
-          const category: import('../../types').ExtractionFailureDiagnostic['category'] = isTimeout
-            ? 'TIMEOUT'
-            : exitCode !== null
-              ? 'NON_ZERO_EXIT'
-              : 'UNKNOWN_ERROR';
+          const category: import('../../types').ExtractionFailureDiagnostic['category'] = isMissingExecutable
+            ? 'MISSING_EXECUTABLE'
+            : isNonExecutable
+              ? 'NON_EXECUTABLE'
+              : isTimeout
+                ? 'TIMEOUT'
+                : exitCode !== null
+                  ? 'NON_ZERO_EXIT'
+                  : 'UNKNOWN_ERROR';
 
           const stderrLine = String(extErr?.stderr || extErr?.message || 'FFmpeg extraction failed')
             .split(/\r?\n/)
             .filter(Boolean)
             .slice(-2)
             .join(' | ');
-          const rawReason = isTimeout
-            ? `Frame extraction timed out at ${ts}s.`
-            : exitCode !== null
-              ? `FFmpeg exited with code ${exitCode} at ${ts}s: ${stderrLine}`
-              : `Frame extraction error at ${ts}s: ${stderrLine}`;
+          const rawReason = isMissingExecutable
+            ? `FFmpeg executable was not found at ${ts}s (${path.basename(ffmpegBin)}).`
+            : isNonExecutable
+              ? `FFmpeg binary is not executable (${errCodeStr}) at ${ts}s.`
+              : isTimeout
+                ? `Frame extraction timed out at ${ts}s.`
+                : exitCode !== null
+                  ? `FFmpeg exited with code ${exitCode} at ${ts}s: ${stderrLine}`
+                  : `Frame extraction error at ${ts}s: ${stderrLine}`;
 
           if (extractionErrors.length < MAX_DIAGNOSTIC_ERRORS) {
             extractionErrors.push({
@@ -1391,12 +1405,19 @@ export class VideoProcessor {
               reason: sanitizeReason(rawReason)
             });
           }
+
+          if (isMissingExecutable || isNonExecutable) {
+            extractionBinaryUnusable = true;
+            break;
+          }
         }
       }
 
       const framesExtracted = extractedFrames.length;
       const extractedTimestamps = extractedFrames.map(f => f.timestamp);
-      const plannedExtractionAttempts = extractionTimeouts ? framesExtracted + framesExtractionFailed : totalCandidateFrames;
+      const plannedExtractionAttempts = (extractionTimeouts || extractionBinaryUnusable)
+        ? framesExtracted + framesExtractionFailed
+        : totalCandidateFrames;
       const extractionSkipped = Math.max(0, totalCandidateFrames - plannedExtractionAttempts);
       const samplingCoverageRatio = framesTargeted > 0
         ? parseFloat((framesExtracted / framesTargeted).toFixed(3))

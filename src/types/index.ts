@@ -238,7 +238,14 @@ export interface VideoFrameOcrItem {
 export interface ExtractionFailureDiagnostic {
   frameIndex: number;
   timestamp: number;
-  category: 'TIMEOUT' | 'NON_ZERO_EXIT' | 'MISSING_OUTPUT' | 'EMPTY_OUTPUT' | 'UNKNOWN_ERROR';
+  category:
+    | 'MISSING_EXECUTABLE'
+    | 'NON_EXECUTABLE'
+    | 'TIMEOUT'
+    | 'NON_ZERO_EXIT'
+    | 'MISSING_OUTPUT'
+    | 'EMPTY_OUTPUT'
+    | 'UNKNOWN_ERROR';
   reason: string;
 }
 
@@ -663,9 +670,50 @@ export type CreditTransactionType =
   | 'SUBSCRIPTION_RENEWAL' 
   | 'SCAN_DEDUCTION' 
   | 'SCAN_REFUND' 
+  | 'STRIPE_PAYMENT_REFUND'
+  | 'STRIPE_PARTIAL_REFUND'
+  | 'STRIPE_REFUND_FAILED'
   | 'MANUAL_GRANT'
   | 'MANUAL_DEDUCTION' 
   | 'SIMULATED_PURCHASE';
+
+export interface StripePaymentRecord {
+  id: string;
+  userId: string;
+  sessionId?: string;
+  paymentIntentId?: string;
+  chargeId?: string;
+  invoiceId?: string;
+  subscriptionId?: string;
+  customerId?: string;
+  planId?: string;
+  creditsGranted: number;
+  amountTotal?: number;
+  currency?: string;
+  status: 'paid' | 'partially_refunded' | 'refunded';
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface StripeRefundRecord {
+  refundId: string;
+  paymentId?: string;
+  userId?: string;
+  chargeId?: string;
+  paymentIntentId?: string;
+  invoiceId?: string;
+  subscriptionId?: string;
+  planId?: string;
+  amountRefunded: number;
+  totalAmount?: number;
+  isFullRefund: boolean;
+  status: 'pending' | 'succeeded' | 'failed' | 'canceled';
+  creditsAdjusted: number;
+  failureReason?: string;
+  eventId: string;
+  createdAt: string;
+  updatedAt: string;
+}
 
 export interface CreditTransactionRecord {
   id: string;

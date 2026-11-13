@@ -1713,25 +1713,31 @@ apiRouter.post('/billing/checkout', async (req: Request, res: Response) => {
     const user = await requireAuth(req, res);
     if (!user) return;
 
-    const { planId } = req.body;
+    const { planId, originUrl } = req.body || {};
     if (!planId || !ALLOWED_PAID_PLANS.includes(planId as any)) {
       return res.status(400).json({ 
         error: `Valid paid plan ID is required for checkout. Allowed plans: ${ALLOWED_PAID_PLANS.join(', ')}` 
       });
     }
 
-    const origin = req.headers.origin || `${req.protocol}://${req.get('host')}`;
+    const trustedOrigin = billingService.resolveTrustedCheckoutOrigin({
+      requestedOrigin: req.headers.origin,
+      bodyOrigin: typeof originUrl === 'string' ? originUrl : undefined,
+    });
 
     const session = await billingService.createCheckoutSession({
       userId: user.id,
       planId,
-      originUrl: origin,
+      originUrl: trustedOrigin,
     });
 
     res.json(session);
   } catch (err: any) {
     console.error('[API] Checkout session creation failed:', err.message);
-    res.status(400).json({ error: err.message || 'Failed to create checkout session.' });
+    const statusCode = (err.statusCode && err.statusCode >= 400 && err.statusCode < 600 && err.statusCode !== 401)
+      ? err.statusCode
+      : 400;
+    res.status(statusCode).json({ error: err.message || 'Failed to create checkout session.' });
   }
 });
 

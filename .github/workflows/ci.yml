@@ -31,16 +31,33 @@ jobs:
       - name: Run linter and typecheck
         run: npm run lint
 
-      - name: Install system dependencies (FFmpeg)
+      - name: Install system dependencies (FFmpeg & Tesseract OCR + eng/tha)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg
+          sudo apt-get install -y --no-install-recommends ffmpeg tesseract-ocr tesseract-ocr-eng tesseract-ocr-tha
+
+      - name: Verify native media binaries and OCR languages
+        run: |
+          ffmpeg -version
+          ffprobe -version
+          tesseract --version
+          tesseract --list-langs | grep -qx 'eng'
+          tesseract --list-langs | grep -qx 'tha'
 
       - name: Validate environment and plan configuration
         run: npx tsx scripts/validate-env.ts --mode=ci
 
-      - name: Run automated verification tests
+      - name: Run Master Verification Suites (Suites 1-22)
         run: npm test
+
+      - name: Run Phase 4-6 gap closure suite
+        run: npm run test:phase4-6
+
+      - name: Run targeted remediation regression suite (FFmpeg/Tesseract real, Whisper contract mocks)
+        run: npm run test:regression
+
+      - name: Run checkout origin security and Stripe refund lifecycle suite (test HMAC signatures, mocked SDK)
+        run: npm run test:billing
 
       - name: Run production build
         run: npm run build

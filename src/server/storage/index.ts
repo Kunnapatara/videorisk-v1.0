@@ -17,7 +17,9 @@ import {
   FencingError,
   CreditTransactionRecord,
   ChannelIntelligenceRecord,
-  PlanDetails
+  PlanDetails,
+  StripePaymentRecord,
+  StripeRefundRecord
 } from '../../types';
 import { OFFICIAL_PRICING_PLANS } from './pricingCatalogue';
 
@@ -197,6 +199,8 @@ export class InMemoryStorageRepository implements IStorageRepository {
     webhookEvents: Record<string, WebhookEventRecord>;
     subscriptions: Record<string, SubscriptionRecord>;
     creditTransactions: CreditTransactionRecord[];
+    stripePayments: Record<string, StripePaymentRecord>;
+    stripeRefunds: Record<string, StripeRefundRecord>;
   };
 
   constructor(customDataFile?: string) {
@@ -227,6 +231,8 @@ export class InMemoryStorageRepository implements IStorageRepository {
       webhookEvents: {},
       subscriptions: {},
       creditTransactions: [],
+      stripePayments: {},
+      stripeRefunds: {},
     };
     this.load();
     this.seedDefaultUserIfNeeded();
@@ -354,6 +360,8 @@ export class InMemoryStorageRepository implements IStorageRepository {
       webhookEvents: parsed.webhookEvents || {},
       subscriptions: parsed.subscriptions || {},
       creditTransactions: Array.isArray(parsed.creditTransactions) ? parsed.creditTransactions : [],
+      stripePayments: parsed.stripePayments || {},
+      stripeRefunds: parsed.stripeRefunds || {},
     };
 
     let migratedLegacyFreeTrialFlags = false;

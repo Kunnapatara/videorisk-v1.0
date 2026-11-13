@@ -1,0 +1,765 @@
+# AIXSHOP? No — VideoRisk v1.0: Complete Remediation & Production Verification
+
+Repository: `Kunnapatara/videorisk-v1.0`
+
+Execution Environment: Google AI Studio — Build Mode
+
+Objective: Complete all outstanding remediation and verification work for Fix C, Fix E, Fix F, CI integration, Stripe Test Mode lifecycle, Checkout Redirect Origin security, Refund Handling, and Production Deployment/Smoke Testing.
+
+## 1. Non-Negotiable Execution Rules
+
+This is a continuation of the existing VideoRisk v1.0 codebase, not a rebuild.
+
+1. Preserve all existing source code, features, tests, configurations, database data, migrations, and development progress.
+2. Follow **Zero Loss of Development Progress**.
+3. Do not reset, clean, force checkout, hard reset, rebase, stash, delete, or overwrite existing work.
+4. Do not replace working implementations with simplified mock implementations.
+5. Do not remove or weaken existing tests to obtain a passing result.
+6. Do not silently change product behavior, pricing, credit rules, subscription rules, or risk-assessment logic.
+7. Do not introduce unrelated features or scope expansion.
+8. Inspect the actual repository and current Git state before making any modification.
+9. Use existing architecture, services, dependency injection, test utilities, and coding conventions wherever possible.
+10. Make targeted changes with backward compatibility wherever practical.
+11. Do not expose secrets, API keys, Stripe credentials, customer data, or private environment variables in logs, reports, or committed files.
+12. Never claim a test, deployment, transaction, or integration passed unless it was actually executed and its result was observed.
+13. When a required external service, credential, binary, model, or production environment is unavailable, report `NOT VERIFIED` and explain exactly what is missing.
+14. Do not use P0/P1 priority labels.
+15. Do not include implementation-duration estimates.
+16. Do not claim Whisper accuracy, copyright detection accuracy, or real-world risk-detection accuracy based only on software integration tests.
+
+## 2. Mandatory Baseline Audit — Before Editing
+
+Inspect the current repository state and establish a baseline.
+
+Inspect at minimum:
+
+- Current Git branch, HEAD commit, working-tree status, and untracked files.
+- Existing Fix C, Fix E, and Fix F implementations.
+- Whisper runtime configuration and model validation.
+- FFmpeg execution and diagnostic handling.
+- JobOrchestrator and sampling implementation.
+- Existing integration and regression tests.
+- `npm test`
+- `npm run test:regression`
+- `npm run test:phase4-6`
+- TypeScript validation and lint scripts.
+- Production build.
+- Existing GitHub Actions workflows.
+- Stripe Checkout, webhook, subscription, billing, and refund-related code.
+- Environment variable validation and deployment configuration.
+- Existing database schema and migration history.
+
+Record the baseline results before editing.
+
+If a baseline command fails, investigate and classify the failure before changing code. Do not assume a pre-existing failure was caused by the remediation.
+
+Do not stop merely because the working tree contains uncommitted or untracked files. Preserve them and work around them safely.
+
+## 3. Fix C — Verify Actual Whisper Binary + Model Compatibility
+
+### Current limitation
+
+The existing implementation checks:
+
+- Binary execute permission.
+- `--help` and `--version`.
+- Runtime identity.
+- Model file existence and readability.
+- Model file size and magic header.
+
+These checks do not prove that the selected binary can load the selected model and perform actual transcription.
+
+### Required implementation
+
+A. Inspect the existing supported runtime adapters:
+
+- `openai_whisper`
+- `whisper_cpp`
+- `unconfigured`
+
+Preserve the existing runtime architecture. Do not introduce filename-substring guessing or falsely identify a runtime.
+
+B. Add an actual runtime compatibility verification path.
+
+The verification must:
+
+1. Resolve the configured Whisper executable.
+2. Confirm that the executable can actually be invoked.
+3. Resolve the configured model path.
+4. Confirm the model is readable and meets the relevant runtime's expected format.
+5. Execute the actual transcription command using the configured binary and model together.
+6. Use a known, short, valid audio fixture.
+7. Confirm the process exits successfully.
+8. Confirm the expected transcription output is generated and non-empty.
+9. Capture the actual runtime identity, binary version, model identity, execution result, and diagnostic information.
+10. Apply a bounded execution timeout and resource-safe test conditions.
+
+C. Validate the runtime-specific invocation.
+
+Do not assume that `openai_whisper` and `whisper_cpp` share identical command-line arguments, model formats, or output formats.
+
+Use the actual supported command syntax for each runtime.
+
+D. Failure diagnostics must distinguish at least:
+
+- `BINARY_NOT_FOUND`
+- `BINARY_NOT_EXECUTABLE`
+- `MODEL_NOT_FOUND`
+- `MODEL_NOT_READABLE`
+- `MODEL_INCOMPATIBLE`
+- `TRANSCRIPTION_TIMEOUT`
+- `TRANSCRIPTION_FAILED`
+- `EMPTY_TRANSCRIPTION_OUTPUT`
+- `VERIFICATION_PASSED`
+- `UNCONFIGURED`
+
+Use the project's existing naming conventions if equivalent states already exist, but preserve the diagnostic distinctions.
+
+E. Do not download large models automatically without an explicit existing configuration or approval.
+
+Do not commit Whisper binaries or large model files into the repository.
+
+F. Add tests for:
+
+- Missing binary.
+- Non-executable binary.
+- Missing model.
+- Unreadable model.
+- Incompatible model/runtime combination.
+- Runtime invocation failure.
+- Timeout.
+- Empty transcription output.
+- Successful actual transcription using a compatible binary and model.
+
+Mocks may remain for failure-path unit tests. However, at least one successful compatibility test must execute a real Whisper binary with a real compatible model and a real audio fixture.
+
+If the environment cannot provide the actual binary/model pair, report the real-runtime test as `NOT VERIFIED`. Do not substitute a mock and report success.
+
+### Acceptance criteria
+
+- Runtime identity alone is not considered proof of compatibility.
+- Model header validation alone is not considered proof of compatibility.
+- Actual transcription is required for `VERIFICATION_PASSED`.
+- Test results distinguish mocked tests from real binary/model execution.
+
+## 4. Fix E — FFmpeg Missing Executable Diagnostics
+
+### Current limitation
+
+Existing diagnostic categories include:
+
+- `TIMEOUT`
+- `NON_ZERO_EXIT`
+- `MISSING_OUTPUT`
+- `EMPTY_OUTPUT`
+- `UNKNOWN_ERROR`
+
+When FFmpeg is missing, Node.js may return `ENOENT`, which currently falls into `UNKNOWN_ERROR`.
+
+### Required implementation
+
+A. Add a dedicated diagnostic category:
+
+`MISSING_EXECUTABLE`
+
+B. Detect missing executable errors reliably, including:
+
+- `ENOENT`
+- Missing configured FFmpeg path.
+- Invalid executable path where the process cannot be started because the executable does not exist.
+
+C. Preserve the distinction between:
+
+- FFmpeg executable missing.
+- FFmpeg executable exists but cannot execute.
+- FFmpeg process exits with a non-zero code.
+- FFmpeg process times out.
+- FFmpeg exits successfully but expected output is missing.
+- FFmpeg produces an empty output.
+- Other unexpected errors.
+
+D. Do not classify every process-start failure as `MISSING_EXECUTABLE`. Distinguish permission errors and other operating-system errors where possible.
+
+E. Return safe, actionable diagnostics without exposing sensitive filesystem information unnecessarily.
+
+F. Preserve existing:
+
+- `FFMPEG_PATH` configuration.
+- Per-frame timeout behavior.
+- Existing bounded error output.
+- Existing diagnostic categories and callers.
+
+### Required regression tests
+
+1. FFmpeg executable does not exist → `MISSING_EXECUTABLE`.
+2. FFmpeg executable exists but permission is denied → appropriate executable/permission diagnostic.
+3. FFmpeg returns non-zero exit code → `NON_ZERO_EXIT`.
+4. FFmpeg process times out → `TIMEOUT`.
+5. FFmpeg succeeds but output is absent → `MISSING_OUTPUT`.
+6. FFmpeg produces zero-byte output → `EMPTY_OUTPUT`.
+7. Unexpected failure → `UNKNOWN_ERROR`.
+
+### Acceptance criteria
+
+All diagnostic categories must be independently tested.
+
+Existing error-handling behavior must remain compatible with current callers.
+
+## 5. Fix F — Real 10-Minute and 30-Minute End-to-End Sampling Tests
+
+### Current limitation
+
+The existing DI test verifies:
+
+- Standard sends `maxFrames: 15`.
+- Deep sends `maxFrames: 30`.
+- No fixed `sampleIntervalSeconds` is sent.
+
+However, the test calculates timestamps from simulated 600/1,800-second metadata and then uses a real 3-second video fixture (`meta3s`) for OCR execution.
+
+This does not prove that the actual extraction pipeline works against real 10-minute and 30-minute video files.
+
+### Required implementation
+
+A. Preserve the existing sampling behavior:
+
+- Standard: maximum 15 frames.
+- Deep: maximum 30 frames.
+- No fixed sampling interval that contradicts the duration-aware sampling design.
+
+Do not silently change these limits.
+
+B. Add real-duration video fixtures.
+
+Use FFmpeg to generate or prepare actual valid video files with verified durations:
+
+- 10-minute video: approximately 600 seconds.
+- 30-minute video: approximately 1,800 seconds.
+
+The test must inspect actual media duration using FFprobe or an equivalent reliable media inspection mechanism.
+
+Do not use mocked metadata to represent a long video.
+
+C. Execute the real end-to-end pipeline.
+
+For each fixture:
+
+1. Submit the actual video through the production sampling entry point.
+2. Execute the real JobOrchestrator.
+3. Execute the actual sampling timestamp generation.
+4. Execute actual FFmpeg frame extraction.
+5. Verify extracted frame files.
+6. Execute actual OCR using Tesseract where applicable.
+7. Verify the extracted frame timestamps and execution results.
+8. Verify the final sampling evidence and coverage fields.
+9. Verify that failures are reported accurately and do not become fabricated successful coverage.
+
+D. Verify Standard and Deep behavior against both durations.
+
+Required combinations:
+
+| Video duration | Sampling mode | Maximum frames |
+|---|---|---:|
+| 10 minutes | Standard | 15 |
+| 10 minutes | Deep | 30 |
+| 30 minutes | Standard | 15 |
+| 30 minutes | Deep | 30 |
+
+E. Timestamp validation.
+
+Verify:
+
+- Every requested timestamp is within the actual video duration.
+- Timestamps are ordered correctly.
+- No duplicate timestamps are generated unless explicitly permitted by the existing algorithm.
+- Actual extracted frames correspond to the requested timestamps within a documented tolerance.
+- Extraction failures are counted as failures, not successful samples.
+- The implementation does not claim full timeline inspection merely because a limited number of frames were sampled.
+
+F. Resource and test design.
+
+- Do not commit unnecessarily large generated video fixtures.
+- Prefer deterministic FFmpeg-generated test media.
+- Clean up only test-generated temporary files.
+- Do not delete user files or existing repository artifacts.
+- Keep test execution bounded and suitable for CI.
+- If real-duration media generation or execution fails, report the exact failure rather than falling back to simulated metadata.
+
+### Acceptance criteria
+
+A passing test must demonstrate actual extraction from a real 10-minute media file and a real 30-minute media file through the production sampling path.
+
+The existing DI tests may remain, but they cannot substitute for these end-to-end tests.
+
+## 6. CI — Integrate Regression and Phase 4–6 Tests
+
+### Current limitation
+
+The existing GitHub Actions workflow executes the master test suite and other checks, but does not execute:
+
+- `npm run test:regression`
+- `npm run test:phase4-6`
+
+### Required implementation
+
+A. Inspect the current GitHub Actions workflow before editing.
+
+B. Extend the existing workflow without replacing working jobs or removing existing checks.
+
+C. Ensure CI installs and verifies the required dependencies:
+
+- Supported Node.js version.
+- FFmpeg.
+- Tesseract 5.x.
+- English OCR language data (`eng`).
+- Thai OCR language data (`tha`).
+- Any other actual dependencies required by the existing test scripts.
+
+D. Add these commands to CI:
+
+```bash
+npm run test:regression
+npm run test:phase4-6
+```
+
+E. Retain all existing CI checks, including:
+
+```bash
+npx tsc --noEmit
+npm run lint
+npm test
+npm run build
+```
+
+Use the repository's actual script names if they differ.
+
+F. Ensure the CI environment verifies the installed tools and OCR language packs before running dependent tests.
+
+G. Ensure CI fails when a required dependency or test fails. Do not silently skip tests or convert failures into warnings.
+
+H. If a real Whisper model is unavailable in CI, clearly separate the gated real-runtime compatibility test from the mandatory regression suite. Do not report the real Whisper verification as passed merely because CI skipped it.
+
+### Acceptance criteria
+
+A successful GitHub Actions run must show the regression and Phase 4–6 suites executing and passing, not merely existing in `package.json`.
+
+Provide the actual GitHub Actions run URL and commit SHA after a successful run.
+
+## 7. Stripe Test Mode — Complete Subscription and Billing Lifecycle
+
+### Objective
+
+Verify the actual Stripe integration in Test Mode, including Checkout, webhooks, subscriptions, entitlements, billing status, and customer self-service.
+
+Do not use Stripe Live Mode for this task.
+
+### Required pre-test audit
+
+Inspect:
+
+- Stripe Checkout Session creation.
+- Customer creation and association.
+- Session ownership verification.
+- Webhook signature verification.
+- Webhook event idempotency.
+- Subscription creation.
+- Subscription updates.
+- Subscription cancellation.
+- Renewal and invoice events.
+- Failed payment handling.
+- Customer Portal.
+- Billing summary.
+- User plan and credit entitlements.
+- Existing transaction ledger and refund behavior.
+
+Do not create a second billing system if the current implementation already supports the relevant behavior.
+
+### Required Test Mode scenarios
+
+Execute and verify the applicable lifecycle:
+
+1. New customer starts with the correct Free entitlement.
+2. Customer selects a paid plan.
+3. Checkout Session is created with the correct customer, plan, amount, and billing interval.
+4. Successful Test Mode payment activates the correct subscription and entitlement.
+5. Duplicate webhook delivery does not duplicate credits, subscriptions, or ledger entries.
+6. Subscription update changes the correct entitlement.
+7. Subscription cancellation updates the correct subscription state and access behavior.
+8. Renewal/invoice success is handled correctly.
+9. Failed payment is handled according to the defined subscription policy.
+10. Customer Portal opens for the correct authenticated customer.
+11. A user cannot access another user's Checkout Session, billing summary, or subscription.
+12. Invalid webhook signatures are rejected.
+13. Out-of-order or duplicate events do not corrupt subscription state.
+
+Use Stripe Test Mode test cards and supported Stripe testing mechanisms.
+
+Where lifecycle timing requires simulation, use Stripe-supported Test Clocks or equivalent Test Mode facilities where appropriate.
+
+### Evidence requirements
+
+Record:
+
+- Test scenario.
+- Stripe Test Mode event type.
+- Test object identifiers, safely redacted where appropriate.
+- Expected result.
+- Actual result.
+- Relevant application-side database/ledger result.
+- Pass/fail status.
+
+Never publish Stripe secrets or full payment credentials.
+
+If credentials are unavailable, report `NOT VERIFIED` and list the exact required configuration. Do not fabricate a successful transaction.
+
+## 8. Checkout Redirect Origin Security
+
+### Current security concern
+
+Review the Checkout return URL construction. If it uses `req.headers.origin` directly, an untrusted client may influence the redirect destination.
+
+### Required implementation
+
+A. Do not trust a client-supplied Origin header as the source of truth for Checkout redirect URLs.
+
+B. Use a server-configured canonical application URL, such as:
+
+`APP_BASE_URL`
+
+C. If multiple legitimate application origins are required, use an explicit server-side allowlist.
+
+D. Validate the origin before constructing:
+
+- `success_url`
+- `cancel_url`
+- Any other Checkout redirect URL.
+
+E. Apply consistent trusted-origin rules to Checkout and Customer Portal.
+
+F. Reject or safely handle:
+
+- Untrusted origins.
+- Malformed URLs.
+- Unexpected protocols.
+- Hostname spoofing.
+- Lookalike domains.
+- Missing required configuration.
+
+G. Do not introduce open redirects.
+
+H. Preserve valid local development and approved production environments through explicit configuration.
+
+### Required security tests
+
+- Valid configured production origin.
+- Valid approved development origin.
+- Malicious Origin header.
+- Spoofed hostname.
+- Malformed Origin.
+- Missing `APP_BASE_URL`.
+- Unexpected URL scheme.
+- Checkout success/cancel URL correctness.
+- Customer Portal return URL correctness.
+
+### Acceptance criteria
+
+Checkout redirect destinations must be derived from trusted server configuration, not arbitrary request headers.
+
+## 9. Refund Handling — Define and Implement Consistent Billing Behavior
+
+### Objective
+
+Audit and complete the Stripe refund handling lifecycle without confusing internal scan-credit refunds with actual Stripe payment refunds.
+
+The existing internal `SCAN_REFUND` transaction is not proof that Stripe payment refunds are supported.
+
+### Required audit
+
+Inspect all existing:
+
+- Stripe refund-related event handlers.
+- Webhook event processing.
+- Payment and invoice records.
+- Subscription entitlements.
+- Credit ledger entries.
+- Internal scan-credit refund logic.
+- Idempotency controls.
+
+Determine which Stripe refund event types are currently handled.
+
+### Required implementation
+
+A. Define explicit refund semantics.
+
+Document and implement the expected behavior for:
+
+1. Full payment refund.
+2. Partial payment refund.
+3. Duplicate refund webhook.
+4. Failed refund.
+5. Refund event arriving after the original payment event.
+6. Refund associated with a subscription invoice.
+7. Refund associated with a one-time purchase, if supported.
+
+B. Use Stripe's actual refund/payment identifiers to associate refund events with the correct payment and user.
+
+C. Process refund events idempotently.
+
+D. Prevent duplicate credit deductions or duplicate entitlement changes.
+
+E. Maintain an auditable transaction ledger that distinguishes:
+
+- Original payment.
+- Refund amount.
+- Refund status.
+- Related Stripe identifiers.
+- Related user/account.
+- Related subscription or invoice where applicable.
+- Resulting entitlement or credit adjustment.
+
+F. Define how full and partial refunds affect:
+
+- Subscription status.
+- Paid plan access.
+- Remaining credits.
+- Already consumed credits.
+- Internal scan-credit refunds.
+
+Do not invent automatic credit or entitlement reversal rules. Establish the policy explicitly from the existing product behavior and current implementation, and identify any policy decision that requires owner approval.
+
+G. Do not issue actual money refunds automatically during tests unless the test is explicitly operating in Stripe Test Mode.
+
+H. Do not treat an internal credit refund as a Stripe money refund.
+
+I. Add tests for full refund, partial refund, duplicate events, failed refund, event ordering, and ledger consistency.
+
+### Acceptance criteria
+
+The application must have a clearly documented and tested distinction between Stripe payment refunds and internal scan-credit refunds.
+
+If the correct business policy cannot be determined from existing code or documentation, report the unresolved decision and implement only the safe behavior that does not assume the owner's intent.
+
+## 10. Production Deployment and Smoke Test
+
+### Objective
+
+Verify that the application can be deployed and that the deployed application functions correctly.
+
+A successful local build is not proof of successful production deployment.
+
+### Pre-deployment audit
+
+Inspect:
+
+- Production build.
+- Runtime entry point.
+- Required environment variables.
+- Database configuration.
+- Database migration procedure.
+- Persistent storage requirements.
+- FFmpeg availability.
+- Tesseract availability and language packs.
+- Whisper runtime configuration.
+- Stripe production configuration.
+- Webhook endpoint configuration.
+- Authentication/session configuration.
+- Health-check endpoint.
+- Logging and error handling.
+- Deployment provider configuration.
+- Existing production deployment state.
+
+### Deployment safety rules
+
+1. Never delete or overwrite production data.
+2. Never reset the production database.
+3. Never run destructive migrations.
+4. Never expose secrets in logs.
+5. Never switch Stripe to Live Mode as part of this task.
+6. Do not change DNS, domains, production secrets, or billing configuration without the required authorization.
+7. Do not deploy an unverified build.
+8. If deployment credentials or production authorization are unavailable, stop before the external deployment action and report the exact blocker.
+9. Do not claim deployment succeeded unless the actual deployment provider confirms success.
+
+### Required deployment verification
+
+Where authorized and configured:
+
+1. Build the production artifact.
+2. Verify required runtime dependencies.
+3. Verify environment configuration without revealing secret values.
+4. Deploy using the repository's existing supported deployment process.
+5. Confirm deployment provider reports success.
+6. Confirm the deployed application is reachable.
+7. Confirm application health.
+8. Confirm database connectivity.
+9. Confirm authentication and session behavior.
+10. Confirm the main application routes load.
+11. Confirm the analysis workflow can accept a valid test input.
+12. Confirm FFmpeg and Tesseract are available in the deployed runtime if required by the product.
+13. Confirm the application reports missing Whisper configuration accurately rather than falsely claiming Whisper is ready.
+14. Confirm Stripe webhook endpoint availability and signature-validation behavior without using Live Mode.
+15. Confirm logs contain no exposed secrets or sensitive user data.
+
+### Smoke test safety
+
+Use a dedicated test account and non-sensitive test media.
+
+Do not use a real customer's data.
+
+Do not initiate a real payment.
+
+Do not modify existing customer subscriptions or production credits.
+
+If a production smoke test requires a write operation, use a controlled test record and clean up only that test-generated record after confirming cleanup is safe.
+
+### Acceptance criteria
+
+Report deployment and smoke-test results separately:
+
+- `DEPLOYMENT_VERIFIED`
+- `SMOKE_TEST_PASSED`
+- `PARTIALLY_VERIFIED`
+- `NOT VERIFIED`
+
+A successful build alone cannot satisfy either deployment or smoke-test acceptance criteria.
+
+## 11. Full Regression and Compatibility Verification
+
+After implementation, execute the complete applicable verification suite.
+
+At minimum:
+
+```bash
+npx tsc --noEmit
+npm run lint
+npm test
+npm run test:regression
+npm run test:phase4-6
+npm run build
+git diff --check
+```
+
+Also execute:
+
+- Fix C actual Whisper binary/model compatibility test, if the real runtime is available.
+- Fix E missing executable diagnostic tests.
+- Fix F actual 10-minute and 30-minute end-to-end sampling tests.
+- Stripe Test Mode lifecycle tests.
+- Checkout Origin security tests.
+- Refund lifecycle and ledger tests.
+- Production deployment and smoke tests, when authorized.
+
+Do not substitute mocks for tests whose purpose is to verify real external binaries or services.
+
+Do not mark a test as passed if it was skipped, blocked, or executed only with a mock.
+
+## 12. Git and Change Management
+
+Before and after implementation:
+
+- Record current HEAD.
+- Record the initial working-tree status.
+- Preserve all existing changes.
+- Inspect every modified file.
+- Inspect the complete diff.
+- Run `git diff --check`.
+- Verify no secrets, model binaries, generated media, or unintended artifacts were added.
+- Verify no unrelated files were modified.
+- Verify no existing tests were removed or weakened.
+
+Do not commit or push automatically unless the user explicitly authorizes that action in the current workflow.
+
+Do not use destructive Git commands.
+
+## 13. Final Report — Mandatory Format
+
+Produce a detailed evidence-based report using the following sections.
+
+### A. Baseline
+
+- Initial commit SHA.
+- Branch.
+- Working-tree status.
+- Baseline test results.
+- Existing limitations discovered.
+
+### B. Remediation Results
+
+| Workstream | Result | Evidence |
+|---|---|---|
+| Fix C — Whisper Runtime | PASS / PARTIAL / NOT VERIFIED | Actual binary/model transcription evidence |
+| Fix E — FFmpeg Diagnostics | PASS / PARTIAL / NOT VERIFIED | Diagnostic regression test results |
+| Fix F — Production Sampling | PASS / PARTIAL / NOT VERIFIED | Actual 10/30-minute end-to-end extraction |
+| CI Integration | PASS / PARTIAL / NOT VERIFIED | GitHub Actions run |
+| Stripe Test Mode | PASS / PARTIAL / NOT VERIFIED | Lifecycle test evidence |
+| Checkout Origin Security | PASS / PARTIAL / NOT VERIFIED | Security test evidence |
+| Refund Handling | PASS / PARTIAL / NOT VERIFIED | Refund event and ledger evidence |
+| Production Deployment | PASS / PARTIAL / NOT VERIFIED | Deployment provider evidence |
+| Production Smoke Test | PASS / PARTIAL / NOT VERIFIED | Actual deployed application results |
+
+### C. Test Evidence
+
+For each command and test:
+
+- Exact command or test scenario.
+- Exit code.
+- Passed/failed/skipped count.
+- Relevant output.
+- Whether it was a unit test, integration test, real binary test, external-service test, or production test.
+
+Clearly distinguish:
+
+- Mocked execution.
+- Local real-binary execution.
+- CI execution.
+- Stripe Test Mode execution.
+- Production execution.
+
+### D. Files Changed
+
+List every modified, added, and deleted file.
+
+Explain why each file changed.
+
+### E. Remaining Blockers
+
+For every incomplete item, state:
+
+- What remains incomplete.
+- Why it is incomplete.
+- What access, credential, configuration, or decision is required.
+- The exact next action needed.
+
+### F. Final Readiness Assessment
+
+Provide separate conclusions for:
+
+1. Source-code implementation.
+2. Automated test coverage.
+3. Real external binary integration.
+4. Stripe Test Mode verification.
+5. Security verification.
+6. Production deployment.
+7. Production smoke testing.
+8. Overall launch readiness.
+
+Do not use a single passing test count to claim the product is production-ready.
+
+## 14. Definition of Done
+
+This remediation is complete only when:
+
+- Fix C has an actual successful Whisper binary + compatible model transcription test, or is explicitly marked `NOT VERIFIED` with the exact blocker.
+- Fix E correctly identifies missing FFmpeg executables and passes all diagnostic regression tests.
+- Fix F executes real 10-minute and 30-minute media through the actual sampling and extraction path for Standard and Deep.
+- Regression and Phase 4–6 tests are integrated into CI and actually pass.
+- Stripe Test Mode lifecycle has been exercised with verifiable evidence, or is explicitly blocked.
+- Checkout Redirect Origin is secured and tested.
+- Refund handling has explicit semantics, correct event handling, idempotency, and ledger tests, or unresolved owner decisions are clearly reported.
+- Production deployment is actually verified, or explicitly marked `NOT VERIFIED`.
+- Production smoke tests are actually executed, or explicitly marked `NOT VERIFIED`.
+- Existing functionality and development progress are preserved.
+
+**Execution instruction:** Begin with the baseline audit. Then implement the work in controlled, independently testable changes. After each workstream, run its targeted tests before proceeding. Finish with the full regression suite and the mandatory evidence-based report.
+
+Do not stop after writing a plan. Execute all work that can safely and legitimately be completed in the available environment. Clearly identify any action that requires unavailable credentials, external access, or explicit owner authorization.

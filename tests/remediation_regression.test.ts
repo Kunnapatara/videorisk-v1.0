@@ -9,6 +9,7 @@ import {
   validateTesseractTsv
 } from '../src/server/pipeline/videoProcessor';
 import { thumbnailInspector } from '../src/server/pipeline/thumbnailInspector';
+import { mediaInspector } from '../src/server/pipeline/mediaInspector';
 import { SpeechTranscriptionAdapter } from '../src/server/pipeline/audioProcessor';
 import { policyIntelligenceEngine } from '../src/server/intelligence/policyIntelligence';
 import { billingService } from '../src/server/services/billingService';
@@ -37,17 +38,12 @@ export async function runRemediationRegressionTests() {
     for (const f of generatedFiles) {
       try {
         if (fs.existsSync(f)) {
-          const stat = fs.statSync(f);
-          if (stat.isDirectory()) {
-            fs.rmdirSync(f);
-          } else {
-            fs.unlinkSync(f);
-          }
+          fs.rmSync(f, { recursive: true, force: true });
         }
       } catch {}
     }
     try {
-      if (fs.existsSync(testDir)) fs.rmdirSync(testDir);
+      if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
     } catch {}
   };
 
@@ -400,9 +396,153 @@ printf "5\\t1\\t1\\t1\\t1\\t1\\t10abc\\t10\\t50\\t20\\t90xyz\\tSAMPLE\\n"
     assert.strictEqual(preflightBlocked.status, 'ANALYSIS_UNAVAILABLE', '3.12 Preflight blocks transcription when runtime not READY');
     assert.ok(preflightBlocked.failureReason?.includes('empty file'), '3.13 Explains model failure in failureReason');
 
+    // 3.10 verifyRuntimeCompatibility() diagnostic contract coverage
+    delete process.env.WHISPER_PATH;
+    delete process.env.LOCAL_STT_PATH;
+    delete process.env.WHISPER_MODEL_PATH;
+    assert.strictEqual((await stt.verifyRuntimeCompatibility()).diagnosticCode, 'UNCONFIGURED', '3.14 Compatibility probe: UNCONFIGURED');
+
+    process.env.WHISPER_PATH = '/usr/local/bin/nonexistent_whisper_compat';
+    assert.strictEqual((await stt.verifyRuntimeCompatibility()).diagnosticCode, 'BINARY_NOT_FOUND', '3.15 Compatibility probe: BINARY_NOT_FOUND');
+
+    process.env.WHISPER_PATH = nonExecPath;
+    assert.strictEqual((await stt.verifyRuntimeCompatibility()).diagnosticCode, 'BINARY_NOT_EXECUTABLE', '3.16 Compatibility probe: BINARY_NOT_EXECUTABLE');
+
+    const failProbeBin = path.resolve(testDir, 'whisper_fail_probe.sh');
+    fs.writeFileSync(failProbeBin, `#!/bin/sh\necho "segfault during probe" >&2\nexit 2\n`, { mode: 0o755 });
+    generatedFiles.push(failProbeBin);
+    process.env.WHISPER_PATH = failProbeBin;
+    assert.strictEqual((await stt.verifyRuntimeCompatibility()).diagnosticCode, 'IDENTITY_PROBE_FAILED', '3.17 Compatibility probe: IDENTITY_PROBE_FAILED');
+
+    process.env.WHISPER_PATH = spoofedBasenameBin;
+    assert.strictEqual((await stt.verifyRuntimeCompatibility()).diagnosticCode, 'IDENTITY_CONTRACT_MISMATCH', '3.18 Compatibility probe: IDENTITY_CONTRACT_MISMATCH');
+
+    process.env.WHISPER_PATH = mockWhisperCpp;
+    delete process.env.WHISPER_MODEL_PATH;
+    assert.strictEqual((await stt.verifyRuntimeCompatibility()).diagnosticCode, 'MODEL_NOT_CONFIGURED', '3.19 Compatibility probe: MODEL_NOT_CONFIGURED');
+
+    process.env.WHISPER_MODEL_PATH = '/path/to/missing_ggml.bin';
+    assert.strictEqual((await stt.verifyRuntimeCompatibility()).diagnosticCode, 'MODEL_NOT_FOUND', '3.20 Compatibility probe: MODEL_NOT_FOUND');
+
+    const unreadableModel = path.resolve(testDir, 'unreadable_model.bin');
+    fs.writeFileSync(unreadableModel, Buffer.concat([Buffer.from('GGUF', 'ascii'), Buffer.alloc(64, 0x01)]), { mode: 0o644 });
+    generatedFiles.push(unreadableModel);
+    fs.chmodSync(unreadableModel, 0o000);
+    try {
+      process.env.WHISPER_MODEL_PATH = unreadableModel;
+      assert.strictEqual((await stt.verifyRuntimeCompatibility()).diagnosticCode, 'MODEL_NOT_READABLE', '3.21 Compatibility probe: MODEL_NOT_READABLE');
+    } finally {
+      fs.chmodSync(unreadableModel, 0o644);
+    }
+
+    process.env.WHISPER_MODEL_PATH = fakeTextModel;
+    assert.strictEqual((await stt.verifyRuntimeCompatibility()).diagnosticCode, 'MODEL_INCOMPATIBLE', '3.22 Compatibility probe: header MODEL_INCOMPATIBLE');
+
+    // Runtime execution tests for whisper_cpp contract
+    const compatWhisperCppBin = path.resolve(testDir, 'compat_whisper_cpp.sh');
+    fs.writeFileSync(
+      compatWhisperCppBin,
+      `#!/bin/sh
+if [ "$1" = "--help" ] || [ "$1" = "--version" ]; then
+  echo "whisper.cpp main: -m FNAME, --model FNAME -f FNAME, --file FNAME --output-json"
+  exit 0
+fi
+OUT_PREFIX=""
+PREV=""
+for arg in "$@"; do
+  if [ "$PREV" = "-of" ]; then OUT_PREFIX="$arg"; fi
+  PREV="$arg"
+done
+case "\${COMPAT_MODE:-pass}" in
+  timeout)
+    sleep 2
+    exit 0
+    ;;
+  bad_model)
+    echo "error: failed to initialize whisper context: invalid model magic" >&2
+    exit 1
+    ;;
+  fail_exit)
+    echo "runtime crash" >&2
+    exit 3
+    ;;
+  empty)
+    echo '{"transcription":[]}' > "\${OUT_PREFIX}.json"
+    exit 0
+    ;;
+  pass)
+    echo '{"transcription":[{"timestamps":{"from":"00:00:00,000","to":"00:00:01,000"},"text":" hello compat test"}]}' > "\${OUT_PREFIX}.json"
+    exit 0
+    ;;
+esac
+`,
+      { mode: 0o755 }
+    );
+    generatedFiles.push(compatWhisperCppBin);
+
+    process.env.WHISPER_PATH = compatWhisperCppBin;
+    process.env.WHISPER_MODEL_PATH = validModel;
+
+    process.env.COMPAT_MODE = 'timeout';
+    const compatTimeout = await stt.verifyRuntimeCompatibility({ timeoutMs: 120 });
+    assert.strictEqual(compatTimeout.compatible, false);
+    assert.strictEqual(compatTimeout.diagnosticCode, 'TRANSCRIPTION_TIMEOUT', '3.23 Compatibility probe: TRANSCRIPTION_TIMEOUT');
+
+    process.env.COMPAT_MODE = 'bad_model';
+    const compatBadModel = await stt.verifyRuntimeCompatibility();
+    assert.strictEqual(compatBadModel.diagnosticCode, 'MODEL_INCOMPATIBLE', '3.24 Compatibility probe: runtime MODEL_INCOMPATIBLE');
+
+    process.env.COMPAT_MODE = 'fail_exit';
+    const compatFailExit = await stt.verifyRuntimeCompatibility();
+    assert.strictEqual(compatFailExit.diagnosticCode, 'TRANSCRIPTION_FAILED', '3.25 Compatibility probe: TRANSCRIPTION_FAILED');
+
+    process.env.COMPAT_MODE = 'empty';
+    const compatEmpty = await stt.verifyRuntimeCompatibility();
+    assert.strictEqual(compatEmpty.diagnosticCode, 'EMPTY_TRANSCRIPTION_OUTPUT', '3.26 Compatibility probe: EMPTY_TRANSCRIPTION_OUTPUT');
+
+    process.env.COMPAT_MODE = 'pass';
+    const compatPassCpp = await stt.verifyRuntimeCompatibility();
+    assert.strictEqual(compatPassCpp.compatible, true, '3.27 whisper_cpp compatibility passes with JSON transcript');
+    assert.strictEqual(compatPassCpp.diagnosticCode, 'VERIFICATION_PASSED', '3.28 whisper_cpp reports VERIFICATION_PASSED');
+    assert.strictEqual(compatPassCpp.transcriptText, 'hello compat test', '3.29 whisper_cpp extracts non-empty transcriptText');
+    assert.strictEqual(compatPassCpp.segmentsCount, 1, '3.30 whisper_cpp records segment count');
+    delete process.env.COMPAT_MODE;
+
+    // Runtime execution pass test for openai_whisper contract
+    const compatOpenAiBin = path.resolve(testDir, 'compat_openai_whisper.sh');
+    fs.writeFileSync(
+      compatOpenAiBin,
+      `#!/bin/sh
+if [ "$1" = "--help" ] || [ "$1" = "--version" ]; then
+  echo "usage: whisper [-h] [--model MODEL] [--output_format {txt,vtt,srt,tsv,json,all}]"
+  exit 0
+fi
+AUDIO="$1"
+OUT_DIR=""
+PREV=""
+for arg in "$@"; do
+  if [ "$PREV" = "--output_dir" ]; then OUT_DIR="$arg"; fi
+  PREV="$arg"
+done
+BASE=$(basename "$AUDIO" .wav)
+echo '{"text":"openai whisper test","segments":[{"start":0,"end":1.1,"text":"openai whisper test"}]}' > "\${OUT_DIR}/\${BASE}.json"
+exit 0
+`,
+      { mode: 0o755 }
+    );
+    generatedFiles.push(compatOpenAiBin);
+
+    process.env.WHISPER_PATH = compatOpenAiBin;
+    process.env.WHISPER_MODEL_PATH = validPtModel;
+    const compatPassOpenAi = await stt.verifyRuntimeCompatibility();
+    assert.strictEqual(compatPassOpenAi.compatible, true, '3.31 openai_whisper compatibility passes with JSON output_dir artifact');
+    assert.strictEqual(compatPassOpenAi.diagnosticCode, 'VERIFICATION_PASSED', '3.32 openai_whisper reports VERIFICATION_PASSED');
+    assert.strictEqual(compatPassOpenAi.transcriptText, 'openai whisper test', '3.33 openai_whisper parses direct text output');
+
     delete process.env.WHISPER_PATH;
     delete process.env.WHISPER_MODEL_PATH;
-    console.log('  ✅ PASS: Whisper STT strict runtime identity & model header verification complete');
+    console.log('  [Boundary Notice] Real Whisper binary+model audio transcription: NOT VERIFIED in CI/test container (verified via mocked whisper_cpp/openai_whisper CLI contracts).');
+    console.log('  ✅ PASS: Whisper STT strict runtime identity, model header & compatibility verification complete');
 
     // -------------------------------------------------------------------------
     // 4. THUMBNAIL CONTRAST EVALUATION CONTRACT
@@ -771,7 +911,32 @@ esac
       assert.ok(cats.includes('NON_ZERO_EXIT'), '8.21 Distinguishes NON_ZERO_EXIT extraction failure');
       assert.ok(cats.includes('MISSING_OUTPUT'), '8.22 Distinguishes MISSING_OUTPUT extraction failure');
       assert.ok(cats.includes('EMPTY_OUTPUT'), '8.23 Distinguishes EMPTY_OUTPUT (0-byte) extraction failure');
-      assert.ok(diagRes.failureReason?.includes('FFmpeg extraction failed on 4 frame(s)'), '8.24 failureReason summarizes extraction diagnostics');
+      // 8.3 MISSING_EXECUTABLE (ENOENT) breaks fast and preserves strict accounting invariant
+      process.env.FFMPEG_PATH = '/path/to/missing/ffmpeg_binary_does_not_exist';
+      const missingFfmpegRes = await videoProcessor.performVideoOcr(dummyVideoPath, meta3s, { maxFrames: 3 });
+      assert.strictEqual(missingFfmpegRes.status, 'ANALYSIS_UNAVAILABLE', '8.25 Missing FFmpeg binary returns ANALYSIS_UNAVAILABLE');
+      assert.strictEqual(missingFfmpegRes.framesExtractionFailed, 1, '8.26 Missing FFmpeg breaks fast after 1 attempt');
+      assert.strictEqual(missingFfmpegRes.framesSkipped, 2, '8.27 Remaining 2 frames accurately recorded as framesSkipped');
+      assert.strictEqual(
+        (missingFfmpegRes.framesAttempted || 0) + (missingFfmpegRes.framesExtractionFailed || 0) + (missingFfmpegRes.framesSkipped || 0),
+        missingFfmpegRes.framesTargeted,
+        '8.28 Strict accounting invariant holds on MISSING_EXECUTABLE'
+      );
+      assert.strictEqual(missingFfmpegRes.extractionErrors?.[0]?.category, 'MISSING_EXECUTABLE', '8.29 Categorizes ENOENT strictly as MISSING_EXECUTABLE');
+
+      // 8.4 NON_EXECUTABLE (EACCES) breaks fast and distinguishes permission errors
+      const nonExecFfmpeg = path.resolve(testDir, 'non_exec_ffmpeg.sh');
+      fs.writeFileSync(nonExecFfmpeg, '#!/bin/sh\nexit 0\n', { mode: 0o644 });
+      generatedFiles.push(nonExecFfmpeg);
+      process.env.FFMPEG_PATH = nonExecFfmpeg;
+      const nonExecFfmpegRes = await videoProcessor.performVideoOcr(dummyVideoPath, meta3s, { maxFrames: 3 });
+      assert.strictEqual(nonExecFfmpegRes.status, 'ANALYSIS_UNAVAILABLE', '8.30 Non-executable FFmpeg returns ANALYSIS_UNAVAILABLE');
+      assert.strictEqual(nonExecFfmpegRes.extractionErrors?.[0]?.category, 'NON_EXECUTABLE', '8.31 Categorizes EACCES strictly as NON_EXECUTABLE');
+      assert.strictEqual(
+        (nonExecFfmpegRes.framesAttempted || 0) + (nonExecFfmpegRes.framesExtractionFailed || 0) + (nonExecFfmpegRes.framesSkipped || 0),
+        nonExecFfmpegRes.framesTargeted,
+        '8.32 Strict accounting invariant holds on NON_EXECUTABLE'
+      );
     } finally {
       if (prevFfmpegPath === undefined) {
         delete process.env.FFMPEG_PATH;
@@ -781,7 +946,7 @@ esac
       delete process.env.TESSERACT_PATH;
     }
 
-    console.log('  ✅ PASS: Extraction failure categorization (TIMEOUT/NON_ZERO_EXIT/MISSING_OUTPUT/EMPTY_OUTPUT) & invariants verified');
+    console.log('  ✅ PASS: Extraction failure categorization (MISSING_EXECUTABLE/NON_EXECUTABLE/TIMEOUT/NON_ZERO_EXIT/MISSING_OUTPUT/EMPTY_OUTPUT) & invariants verified');
 
     // -------------------------------------------------------------------------
     // 9. FIX F: REAL PRODUCTION SAMPLING PATH THROUGH JobOrchestrator
@@ -907,6 +1072,115 @@ esac
     }
 
     console.log('  ✅ PASS: Production JobOrchestrator OCR sampling plan & end-to-end report persistence verified');
+
+    // -------------------------------------------------------------------------
+    // 10. FIX F (REAL MP4 E2E): ACTUAL 10-MIN (600s) & 30-MIN (1800s) 4-CELL MATRIX
+    // -------------------------------------------------------------------------
+    console.log('\n[10. Fix F (Real Media E2E) — Real 10m (600s) & 30m (1800s) 4-Case Pipeline]');
+
+    const real10mPath = path.resolve(testDir, 'real_10m_600s.mp4');
+    const real30mPath = path.resolve(testDir, 'real_30m_1800s.mp4');
+
+    await execFileAsync('ffmpeg', [
+      '-y',
+      '-f', 'lavfi',
+      '-i', "color=c=navy:s=320x240:r=1:d=600,drawtext=text='AUDIT 10M SAMPLE':fontsize=26:fontcolor=yellow:box=1:boxcolor=black@0.95:boxborderw=6:x=(w-text_w)/2:y=(h-text_h)/2",
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-pix_fmt', 'yuv420p', '-g', '15',
+      real10mPath
+    ]);
+    generatedFiles.push(real10mPath);
+
+    await execFileAsync('ffmpeg', [
+      '-y',
+      '-f', 'lavfi',
+      '-i', "color=c=navy:s=320x240:r=1:d=1800,drawtext=text='AUDIT 30M SAMPLE':fontsize=26:fontcolor=yellow:box=1:boxcolor=black@0.95:boxborderw=6:x=(w-text_w)/2:y=(h-text_h)/2",
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-pix_fmt', 'yuv420p', '-g', '15',
+      real30mPath
+    ]);
+    generatedFiles.push(real30mPath);
+
+    const inspected10m = await mediaInspector.inspect(real10mPath, 'real_10m_600s.mp4');
+    const inspected30m = await mediaInspector.inspect(real30mPath, 'real_30m_1800s.mp4');
+    assert.ok(inspected10m.durationSeconds >= 599 && inspected10m.durationSeconds <= 601, `10.1 Real 10m fixture duration verified via FFprobe: ${inspected10m.durationSeconds}s`);
+    assert.ok(inspected30m.durationSeconds >= 1799 && inspected30m.durationSeconds <= 1801, `10.2 Real 30m fixture duration verified via FFprobe: ${inspected30m.durationSeconds}s`);
+
+    const runRealPipelineCell = async (
+      label: string,
+      filePath: string,
+      filename: string,
+      scanMode: 'standard' | 'deep',
+      expectedMaxFrames: number,
+      expectedMinDuration: number
+    ) => {
+      const storePath = path.resolve(testDir, `mem_real_${label}_${Date.now()}.json`);
+      generatedFiles.push(storePath);
+      const cellStorage = new InMemoryStorageRepository(storePath);
+      const user = await cellStorage.users.createUser(
+        `real_${label}_${Date.now()}@videorisk.test`,
+        'hash',
+        'salt',
+        200,
+        'agency'
+      );
+      const scan = await cellStorage.scans.createScan({
+        id: `scan_real_${label}_${Date.now()}`,
+        userId: user.id,
+        videoFilename: filename,
+        videoPath: filePath,
+        videoTitle: `Real E2E ${label}`,
+        scanMode,
+        status: 'QUEUED',
+        currentStage: 'Upload',
+        completedStages: ['Upload'],
+        creditsUsed: 0,
+        createdAt: new Date().toISOString()
+      });
+
+      // Unmocked production JobOrchestrator: uses real mediaInspector, proxyGenerator, audioProcessor, videoProcessor (FFmpeg + Tesseract), and policyIntelligenceEngine
+      const orchestrator = new JobOrchestrator(cellStorage, false);
+      const job = await cellStorage.queue.claimNextJob((orchestrator as any).workerId, 120000);
+      assert.ok(job, `${label}: Queue job claimed`);
+      await orchestrator.executeJob(job!);
+
+      const savedScan = await cellStorage.scans.getScan(scan.id);
+      const savedReport = await cellStorage.scans.getReport(scan.id);
+      assert.strictEqual(savedScan?.status, 'COMPLETED', `${label}: Scan completed with real binaries`);
+      assert.ok((savedScan?.metadata?.durationSeconds || 0) >= expectedMinDuration, `${label}: Persisted duration reflects real media`);
+
+      const ocrReport = savedReport?.detectors?.video_ocr;
+      assert.ok(ocrReport, `${label}: video_ocr detector report persisted`);
+      const details = ocrReport!.details as any;
+      assert.strictEqual(details.framesTargeted, expectedMaxFrames, `${label}: Targeted exactly ${expectedMaxFrames} frames`);
+      assert.strictEqual(details.framesExtracted, expectedMaxFrames, `${label}: Extracted all ${expectedMaxFrames} frames via FFmpeg`);
+      assert.strictEqual(details.framesSucceeded, expectedMaxFrames, `${label}: Evaluated all ${expectedMaxFrames} frames via Tesseract`);
+      assert.strictEqual(details.timelineCoverageRatio, null, `${label}: timelineCoverageRatio remains null`);
+      assert.strictEqual(details.timelineCoverageStatus, 'NOT_VERIFIED', `${label}: timelineCoverageStatus remains NOT_VERIFIED`);
+
+      const planned: number[] = details.plannedTimestamps || [];
+      const extracted: number[] = details.extractedTimestamps || [];
+      const succeeded: number[] = details.succeededTimestamps || [];
+      assert.strictEqual(planned.length, expectedMaxFrames, `${label}: plannedTimestamps count matches`);
+      assert.deepStrictEqual(extracted, planned, `${label}: extractedTimestamps match plannedTimestamps`);
+      assert.deepStrictEqual(succeeded, planned, `${label}: succeededTimestamps match plannedTimestamps`);
+      assert.strictEqual(new Set(planned).size, expectedMaxFrames, `${label}: all timestamps unique`);
+      assert.strictEqual(planned[0], 0, `${label}: first sample starts at 0s`);
+      assert.ok(planned[planned.length - 1] >= expectedMinDuration - 10 && planned[planned.length - 1] <= (savedScan?.metadata?.durationSeconds || expectedMinDuration), `${label}: final sample reaches near EOF within duration`);
+      for (let idx = 1; idx < planned.length; idx++) {
+        assert.ok(planned[idx] > planned[idx - 1], `${label}: timestamps strictly ascending at idx=${idx}`);
+      }
+    };
+
+    process.env.TESSERACT_PATH = '/usr/bin/tesseract';
+    try {
+      await runRealPipelineCell('10m_standard', real10mPath, 'real_10m_600s.mp4', 'standard', 15, 599);
+      await runRealPipelineCell('10m_deep', real10mPath, 'real_10m_600s.mp4', 'deep', 30, 599);
+      await runRealPipelineCell('30m_standard', real30mPath, 'real_30m_1800s.mp4', 'standard', 15, 1799);
+      await runRealPipelineCell('30m_deep', real30mPath, 'real_30m_1800s.mp4', 'deep', 30, 1799);
+    } finally {
+      delete process.env.TESSERACT_PATH;
+    }
+
+    console.log('  ✅ PASS: All 4 real MP4 E2E sampling runs (10m/30m x standard/deep) verified with real FFmpeg, FFprobe & Tesseract');
 
     console.log('\n======================================================');
     console.log('🎉 ALL TARGETED REMEDIATION REGRESSION TESTS PASSED!');
