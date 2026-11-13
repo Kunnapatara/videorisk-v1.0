@@ -356,7 +356,7 @@ export async function runProductCapabilitiesTests() {
     assert(acousticItems.length > 0, '2. Acoustic audio activity is reported as a measurable observation');
     for (const item of acousticItems) {
       assert(item.confidenceLevel !== 'HIGH', '2. Acoustic activity does not claim HIGH confidence narration');
-      assert(item.confidence <= 0.75, '2. Confidence score reflects unverified speech limitation (<= 0.75)');
+      assert(typeof item.confidence === 'number' && item.confidence <= 0.75, '2. Confidence score reflects unverified speech limitation (<= 0.75)');
       assert(Boolean(item.limitations?.includes('transcript') || item.limitations?.includes('verify speech')), '2. Limitations explicitly state speech is unverified without transcript analysis');
     }
 

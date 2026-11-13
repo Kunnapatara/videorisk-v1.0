@@ -9,6 +9,15 @@ import { policyIntelligenceEngine } from '../intelligence/policyIntelligence';
 import { creditService } from '../services/creditService';
 import { ScanJob, ScanStage, JobStatus, ThumbnailMetadata, JobQueueRecord, FencingError } from '../../types';
 
+export interface JobOrchestratorPipelineDeps {
+  mediaInspector?: Pick<typeof mediaInspector, 'inspect'>;
+  proxyGenerator?: Pick<typeof proxyGenerator, 'generateProxyIfNeeded'>;
+  audioProcessor?: Pick<typeof audioProcessor, 'analyzeAudio'>;
+  videoProcessor?: Pick<typeof videoProcessor, 'analyzeVideo' | 'performVideoOcr' | 'cleanupFrames'>;
+  thumbnailInspector?: Pick<typeof thumbnailInspector, 'inspect'>;
+  policyIntelligenceEngine?: Pick<typeof policyIntelligenceEngine, 'generateEvidenceTimeline' | 'buildReport' | 'generateComparison'>;
+}
+
 export class JobOrchestrator {
   private activeJobs = new Set<string>();
   private workerId = `worker_${process.pid}_${crypto.randomBytes(4).toString('hex')}`;
@@ -18,9 +27,22 @@ export class JobOrchestrator {
   private maxConcurrentJobs = 2;
   private currentRunningCount = 0;
   private storageRepo: IStorageRepository;
+  private deps: Required<JobOrchestratorPipelineDeps>;
 
-  constructor(customStorage?: IStorageRepository, autoStart: boolean = true) {
+  constructor(
+    customStorage?: IStorageRepository,
+    autoStart: boolean = true,
+    pipelineDeps?: JobOrchestratorPipelineDeps
+  ) {
     this.storageRepo = customStorage || storage;
+    this.deps = {
+      mediaInspector: pipelineDeps?.mediaInspector || mediaInspector,
+      proxyGenerator: pipelineDeps?.proxyGenerator || proxyGenerator,
+      audioProcessor: pipelineDeps?.audioProcessor || audioProcessor,
+      videoProcessor: pipelineDeps?.videoProcessor || videoProcessor,
+      thumbnailInspector: pipelineDeps?.thumbnailInspector || thumbnailInspector,
+      policyIntelligenceEngine: pipelineDeps?.policyIntelligenceEngine || policyIntelligenceEngine
+    };
     if (autoStart) {
       this.startWorker();
     }
@@ -261,13 +283,13 @@ export class JobOrchestrator {
       }, leaseToken);
 
       const inspectionStart = Date.now();
-      const metadata = await mediaInspector.inspect(scan.videoPath, scan.videoFilename);
+      const metadata = await this.deps.mediaInspector.inspect(scan.videoPath, scan.videoFilename);
       const inspectionMs = Date.now() - inspectionStart;
 
       // Check proxy requirements for 4K / UHD
       let proxyPath = scan.videoPath;
       if (metadata.isProxyUsed) {
-        proxyPath = await proxyGenerator.generateProxyIfNeeded(scan.videoPath, metadata);
+        proxyPath = await this.deps.proxyGenerator.generateProxyIfNeeded(scan.videoPath, metadata);
       }
 
       checkLease();
@@ -307,7 +329,7 @@ export class JobOrchestrator {
         completedStages: ['Upload', 'Media inspection']
       }, leaseToken);
       const audioStart = Date.now();
-      const audioResult = await audioProcessor.analyzeAudio(proxyPath, metadata);
+      const audioResult = await this.deps.audioProcessor.analyzeAudio(proxyPath, metadata);
       const audioMs = Date.now() - audioStart;
 
       await this.sleep(300);
@@ -320,13 +342,13 @@ export class JobOrchestrator {
         completedStages: ['Upload', 'Media inspection', 'Audio & transcript']
       }, leaseToken);
       const videoStart = Date.now();
-      const videoResult = await videoProcessor.analyzeVideo(proxyPath, metadata, scan.scanMode);
+      const videoResult = await this.deps.videoProcessor.analyzeVideo(proxyPath, metadata, scan.scanMode);
       tempFramesDirToClean = videoResult.tempFramesDir;
 
       // Execute Full-Video OCR (Phase 4.3) on sampled frames if video stream is present
       try {
         // Timeline-wide sampling: do not pass sampleIntervalSeconds so samples distribute across [0, dur]
-        const videoOcr = await videoProcessor.performVideoOcr(proxyPath, metadata, {
+        const videoOcr = await this.deps.videoProcessor.performVideoOcr(proxyPath, metadata, {
           maxFrames: scan.scanMode === 'deep' ? 30 : 15
         });
         videoResult.videoOcr = videoOcr;
@@ -357,7 +379,7 @@ export class JobOrchestrator {
 
       if (thumbnailProvided) {
         try {
-          thumbnailMetadata = await thumbnailInspector.inspect(scan.thumbnailPath!, scan.thumbnailFilename!);
+          thumbnailMetadata = await this.deps.thumbnailInspector.inspect(scan.thumbnailPath!, scan.thumbnailFilename!);
         } catch (thumbErr: any) {
           thumbnailInspectionError = thumbErr?.message || 'Failed to inspect thumbnail image.';
           console.warn('[JobOrchestrator] Thumbnail inspection error:', thumbErr);
@@ -368,7 +390,7 @@ export class JobOrchestrator {
       const channelProfile = await this.storageRepo.channelProfiles.getProfile(scan.userId);
 
       const evidenceStart = Date.now();
-      const timeline = policyIntelligenceEngine.generateEvidenceTimeline({
+      const timeline = this.deps.policyIntelligenceEngine.generateEvidenceTimeline({
         scanId,
         metadata,
         scanMode: scan.scanMode,
@@ -407,7 +429,7 @@ export class JobOrchestrator {
         completedStages: ['Upload', 'Media inspection', 'Audio & transcript', 'Scene analysis', 'Visual evidence', 'Policy analysis']
       }, leaseToken);
       const policyStart = Date.now();
-      const report = policyIntelligenceEngine.buildReport({
+      const report = this.deps.policyIntelligenceEngine.buildReport({
         scanId,
         metadata,
         scanMode: scan.scanMode,
@@ -445,7 +467,7 @@ export class JobOrchestrator {
         const parentReport = await this.storageRepo.scans.getReport(scan.parentScanId);
         const parentScan = await this.storageRepo.scans.getScan(scan.parentScanId);
         if (parentReport) {
-          const comparison = policyIntelligenceEngine.generateComparison(parentReport, report, {
+          const comparison = this.deps.policyIntelligenceEngine.generateComparison(parentReport, report, {
             originalScanRecord: parentScan || undefined,
             revisedScanRecord: { ...scan, metadata },
           });
@@ -473,7 +495,7 @@ export class JobOrchestrator {
     } finally {
       // Clean up temporary extracted frames to prevent disk exhaustion
       if (tempFramesDirToClean) {
-        await videoProcessor.cleanupFrames(tempFramesDirToClean);
+        await this.deps.videoProcessor.cleanupFrames(tempFramesDirToClean);
       }
     }
   }
@@ -489,12 +511,17 @@ export function mapVideoOcrDetectorReport(
   metadata: import('../../types').MediaMetadata,
   scanMode: import('../../types').ScanMode = 'standard'
 ): import('../../types').DetectorReport {
-  // Genuine confidence extraction: strictly 0 when no frames detected or confidence is 0
-  let confidence = 0;
-  if (videoOcr.detectedFrames.length > 0) {
-    const rawConf = videoOcr.detectedFrames[0]?.confidence;
-    confidence = (typeof rawConf === 'number' && Number.isFinite(rawConf)) ? rawConf : 0;
-  }
+  // 3-state confidence handling:
+  // 1) genuine 0 preserved strictly as 0
+  // 2) genuine > 0 preserved (mean across frames with valid confidence)
+  // 3) missing/empty/null confidence preserved as undefined (never fabricated or coerced to 0)
+  const validConfidences = videoOcr.detectedFrames
+    .map(f => f?.confidence)
+    .filter((c): c is number => typeof c === 'number' && Number.isFinite(c));
+
+  const confidence: number | undefined = validConfidences.length > 0
+    ? parseFloat((validConfidences.reduce((sum, c) => sum + c, 0) / validConfidences.length).toFixed(3))
+    : undefined;
 
   const framesTargeted = videoOcr.framesTargeted ?? videoOcr.totalCandidateFrames;
   const framesExtracted = videoOcr.framesExtracted ?? videoOcr.framesInspected;
@@ -502,6 +529,16 @@ export function mapVideoOcrDetectorReport(
   const framesSucceeded = videoOcr.framesSucceeded ?? videoOcr.framesInspected;
   const framesFailed = videoOcr.framesFailed ?? 0;
   const framesSkipped = videoOcr.framesSkipped ?? 0;
+  const samplingCoverageRatio = videoOcr.samplingCoverageRatio !== undefined
+    ? videoOcr.samplingCoverageRatio
+    : (videoOcr.coverageRatio ?? null);
+  const ocrExecutionSuccessRatio = videoOcr.ocrExecutionSuccessRatio !== undefined
+    ? videoOcr.ocrExecutionSuccessRatio
+    : null;
+  const timelineCoverageStatus = videoOcr.timelineCoverageStatus ?? 'NOT_VERIFIED';
+  const timelineCoverageRatio = videoOcr.timelineCoverageRatio !== undefined
+    ? videoOcr.timelineCoverageRatio
+    : null;
 
   return {
     detectorName: 'full_video_ocr_adapter',
@@ -518,9 +555,9 @@ export function mapVideoOcrDetectorReport(
       method: 'deterministic_timeline_sampling_and_tsv_parser'
     },
     coverage: {
-      expectedScope: `Full video timeline (${Math.round(metadata.durationSeconds)}s, up to ${scanMode === 'deep' ? 30 : 15} frames)`,
-      inspectedScope: `${videoOcr.framesInspected} frames successfully assessed`,
-      coverageRatio: videoOcr.coverageRatio,
+      expectedScope: `Full video timeline (${Math.round(metadata.durationSeconds)}s, up to ${scanMode === 'deep' ? 30 : 15} discrete samples)`,
+      inspectedScope: `${videoOcr.framesInspected} discrete timestamps assessed (temporal interval coverage: ${timelineCoverageStatus})`,
+      coverageRatio: typeof samplingCoverageRatio === 'number' ? samplingCoverageRatio : videoOcr.coverageRatio,
       partialReason: videoOcr.isPartial ? (videoOcr.failureReason ?? 'Partial sampling bounds reached') : undefined,
       limitsReached: videoOcr.isPartial ? ['FRAME_BUDGET_OR_TIMEOUT'] : []
     },
@@ -535,9 +572,14 @@ export function mapVideoOcrDetectorReport(
       framesFailed,
       framesOcrFailed: videoOcr.framesOcrFailed ?? framesFailed,
       framesSkipped,
-      timelineCoverageRatio: videoOcr.timelineCoverageRatio ?? videoOcr.coverageRatio,
-      samplingCoverageRatio: videoOcr.samplingCoverageRatio ?? videoOcr.coverageRatio,
-      ocrExecutionSuccessRatio: videoOcr.ocrExecutionSuccessRatio ?? 0,
+      plannedTimestamps: videoOcr.plannedTimestamps ?? [],
+      extractedTimestamps: videoOcr.extractedTimestamps ?? [],
+      succeededTimestamps: videoOcr.succeededTimestamps ?? [],
+      extractionErrors: videoOcr.extractionErrors ?? [],
+      timelineCoverageStatus,
+      timelineCoverageRatio,
+      samplingCoverageRatio,
+      ocrExecutionSuccessRatio,
       framesInspected: videoOcr.framesInspected,
       totalCandidateFrames: videoOcr.totalCandidateFrames,
       coverageRatio: videoOcr.coverageRatio,

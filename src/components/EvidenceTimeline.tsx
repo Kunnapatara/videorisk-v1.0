@@ -140,7 +140,9 @@ export const EvidenceTimeline: React.FC<EvidenceTimelineProps> = ({
                   Segment: {selectedItem.timestampLabel}
                 </span>
                 <span className="text-xs text-stone-500">
-                  Confidence: {Math.round(selectedItem.confidence * 100)}%
+                  Confidence: {typeof selectedItem.confidence === 'number' && Number.isFinite(selectedItem.confidence)
+                    ? `${Math.round(selectedItem.confidence * 100)}%`
+                    : 'Unavailable'}
                 </span>
               </div>
 

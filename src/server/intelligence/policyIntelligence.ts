@@ -126,7 +126,7 @@ export class PolicyIntelligenceEngine {
       type: string;
       category: EvidenceItem['category'];
       severity: EvidenceItem['severity'];
-      confidence: number;
+      confidence?: number | null;
       confidenceLevel: ConfidenceLevel;
       uncertaintyReason?: UncertaintyReason;
       evidenceStatus?: EvidenceItem['evidenceStatus'];
@@ -350,6 +350,9 @@ export class PolicyIntelligenceEngine {
     // Full-Video On-Screen OCR Text Detection Integration (Phase 4.3 & Phase 5)
     if (videoResult.videoOcr && videoResult.videoOcr.status === 'DETECTED' && videoResult.videoOcr.detectedFrames && videoResult.videoOcr.detectedFrames.length > 0) {
       for (const ocrFrame of videoResult.videoOcr.detectedFrames) {
+        const hasValidConf = typeof ocrFrame.confidence === 'number' && Number.isFinite(ocrFrame.confidence);
+        const frameConf = hasValidConf ? ocrFrame.confidence! : null;
+        const confText = hasValidConf ? `${Math.round(frameConf! * 100)}%` : 'unavailable';
         addItem({
           domain: 'video_audio',
           start: ocrFrame.timestamp,
@@ -358,14 +361,14 @@ export class PolicyIntelligenceEngine {
           type: 'video_text_overlay',
           category: 'metadata_coherence',
           severity: 'info',
-          confidence: ocrFrame.confidence,
-          confidenceLevel: ocrFrame.confidence >= 0.8 ? 'HIGH' : ocrFrame.confidence >= 0.5 ? 'MEDIUM' : 'LOW',
-          uncertaintyReason: 'NONE',
+          confidence: frameConf,
+          confidenceLevel: !hasValidConf ? 'UNKNOWN' : frameConf! >= 0.8 ? 'HIGH' : frameConf! >= 0.5 ? 'MEDIUM' : 'LOW',
+          uncertaintyReason: hasValidConf ? 'NONE' : 'AMBIGUOUS_CONTEXT',
           evidenceStatus: 'VERIFIED',
           provenance: 'tesseract_ocr:full_video_frame',
           source: 'video_frame_ocr',
           label: 'ℹ️ On-Screen Visual Text Detected',
-          details: `Text detected on video frame at ${this.formatTimestamp(ocrFrame.timestamp)}: "${ocrFrame.text.substring(0, 80)}${ocrFrame.text.length > 80 ? '...' : ''}" (Confidence: ${Math.round(ocrFrame.confidence * 100)}%).`,
+          details: `Text detected on video frame at ${this.formatTimestamp(ocrFrame.timestamp)}: "${ocrFrame.text.substring(0, 80)}${ocrFrame.text.length > 80 ? '...' : ''}" (Confidence: ${confText}).`,
           contextualInterpretation: 'On-screen visual text provides viewer context, tutorial steps, or subtitle annotations.',
           limitations: videoResult.videoOcr.limitations,
           recommendedAction: 'Ensure on-screen visual text accurately reflects video content and creator intent.'
@@ -380,8 +383,8 @@ export class PolicyIntelligenceEngine {
         type: 'video_ocr_partial_or_failed',
         category: 'metadata_coherence',
         severity: 'info',
-        confidence: 0.85,
-        confidenceLevel: 'MEDIUM',
+        confidence: null,
+        confidenceLevel: 'UNKNOWN',
         uncertaintyReason: videoResult.videoOcr.executionStatus === 'FAILED' ? 'ANALYZER_UNAVAILABLE' : 'INSUFFICIENT_EVIDENCE',
         evidenceStatus: 'OBSERVED',
         provenance: 'tesseract_ocr:pipeline_supervisor',

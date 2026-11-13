@@ -544,10 +544,14 @@ export async function runComprehensiveDefectAndPipelineTests() {
 
     const sttAdapter = new SpeechTranscriptionAdapter();
 
+    // Helper generating a controlled openai-whisper CLI mock script
+    const makeMockWhisperScript = (body: string) =>
+      `#!/bin/sh\nif [ "$1" = "--help" ] || [ "$1" = "--version" ]; then\n  echo "usage: whisper [-h] [--model MODEL] [--output_format {txt,vtt,srt,tsv,json,all}]"\n  exit 0\nfi\n${body}\n`;
+
     // 4.1 Plain text output WITHOUT timestamps (MUST NOT fabricate [0, duration] segment)
     // Create mock script that outputs plain text
     const mockPlainTextScript = path.resolve(testDir, 'mock_stt_plaintext.sh');
-    fs.writeFileSync(mockPlainTextScript, '#!/bin/sh\necho "Hello this is a plain text transcript without timestamps"\n');
+    fs.writeFileSync(mockPlainTextScript, makeMockWhisperScript('echo "Hello this is a plain text transcript without timestamps"'));
     fs.chmodSync(mockPlainTextScript, 0o755);
 
     const prevStt = process.env.WHISPER_PATH;
@@ -571,7 +575,7 @@ export async function runComprehensiveDefectAndPipelineTests() {
         { start: 3.0, end: 5.5, text: "Second point." }
       ]
     });
-    fs.writeFileSync(mockValidJsonScript, `#!/bin/sh\ncat << 'EOF'\n${validJsonOutput}\nEOF\n`);
+    fs.writeFileSync(mockValidJsonScript, makeMockWhisperScript(`cat << 'EOF'\n${validJsonOutput}\nEOF`));
     fs.chmodSync(mockValidJsonScript, 0o755);
 
     process.env.WHISPER_PATH = mockValidJsonScript;
@@ -587,7 +591,7 @@ export async function runComprehensiveDefectAndPipelineTests() {
 
     // 4.3 Malformed JSON output
     const mockMalformedJsonScript = path.resolve(testDir, 'mock_stt_malformed.sh');
-    fs.writeFileSync(mockMalformedJsonScript, '#!/bin/sh\necho "{\\"text\\": incomplete json corrupt"\n');
+    fs.writeFileSync(mockMalformedJsonScript, makeMockWhisperScript('echo "{\\"text\\": incomplete json corrupt"'));
     fs.chmodSync(mockMalformedJsonScript, 0o755);
 
     process.env.WHISPER_PATH = mockMalformedJsonScript;
@@ -610,7 +614,7 @@ export async function runComprehensiveDefectAndPipelineTests() {
         { start: 4.0, end: 7.0, text: "Valid middle segment" }
       ]
     });
-    fs.writeFileSync(mockCorruptTimestampsScript, `#!/bin/sh\ncat << 'EOF'\n${corruptJsonOutput}\nEOF\n`);
+    fs.writeFileSync(mockCorruptTimestampsScript, makeMockWhisperScript(`cat << 'EOF'\n${corruptJsonOutput}\nEOF`));
     fs.chmodSync(mockCorruptTimestampsScript, 0o755);
 
     process.env.WHISPER_PATH = mockCorruptTimestampsScript;
@@ -625,7 +629,7 @@ export async function runComprehensiveDefectAndPipelineTests() {
 
     // 4.5 Empty output fails closed to INSUFFICIENT_EVIDENCE (must NOT report NO_SIGNAL_DETECTED)
     const mockEmptyScript = path.resolve(testDir, 'mock_stt_empty.sh');
-    fs.writeFileSync(mockEmptyScript, '#!/bin/sh\nexit 0\n');
+    fs.writeFileSync(mockEmptyScript, makeMockWhisperScript('exit 0'));
     fs.chmodSync(mockEmptyScript, 0o755);
 
     process.env.WHISPER_PATH = mockEmptyScript;
@@ -650,7 +654,7 @@ export async function runComprehensiveDefectAndPipelineTests() {
 
     // 4.7 Missing both text and segments fields in JSON fails closed
     const mockMissingFieldsScript = path.resolve(testDir, 'mock_stt_missing_fields.sh');
-    fs.writeFileSync(mockMissingFieldsScript, '#!/bin/sh\necho \'{"status": "ok", "duration": 10}\'\n');
+    fs.writeFileSync(mockMissingFieldsScript, makeMockWhisperScript('echo \'{"status": "ok", "duration": 10}\''));
     fs.chmodSync(mockMissingFieldsScript, 0o755);
     process.env.WHISPER_PATH = mockMissingFieldsScript;
     try {
@@ -663,7 +667,7 @@ export async function runComprehensiveDefectAndPipelineTests() {
 
     // 4.8 Explicit confirmed negative detection {"text": "", "segments": []}
     const mockExplicitNegativeScript = path.resolve(testDir, 'mock_stt_explicit_negative.sh');
-    fs.writeFileSync(mockExplicitNegativeScript, '#!/bin/sh\necho \'{"text": "", "segments": []}\'\n');
+    fs.writeFileSync(mockExplicitNegativeScript, makeMockWhisperScript('echo \'{"text": "", "segments": []}\''));
     fs.chmodSync(mockExplicitNegativeScript, 0o755);
     process.env.WHISPER_PATH = mockExplicitNegativeScript;
     try {
@@ -676,7 +680,7 @@ export async function runComprehensiveDefectAndPipelineTests() {
 
     // 4.9 Process error non-zero exit code fails closed
     const mockSttErrorScript = path.resolve(testDir, 'mock_stt_error.sh');
-    fs.writeFileSync(mockSttErrorScript, '#!/bin/sh\necho "STT engine crashed" >&2\nexit 1\n');
+    fs.writeFileSync(mockSttErrorScript, makeMockWhisperScript('echo "STT engine crashed" >&2\nexit 1'));
     fs.chmodSync(mockSttErrorScript, 0o755);
     process.env.WHISPER_PATH = mockSttErrorScript;
     try {
@@ -689,7 +693,7 @@ export async function runComprehensiveDefectAndPipelineTests() {
 
     // 4.10 All segment timestamps invalid with no transcript text
     const mockAllInvalidTsScript = path.resolve(testDir, 'mock_stt_all_invalid_ts.sh');
-    fs.writeFileSync(mockAllInvalidTsScript, '#!/bin/sh\necho \'{"text": "", "segments": [{"start": -10, "end": -5, "text": "bad"}]}\'\n');
+    fs.writeFileSync(mockAllInvalidTsScript, makeMockWhisperScript('echo \'{"text": "", "segments": [{"start": -10, "end": -5, "text": "bad"}]}\''));
     fs.chmodSync(mockAllInvalidTsScript, 0o755);
     process.env.WHISPER_PATH = mockAllInvalidTsScript;
     try {
@@ -1734,7 +1738,7 @@ export async function runComprehensiveDefectAndPipelineTests() {
 
     // 11.1 Task 2: STT plain text output vs hasVoiceover & hasTimestampedVoiceover
     const mockSec11PlainTextScript = path.resolve(testDir, 'mock_stt_sec11_plain_text.sh');
-    fs.writeFileSync(mockSec11PlainTextScript, '#!/bin/sh\necho "Hello and welcome to my original commentary on this topic."\n');
+    fs.writeFileSync(mockSec11PlainTextScript, `#!/bin/sh\nif [ "$1" = "--help" ] || [ "$1" = "--version" ]; then\n  echo "usage: whisper [-h] [--model MODEL] [--output_format {txt,vtt,srt,tsv,json,all}]"\n  exit 0\nfi\necho "Hello and welcome to my original commentary on this topic."\n`);
     fs.chmodSync(mockSec11PlainTextScript, 0o755);
 
     const prevSttPath = process.env.WHISPER_PATH;

@@ -111,10 +111,51 @@ export function calculateOcrSamplingTimestamps(
   return candidateTimestamps.sort((a, b) => a - b);
 }
 
+export const CANONICAL_TESSERACT_TSV_COLUMNS = [
+  'level',
+  'page_num',
+  'block_num',
+  'par_num',
+  'line_num',
+  'word_num',
+  'left',
+  'top',
+  'width',
+  'height',
+  'conf',
+  'text'
+] as const;
+
+function parseStrictNonNegativeInt(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return null;
+  }
+  const n = Number(trimmed);
+  if (!Number.isSafeInteger(n) || n < 0) {
+    return null;
+  }
+  return n;
+}
+
+function parseStrictFloat(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!/^-?\d+(?:\.\d+)?$/.test(trimmed)) {
+    return null;
+  }
+  const n = Number(trimmed);
+  if (!Number.isFinite(n)) {
+    return null;
+  }
+  return n;
+}
+
 /**
- * Validates Tesseract TSV output structure before accepting OCR results.
- * Verifies standard header format, exact column count per row, numeric bounding boxes,
- * valid confidences in range [-1, 100], and rejects header-only TSV files.
+ * Validates Tesseract TSV output structure strictly before accepting OCR results.
+ * Verifies exact canonical 12-column header order, exact column count (=== 12) per row,
+ * hierarchy level (1..5), strict non-negative integer page/block/par/line/word & geometry fields
+ * (rejecting trailing junk like '10abc' and decimals), valid numeric confidence in [-1, 100],
+ * and rejects header-only TSV output.
  */
 export function validateTesseractTsv(stdout: string): {
   isValid: boolean;
@@ -124,19 +165,35 @@ export function validateTesseractTsv(stdout: string): {
   totalConf: number;
   wordCount: number;
 } {
-  // Split by newlines without stripping trailing tabs
+  // Split by newlines without stripping trailing tabs so trailing empty text columns retain 12 fields
   const lines = stdout.split(/\r?\n/).filter(l => l.length > 0);
   if (lines.length === 0) {
     return { isValid: false, error: 'Empty TSV output from Tesseract', boundingBoxes: [], words: [], totalConf: 0, wordCount: 0 };
   }
 
   const header = lines[0].split('\t').map(h => h.trim().toLowerCase());
-  // Standard expected columns: level, page_num, block_num, par_num, line_num, word_num, left, top, width, height, conf, text
-  const requiredColumns = ['level', 'left', 'top', 'width', 'height', 'conf', 'text'];
-  const hasRequiredHeaders = requiredColumns.every(col => header.includes(col));
+  if (header.length !== CANONICAL_TESSERACT_TSV_COLUMNS.length) {
+    return {
+      isValid: false,
+      error: `Malformed TSV header: expected exact ${CANONICAL_TESSERACT_TSV_COLUMNS.length} canonical columns, found ${header.length}`,
+      boundingBoxes: [],
+      words: [],
+      totalConf: 0,
+      wordCount: 0
+    };
+  }
 
-  if (!hasRequiredHeaders) {
-    return { isValid: false, error: 'Malformed TSV header: missing required columns', boundingBoxes: [], words: [], totalConf: 0, wordCount: 0 };
+  for (let i = 0; i < CANONICAL_TESSERACT_TSV_COLUMNS.length; i++) {
+    if (header[i] !== CANONICAL_TESSERACT_TSV_COLUMNS[i]) {
+      return {
+        isValid: false,
+        error: `Malformed TSV header at column ${i + 1}: expected '${CANONICAL_TESSERACT_TSV_COLUMNS[i]}', found '${header[i]}'`,
+        boundingBoxes: [],
+        words: [],
+        totalConf: 0,
+        wordCount: 0
+      };
+    }
   }
 
   // Reject header-only TSV (no data rows)
@@ -145,14 +202,6 @@ export function validateTesseractTsv(stdout: string): {
     return { isValid: false, error: 'Header-only TSV output: missing data lines (contains no data rows)', boundingBoxes: [], words: [], totalConf: 0, wordCount: 0 };
   }
 
-  const levelIdx = header.indexOf('level');
-  const leftIdx = header.indexOf('left');
-  const topIdx = header.indexOf('top');
-  const widthIdx = header.indexOf('width');
-  const heightIdx = header.indexOf('height');
-  const confIdx = header.indexOf('conf');
-  const textIdx = header.indexOf('text');
-
   const boundingBoxes: import('../../types').OcrBoundingBox[] = [];
   const words: string[] = [];
   let totalConf = 0;
@@ -160,15 +209,12 @@ export function validateTesseractTsv(stdout: string): {
 
   for (let l = 0; l < dataLines.length; l++) {
     const rawLine = dataLines[l];
-    let parts = rawLine.split('\t');
-    // If the trailing text column is empty, parts.length might be header.length - 1 if trailing tab was omitted
-    if (parts.length === header.length - 1 && textIdx === header.length - 1) {
-      parts.push('');
-    }
-    if (parts.length < header.length) {
+    const parts = rawLine.split('\t');
+
+    if (parts.length !== CANONICAL_TESSERACT_TSV_COLUMNS.length) {
       return {
         isValid: false,
-        error: `Malformed TSV row at line ${l + 2}: expected ${header.length} columns, found ${parts.length}`,
+        error: `Malformed TSV row at line ${l + 2}: expected exact ${CANONICAL_TESSERACT_TSV_COLUMNS.length} columns, found ${parts.length}`,
         boundingBoxes: [],
         words: [],
         totalConf: 0,
@@ -176,12 +222,12 @@ export function validateTesseractTsv(stdout: string): {
       };
     }
 
-    // Validate level is numeric
-    const level = parseInt(parts[levelIdx], 10);
-    if (!Number.isFinite(level) || level < 1) {
+    // Columns 0..5: level (1..5), page_num (>= 1), block_num, par_num, line_num, word_num (all strict ints)
+    const level = parseStrictNonNegativeInt(parts[0]);
+    if (level === null || level < 1 || level > 5) {
       return {
         isValid: false,
-        error: `Malformed TSV row at line ${l + 2}: invalid level field '${parts[levelIdx]}'`,
+        error: `Malformed TSV row at line ${l + 2}: invalid hierarchy level '${parts[0]}' (expected integer 1..5)`,
         boundingBoxes: [],
         words: [],
         totalConf: 0,
@@ -189,16 +235,18 @@ export function validateTesseractTsv(stdout: string): {
       };
     }
 
-    // Validate geometry fields are numeric non-negative integers
-    const left = parseInt(parts[leftIdx], 10);
-    const top = parseInt(parts[topIdx], 10);
-    const w = parseInt(parts[widthIdx], 10);
-    const h = parseInt(parts[heightIdx], 10);
-    if (!Number.isFinite(left) || left < 0 || !Number.isFinite(top) || top < 0 ||
-        !Number.isFinite(w) || w < 0 || !Number.isFinite(h) || h < 0) {
+    const pageNum = parseStrictNonNegativeInt(parts[1]);
+    const blockNum = parseStrictNonNegativeInt(parts[2]);
+    const parNum = parseStrictNonNegativeInt(parts[3]);
+    const lineNum = parseStrictNonNegativeInt(parts[4]);
+    const wordNum = parseStrictNonNegativeInt(parts[5]);
+    if (
+      pageNum === null || pageNum < 1 ||
+      blockNum === null || parNum === null || lineNum === null || wordNum === null
+    ) {
       return {
         isValid: false,
-        error: `Malformed TSV row at line ${l + 2}: non-numeric or negative geometry (${parts[leftIdx]}, ${parts[topIdx]}, ${parts[widthIdx]}, ${parts[heightIdx]})`,
+        error: `Malformed TSV row at line ${l + 2}: invalid hierarchy index field(s)`,
         boundingBoxes: [],
         words: [],
         totalConf: 0,
@@ -206,12 +254,15 @@ export function validateTesseractTsv(stdout: string): {
       };
     }
 
-    // Validate confidence is a valid number between -1 and 100
-    const conf = parseFloat(parts[confIdx]);
-    if (!Number.isFinite(conf) || conf < -1 || conf > 100) {
+    // Columns 6..9: geometry fields must be strict non-negative integers (no decimals or trailing characters)
+    const left = parseStrictNonNegativeInt(parts[6]);
+    const top = parseStrictNonNegativeInt(parts[7]);
+    const w = parseStrictNonNegativeInt(parts[8]);
+    const h = parseStrictNonNegativeInt(parts[9]);
+    if (left === null || top === null || w === null || h === null) {
       return {
         isValid: false,
-        error: `Malformed TSV row at line ${l + 2}: invalid confidence value '${parts[confIdx]}'`,
+        error: `Malformed TSV row at line ${l + 2}: non-integer or negative geometry (${parts[6]}, ${parts[7]}, ${parts[8]}, ${parts[9]})`,
         boundingBoxes: [],
         words: [],
         totalConf: 0,
@@ -219,7 +270,20 @@ export function validateTesseractTsv(stdout: string): {
       };
     }
 
-    const wText = parts[textIdx]?.trim() || '';
+    // Column 10: confidence must be a strict full-string number in [-1, 100]
+    const conf = parseStrictFloat(parts[10]);
+    if (conf === null || conf < -1 || conf > 100) {
+      return {
+        isValid: false,
+        error: `Malformed TSV row at line ${l + 2}: invalid confidence value '${parts[10]}'`,
+        boundingBoxes: [],
+        words: [],
+        totalConf: 0,
+        wordCount: 0
+      };
+    }
+
+    const wText = parts[11]?.trim() || '';
     if (wText.length > 0 && conf >= 0) {
       words.push(wText);
       totalConf += conf;
@@ -1117,6 +1181,7 @@ export class VideoProcessor {
       timeoutMs?: number;
       languages?: string;
       timestamps?: number[];
+      perFrameTimeoutMs?: number;
     }
   ): Promise<import('../../types').VideoOcrResult> {
     const startTime = Date.now();
@@ -1128,6 +1193,13 @@ export class VideoProcessor {
         framesInspected: 0,
         totalCandidateFrames: 0,
         coverageRatio: 0,
+        timelineCoverageStatus: 'NOT_VERIFIED',
+        timelineCoverageRatio: null,
+        samplingCoverageRatio: null,
+        ocrExecutionSuccessRatio: null,
+        plannedTimestamps: [],
+        extractedTimestamps: [],
+        succeededTimestamps: [],
         limitations: 'Video file does not exist on disk.',
         failureReason: `Video media file not found at ${path.basename(videoPath)}`,
         executionDurationMs: 0,
@@ -1142,6 +1214,13 @@ export class VideoProcessor {
         framesInspected: 0,
         totalCandidateFrames: 0,
         coverageRatio: 0,
+        timelineCoverageStatus: 'NOT_VERIFIED',
+        timelineCoverageRatio: null,
+        samplingCoverageRatio: null,
+        ocrExecutionSuccessRatio: null,
+        plannedTimestamps: [],
+        extractedTimestamps: [],
+        succeededTimestamps: [],
         limitations: 'Container does not contain an active visual video stream.',
         executionDurationMs: 0,
         detectedFrames: [],
@@ -1160,6 +1239,13 @@ export class VideoProcessor {
         framesInspected: 0,
         totalCandidateFrames: 0,
         coverageRatio: 0,
+        timelineCoverageStatus: 'NOT_VERIFIED',
+        timelineCoverageRatio: null,
+        samplingCoverageRatio: null,
+        ocrExecutionSuccessRatio: null,
+        plannedTimestamps: [],
+        extractedTimestamps: [],
+        succeededTimestamps: [],
         limitations: 'OCR engine path configured but executable is missing on disk.',
         failureReason: `Configured TESSERACT_PATH not found at ${tesseractPath}`,
         executionDurationMs: Date.now() - startTime,
@@ -1174,6 +1260,13 @@ export class VideoProcessor {
         framesInspected: 0,
         totalCandidateFrames: 0,
         coverageRatio: 0,
+        timelineCoverageStatus: 'NOT_VERIFIED',
+        timelineCoverageRatio: null,
+        samplingCoverageRatio: null,
+        ocrExecutionSuccessRatio: null,
+        plannedTimestamps: [],
+        extractedTimestamps: [],
+        succeededTimestamps: [],
         limitations: 'Local visual OCR engine (TESSERACT_PATH) not configured or installed. Full-video on-screen text overlays are not assessed.',
         executionDurationMs: 0,
         detectedFrames: [],
@@ -1184,7 +1277,9 @@ export class VideoProcessor {
     // Bounded configuration limits
     const maxFrames = Math.max(1, Math.min(60, options?.maxFrames || 15));
     const timeoutMs = options?.timeoutMs || 45000;
+    const perFrameTimeoutMs = options?.perFrameTimeoutMs || 10000;
     const langs = options?.languages || 'eng+tha';
+    const ffmpegBin = process.env.FFMPEG_PATH || 'ffmpeg';
 
     // Calculate candidate timestamps distributed deterministically across the entire duration [0, dur]
     const candidateTimestamps = (options?.timestamps && options.timestamps.length > 0)
@@ -1196,18 +1291,27 @@ export class VideoProcessor {
     const uniqueOcrDir = `video_ocr_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
     const tempOcrDir = path.resolve(process.cwd(), 'uploads', 'ocr_frames', uniqueOcrDir);
 
+    const MAX_DIAGNOSTIC_ERRORS = 10;
+    const extractionErrors: import('../../types').ExtractionFailureDiagnostic[] = [];
+    const sanitizeReason = (raw: string): string =>
+      raw
+        .replace(/\/[^\s:'"]+\//g, '[path]/')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 160);
+
     try {
       if (!fs.existsSync(tempOcrDir)) {
         fs.mkdirSync(tempOcrDir, { recursive: true });
       }
 
-      // Extract candidate frames to disk via FFmpeg
+      // Extract candidate frames to disk via FFmpeg with categorized failure diagnostics
       const extractedFrames: Array<{ timestamp: number; index: number; filePath: string }> = [];
       let extractionTimeouts = false;
       let framesExtractionFailed = 0;
 
       for (let i = 0; i < candidateTimestamps.length; i++) {
-        // Enforce overall processing timeout
+        // Enforce overall processing timeout before launching next extraction
         if (Date.now() - startTime >= timeoutMs) {
           extractionTimeouts = true;
           break;
@@ -1218,39 +1322,104 @@ export class VideoProcessor {
         const outPath = path.join(tempOcrDir, outName);
 
         try {
-          await execFileAsync('ffmpeg', [
+          await execFileAsync(ffmpegBin, [
             '-y',
             '-ss', String(ts),
             '-i', videoPath,
             '-vframes', '1',
             '-vf', 'scale=640:-2', // Standardize frame resolution for bounded OCR processing
             outPath
-          ], { timeout: 10000 });
+          ], { timeout: perFrameTimeoutMs });
 
-          if (fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
-            extractedFrames.push({ timestamp: ts, index: i, filePath: outPath });
-          } else {
+          if (!fs.existsSync(outPath)) {
             framesExtractionFailed++;
+            if (extractionErrors.length < MAX_DIAGNOSTIC_ERRORS) {
+              extractionErrors.push({
+                frameIndex: i,
+                timestamp: ts,
+                category: 'MISSING_OUTPUT',
+                reason: `FFmpeg exited cleanly at ${ts}s without producing output image file.`
+              });
+            }
+          } else {
+            const stat = fs.statSync(outPath);
+            if (stat.size <= 0) {
+              framesExtractionFailed++;
+              if (extractionErrors.length < MAX_DIAGNOSTIC_ERRORS) {
+                extractionErrors.push({
+                  frameIndex: i,
+                  timestamp: ts,
+                  category: 'EMPTY_OUTPUT',
+                  reason: `FFmpeg produced empty 0-byte frame image at ${ts}s.`
+                });
+              }
+            } else {
+              extractedFrames.push({ timestamp: ts, index: i, filePath: outPath });
+            }
           }
-        } catch {
+        } catch (extErr: any) {
           framesExtractionFailed++;
+          const isTimeout = Boolean(
+            extErr?.killed === true ||
+            extErr?.signal === 'SIGTERM' ||
+            extErr?.code === 'ETIMEDOUT' ||
+            /timed?\s*out/i.test(String(extErr?.message || ''))
+          );
+          const exitCode = typeof extErr?.code === 'number' ? extErr.code : null;
+          const category: import('../../types').ExtractionFailureDiagnostic['category'] = isTimeout
+            ? 'TIMEOUT'
+            : exitCode !== null
+              ? 'NON_ZERO_EXIT'
+              : 'UNKNOWN_ERROR';
+
+          const stderrLine = String(extErr?.stderr || extErr?.message || 'FFmpeg extraction failed')
+            .split(/\r?\n/)
+            .filter(Boolean)
+            .slice(-2)
+            .join(' | ');
+          const rawReason = isTimeout
+            ? `Frame extraction timed out at ${ts}s.`
+            : exitCode !== null
+              ? `FFmpeg exited with code ${exitCode} at ${ts}s: ${stderrLine}`
+              : `Frame extraction error at ${ts}s: ${stderrLine}`;
+
+          if (extractionErrors.length < MAX_DIAGNOSTIC_ERRORS) {
+            extractionErrors.push({
+              frameIndex: i,
+              timestamp: ts,
+              category,
+              reason: sanitizeReason(rawReason)
+            });
+          }
         }
       }
 
       const framesExtracted = extractedFrames.length;
-      const plannedExtractionAttempts = extractionTimeouts ? extractedFrames.length + framesExtractionFailed : totalCandidateFrames;
+      const extractedTimestamps = extractedFrames.map(f => f.timestamp);
+      const plannedExtractionAttempts = extractionTimeouts ? framesExtracted + framesExtractionFailed : totalCandidateFrames;
       const extractionSkipped = Math.max(0, totalCandidateFrames - plannedExtractionAttempts);
+      const samplingCoverageRatio = framesTargeted > 0
+        ? parseFloat((framesExtracted / framesTargeted).toFixed(3))
+        : null;
 
       if (framesExtracted === 0) {
+        const errorSummary = extractionErrors.length > 0
+          ? extractionErrors.slice(0, 3).map(e => `[${e.category}] ${e.reason}`).join('; ')
+          : '';
         return {
           status: 'ANALYSIS_UNAVAILABLE',
           executionStatus: 'UNAVAILABLE',
           framesInspected: 0,
           totalCandidateFrames,
           coverageRatio: 0,
-          timelineCoverageRatio: 0,
-          samplingCoverageRatio: 0,
-          ocrExecutionSuccessRatio: 0,
+          timelineCoverageStatus: 'NOT_VERIFIED',
+          timelineCoverageRatio: null,
+          samplingCoverageRatio,
+          ocrExecutionSuccessRatio: null,
+          plannedTimestamps: candidateTimestamps,
+          extractedTimestamps: [],
+          succeededTimestamps: [],
+          extractionErrors: extractionErrors.length > 0 ? extractionErrors : undefined,
           framesTargeted,
           framesExtracted: 0,
           framesExtractionFailed,
@@ -1260,8 +1429,8 @@ export class VideoProcessor {
           framesOcrFailed: 0,
           framesSkipped: extractionSkipped,
           isPartial: true,
-          limitations: 'Failed to extract video frames for OCR analysis.',
-          failureReason: `FFmpeg frame extraction yielded 0 readable candidate frames (${framesExtractionFailed} attempt(s) failed).`,
+          limitations: 'Failed to extract video frames for OCR analysis; continuous temporal interval coverage not verified.',
+          failureReason: `FFmpeg frame extraction yielded 0 readable candidate frames (${framesExtractionFailed} attempt(s) failed)${errorSummary ? `: ${errorSummary}` : '.'}`,
           executionDurationMs: Date.now() - startTime,
           detectedFrames: [],
           allExtractedText: []
@@ -1290,11 +1459,13 @@ export class VideoProcessor {
         try {
           const { stdout } = await execFileAsync(executable, [ef.filePath, 'stdout', '-l', langs, 'tsv'], { timeout: 15000 });
 
-          // Strict TSV structural validation: verify header, columns, rows, geometry, and confidence
+          // Strict TSV structural validation: verify exact canonical header, exact row columns, hierarchy, geometry, and confidence
           const tsvValidation = validateTesseractTsv(stdout || '');
           if (!tsvValidation.isValid) {
             framesOcrFailed++;
-            ocrErrors.push(`Frame @ ${ef.timestamp}s: ${tsvValidation.error || 'Invalid TSV structure'}`);
+            if (ocrErrors.length < MAX_DIAGNOSTIC_ERRORS) {
+              ocrErrors.push(`Frame @ ${ef.timestamp}s: ${tsvValidation.error || 'Invalid TSV structure'}`);
+            }
             continue;
           }
 
@@ -1305,7 +1476,7 @@ export class VideoProcessor {
           const frameText = words.join(' ').trim();
           if (frameText.length > 0) {
             // Deduplicate identical repeated text across immediately consecutive sampled frames
-            const avgConf = wordCount > 0 ? parseFloat((totalConf / (wordCount * 100)).toFixed(3)) : 0;
+            const avgConf = wordCount > 0 ? parseFloat((totalConf / (wordCount * 100)).toFixed(3)) : undefined;
             if (frameText !== previousFrameText) {
               detectedFrames.push({
                 timestamp: ef.timestamp,
@@ -1321,63 +1492,35 @@ export class VideoProcessor {
           }
         } catch (ocrErr: any) {
           framesOcrFailed++;
-          ocrErrors.push(`Frame @ ${ef.timestamp}s: ${ocrErr?.message || ocrErr}`);
-        }
-      }
-
-      // framesFailed: total OCR failures
-      const framesFailed = framesOcrFailed;
-      // framesSkipped: frames planned but never attempted due to timeout or prior fatal stage
-      const framesSkipped = Math.max(0, framesTargeted - (framesAttempted + framesExtractionFailed));
-
-      // samplingCoverageRatio: sampling fulfillment ratio = framesExtracted / framesTargeted
-      const samplingCoverageRatio = framesTargeted > 0
-        ? parseFloat((framesExtracted / framesTargeted).toFixed(3))
-        : 0;
-
-      // ocrExecutionSuccessRatio: proportion of attempted OCR evaluations that succeeded with valid TSV
-      const ocrExecutionSuccessRatio = framesAttempted > 0
-        ? parseFloat((framesSucceeded / framesAttempted).toFixed(3))
-        : 0;
-
-      // Timeline coverage: union of temporal inspection windows associated with each successfully inspected frame
-      // Each frame represents an inspection window of [ts - halfWindow, ts + halfWindow] clipped to [0, dur]
-      let timelineCoverageRatio = 0;
-      if (succeededTimestamps.length > 0 && dur > 0) {
-        // Window size per sample point = dur / framesTargeted
-        const windowSize = dur / Math.max(1, framesTargeted);
-        const halfWindow = windowSize / 2;
-
-        const rawIntervals = succeededTimestamps.map(t => ({
-          start: Math.max(0, parseFloat((t - halfWindow).toFixed(3))),
-          end: Math.min(dur, parseFloat((t + halfWindow).toFixed(3)))
-        })).sort((a, b) => a.start - b.start);
-
-        // Compute mathematical union of non-overlapping intervals
-        const mergedIntervals: Array<{ start: number; end: number }> = [];
-        for (const interval of rawIntervals) {
-          const last = mergedIntervals[mergedIntervals.length - 1];
-          if (!last || interval.start > last.end) {
-            mergedIntervals.push({ start: interval.start, end: interval.end });
-          } else {
-            last.end = Math.max(last.end, interval.end);
+          if (ocrErrors.length < MAX_DIAGNOSTIC_ERRORS) {
+            ocrErrors.push(`Frame @ ${ef.timestamp}s: ${sanitizeReason(String(ocrErr?.message || ocrErr))}`);
           }
         }
-
-        const coveredSeconds = mergedIntervals.reduce((sum, int) => sum + (int.end - int.start), 0);
-        timelineCoverageRatio = parseFloat(Math.min(1.0, coveredSeconds / dur).toFixed(3));
       }
 
-      // Backward compatible coverageRatio represents true sampling coverage
-      const coverageRatio = samplingCoverageRatio;
-      const isPartial = framesSucceeded < framesTargeted || executionTimedOut;
+      // Accounting invariants:
+      // framesExtractionFailed: planned frames whose extraction failed (never counted in framesAttempted or framesSkipped)
+      // framesAttempted: extracted frames actually submitted to OCR
+      // framesSucceeded + framesOcrFailed === framesAttempted
+      // framesSkipped: planned frames never attempted (neither extraction failed nor submitted to OCR)
+      const framesFailed = framesOcrFailed;
+      const framesSkipped = Math.max(0, framesTargeted - (framesAttempted + framesExtractionFailed));
+
+      // ocrExecutionSuccessRatio: null when 0 OCR attempts were made; otherwise framesSucceeded / framesAttempted
+      const ocrExecutionSuccessRatio = framesAttempted > 0
+        ? parseFloat((framesSucceeded / framesAttempted).toFixed(3))
+        : null;
+
+      // Evidence-based timeline coverage:
+      // Still-frame OCR inspects discrete point timestamps only; continuous surrounding temporal intervals are NOT verified.
+      const timelineCoverageStatus: 'NOT_VERIFIED' = 'NOT_VERIFIED';
+      const timelineCoverageRatio: null = null;
+
+      // coverageRatio represents sample-point fulfillment ratio (distinct from unverified temporal interval coverage)
+      const coverageRatio = samplingCoverageRatio ?? 0;
+      const isPartial = framesSucceeded < framesTargeted || executionTimedOut || framesExtractionFailed > 0;
 
       // Semantic status classification:
-      // SUCCESS_WITH_SIGNAL: all required work succeeded AND text was detected
-      // NO_SIGNAL_DETECTED: all required work succeeded AND no text was detected
-      // PARTIAL: some OCR frames succeeded but others failed or timed out
-      // FAILED: all attempted OCR failed or 0 frames succeeded
-      // UNAVAILABLE: executable missing/unusable
       let executionStatus: 'SUCCESS_WITH_SIGNAL' | 'NO_SIGNAL_DETECTED' | 'PARTIAL' | 'FAILED' | 'UNAVAILABLE' | 'NOT_ASSESSED';
       let status: import('../../types').DetectorExecutionStatus;
 
@@ -1395,18 +1538,28 @@ export class VideoProcessor {
         status = 'NO_SIGNAL_DETECTED';
       }
 
+      const samplePct = Math.round(coverageRatio * 100);
       let limitations: string;
       if (executionStatus === 'FAILED') {
-        limitations = `OCR execution failed for all ${framesAttempted} attempted frame(s). No visual text signals could be assessed.`;
+        limitations = `OCR execution failed for all ${framesAttempted} attempted frame(s). No visual text signals could be assessed; temporal timeline coverage not verified.`;
       } else if (isPartial) {
-        limitations = `Sampled and completed OCR on ${framesSucceeded} of ${framesTargeted} target frames (${Math.round(samplingCoverageRatio * 100)}% sampling fulfillment, ${Math.round(timelineCoverageRatio * 100)}% temporal timeline coverage) due to ${executionTimedOut ? 'timeout' : 'frame processing error'}. Text on uninspected portions was not evaluated.`;
+        limitations = `Inspected ${framesSucceeded} discrete frame timestamps of ${framesTargeted} planned sample points (${samplePct}% sample fulfillment across ${Math.round(dur)}s) due to ${executionTimedOut ? 'timeout' : framesExtractionFailed > 0 ? 'frame extraction/processing error' : 'frame processing error'}; continuous temporal interval coverage between still frames is not verified.`;
       } else {
-        limitations = `Sampled ${framesSucceeded} video frames deterministically across the entire ${Math.round(dur)}s timeline (${Math.round(samplingCoverageRatio * 100)}% sampling fulfillment, ${Math.round(timelineCoverageRatio * 100)}% timeline coverage) via local Tesseract OCR.`;
+        limitations = `Inspected ${framesSucceeded} discrete frame timestamps deterministically distributed across ${Math.round(dur)}s (${samplePct}% sample fulfillment) via local Tesseract OCR; continuous temporal interval coverage between still frames is not verified.`;
       }
 
-      const failureReason = ocrErrors.length > 0
-        ? `OCR encountered errors on ${framesOcrFailed} frame(s): ${ocrErrors.slice(0, 3).join('; ')}`
-        : (executionTimedOut ? `OCR execution timed out after ${timeoutMs}ms` : undefined);
+      const failureParts: string[] = [];
+      if (framesExtractionFailed > 0) {
+        const extSummary = extractionErrors.slice(0, 2).map(e => `[${e.category}] ${e.reason}`).join('; ');
+        failureParts.push(`FFmpeg extraction failed on ${framesExtractionFailed} frame(s)${extSummary ? `: ${extSummary}` : ''}`);
+      }
+      if (ocrErrors.length > 0) {
+        failureParts.push(`OCR encountered errors on ${framesOcrFailed} frame(s): ${ocrErrors.slice(0, 3).join('; ')}`);
+      }
+      if (executionTimedOut) {
+        failureParts.push(`OCR pipeline exceeded ${timeoutMs}ms time budget`);
+      }
+      const failureReason = failureParts.length > 0 ? failureParts.join(' | ') : undefined;
 
       return {
         status,
@@ -1414,9 +1567,14 @@ export class VideoProcessor {
         framesInspected: framesSucceeded,
         totalCandidateFrames,
         coverageRatio,
+        timelineCoverageStatus,
         timelineCoverageRatio,
         samplingCoverageRatio,
         ocrExecutionSuccessRatio,
+        plannedTimestamps: candidateTimestamps,
+        extractedTimestamps,
+        succeededTimestamps,
+        extractionErrors: extractionErrors.length > 0 ? extractionErrors : undefined,
         framesTargeted,
         framesExtracted,
         framesExtractionFailed,

@@ -53,7 +53,7 @@ export interface DetectorReport {
   status: DetectorExecutionStatus;
   executionDurationMs: number;
   evidenceReferences?: string[];
-  confidence?: number;
+  confidence?: number | null;
   limitations?: string;
   failureReason?: string;
   details?: Record<string, any>;
@@ -126,7 +126,7 @@ export interface EvidenceItem {
   type: string;
   category: EvidenceCategory;
   severity: EvidenceSeverity;
-  confidence: number; // 0 to 1
+  confidence?: number | null; // 0 to 1, or null when missing/unavailable
   confidenceLevel: ConfidenceLevel;
   uncertaintyReason?: UncertaintyReason;
   evidenceStatus?: EvidenceStatus;
@@ -231,8 +231,15 @@ export interface VideoFrameOcrItem {
   frameIndex: number;
   frameFile: string;
   text: string;
-  confidence: number;
+  confidence?: number | null;
   boundingBoxes: OcrBoundingBox[];
+}
+
+export interface ExtractionFailureDiagnostic {
+  frameIndex: number;
+  timestamp: number;
+  category: 'TIMEOUT' | 'NON_ZERO_EXIT' | 'MISSING_OUTPUT' | 'EMPTY_OUTPUT' | 'UNKNOWN_ERROR';
+  reason: string;
 }
 
 export interface VideoOcrResult {
@@ -247,9 +254,14 @@ export interface VideoOcrResult {
   allExtractedText: string[];
   // Granular timeline and execution metrics
   executionStatus?: 'SUCCESS_WITH_SIGNAL' | 'NO_SIGNAL_DETECTED' | 'PARTIAL' | 'FAILED' | 'UNAVAILABLE' | 'NOT_ASSESSED';
-  timelineCoverageRatio?: number;
-  samplingCoverageRatio?: number;
-  ocrExecutionSuccessRatio?: number;
+  timelineCoverageStatus?: 'NOT_VERIFIED' | 'VERIFIED';
+  timelineCoverageRatio?: number | null;
+  samplingCoverageRatio?: number | null;
+  ocrExecutionSuccessRatio?: number | null;
+  plannedTimestamps?: number[];
+  extractedTimestamps?: number[];
+  succeededTimestamps?: number[];
+  extractionErrors?: ExtractionFailureDiagnostic[];
   framesTargeted?: number;
   framesExtracted?: number;
   framesExtractionFailed?: number;

@@ -7,6 +7,7 @@ import {
   DetectorExecutionStatus, 
   DetectorReport 
 } from '../../types';
+import { validateTesseractTsv } from './videoProcessor';
 
 const execFileAsync = promisify(execFile);
 
@@ -72,41 +73,21 @@ export class ThumbnailOcrAdapter {
       // Execute tesseract with TSV output format for genuine confidence scores and bounding boxes
       const { stdout } = await execFileAsync(executable, [imagePath, 'stdout', '-l', 'eng+tha', 'tsv'], { timeout: 20000 });
       const elapsed = Date.now() - startTime;
-      const rawTsv = (stdout || '').trim();
 
-      // Parse TSV lines
-      const lines = rawTsv.split('\n');
-      const boundingBoxes: import('../../types').OcrBoundingBox[] = [];
-      const detectedWords: string[] = [];
-      let totalConfidence = 0;
-      let wordCount = 0;
-
-      for (let i = 1; i < lines.length; i++) {
-        const parts = lines[i].split('\t');
-        if (parts.length >= 12) {
-          const conf = parseFloat(parts[10]);
-          const word = parts[11]?.trim() || '';
-          const left = parseInt(parts[6], 10) || 0;
-          const top = parseInt(parts[7], 10) || 0;
-          const w = parseInt(parts[8], 10) || 0;
-          const h = parseInt(parts[9], 10) || 0;
-
-          if (word.length > 0 && Number.isFinite(conf) && conf >= 0) {
-            detectedWords.push(word);
-            totalConfidence += conf;
-            wordCount++;
-            boundingBoxes.push({
-              text: word,
-              confidence: parseFloat((conf / 100).toFixed(3)),
-              left,
-              top,
-              width: w,
-              height: h
-            });
-          }
-        }
+      const tsvValidation = validateTesseractTsv(stdout || '');
+      if (!tsvValidation.isValid) {
+        return {
+          status: 'ANALYSIS_UNAVAILABLE',
+          extractedText: null,
+          textDensityRatio: null,
+          confidence: 0,
+          failureReason: `Invalid TSV output from Tesseract: ${tsvValidation.error || 'malformed TSV'}`,
+          limitations: 'Thumbnail OCR returned malformed or incomplete TSV output.',
+          executionDurationMs: elapsed
+        };
       }
 
+      const { boundingBoxes, words: detectedWords, totalConf: totalConfidence, wordCount } = tsvValidation;
       const fullText = detectedWords.join(' ').trim();
 
       if (detectedWords.length === 0 || fullText.length === 0) {

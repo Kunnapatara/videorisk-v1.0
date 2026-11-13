@@ -132,7 +132,7 @@ export async function runPhase456VerificationTests() {
     const firstFrameOcr = videoOcrRes.detectedFrames[0];
     assert.ok(Number.isFinite(firstFrameOcr.timestamp), '2.6 Detected frame has valid numeric timestamp');
     assert.ok(firstFrameOcr.boundingBoxes.length > 0, '2.7 Frame OCR contains bounding boxes');
-    assert.ok(firstFrameOcr.confidence > 0, '2.8 Frame OCR confidence is genuine engine output');
+    assert.ok(typeof firstFrameOcr.confidence === 'number' && firstFrameOcr.confidence > 0, '2.8 Frame OCR confidence is genuine engine output');
 
     // Video 2: Video without text
     const noTextVideoPath = path.resolve(testDir, 'video_no_text.mp4');
@@ -177,6 +177,10 @@ export async function runPhase456VerificationTests() {
     // 3.3 Verify mock CLI wrapper supporting genuine JSON contract with timestamps
     const mockWhisperScript = path.resolve(testDir, 'whisper_cli_runner.sh');
     fs.writeFileSync(mockWhisperScript, `#!/bin/sh
+if [ "$1" = "--help" ] || [ "$1" = "--version" ]; then
+  echo "usage: whisper [-h] [--model MODEL] [--output_format {txt,vtt,srt,tsv,json,all}]"
+  exit 0
+fi
 cat << 'EOF'
 {
   "text": "Hello world from Whisper STT",
