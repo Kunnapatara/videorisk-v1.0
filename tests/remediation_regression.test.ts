@@ -5,11 +5,12 @@ import { promisify } from 'util';
 import { execFile } from 'child_process';
 import {
   videoProcessor,
+  VideoProcessingError,
   calculateOcrSamplingTimestamps,
   validateTesseractTsv
 } from '../src/server/pipeline/videoProcessor';
 import { thumbnailInspector } from '../src/server/pipeline/thumbnailInspector';
-import { mediaInspector } from '../src/server/pipeline/mediaInspector';
+import { mediaInspector, MediaInspectionError } from '../src/server/pipeline/mediaInspector';
 import { SpeechTranscriptionAdapter } from '../src/server/pipeline/audioProcessor';
 import { policyIntelligenceEngine } from '../src/server/intelligence/policyIntelligence';
 import { billingService } from '../src/server/services/billingService';
@@ -462,6 +463,10 @@ case "\${COMPAT_MODE:-pass}" in
     echo "error: failed to initialize whisper context: invalid model magic" >&2
     exit 1
     ;;
+  runtime_init)
+    echo "error while loading shared libraries: libwhisper.so.1: cannot open shared object file" >&2
+    exit 127
+    ;;
   fail_exit)
     echo "runtime crash" >&2
     exit 3
@@ -480,32 +485,118 @@ esac
     );
     generatedFiles.push(compatWhisperCppBin);
 
+    // Helper to build a valid 16kHz mono 16-bit PCM WAV header + PCM payload for mock CLI contract tests
+    const writeTestPcmWav = (wavPath: string, sampleRate: number, amplitude: number) => {
+      const numSamples = Math.floor(sampleRate * 0.5);
+      const dataSize = numSamples * 2;
+      const buf = Buffer.alloc(44 + dataSize);
+      buf.write('RIFF', 0, 'ascii');
+      buf.writeUInt32LE(36 + dataSize, 4);
+      buf.write('WAVE', 8, 'ascii');
+      buf.write('fmt ', 12, 'ascii');
+      buf.writeUInt32LE(16, 16);
+      buf.writeUInt16LE(1, 20);
+      buf.writeUInt16LE(1, 22);
+      buf.writeUInt32LE(sampleRate, 24);
+      buf.writeUInt32LE(sampleRate * 2, 28);
+      buf.writeUInt16LE(2, 32);
+      buf.writeUInt16LE(16, 34);
+      buf.write('data', 36, 'ascii');
+      buf.writeUInt32LE(dataSize, 40);
+      for (let i = 0; i < numSamples; i++) {
+        const val = amplitude > 0 ? Math.round(Math.sin((2 * Math.PI * 300 * i) / sampleRate) * amplitude * 32767) : 0;
+        buf.writeInt16LE(val, 44 + i * 2);
+      }
+      fs.writeFileSync(wavPath, buf);
+      generatedFiles.push(wavPath);
+    };
+
+    const mockSpeechWav = path.resolve(testDir, 'mock_speech_16k.wav');
+    writeTestPcmWav(mockSpeechWav, 16000, 0.25);
+
+    const silentWav = path.resolve(testDir, 'silent_16k.wav');
+    writeTestPcmWav(silentWav, 16000, 0);
+
+    const wrongRateWav = path.resolve(testDir, 'wrong_rate_8k.wav');
+    writeTestPcmWav(wrongRateWav, 8000, 0.25);
+
     process.env.WHISPER_PATH = compatWhisperCppBin;
     process.env.WHISPER_MODEL_PATH = validModel;
+    delete process.env.WHISPER_COMPAT_AUDIO_PATH;
+    delete process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT;
+    stt.clearCompatibilityCache();
+
+    // 3.23a Fails closed with SPEECH_FIXTURE_NOT_FOUND when no audio fixture is configured (no sine-tone fabrication)
+    const missingFixtureRes = await stt.verifyRuntimeCompatibility();
+    assert.strictEqual(missingFixtureRes.compatible, false, '3.23a No speech fixture fails closed');
+    assert.strictEqual(missingFixtureRes.diagnosticCode, 'SPEECH_FIXTURE_NOT_FOUND', '3.23b Reports SPEECH_FIXTURE_NOT_FOUND without synthetic fallback');
+
+    // 3.23c Rejects silent or wrong-sample-rate WAV fixtures
+    const silentFixtureRes = await stt.verifyRuntimeCompatibility({ audioFixturePath: silentWav });
+    assert.strictEqual(silentFixtureRes.diagnosticCode, 'SPEECH_FIXTURE_INVALID', '3.23c Silent WAV rejected as SPEECH_FIXTURE_INVALID');
+    const wrongRateRes = await stt.verifyRuntimeCompatibility({ audioFixturePath: wrongRateWav });
+    assert.strictEqual(wrongRateRes.diagnosticCode, 'SPEECH_FIXTURE_INVALID', '3.23d Non-16kHz WAV rejected as SPEECH_FIXTURE_INVALID');
 
     process.env.COMPAT_MODE = 'timeout';
-    const compatTimeout = await stt.verifyRuntimeCompatibility({ timeoutMs: 120 });
+    const compatTimeout = await stt.verifyRuntimeCompatibility({ timeoutMs: 120, audioFixturePath: mockSpeechWav });
     assert.strictEqual(compatTimeout.compatible, false);
     assert.strictEqual(compatTimeout.diagnosticCode, 'TRANSCRIPTION_TIMEOUT', '3.23 Compatibility probe: TRANSCRIPTION_TIMEOUT');
 
     process.env.COMPAT_MODE = 'bad_model';
-    const compatBadModel = await stt.verifyRuntimeCompatibility();
+    const compatBadModel = await stt.verifyRuntimeCompatibility({ audioFixturePath: mockSpeechWav });
     assert.strictEqual(compatBadModel.diagnosticCode, 'MODEL_INCOMPATIBLE', '3.24 Compatibility probe: runtime MODEL_INCOMPATIBLE');
 
+    process.env.COMPAT_MODE = 'runtime_init';
+    const compatRuntimeInit = await stt.verifyRuntimeCompatibility({ audioFixturePath: mockSpeechWav });
+    assert.strictEqual(compatRuntimeInit.diagnosticCode, 'RUNTIME_INIT_FAILED', '3.24b Compatibility probe: RUNTIME_INIT_FAILED on shared lib load error');
+
     process.env.COMPAT_MODE = 'fail_exit';
-    const compatFailExit = await stt.verifyRuntimeCompatibility();
+    const compatFailExit = await stt.verifyRuntimeCompatibility({ audioFixturePath: mockSpeechWav });
     assert.strictEqual(compatFailExit.diagnosticCode, 'TRANSCRIPTION_FAILED', '3.25 Compatibility probe: TRANSCRIPTION_FAILED');
 
     process.env.COMPAT_MODE = 'empty';
-    const compatEmpty = await stt.verifyRuntimeCompatibility();
+    const compatEmpty = await stt.verifyRuntimeCompatibility({ audioFixturePath: mockSpeechWav });
     assert.strictEqual(compatEmpty.diagnosticCode, 'EMPTY_TRANSCRIPTION_OUTPUT', '3.26 Compatibility probe: EMPTY_TRANSCRIPTION_OUTPUT');
 
     process.env.COMPAT_MODE = 'pass';
-    const compatPassCpp = await stt.verifyRuntimeCompatibility();
+    const compatMismatch = await stt.verifyRuntimeCompatibility({
+      audioFixturePath: mockSpeechWav,
+      expectedTranscript: 'completely unrelated reference phrase'
+    });
+    assert.strictEqual(compatMismatch.compatible, false, '3.26b Reference transcript mismatch fails closed');
+    assert.strictEqual(compatMismatch.diagnosticCode, 'TRANSCRIPTION_FAILED', '3.26c Mismatch classifies as TRANSCRIPTION_FAILED');
+    assert.strictEqual(compatMismatch.referenceMatched, false, '3.26d Records referenceMatched=false');
+
+    const compatPassCpp = await stt.verifyRuntimeCompatibility({
+      audioFixturePath: mockSpeechWav,
+      expectedTranscript: 'hello compat test'
+    });
     assert.strictEqual(compatPassCpp.compatible, true, '3.27 whisper_cpp compatibility passes with JSON transcript');
     assert.strictEqual(compatPassCpp.diagnosticCode, 'VERIFICATION_PASSED', '3.28 whisper_cpp reports VERIFICATION_PASSED');
     assert.strictEqual(compatPassCpp.transcriptText, 'hello compat test', '3.29 whisper_cpp extracts non-empty transcriptText');
     assert.strictEqual(compatPassCpp.segmentsCount, 1, '3.30 whisper_cpp records segment count');
+    assert.strictEqual(compatPassCpp.referenceMatched, true, '3.30a Reference transcript match verified');
+
+    // Cached initializeRuntime() hit & fingerprint invalidation when model changes
+    stt.clearCompatibilityCache();
+    const initCold = await stt.initializeRuntime({ audioFixturePath: mockSpeechWav, expectedTranscript: 'hello compat test' });
+    assert.strictEqual(initCold.compatible, true, '3.30b Cold initializeRuntime succeeds');
+    assert.strictEqual(initCold.fromCache, false, '3.30c Cold run has fromCache=false');
+    const initWarm = await stt.initializeRuntime({ audioFixturePath: mockSpeechWav, expectedTranscript: 'hello compat test' });
+    assert.strictEqual(initWarm.compatible, true, '3.30d Warm initializeRuntime succeeds');
+    assert.strictEqual(initWarm.fromCache, true, '3.30e Warm run served from cache (fromCache=true)');
+
+    // Transcribe preflight compatibility gating
+    process.env.COMPAT_MODE = 'runtime_init';
+    stt.clearCompatibilityCache();
+    const blockedTranscribe = await stt.transcribe(dummyVideoPath, 10, {
+      verifyCompatibility: true,
+      audioFixturePath: mockSpeechWav
+    });
+    assert.strictEqual(blockedTranscribe.status, 'ANALYSIS_UNAVAILABLE', '3.30f transcribe blocks on failed compatibility init');
+    assert.strictEqual(blockedTranscribe.diagnosticCode, 'RUNTIME_INIT_FAILED', '3.30g Preserves RUNTIME_INIT_FAILED diagnosticCode');
+    assert.strictEqual(blockedTranscribe.compatibilityVerified, false, '3.30h Records compatibilityVerified=false');
+
     delete process.env.COMPAT_MODE;
 
     // Runtime execution pass test for openai_whisper contract
@@ -534,14 +625,18 @@ exit 0
 
     process.env.WHISPER_PATH = compatOpenAiBin;
     process.env.WHISPER_MODEL_PATH = validPtModel;
-    const compatPassOpenAi = await stt.verifyRuntimeCompatibility();
+    stt.clearCompatibilityCache();
+    const compatPassOpenAi = await stt.verifyRuntimeCompatibility({ audioFixturePath: mockSpeechWav });
     assert.strictEqual(compatPassOpenAi.compatible, true, '3.31 openai_whisper compatibility passes with JSON output_dir artifact');
     assert.strictEqual(compatPassOpenAi.diagnosticCode, 'VERIFICATION_PASSED', '3.32 openai_whisper reports VERIFICATION_PASSED');
     assert.strictEqual(compatPassOpenAi.transcriptText, 'openai whisper test', '3.33 openai_whisper parses direct text output');
 
     delete process.env.WHISPER_PATH;
     delete process.env.WHISPER_MODEL_PATH;
-    console.log('  [Boundary Notice] Real Whisper binary+model audio transcription: NOT VERIFIED in CI/test container (verified via mocked whisper_cpp/openai_whisper CLI contracts).');
+    delete process.env.WHISPER_COMPAT_AUDIO_PATH;
+    delete process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT;
+    stt.clearCompatibilityCache();
+    console.log('  [Boundary Notice] Real Whisper binary+model human speech transcription: NOT VERIFIED in container (no Whisper binary/model or TTS/speech WAV installed; verified via mocked whisper_cpp/openai_whisper CLI contracts).');
     console.log('  ✅ PASS: Whisper STT strict runtime identity, model header & compatibility verification complete');
 
     // -------------------------------------------------------------------------
@@ -790,7 +885,21 @@ exit 0
     assert.ok(currentReadiness.body.checks?.database, '7.3 Database check is included in readiness probe');
     assert.ok(currentReadiness.body.checks?.storage, '7.4 Storage writeability check is included');
     assert.ok(currentReadiness.body.checks?.billing, '7.5 Billing check is included');
+    assert.ok(currentReadiness.body.checks?.whisperStt, '7.5b Optional whisperStt check is exposed in readiness payload');
+    assert.strictEqual(currentReadiness.body.checks?.whisperStt?.details?.diagnosticCode, 'UNCONFIGURED', '7.5c Unconfigured whisperStt reports UNCONFIGURED honestly');
     assert.strictEqual(currentReadiness.body.checks?.storage?.status, 'healthy', '7.6 Upload storage directory writeability probe succeeds');
+
+    const prevWhisperPathReadiness = process.env.WHISPER_PATH;
+    try {
+      process.env.WHISPER_PATH = '/path/to/nonexistent_whisper_readiness';
+      const degradedWhisperReadiness = await invokeReadiness();
+      assert.strictEqual(degradedWhisperReadiness.statusCode, 200, '7.6b Degraded optional Whisper STT does not bring down core readiness');
+      assert.strictEqual(degradedWhisperReadiness.body.checks?.whisperStt?.status, 'degraded', '7.6c Invalid WHISPER_PATH surfaces degraded whisperStt check');
+      assert.strictEqual(degradedWhisperReadiness.body.checks?.whisperStt?.details?.diagnosticCode, 'BINARY_NOT_FOUND', '7.6d Surfaces BINARY_NOT_FOUND diagnostic code');
+    } finally {
+      if (prevWhisperPathReadiness === undefined) delete process.env.WHISPER_PATH;
+      else process.env.WHISPER_PATH = prevWhisperPathReadiness;
+    }
 
     const prevNodeEnv = process.env.NODE_ENV;
     const prevDbPath = (storage as any).dbPath;
@@ -1181,6 +1290,231 @@ esac
     }
 
     console.log('  ✅ PASS: All 4 real MP4 E2E sampling runs (10m/30m x standard/deep) verified with real FFmpeg, FFprobe & Tesseract');
+
+    // -------------------------------------------------------------------------
+    // 11. FFPROBE (MediaInspector) & FFMPEG (VideoProcessor.analyzeVideo) DIAGNOSTICS
+    // -------------------------------------------------------------------------
+    console.log('\n[11. FFprobe (MediaInspector) & analyzeVideo FFmpeg Failure Diagnostics & Cleanup]');
+
+    const prevFfprobeDiag = process.env.FFPROBE_PATH;
+    const prevFfmpegDiag = process.env.FFMPEG_PATH;
+
+    try {
+      // 11.1 MediaInspector.inspect failure categories
+      await assert.rejects(
+        () => mediaInspector.inspect(path.join(testDir, 'does_not_exist.mp4'), 'does_not_exist.mp4'),
+        (err: any) => err instanceof MediaInspectionError && err.category === 'INVALID_INPUT_PATH',
+        '11.1a Non-existent file classified INVALID_INPUT_PATH'
+      );
+
+      await assert.rejects(
+        () => mediaInspector.inspect(testDir, 'testDir'),
+        (err: any) => err instanceof MediaInspectionError && err.category === 'INVALID_INPUT_PATH',
+        '11.1b Directory path classified INVALID_INPUT_PATH'
+      );
+
+      process.env.FFPROBE_PATH = '/nonexistent/binary/ffprobe_missing';
+      await assert.rejects(
+        () => mediaInspector.inspect(dummyVideoPath, 'dummy_ocr.mp4'),
+        (err: any) => err instanceof MediaInspectionError && err.category === 'MISSING_EXECUTABLE',
+        '11.1c Missing ffprobe classified MISSING_EXECUTABLE'
+      );
+
+      const nonExecFfprobe = path.resolve(testDir, 'non_exec_ffprobe.sh');
+      fs.writeFileSync(nonExecFfprobe, '#!/bin/sh\nexit 0\n', { mode: 0o644 });
+      generatedFiles.push(nonExecFfprobe);
+      process.env.FFPROBE_PATH = nonExecFfprobe;
+      await assert.rejects(
+        () => mediaInspector.inspect(dummyVideoPath, 'dummy_ocr.mp4'),
+        (err: any) => err instanceof MediaInspectionError && err.category === 'NON_EXECUTABLE',
+        '11.1d Non-executable ffprobe classified NON_EXECUTABLE'
+      );
+
+      const mockFfprobeDiag = path.resolve(testDir, 'mock_ffprobe_diag.sh');
+      fs.writeFileSync(
+        mockFfprobeDiag,
+        `#!/bin/sh
+case "\${PROBE_MODE:-empty}" in
+  empty)
+    exit 0
+    ;;
+  bad_json)
+    echo "{not_valid_json"
+    exit 0
+    ;;
+  no_streams)
+    echo '{"format":{"duration":"5.0"},"streams":[]}'
+    exit 0
+    ;;
+  term)
+    kill -TERM $$
+    ;;
+  kill)
+    kill -KILL $$
+    ;;
+esac
+`,
+        { mode: 0o755 }
+      );
+      generatedFiles.push(mockFfprobeDiag);
+      process.env.FFPROBE_PATH = mockFfprobeDiag;
+
+      process.env.PROBE_MODE = 'empty';
+      await assert.rejects(
+        () => mediaInspector.inspect(dummyVideoPath, 'dummy_ocr.mp4'),
+        (err: any) => err instanceof MediaInspectionError && err.category === 'EMPTY_OUTPUT',
+        '11.1e Empty ffprobe output classified EMPTY_OUTPUT'
+      );
+
+      process.env.PROBE_MODE = 'bad_json';
+      await assert.rejects(
+        () => mediaInspector.inspect(dummyVideoPath, 'dummy_ocr.mp4'),
+        (err: any) => err instanceof MediaInspectionError && err.category === 'INVALID_OUTPUT',
+        '11.1f Malformed ffprobe JSON classified INVALID_OUTPUT'
+      );
+
+      process.env.PROBE_MODE = 'no_streams';
+      await assert.rejects(
+        () => mediaInspector.inspect(dummyVideoPath, 'dummy_ocr.mp4'),
+        (err: any) => err instanceof MediaInspectionError && err.category === 'NO_MEDIA_STREAMS',
+        '11.1g Missing container streams classified NO_MEDIA_STREAMS'
+      );
+
+      process.env.PROBE_MODE = 'term';
+      await assert.rejects(
+        () => mediaInspector.inspect(dummyVideoPath, 'dummy_ocr.mp4'),
+        (err: any) => err instanceof MediaInspectionError && err.category === 'TIMEOUT',
+        '11.1h SIGTERM ffprobe classified TIMEOUT'
+      );
+
+      process.env.PROBE_MODE = 'kill';
+      await assert.rejects(
+        () => mediaInspector.inspect(dummyVideoPath, 'dummy_ocr.mp4'),
+        (err: any) => err instanceof MediaInspectionError && err.category === 'PROCESS_TERMINATED',
+        '11.1i SIGKILL ffprobe classified PROCESS_TERMINATED'
+      );
+      delete process.env.PROBE_MODE;
+
+      // Real ffprobe on corrupt media -> NON_ZERO_EXIT
+      delete process.env.FFPROBE_PATH;
+      await assert.rejects(
+        () => mediaInspector.inspect(corruptVideoPath, 'corrupt_video.mp4'),
+        (err: any) => err instanceof MediaInspectionError && err.category === 'NON_ZERO_EXIT',
+        '11.1j Corrupt media with real ffprobe classified NON_ZERO_EXIT'
+      );
+
+      // 11.2 VideoProcessor.analyzeVideo failure diagnostics & guaranteed tempFramesDir cleanup
+      const framesRoot = path.resolve(process.cwd(), 'uploads', 'frames');
+      const existingFrameDirs = new Set(fs.existsSync(framesRoot) ? fs.readdirSync(framesRoot) : []);
+      const assertNoFrameDirLeak = (stepLabel: string) => {
+        if (!fs.existsSync(framesRoot)) return;
+        const afterDirs = fs.readdirSync(framesRoot);
+        const leaked = afterDirs.filter(d => !existingFrameDirs.has(d));
+        assert.strictEqual(leaked.length, 0, `${stepLabel}: Zero temp frame directories leaked (found ${leaked.join(', ')})`);
+      };
+
+      await assert.rejects(
+        () => videoProcessor.analyzeVideo(path.join(testDir, 'missing_video.mp4'), meta3s, 'standard'),
+        (err: any) => err instanceof VideoProcessingError && err.category === 'INVALID_INPUT',
+        '11.2a Missing video path classified INVALID_INPUT'
+      );
+      assertNoFrameDirLeak('11.2a');
+
+      process.env.FFMPEG_PATH = '/nonexistent/binary/ffmpeg_missing';
+      await assert.rejects(
+        () => videoProcessor.analyzeVideo(dummyVideoPath, meta3s, 'standard'),
+        (err: any) => err instanceof VideoProcessingError && err.category === 'MISSING_EXECUTABLE',
+        '11.2b Missing ffmpeg classified MISSING_EXECUTABLE'
+      );
+      assertNoFrameDirLeak('11.2b');
+
+      const nonExecFfmpegAnalyze = path.resolve(testDir, 'non_exec_ffmpeg_analyze.sh');
+      fs.writeFileSync(nonExecFfmpegAnalyze, '#!/bin/sh\nexit 0\n', { mode: 0o644 });
+      generatedFiles.push(nonExecFfmpegAnalyze);
+      process.env.FFMPEG_PATH = nonExecFfmpegAnalyze;
+      await assert.rejects(
+        () => videoProcessor.analyzeVideo(dummyVideoPath, meta3s, 'standard'),
+        (err: any) => err instanceof VideoProcessingError && err.category === 'NON_EXECUTABLE',
+        '11.2c Non-executable ffmpeg classified NON_EXECUTABLE'
+      );
+      assertNoFrameDirLeak('11.2c');
+
+      const mockFfmpegAnalyze = path.resolve(testDir, 'mock_ffmpeg_analyze.sh');
+      fs.writeFileSync(
+        mockFfmpegAnalyze,
+        `#!/bin/sh
+LAST_ARG=""
+IS_RAW=0
+for arg in "$@"; do
+  if [ "$arg" = "rawvideo" ]; then IS_RAW=1; fi
+  LAST_ARG="$arg"
+done
+case "\${ANALYZE_MODE:-bad_raw}" in
+  term)
+    kill -TERM $$
+    ;;
+  kill)
+    kill -KILL $$
+    ;;
+  bad_raw)
+    if [ "$IS_RAW" = "1" ]; then
+      printf "CORRUPT_NOT_192_MULTIPLES"
+      exit 0
+    fi
+    OUT_DIR=$(dirname "$LAST_ARG")
+    cp "${validSamplePng}" "$OUT_DIR/frame_001.jpg"
+    exit 0
+    ;;
+esac
+`,
+        { mode: 0o755 }
+      );
+      generatedFiles.push(mockFfmpegAnalyze);
+      process.env.FFMPEG_PATH = mockFfmpegAnalyze;
+
+      process.env.ANALYZE_MODE = 'term';
+      await assert.rejects(
+        () => videoProcessor.analyzeVideo(dummyVideoPath, meta3s, 'standard'),
+        (err: any) => err instanceof VideoProcessingError && err.category === 'TIMEOUT',
+        '11.2d SIGTERM ffmpeg classified TIMEOUT'
+      );
+      assertNoFrameDirLeak('11.2d');
+
+      process.env.ANALYZE_MODE = 'kill';
+      await assert.rejects(
+        () => videoProcessor.analyzeVideo(dummyVideoPath, meta3s, 'standard'),
+        (err: any) => err instanceof VideoProcessingError && err.category === 'PROCESS_TERMINATED',
+        '11.2e SIGKILL ffmpeg classified PROCESS_TERMINATED'
+      );
+      assertNoFrameDirLeak('11.2e');
+
+      process.env.ANALYZE_MODE = 'bad_raw';
+      await assert.rejects(
+        () => videoProcessor.analyzeVideo(dummyVideoPath, meta3s, 'standard'),
+        (err: any) => err instanceof VideoProcessingError && err.category === 'INVALID_OUTPUT',
+        '11.2f Truncated rawvideo RGB stream classified INVALID_OUTPUT'
+      );
+      assertNoFrameDirLeak('11.2f');
+      delete process.env.ANALYZE_MODE;
+
+      // Real ffmpeg on corrupt video -> NON_ZERO_EXIT & clean temp dir
+      delete process.env.FFMPEG_PATH;
+      await assert.rejects(
+        () => videoProcessor.analyzeVideo(corruptVideoPath, meta3s, 'standard'),
+        (err: any) => err instanceof VideoProcessingError && err.category === 'NON_ZERO_EXIT',
+        '11.2g Real ffmpeg on corrupt video classified NON_ZERO_EXIT'
+      );
+      assertNoFrameDirLeak('11.2g');
+    } finally {
+      delete process.env.PROBE_MODE;
+      delete process.env.ANALYZE_MODE;
+      if (prevFfprobeDiag === undefined) delete process.env.FFPROBE_PATH;
+      else process.env.FFPROBE_PATH = prevFfprobeDiag;
+      if (prevFfmpegDiag === undefined) delete process.env.FFMPEG_PATH;
+      else process.env.FFMPEG_PATH = prevFfmpegDiag;
+    }
+
+    console.log('  ✅ PASS: FFprobe & analyzeVideo FFmpeg failure diagnostics and temp cleanup verified');
 
     console.log('\n======================================================');
     console.log('🎉 ALL TARGETED REMEDIATION REGRESSION TESTS PASSED!');

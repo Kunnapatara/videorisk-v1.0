@@ -1,11 +1,12 @@
 import Stripe from 'stripe';
-import { storage } from '../storage';
+import { storage, IStorageRepository } from '../storage';
 import {
   UserAccount,
   SubscriptionRecord,
   WebhookEventRecord,
   StripePaymentRecord,
-  StripeRefundRecord
+  StripeRefundRecord,
+  StripeRefundStatus
 } from '../../types';
 
 export const ALLOWED_PAID_PLANS = ['creator', 'pro', 'agency', 'audit_once'] as const;
@@ -57,9 +58,18 @@ export class BillingService {
   }
 
   private hasExplicitTestClient: boolean = false;
+  private storageOverride: IStorageRepository | null = null;
 
   constructor() {
     this.reconfigure();
+  }
+
+  private getActiveStorage(): IStorageRepository {
+    return this.storageOverride || storage;
+  }
+
+  public setStorageForTest(repo: IStorageRepository | null): void {
+    this.storageOverride = repo;
   }
 
   public reconfigure(): void {
@@ -228,99 +238,110 @@ export class BillingService {
       }
     }
 
-    const trustedOrigins = this.getTrustedOrigins();
-    const rawCandidate = options?.bodyOrigin !== undefined && options?.bodyOrigin !== null
-      ? options.bodyOrigin
-      : options?.requestedOrigin;
-
-    if (Array.isArray(rawCandidate)) {
-      const err: any = new Error('Multiple Origin headers are not permitted.');
-      err.statusCode = 400;
-      throw err;
-    }
-
-    if (rawCandidate === undefined || rawCandidate === null || (typeof rawCandidate === 'string' && rawCandidate.trim() === '')) {
-      // No client-supplied origin (e.g., server-to-server call or same-origin without Origin header).
-      // Use strictly server-configured canonical origin — never req.get('host').
-      const canonical = configuredBase ? new URL(configuredBase).origin : this.getCanonicalAppUrl();
-      return canonical;
-    }
-
-    if (typeof rawCandidate !== 'string') {
-      const err: any = new Error('Invalid checkout origin format.');
-      err.statusCode = 400;
-      throw err;
-    }
-
-    const trimmed = rawCandidate.trim();
-
-    if (trimmed.startsWith('//') || trimmed.includes('\\') || /\s/.test(trimmed)) {
-      const err: any = new Error('Malformed or protocol-relative checkout origin is strictly forbidden.');
-      err.statusCode = 400;
-      throw err;
-    }
-
-    if (trimmed.includes('@')) {
-      const err: any = new Error('Userinfo credentials (@) in checkout origin are strictly forbidden.');
-      err.statusCode = 400;
-      throw err;
-    }
-
-    let parsed: URL;
-    try {
-      parsed = new URL(trimmed);
-    } catch {
-      const err: any = new Error('Malformed checkout origin URL format.');
-      err.statusCode = 400;
-      throw err;
-    }
-
-    if (parsed.username || parsed.password) {
-      const err: any = new Error('Userinfo credentials in checkout origin URL are strictly forbidden.');
-      err.statusCode = 400;
-      throw err;
-    }
-
-    if (parsed.protocol === 'javascript:' || parsed.protocol === 'data:' || parsed.protocol === 'file:') {
-      const err: any = new Error(`Dangerous checkout origin scheme: ${parsed.protocol}`);
-      err.statusCode = 400;
-      throw err;
-    }
-
-    if (parsed.protocol === 'http:') {
-      const isLocalHost = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
-      if (!isDevOrTest || !isLocalHost) {
-        const err: any = new Error('Insecure HTTP checkout origins are not permitted outside of development localhost.');
+    const validateCandidateOrigin = (candidate: unknown): string | null => {
+      if (Array.isArray(candidate)) {
+        const err: any = new Error('Multiple Origin headers are not permitted.');
         err.statusCode = 400;
         throw err;
       }
-    } else if (parsed.protocol !== 'https:') {
-      const err: any = new Error(`Unsupported checkout origin protocol: ${parsed.protocol}`);
-      err.statusCode = 400;
-      throw err;
-    }
 
-    // Strict origin comparison (rejects lookalike suffixes such as videorisk.com.evil.com)
-    const isTrusted = trustedOrigins.some(trusted => {
-      try {
-        const t = new URL(trusted);
-        if (parsed.origin === t.origin) return true;
-        if (isDevOrTest && (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') && (t.hostname === 'localhost' || t.hostname === '127.0.0.1')) {
-          return true;
-        }
-      } catch {
-        return false;
+      if (candidate === undefined || candidate === null || (typeof candidate === 'string' && candidate.trim() === '')) {
+        return null;
       }
-      return false;
-    });
 
-    if (!isTrusted) {
-      const err: any = new Error(`Checkout origin '${parsed.origin}' is not authorized.`);
-      err.statusCode = 400;
-      throw err;
+      if (typeof candidate !== 'string') {
+        const err: any = new Error('Invalid checkout origin format.');
+        err.statusCode = 400;
+        throw err;
+      }
+
+      const trimmed = candidate.trim();
+
+      if (trimmed.startsWith('//') || trimmed.includes('\\') || /\s/.test(trimmed)) {
+        const err: any = new Error('Malformed or protocol-relative checkout origin is strictly forbidden.');
+        err.statusCode = 400;
+        throw err;
+      }
+
+      if (trimmed.includes('@')) {
+        const err: any = new Error('Userinfo credentials (@) in checkout origin are strictly forbidden.');
+        err.statusCode = 400;
+        throw err;
+      }
+
+      let parsed: URL;
+      try {
+        parsed = new URL(trimmed);
+      } catch {
+        const err: any = new Error('Malformed checkout origin URL format.');
+        err.statusCode = 400;
+        throw err;
+      }
+
+      if (parsed.username || parsed.password) {
+        const err: any = new Error('Userinfo credentials in checkout origin URL are strictly forbidden.');
+        err.statusCode = 400;
+        throw err;
+      }
+
+      if (parsed.protocol === 'javascript:' || parsed.protocol === 'data:' || parsed.protocol === 'file:') {
+        const err: any = new Error(`Dangerous checkout origin scheme: ${parsed.protocol}`);
+        err.statusCode = 400;
+        throw err;
+      }
+
+      if (parsed.protocol === 'http:') {
+        const isLocalHost = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
+        if (!isDevOrTest || !isLocalHost) {
+          const err: any = new Error('Insecure HTTP checkout origins are not permitted outside of development localhost.');
+          err.statusCode = 400;
+          throw err;
+        }
+      } else if (parsed.protocol !== 'https:') {
+        const err: any = new Error(`Unsupported checkout origin protocol: ${parsed.protocol}`);
+        err.statusCode = 400;
+        throw err;
+      }
+
+      // Strict origin comparison (rejects lookalike suffixes such as videorisk.com.evil.com)
+      const isTrusted = trustedOrigins.some(trusted => {
+        try {
+          const t = new URL(trusted);
+          if (parsed.origin === t.origin) return true;
+          if (isDevOrTest && (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') && (t.hostname === 'localhost' || t.hostname === '127.0.0.1')) {
+            return true;
+          }
+        } catch {
+          return false;
+        }
+        return false;
+      });
+
+      if (!isTrusted) {
+        const err: any = new Error(`Checkout origin '${parsed.origin}' is not authorized.`);
+        err.statusCode = 400;
+        throw err;
+      }
+
+      return parsed.origin;
+    };
+
+    const trustedOrigins = this.getTrustedOrigins();
+    const validatedHeaderOrigin = options?.requestedOrigin !== undefined
+      ? validateCandidateOrigin(options.requestedOrigin)
+      : null;
+    const validatedBodyOrigin = options?.bodyOrigin !== undefined
+      ? validateCandidateOrigin(options.bodyOrigin)
+      : null;
+
+    const resolvedOrigin = validatedBodyOrigin || validatedHeaderOrigin;
+    if (resolvedOrigin) {
+      return resolvedOrigin;
     }
 
-    return parsed.origin;
+    // No client-supplied origin (e.g., server-to-server call or same-origin without Origin header).
+    // Use strictly server-configured canonical origin — never req.get('host').
+    return configuredBase ? new URL(configuredBase).origin : this.getCanonicalAppUrl();
   }
 
   /**
@@ -527,7 +548,7 @@ export class BillingService {
       throw new Error(`Invalid plan ID: ${planId}. Allowed paid plans are: ${ALLOWED_PAID_PLANS.join(', ')}`);
     }
 
-    const user = await storage.users.getUser(userId);
+    const user = await this.getActiveStorage().users.getUser(userId);
     if (!user) {
       throw new Error(`User not found: ${userId}`);
     }
@@ -720,7 +741,70 @@ export class BillingService {
   }
 
   /**
-   * Finds a Stripe payment correlation record by charge, payment_intent, invoice, session, or subscription ID.
+   * Strict allowlist parser for Stripe refund statuses.
+   * Never coerces missing, null, empty, or unknown status strings into 'succeeded'.
+   */
+  private normalizeRefundStatus(
+    rawStatus: unknown,
+    eventType: string
+  ): { status: StripeRefundStatus; rawStatus?: string } {
+    if (eventType === 'refund.failed') {
+      return {
+        status: 'failed',
+        rawStatus: typeof rawStatus === 'string' && rawStatus.trim() ? rawStatus.trim().toLowerCase() : 'failed',
+      };
+    }
+
+    if (typeof rawStatus !== 'string') {
+      return {
+        status: 'unknown',
+        rawStatus: rawStatus === null ? 'null' : rawStatus === undefined ? 'missing' : String(rawStatus),
+      };
+    }
+
+    const trimmed = rawStatus.trim().toLowerCase();
+    if (!trimmed) {
+      return { status: 'unknown', rawStatus: 'empty' };
+    }
+
+    if (
+      trimmed === 'succeeded' ||
+      trimmed === 'pending' ||
+      trimmed === 'requires_action' ||
+      trimmed === 'failed' ||
+      trimmed === 'canceled'
+    ) {
+      return { status: trimmed, rawStatus: trimmed };
+    }
+
+    return { status: 'unknown', rawStatus: trimmed };
+  }
+
+  /**
+   * Exact integer arithmetic for proportional credit reversal on cumulative cents refunded.
+   * Uses BigInt multiplication/division so floating-point precision never causes drift or > 100% over-clawback.
+   */
+  private computeCumulativeTargetCredits(
+    originalCreditsGranted: number,
+    cumulativeCents: number,
+    totalPaymentCents: number | undefined,
+    isFull: boolean
+  ): number {
+    if (originalCreditsGranted <= 0) return 0;
+    if (isFull) return originalCreditsGranted;
+    if (!totalPaymentCents || !Number.isFinite(totalPaymentCents) || totalPaymentCents <= 0) {
+      return 0;
+    }
+    if (!Number.isFinite(cumulativeCents) || cumulativeCents <= 0) {
+      return 0;
+    }
+    const cappedCents = Math.min(Math.trunc(totalPaymentCents), Math.trunc(cumulativeCents));
+    return Number((BigInt(originalCreditsGranted) * BigInt(cappedCents)) / BigInt(Math.trunc(totalPaymentCents)));
+  }
+
+  /**
+   * Finds a Stripe payment correlation record by charge, payment_intent, invoice, session, or
+   * non-conflicting subscription ID.
    */
   private findPaymentRecord(
     state: any,
@@ -732,35 +816,48 @@ export class BillingService {
       subscriptionId?: string;
     }
   ): StripePaymentRecord | null {
+    const mapRow = (row: any): StripePaymentRecord => ({
+      id: row.id,
+      userId: row.user_id,
+      sessionId: row.session_id || undefined,
+      paymentIntentId: row.payment_intent_id || undefined,
+      chargeId: row.charge_id || undefined,
+      invoiceId: row.invoice_id || undefined,
+      subscriptionId: row.subscription_id || undefined,
+      customerId: row.customer_id || undefined,
+      planId: row.plan_id || undefined,
+      creditsGranted: Number(row.credits_granted || 0),
+      amountTotal: row.amount_total !== null && row.amount_total !== undefined ? Number(row.amount_total) : undefined,
+      currency: row.currency || undefined,
+      status: row.status,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    });
+
+    const isCompatibleSubCandidate = (r: StripePaymentRecord): boolean => {
+      if (keys.paymentIntentId && r.paymentIntentId && r.paymentIntentId !== keys.paymentIntentId) return false;
+      if (keys.chargeId && r.chargeId && r.chargeId !== keys.chargeId) return false;
+      if (keys.invoiceId && r.invoiceId && r.invoiceId !== keys.invoiceId) return false;
+      return true;
+    };
+
     if (state.prepare && typeof state.prepare === 'function') {
-      const queries: Array<[string, string | undefined]> = [
+      const specificQueries: Array<[string, string | undefined]> = [
         ['SELECT * FROM stripe_payments WHERE charge_id = ? ORDER BY created_at DESC LIMIT 1', keys.chargeId],
         ['SELECT * FROM stripe_payments WHERE payment_intent_id = ? ORDER BY created_at DESC LIMIT 1', keys.paymentIntentId],
         ['SELECT * FROM stripe_payments WHERE invoice_id = ? ORDER BY created_at DESC LIMIT 1', keys.invoiceId],
         ['SELECT * FROM stripe_payments WHERE session_id = ? ORDER BY created_at DESC LIMIT 1', keys.sessionId],
-        ['SELECT * FROM stripe_payments WHERE subscription_id = ? ORDER BY created_at DESC LIMIT 1', keys.subscriptionId],
       ];
-      for (const [sql, param] of queries) {
+      for (const [sql, param] of specificQueries) {
         if (!param) continue;
         const row = state.prepare(sql).get(param) as any;
+        if (row) return mapRow(row);
+      }
+      if (keys.subscriptionId && !keys.chargeId && !keys.paymentIntentId && !keys.invoiceId) {
+        const row = state.prepare('SELECT * FROM stripe_payments WHERE subscription_id = ? ORDER BY created_at DESC LIMIT 1').get(keys.subscriptionId) as any;
         if (row) {
-          return {
-            id: row.id,
-            userId: row.user_id,
-            sessionId: row.session_id || undefined,
-            paymentIntentId: row.payment_intent_id || undefined,
-            chargeId: row.charge_id || undefined,
-            invoiceId: row.invoice_id || undefined,
-            subscriptionId: row.subscription_id || undefined,
-            customerId: row.customer_id || undefined,
-            planId: row.plan_id || undefined,
-            creditsGranted: Number(row.credits_granted || 0),
-            amountTotal: row.amount_total !== null && row.amount_total !== undefined ? Number(row.amount_total) : undefined,
-            currency: row.currency || undefined,
-            status: row.status,
-            createdAt: row.created_at,
-            updatedAt: row.updated_at,
-          };
+          const mapped = mapRow(row);
+          if (isCompatibleSubCandidate(mapped)) return mapped;
         }
       }
       return null;
@@ -779,85 +876,302 @@ export class BillingService {
     for (const r of records) {
       if (keys.sessionId && r.sessionId === keys.sessionId) return r;
     }
-    for (const r of records) {
-      if (keys.subscriptionId && r.subscriptionId === keys.subscriptionId) return r;
+    if (keys.subscriptionId && !keys.chargeId && !keys.paymentIntentId && !keys.invoiceId) {
+      for (const r of records) {
+        if (r.subscriptionId === keys.subscriptionId && isCompatibleSubCandidate(r)) return r;
+      }
     }
     return null;
   }
 
   /**
-   * Checks whether a full succeeded refund was already recorded for this payment_intent / charge / invoice
-   * (supports out-of-order refund-before-checkout events).
+   * Lists all refund records associated with a payment across all identifiers.
    */
-  private hasSucceededFullRefund(
+  private findRefundsForPayment(
     state: any,
-    keys: { paymentIntentId?: string; chargeId?: string; invoiceId?: string }
-  ): boolean {
+    keys: {
+      paymentId?: string;
+      chargeId?: string;
+      paymentIntentId?: string;
+      invoiceId?: string;
+    }
+  ): StripeRefundRecord[] {
     if (state.prepare && typeof state.prepare === 'function') {
+      const mapRow = (row: any): StripeRefundRecord => ({
+        refundId: row.refund_id,
+        paymentId: row.payment_id || undefined,
+        userId: row.user_id || undefined,
+        chargeId: row.charge_id || undefined,
+        paymentIntentId: row.payment_intent_id || undefined,
+        invoiceId: row.invoice_id || undefined,
+        subscriptionId: row.subscription_id || undefined,
+        planId: row.plan_id || undefined,
+        amountRefunded: Number(row.amount_refunded || 0),
+        totalAmount: row.total_amount !== null && row.total_amount !== undefined ? Number(row.total_amount) : undefined,
+        isFullRefund: Boolean(row.is_full_refund),
+        status: row.status,
+        rawStatus: row.raw_status || undefined,
+        reconciled: Boolean(row.reconciled),
+        creditsAdjusted: Number(row.credits_adjusted || 0),
+        failureReason: row.failure_reason || undefined,
+        eventId: row.event_id,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      });
+
+      const byId = new Map<string, StripeRefundRecord>();
       const queries: Array<[string, string | undefined]> = [
-        ["SELECT refund_id FROM stripe_refunds WHERE status = 'succeeded' AND is_full_refund = 1 AND payment_intent_id = ? LIMIT 1", keys.paymentIntentId],
-        ["SELECT refund_id FROM stripe_refunds WHERE status = 'succeeded' AND is_full_refund = 1 AND charge_id = ? LIMIT 1", keys.chargeId],
-        ["SELECT refund_id FROM stripe_refunds WHERE status = 'succeeded' AND is_full_refund = 1 AND invoice_id = ? LIMIT 1", keys.invoiceId],
+        ['SELECT * FROM stripe_refunds WHERE payment_id = ? ORDER BY created_at ASC, refund_id ASC', keys.paymentId],
+        ['SELECT * FROM stripe_refunds WHERE charge_id = ? ORDER BY created_at ASC, refund_id ASC', keys.chargeId],
+        ['SELECT * FROM stripe_refunds WHERE payment_intent_id = ? ORDER BY created_at ASC, refund_id ASC', keys.paymentIntentId],
+        ['SELECT * FROM stripe_refunds WHERE invoice_id = ? ORDER BY created_at ASC, refund_id ASC', keys.invoiceId],
       ];
       for (const [sql, param] of queries) {
         if (!param) continue;
-        if (state.prepare(sql).get(param)) return true;
+        const rows = state.prepare(sql).all(param) as any[];
+        for (const row of rows) {
+          if (!byId.has(row.refund_id)) {
+            byId.set(row.refund_id, mapRow(row));
+          }
+        }
       }
-      return false;
-    }
-
-    const refunds: StripeRefundRecord[] = Object.values(state.stripeRefunds || {});
-    return refunds.some(r =>
-      r.status === 'succeeded' &&
-      r.isFullRefund &&
-      (
-        (keys.paymentIntentId && r.paymentIntentId === keys.paymentIntentId) ||
-        (keys.chargeId && r.chargeId === keys.chargeId) ||
-        (keys.invoiceId && r.invoiceId === keys.invoiceId)
-      )
-    );
-  }
-
-  /**
-   * Computes total credits previously reversed across succeeded Stripe refunds for a given payment/charge/paymentIntent.
-   */
-  private getPriorCreditsAdjustedForPayment(
-    state: any,
-    keys: { paymentId?: string; paymentIntentId?: string; chargeId?: string }
-  ): number {
-    if (state.prepare && typeof state.prepare === 'function') {
-      if (keys.paymentId) {
-        const row = state.prepare(
-          "SELECT COALESCE(SUM(credits_adjusted), 0) as total FROM stripe_refunds WHERE status = 'succeeded' AND payment_id = ?"
-        ).get(keys.paymentId) as any;
-        return Number(row?.total || 0);
-      }
-      if (keys.paymentIntentId) {
-        const row = state.prepare(
-          "SELECT COALESCE(SUM(credits_adjusted), 0) as total FROM stripe_refunds WHERE status = 'succeeded' AND payment_intent_id = ?"
-        ).get(keys.paymentIntentId) as any;
-        return Number(row?.total || 0);
-      }
-      if (keys.chargeId) {
-        const row = state.prepare(
-          "SELECT COALESCE(SUM(credits_adjusted), 0) as total FROM stripe_refunds WHERE status = 'succeeded' AND charge_id = ?"
-        ).get(keys.chargeId) as any;
-        return Number(row?.total || 0);
-      }
-      return 0;
+      return Array.from(byId.values()).sort((a, b) =>
+        a.createdAt.localeCompare(b.createdAt) || a.refundId.localeCompare(b.refundId)
+      );
     }
 
     const refunds: StripeRefundRecord[] = Object.values(state.stripeRefunds || {});
     return refunds
       .filter(r =>
-        r.status === 'succeeded' &&
-        (
-          (keys.paymentId && r.paymentId === keys.paymentId) ||
-          (keys.paymentIntentId && r.paymentIntentId === keys.paymentIntentId) ||
-          (keys.chargeId && r.chargeId === keys.chargeId)
-        )
+        (keys.paymentId && r.paymentId === keys.paymentId) ||
+        (keys.chargeId && r.chargeId === keys.chargeId) ||
+        (keys.paymentIntentId && r.paymentIntentId === keys.paymentIntentId) ||
+        (keys.invoiceId && r.invoiceId === keys.invoiceId)
       )
-      .reduce((acc, r) => acc + (r.creditsAdjusted || 0), 0);
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.refundId.localeCompare(b.refundId));
+  }
+
+  /**
+   * Checks whether a full succeeded refund was already recorded for this payment_intent / charge / invoice
+   * (supports out-of-order full-refund-before-checkout events).
+   */
+  private hasSucceededFullRefund(
+    state: any,
+    keys: { paymentIntentId?: string; chargeId?: string; invoiceId?: string }
+  ): boolean {
+    const matched = this.findRefundsForPayment(state, keys).filter(r => r.status === 'succeeded');
+    if (matched.some(r => r.isFullRefund)) return true;
+
+    // Also check if cumulative succeeded partial refunds cover 100% of totalAmount
+    const totalAmount = matched.find(r => typeof r.totalAmount === 'number' && r.totalAmount > 0)?.totalAmount;
+    if (totalAmount && totalAmount > 0) {
+      const cumulativeCents = matched.reduce((sum, r) => sum + Math.max(0, Math.trunc(r.amountRefunded || 0)), 0);
+      if (cumulativeCents >= totalAmount) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Computes total credits and cents previously accounted across succeeded Stripe refunds for a given payment.
+   */
+  private getPriorRefundTotalsForPayment(
+    state: any,
+    keys: { paymentId?: string; paymentIntentId?: string; chargeId?: string; invoiceId?: string },
+    excludeRefundId?: string
+  ): { priorCreditsAdjusted: number; priorSucceededCents: number } {
+    const refunds = this.findRefundsForPayment(state, keys).filter(
+      r => r.status === 'succeeded' && (!excludeRefundId || r.refundId !== excludeRefundId) && r.reconciled !== false
+    );
+    let priorCreditsAdjusted = 0;
+    let priorSucceededCents = 0;
+    for (const r of refunds) {
+      priorCreditsAdjusted += Math.max(0, Math.trunc(r.creditsAdjusted || 0));
+      priorSucceededCents += Math.max(0, Math.trunc(r.amountRefunded || 0));
+    }
+    return { priorCreditsAdjusted, priorSucceededCents };
+  }
+
+  /**
+   * Reconciles any refunds that arrived out-of-order before `checkout.session.completed`, `invoice.paid`,
+   * or `verifyAndSynchronizeSession` created the payment record.
+   * Links unattached refunds, reverses net partial/full credits atomically, and updates payment/subscription state.
+   */
+  private reconcilePendingRefundsForPayment(
+    state: any,
+    payment: StripePaymentRecord,
+    user: UserAccount,
+    nowIso: string
+  ): void {
+    const matchedRefunds = this.findRefundsForPayment(state, {
+      paymentId: payment.id,
+      chargeId: payment.chargeId,
+      paymentIntentId: payment.paymentIntentId,
+      invoiceId: payment.invoiceId,
+    });
+
+    if (matchedRefunds.length === 0) return;
+
+    const totalPaymentAmount = payment.amountTotal;
+    const originalCreditsGranted = payment.creditsGranted || 0;
+    let priorCreditsAdjusted = 0;
+    let priorSucceededCents = 0;
+    let priorAccountedTarget = 0;
+
+    // Seed baseline from already-reconciled succeeded refunds
+    for (const r of matchedRefunds) {
+      if (r.status === 'succeeded' && r.reconciled) {
+        const cents = Math.max(0, Math.trunc(r.amountRefunded || 0));
+        priorSucceededCents += cents;
+        priorCreditsAdjusted += Math.max(0, Math.trunc(r.creditsAdjusted || 0));
+      }
+    }
+    if (priorSucceededCents > 0) {
+      priorAccountedTarget = Math.max(
+        priorCreditsAdjusted,
+        this.computeCumulativeTargetCredits(originalCreditsGranted, priorSucceededCents, totalPaymentAmount, false)
+      );
+    }
+
+    for (const r of matchedRefunds) {
+      // Backfill missing ownership/payment links on any matched refund (pending/failed/unknown/succeeded)
+      const needsLinkUpdate =
+        r.paymentId !== payment.id ||
+        r.userId !== user.id ||
+        (payment.planId && !r.planId) ||
+        (payment.amountTotal !== undefined && r.totalAmount === undefined);
+
+      if (r.status !== 'succeeded') {
+        if (needsLinkUpdate) {
+          state.stripeRefunds[r.refundId] = {
+            ...r,
+            paymentId: payment.id,
+            userId: user.id,
+            planId: r.planId || payment.planId,
+            totalAmount: r.totalAmount ?? payment.amountTotal,
+            updatedAt: nowIso,
+          };
+        }
+        continue;
+      }
+
+      if (r.reconciled) {
+        if (needsLinkUpdate) {
+          state.stripeRefunds[r.refundId] = {
+            ...r,
+            paymentId: payment.id,
+            userId: user.id,
+            planId: r.planId || payment.planId,
+            totalAmount: r.totalAmount ?? payment.amountTotal,
+            updatedAt: nowIso,
+          };
+        }
+        continue;
+      }
+
+      // Unreconciled succeeded refund arriving before payment creation
+      const refundCents = Math.max(0, Math.trunc(r.amountRefunded || 0));
+      if (refundCents <= 0) {
+        state.stripeRefunds[r.refundId] = {
+          ...r,
+          paymentId: payment.id,
+          userId: user.id,
+          planId: r.planId || payment.planId,
+          totalAmount: totalPaymentAmount ?? r.totalAmount,
+          isFullRefund: false,
+          reconciled: true,
+          creditsAdjusted: 0,
+          updatedAt: nowIso,
+        };
+        continue;
+      }
+
+      const cumulativeCents = priorSucceededCents + refundCents;
+      const effectiveTotal = totalPaymentAmount ?? r.totalAmount;
+      const isCumulativeFull = Boolean(r.isFullRefund) ||
+        (typeof effectiveTotal === 'number' && effectiveTotal > 0 && cumulativeCents >= effectiveTotal);
+
+      let desiredClawback = 0;
+      if (originalCreditsGranted > 0) {
+        const cumulativeTarget = this.computeCumulativeTargetCredits(
+          originalCreditsGranted,
+          cumulativeCents,
+          effectiveTotal,
+          isCumulativeFull
+        );
+        const remainingReversible = Math.max(0, originalCreditsGranted - priorCreditsAdjusted);
+        desiredClawback = Math.max(0, Math.min(remainingReversible, cumulativeTarget - priorAccountedTarget));
+        priorAccountedTarget = Math.max(priorAccountedTarget, cumulativeTarget);
+      }
+
+      const actualDeduction = Math.min(Math.max(0, user.creditsRemaining), desiredClawback);
+      if (actualDeduction > 0) {
+        user.creditsRemaining -= actualDeduction;
+      }
+
+      priorSucceededCents = cumulativeCents;
+      priorCreditsAdjusted += actualDeduction;
+
+      recordCreditTx(state, {
+        userId: user.id,
+        delta: -actualDeduction,
+        balanceAfter: user.creditsRemaining,
+        type: isCumulativeFull ? 'STRIPE_PAYMENT_REFUND' : 'STRIPE_PARTIAL_REFUND',
+        referenceId: `${r.refundId}:reconciled`,
+        metadataJson: JSON.stringify({
+          eventId: r.eventId,
+          refundId: r.refundId,
+          paymentId: payment.id,
+          chargeId: r.chargeId || payment.chargeId || null,
+          paymentIntentId: r.paymentIntentId || payment.paymentIntentId || null,
+          invoiceId: r.invoiceId || payment.invoiceId || null,
+          subscriptionId: payment.subscriptionId || r.subscriptionId || null,
+          planId: payment.planId || r.planId || null,
+          amountRefunded: refundCents,
+          cumulativeRefundedCents: cumulativeCents,
+          totalPaymentAmount: effectiveTotal,
+          refundScope: isCumulativeFull ? 'full' : 'partial',
+          desiredCreditClawback: desiredClawback,
+          actualCreditsDeducted: actualDeduction,
+          unrecoveredCredits: Math.max(0, desiredClawback - actualDeduction),
+          reconciledFromOutOfOrder: true,
+        }),
+      });
+
+      const isSubscriptionPurchase = Boolean(payment.subscriptionId) && payment.planId !== 'audit_once';
+      if (isCumulativeFull && isSubscriptionPurchase && payment.subscriptionId) {
+        const targetSub = state.subscriptions[payment.subscriptionId];
+        if (targetSub) {
+          targetSub.status = 'canceled';
+          targetSub.updatedAt = nowIso;
+        }
+        if (user.subscriptionId === payment.subscriptionId || !user.subscriptionId) {
+          user.subscriptionStatus = 'canceled';
+          user.plan = 'free';
+        }
+      }
+
+      this.upsertStripePayment(state, {
+        id: payment.id,
+        userId: payment.userId,
+        chargeId: payment.chargeId || r.chargeId,
+        paymentIntentId: payment.paymentIntentId || r.paymentIntentId,
+        invoiceId: payment.invoiceId || r.invoiceId,
+        status: isCumulativeFull ? 'refunded' : (payment.status === 'refunded' ? 'refunded' : 'partially_refunded'),
+      });
+      payment.status = isCumulativeFull ? 'refunded' : (payment.status === 'refunded' ? 'refunded' : 'partially_refunded');
+
+      state.stripeRefunds[r.refundId] = {
+        ...r,
+        paymentId: payment.id,
+        userId: user.id,
+        planId: payment.planId || r.planId,
+        totalAmount: effectiveTotal,
+        isFullRefund: isCumulativeFull,
+        reconciled: true,
+        creditsAdjusted: actualDeduction,
+        updatedAt: nowIso,
+      };
+    }
   }
 
   private resolveUserByStripeRefs(
@@ -889,16 +1203,11 @@ export class BillingService {
    * `refund.created`, `refund.updated`, `refund.failed`) transactionally and idempotently.
    *
    * Credit & Entitlement Refund Policy (non-destructive & audit-logged):
-   * - Full refund: deducts up to remaining unspent granted credits (clamped at 0; unrecovered spent credits
-   *   are recorded in `credit_transactions.metadata_json.unrecoveredCredits` rather than creating negative debt).
-   *   For subscription payments, cancels the associated subscription immediately if no other active sub exists;
-   *   for one-time `audit_once` payments, preserves any unrelated active subscription.
-   * - Partial refund: deducts proportional credits based on `amount_refunded / total_amount` while preserving
-   *   existing subscription status.
-   * - Failed/canceled/pending refunds: perform 0 credit clawback and preserve subscription state; failed refunds
-   *   write a `delta: 0` `STRIPE_REFUND_FAILED` ledger entry for auditability.
-   * - Strictly separates billing refunds (`STRIPE_PAYMENT_REFUND`, `STRIPE_PARTIAL_REFUND`, `STRIPE_REFUND_FAILED`)
-   *   from failed-scan refunds (`SCAN_REFUND`).
+   * - Strict status allowlist (`succeeded`, `pending`, `requires_action`, `failed`, `canceled`, or `unknown`).
+   *   Never coerces missing, null, or unknown status into `'succeeded'`.
+   * - Cumulative exact integer-cent proportional credit math (via BigInt).
+   * - Out-of-order protection: refunds arriving before checkout/invoice persist with `reconciled=false` and
+   *   reconcile atomically when the payment record is created.
    */
   private processRefundWebhook(state: any, event: Stripe.Event): void {
     if (!state.stripeRefunds) state.stripeRefunds = {};
@@ -930,8 +1239,8 @@ export class BillingService {
       subscriptionId: metadataSubscriptionId,
     });
 
-    // Enrich payment correlation with chargeId/paymentIntentId if newly observed
-    if (payment && ((chargeId && !payment.chargeId) || (paymentIntentId && !payment.paymentIntentId))) {
+    // Enrich payment correlation with chargeId/paymentIntentId/invoiceId if newly observed
+    if (payment && ((chargeId && !payment.chargeId) || (paymentIntentId && !payment.paymentIntentId) || (invoiceId && !payment.invoiceId))) {
       this.upsertStripePayment(state, {
         id: payment.id,
         userId: payment.userId,
@@ -939,6 +1248,9 @@ export class BillingService {
         paymentIntentId: payment.paymentIntentId || paymentIntentId,
         invoiceId: payment.invoiceId || invoiceId,
       });
+      if (chargeId && !payment.chargeId) payment.chargeId = chargeId;
+      if (paymentIntentId && !payment.paymentIntentId) payment.paymentIntentId = paymentIntentId;
+      if (invoiceId && !payment.invoiceId) payment.invoiceId = invoiceId;
     }
 
     const effectiveSubId = payment?.subscriptionId || metadataSubscriptionId;
@@ -952,13 +1264,14 @@ export class BillingService {
     const subRecord = effectiveSubId ? state.subscriptions[effectiveSubId] : undefined;
     const planId = payment?.planId || metadataPlanId || subRecord?.planId;
     const totalPaymentAmount = isChargeEvent
-      ? (typeof obj?.amount === 'number' ? Number(obj.amount) : payment?.amountTotal)
+      ? (typeof obj?.amount === 'number' && Number.isFinite(obj.amount) ? Math.trunc(obj.amount) : payment?.amountTotal)
       : (payment?.amountTotal ?? undefined);
 
     interface NormalizedRefundItem {
       refundId: string;
       amount: number;
-      status: 'pending' | 'succeeded' | 'failed' | 'canceled';
+      status: StripeRefundStatus;
+      rawStatus?: string;
       failureReason?: string;
       isFull: boolean;
     }
@@ -967,45 +1280,58 @@ export class BillingService {
 
     if (isChargeEvent) {
       const chargeRefundsList: any[] = Array.isArray(obj?.refunds?.data) ? obj.refunds.data : [];
-      const cumulativeRefunded = Number(obj?.amount_refunded || 0);
-      const chargeFullyRefunded = Boolean(obj?.refunded) ||
+      const cumulativeRefunded = Number.isFinite(Number(obj?.amount_refunded)) ? Math.trunc(Number(obj.amount_refunded)) : 0;
+      const chargeFullyRefunded = obj?.refunded === true ||
         (typeof totalPaymentAmount === 'number' && totalPaymentAmount > 0 && cumulativeRefunded >= totalPaymentAmount);
 
       if (chargeRefundsList.length > 0) {
         for (const r of chargeRefundsList) {
-          const rAmount = Number(r?.amount || 0);
-          const rStatus = (r?.status || 'succeeded') as NormalizedRefundItem['status'];
-          const rIsFull = chargeFullyRefunded ||
-            (typeof totalPaymentAmount === 'number' && totalPaymentAmount > 0 && rAmount >= totalPaymentAmount);
+          const rAmount = Number.isFinite(Number(r?.amount)) ? Math.trunc(Number(r.amount)) : 0;
+          const { status: rStatus, rawStatus } = this.normalizeRefundStatus(r?.status, event.type);
+          const rIsFull =
+            rStatus === 'succeeded' &&
+            rAmount > 0 &&
+            (chargeFullyRefunded ||
+              (typeof totalPaymentAmount === 'number' && totalPaymentAmount > 0 && rAmount >= totalPaymentAmount));
           itemsToProcess.push({
-            refundId: r?.id || `chg_refund_${chargeId}_${rAmount}`,
+            refundId: r?.id || `chg_refund_${chargeId || paymentIntentId || event.id}_${rAmount}`,
             amount: rAmount,
             status: rStatus,
+            rawStatus,
             failureReason: r?.failure_reason || undefined,
             isFull: rIsFull,
           });
         }
       } else {
+        // charge.refunded without refunds.data list: derive status strictly from charge.refunded / amount_refunded > 0
+        const hasValidChargeRefundSignal = obj?.refunded === true || cumulativeRefunded > 0;
+        const derivedStatus: StripeRefundStatus = hasValidChargeRefundSignal ? 'succeeded' : 'unknown';
+        const effectiveAmount = cumulativeRefunded > 0 ? cumulativeRefunded : (obj?.refunded === true ? (totalPaymentAmount || 0) : 0);
         itemsToProcess.push({
-          refundId: `chg_refund_${chargeId || paymentIntentId || event.id}_${cumulativeRefunded}`,
-          amount: cumulativeRefunded > 0 ? cumulativeRefunded : (totalPaymentAmount || 0),
-          status: 'succeeded',
-          isFull: chargeFullyRefunded || cumulativeRefunded === 0,
+          refundId: `chg_refund_${chargeId || paymentIntentId || event.id}_${effectiveAmount}`,
+          amount: effectiveAmount,
+          status: derivedStatus,
+          rawStatus: hasValidChargeRefundSignal ? 'charge_summary_refunded' : 'missing_refund_summary',
+          failureReason: hasValidChargeRefundSignal ? undefined : 'unknown_or_missing_refund_status: missing_charge_refund_summary',
+          isFull: derivedStatus === 'succeeded' && effectiveAmount > 0 && (chargeFullyRefunded || (typeof totalPaymentAmount === 'number' && effectiveAmount >= totalPaymentAmount)),
         });
       }
     } else {
       // refund.created / refund.updated / refund.failed / charge.refund.updated
-      const rawStatus = event.type === 'refund.failed'
-        ? 'failed'
-        : ((obj?.status || 'succeeded') as NormalizedRefundItem['status']);
-      const rAmount = Number(obj?.amount || 0);
-      const rIsFull = typeof totalPaymentAmount === 'number' && totalPaymentAmount > 0
-        ? rAmount >= totalPaymentAmount
-        : false;
+      const { status: rawNormStatus, rawStatus } = this.normalizeRefundStatus(obj?.status, event.type);
+      const rAmount = Number.isFinite(Number(obj?.amount)) ? Math.trunc(Number(obj.amount)) : 0;
+      const rIsFull =
+        rawNormStatus === 'succeeded' &&
+        rAmount > 0 &&
+        typeof totalPaymentAmount === 'number' &&
+        totalPaymentAmount > 0
+          ? rAmount >= totalPaymentAmount
+          : false;
       itemsToProcess.push({
         refundId: obj?.id || `refund_${event.id}`,
         amount: rAmount,
-        status: rawStatus,
+        status: rawNormStatus,
+        rawStatus,
         failureReason: obj?.failure_reason || undefined,
         isFull: rIsFull,
       });
@@ -1019,20 +1345,23 @@ export class BillingService {
 
       // 1. Failed or Canceled Refund: never adjust credits or revoke plan
       if (item.status === 'failed' || item.status === 'canceled') {
-        const alreadyRecordedFailed = existingRefund && (existingRefund.status === 'failed' || existingRefund.status === 'canceled');
+        const alreadyRecordedTerminalFailure =
+          existingRefund && (existingRefund.status === 'failed' || existingRefund.status === 'canceled') && existingRefund.status === item.status;
         state.stripeRefunds[item.refundId] = {
           refundId: item.refundId,
-          paymentId: payment?.id,
-          userId: user?.id,
+          paymentId: payment?.id ?? existingRefund?.paymentId,
+          userId: user?.id ?? existingRefund?.userId,
           chargeId,
           paymentIntentId,
           invoiceId,
           subscriptionId: effectiveSubId,
           planId,
-          amountRefunded: item.amount,
+          amountRefunded: Math.max(0, item.amount),
           totalAmount: totalPaymentAmount,
           isFullRefund: false,
           status: item.status,
+          rawStatus: item.rawStatus,
+          reconciled: Boolean(payment),
           creditsAdjusted: 0,
           failureReason: item.failureReason || (item.status === 'canceled' ? 'refund_canceled' : 'refund_failed'),
           eventId: event.id,
@@ -1040,7 +1369,7 @@ export class BillingService {
           updatedAt: nowIso,
         };
 
-        if (!alreadyRecordedFailed && user) {
+        if (!alreadyRecordedTerminalFailure && user) {
           recordCreditTx(state, {
             userId: user.id,
             delta: 0,
@@ -1061,21 +1390,23 @@ export class BillingService {
         continue;
       }
 
-      // 2. Pending Refund: record provisional state only (wait for terminal succeeded/failed)
-      if (item.status === 'pending') {
+      // 2. Provisional non-terminal states ('pending', 'requires_action'): persist without mutating credits/plan
+      if (item.status === 'pending' || item.status === 'requires_action') {
         state.stripeRefunds[item.refundId] = {
           refundId: item.refundId,
-          paymentId: payment?.id,
-          userId: user?.id,
+          paymentId: payment?.id ?? existingRefund?.paymentId,
+          userId: user?.id ?? existingRefund?.userId,
           chargeId,
           paymentIntentId,
           invoiceId,
           subscriptionId: effectiveSubId,
           planId,
-          amountRefunded: item.amount,
+          amountRefunded: Math.max(0, item.amount),
           totalAmount: totalPaymentAmount,
-          isFullRefund: item.isFull,
-          status: 'pending',
+          isFullRefund: false,
+          status: item.status,
+          rawStatus: item.rawStatus,
+          reconciled: false,
           creditsAdjusted: 0,
           eventId: event.id,
           createdAt: existingRefund?.createdAt || nowIso,
@@ -1084,30 +1415,185 @@ export class BillingService {
         continue;
       }
 
-      // 3. Succeeded Refund: idempotent deduplication check
-      if (existingRefund && existingRefund.status === 'succeeded') {
+      // 3. Unknown / Missing / Null refund status: fail closed with diagnostic state, never deduct credits
+      if (item.status === 'unknown') {
+        state.stripeRefunds[item.refundId] = {
+          refundId: item.refundId,
+          paymentId: payment?.id ?? existingRefund?.paymentId,
+          userId: user?.id ?? existingRefund?.userId,
+          chargeId,
+          paymentIntentId,
+          invoiceId,
+          subscriptionId: effectiveSubId,
+          planId,
+          amountRefunded: Math.max(0, item.amount),
+          totalAmount: totalPaymentAmount,
+          isFullRefund: false,
+          status: 'unknown',
+          rawStatus: item.rawStatus,
+          reconciled: false,
+          creditsAdjusted: 0,
+          failureReason: item.failureReason || `unknown_or_missing_refund_status: ${item.rawStatus || 'missing'}`,
+          eventId: event.id,
+          createdAt: existingRefund?.createdAt || nowIso,
+          updatedAt: nowIso,
+        };
+        continue;
+      }
+
+      // 4. Succeeded Refund: idempotent deduplication check
+      if (existingRefund && existingRefund.status === 'succeeded' && (existingRefund.reconciled || !payment)) {
         // Already applied (e.g. refund.created arrived before charge.refunded or duplicate delivery)
         continue;
       }
 
-      const originalCreditsGranted = payment?.creditsGranted ?? (planId ? this.getPlanCreditAllocation(planId) : 0);
-      const priorAdjusted = this.getPriorCreditsAdjustedForPayment(state, {
-        paymentId: payment?.id,
-        paymentIntentId,
-        chargeId,
-      });
-      const remainingReversible = Math.max(0, originalCreditsGranted - priorAdjusted);
+      // Guard invalid or zero refund amount: persist without deducting credits or canceling subscription
+      if (item.amount <= 0) {
+        state.stripeRefunds[item.refundId] = {
+          refundId: item.refundId,
+          paymentId: payment?.id ?? existingRefund?.paymentId,
+          userId: user?.id ?? existingRefund?.userId,
+          chargeId,
+          paymentIntentId,
+          invoiceId,
+          subscriptionId: effectiveSubId,
+          planId,
+          amountRefunded: Math.max(0, item.amount),
+          totalAmount: totalPaymentAmount,
+          isFullRefund: false,
+          status: 'succeeded',
+          rawStatus: item.rawStatus,
+          reconciled: Boolean(payment),
+          creditsAdjusted: 0,
+          failureReason: item.amount < 0 ? 'invalid_negative_refund_amount' : 'zero_refund_amount',
+          eventId: event.id,
+          createdAt: existingRefund?.createdAt || nowIso,
+          updatedAt: nowIso,
+        };
+        continue;
+      }
 
-      let desiredClawback = 0;
-      if (remainingReversible > 0) {
-        if (item.isFull) {
-          desiredClawback = remainingReversible;
-        } else if (typeof totalPaymentAmount === 'number' && totalPaymentAmount > 0 && item.amount > 0) {
-          desiredClawback = Math.min(
-            remainingReversible,
-            Math.floor(originalCreditsGranted * (item.amount / totalPaymentAmount))
-          );
+      const refundCents = item.amount;
+      const originalCreditsGranted = payment?.creditsGranted ?? (planId ? this.getPlanCreditAllocation(planId) : 0);
+
+      // Out-of-order protection: payment hasn't arrived yet (e.g. refund.created/charge.refunded before checkout.session.completed or invoice.paid).
+      // Record succeeded refund with reconciled=false and creditsAdjusted=0; do NOT deduct pre-existing unrelated balance yet.
+      // When checkout.session.completed / invoice.paid / verifyAndSynchronizeSession arrives, reconcilePendingRefundsForPayment()
+      // links and applies the exact net reversal atomically.
+      if (!payment) {
+        const isEstimatedFull = item.isFull ||
+          (typeof totalPaymentAmount === 'number' && totalPaymentAmount > 0 && refundCents >= totalPaymentAmount);
+
+        state.stripeRefunds[item.refundId] = {
+          refundId: item.refundId,
+          paymentId: undefined,
+          userId: user?.id,
+          chargeId,
+          paymentIntentId,
+          invoiceId,
+          subscriptionId: effectiveSubId,
+          planId,
+          amountRefunded: refundCents,
+          totalAmount: totalPaymentAmount,
+          isFullRefund: isEstimatedFull,
+          status: 'succeeded',
+          rawStatus: item.rawStatus,
+          reconciled: false,
+          creditsAdjusted: 0,
+          eventId: event.id,
+          createdAt: existingRefund?.createdAt || nowIso,
+          updatedAt: nowIso,
+        };
+
+        if (user) {
+          recordCreditTx(state, {
+            userId: user.id,
+            delta: 0,
+            balanceAfter: user.creditsRemaining,
+            type: isEstimatedFull ? 'STRIPE_PAYMENT_REFUND' : 'STRIPE_PARTIAL_REFUND',
+            referenceId: `${item.refundId}:awaiting_payment`,
+            metadataJson: JSON.stringify({
+              eventId: event.id,
+              refundId: item.refundId,
+              chargeId,
+              paymentIntentId,
+              invoiceId,
+              subscriptionId: effectiveSubId,
+              planId,
+              amountRefunded: refundCents,
+              totalPaymentAmount,
+              refundScope: isEstimatedFull ? 'full' : 'partial',
+              desiredCreditClawback: this.computeCumulativeTargetCredits(originalCreditsGranted, refundCents, totalPaymentAmount, isEstimatedFull),
+              actualCreditsDeducted: 0,
+              pendingPaymentReconciliation: true,
+            }),
+          });
         }
+        continue;
+      }
+
+      // Payment exists: compute cumulative succeeded refund cents and proportional clawback
+      const { priorCreditsAdjusted, priorSucceededCents } = this.getPriorRefundTotalsForPayment(
+        state,
+        {
+          paymentId: payment.id,
+          paymentIntentId,
+          chargeId,
+          invoiceId,
+        },
+        item.refundId
+      );
+
+      const effectiveRefundCents = (!isChargeEvent || (Array.isArray(obj?.refunds?.data) && obj.refunds.data.length > 0))
+        ? refundCents
+        : Math.max(0, refundCents - priorSucceededCents);
+
+      if (effectiveRefundCents <= 0) {
+        state.stripeRefunds[item.refundId] = {
+          refundId: item.refundId,
+          paymentId: payment.id,
+          userId: user?.id,
+          chargeId,
+          paymentIntentId,
+          invoiceId,
+          subscriptionId: effectiveSubId,
+          planId,
+          amountRefunded: refundCents,
+          totalAmount: totalPaymentAmount,
+          isFullRefund: item.isFull,
+          status: 'succeeded',
+          rawStatus: item.rawStatus,
+          reconciled: true,
+          creditsAdjusted: 0,
+          eventId: event.id,
+          createdAt: existingRefund?.createdAt || nowIso,
+          updatedAt: nowIso,
+        };
+        continue;
+      }
+
+      const cumulativeSucceededCents = priorSucceededCents + effectiveRefundCents;
+      const isCumulativeFull = item.isFull ||
+        (typeof totalPaymentAmount === 'number' && totalPaymentAmount > 0 && cumulativeSucceededCents >= totalPaymentAmount);
+
+      const remainingReversible = Math.max(0, originalCreditsGranted - priorCreditsAdjusted);
+      let desiredClawback = 0;
+
+      if (remainingReversible > 0) {
+        const cumulativeTarget = this.computeCumulativeTargetCredits(
+          originalCreditsGranted,
+          cumulativeSucceededCents,
+          totalPaymentAmount,
+          isCumulativeFull
+        );
+        const priorTarget = this.computeCumulativeTargetCredits(
+          originalCreditsGranted,
+          priorSucceededCents,
+          totalPaymentAmount,
+          false
+        );
+        const priorAccounted = Math.max(priorCreditsAdjusted, priorTarget);
+        desiredClawback = Math.max(0, Math.min(remainingReversible, cumulativeTarget - priorAccounted));
       }
 
       let actualDeduction = 0;
@@ -1122,28 +1608,30 @@ export class BillingService {
           userId: user.id,
           delta: -actualDeduction,
           balanceAfter: user.creditsRemaining,
-          type: item.isFull ? 'STRIPE_PAYMENT_REFUND' : 'STRIPE_PARTIAL_REFUND',
+          type: isCumulativeFull ? 'STRIPE_PAYMENT_REFUND' : 'STRIPE_PARTIAL_REFUND',
           referenceId: item.refundId,
           metadataJson: JSON.stringify({
             eventId: event.id,
             refundId: item.refundId,
+            paymentId: payment.id,
             chargeId,
             paymentIntentId,
             invoiceId,
             subscriptionId: effectiveSubId,
             planId,
-            amountRefunded: item.amount,
+            amountRefunded: effectiveRefundCents,
+            cumulativeRefundedCents: cumulativeSucceededCents,
             totalPaymentAmount,
-            refundScope: item.isFull ? 'full' : 'partial',
+            refundScope: isCumulativeFull ? 'full' : 'partial',
             desiredCreditClawback: desiredClawback,
             actualCreditsDeducted: actualDeduction,
             unrecoveredCredits: Math.max(0, desiredClawback - actualDeduction),
           }),
         });
 
-        // Subscription revocation only on full refund of a subscription payment (never for audit_once one-time purchases)
+        // Subscription revocation only on full cumulative refund of a subscription payment (never for audit_once one-time purchases)
         const isSubscriptionPurchase = Boolean(effectiveSubId) && planId !== 'audit_once';
-        if (item.isFull && isSubscriptionPurchase && effectiveSubId) {
+        if (isCumulativeFull && isSubscriptionPurchase && effectiveSubId) {
           const targetSub = state.subscriptions[effectiveSubId];
           if (targetSub) {
             targetSub.status = 'canceled';
@@ -1156,29 +1644,35 @@ export class BillingService {
         }
       }
 
-      if (payment) {
-        this.upsertStripePayment(state, {
-          id: payment.id,
-          userId: payment.userId,
-          chargeId: payment.chargeId || chargeId,
-          paymentIntentId: payment.paymentIntentId || paymentIntentId,
-          status: item.isFull ? 'refunded' : 'partially_refunded',
-        });
-      }
+      const nextPaymentStatus = isCumulativeFull
+        ? 'refunded'
+        : (payment.status === 'refunded' ? 'refunded' : 'partially_refunded');
+
+      this.upsertStripePayment(state, {
+        id: payment.id,
+        userId: payment.userId,
+        chargeId: payment.chargeId || chargeId,
+        paymentIntentId: payment.paymentIntentId || paymentIntentId,
+        invoiceId: payment.invoiceId || invoiceId,
+        status: nextPaymentStatus,
+      });
+      payment.status = nextPaymentStatus;
 
       state.stripeRefunds[item.refundId] = {
         refundId: item.refundId,
-        paymentId: payment?.id,
+        paymentId: payment.id,
         userId: user?.id,
         chargeId,
         paymentIntentId,
         invoiceId,
         subscriptionId: effectiveSubId,
         planId,
-        amountRefunded: item.amount,
+        amountRefunded: effectiveRefundCents,
         totalAmount: totalPaymentAmount,
-        isFullRefund: item.isFull,
+        isFullRefund: isCumulativeFull,
         status: 'succeeded',
+        rawStatus: item.rawStatus,
+        reconciled: true,
         creditsAdjusted: actualDeduction,
         eventId: event.id,
         createdAt: existingRefund?.createdAt || nowIso,
@@ -1201,7 +1695,7 @@ export class BillingService {
    * Executes transactional state updates for verified webhook events
    */
   private async processVerifiedEvent(event: Stripe.Event): Promise<{ alreadyProcessed: boolean }> {
-    return await storage.runTransaction(async (state) => {
+    return await this.getActiveStorage().runTransaction(async (state) => {
       // Idempotency check inside transaction
       if (state.webhookEvents[event.id]) {
         console.log(`[BillingService] Idempotency hit: Event ${event.id} already processed.`);
@@ -1273,9 +1767,9 @@ export class BillingService {
           }
 
           // Out-of-order protection: if a full refund for this payment_intent/invoice arrived before checkout.session.completed,
-          // record payment correlation in 'refunded' state and do NOT grant unreversed credits.
+          // record payment correlation in 'refunded' state, cancel any subscription if applicable, and do NOT grant unreversed credits.
           if (this.hasSucceededFullRefund(state, { paymentIntentId: sessionPaymentIntentId, invoiceId: sessionInvoiceId })) {
-            this.upsertStripePayment(state, {
+            const refundedPayment = this.upsertStripePayment(state, {
               id: `pay_${session.id}`,
               userId: user.id,
               sessionId: session.id,
@@ -1289,6 +1783,24 @@ export class BillingService {
               currency: session.currency || undefined,
               status: 'refunded',
             });
+            if (sessionCustomerId) {
+              user.stripeCustomerId = sessionCustomerId;
+            }
+            if (sessionSubId && planId !== 'audit_once') {
+              const nowIso = new Date().toISOString();
+              user.subscriptionId = sessionSubId;
+              user.subscriptionStatus = 'canceled';
+              user.plan = 'free';
+              state.subscriptions[sessionSubId] = {
+                id: sessionSubId,
+                userId: user.id,
+                planId,
+                status: 'canceled',
+                createdAt: state.subscriptions[sessionSubId]?.createdAt || nowIso,
+                updatedAt: nowIso,
+              };
+            }
+            this.reconcilePendingRefundsForPayment(state, refundedPayment, user, new Date().toISOString());
             state.webhookEvents[event.id] = {
               eventId: event.id,
               provider: 'stripe',
@@ -1332,7 +1844,7 @@ export class BillingService {
                 updatedAt: new Date(Math.max(Date.now(), eventCreatedMs)).toISOString(),
               };
             }
-            this.upsertStripePayment(state, {
+            const existingOrSyncedPayment = this.upsertStripePayment(state, {
               id: `pay_${session.id}`,
               userId: user.id,
               sessionId: session.id,
@@ -1346,6 +1858,7 @@ export class BillingService {
               currency: session.currency || undefined,
               status: 'paid',
             });
+            this.reconcilePendingRefundsForPayment(state, existingOrSyncedPayment, user, new Date().toISOString());
             state.webhookEvents[event.id] = {
               eventId: event.id,
               provider: 'stripe',
@@ -1384,7 +1897,7 @@ export class BillingService {
             };
           }
 
-          this.upsertStripePayment(state, {
+          const createdPayment = this.upsertStripePayment(state, {
             id: `pay_${session.id}`,
             userId: user.id,
             sessionId: session.id,
@@ -1425,6 +1938,9 @@ export class BillingService {
             })
           });
 
+          // Reconcile any partial/out-of-order refunds that arrived before checkout.session.completed
+          this.reconcilePendingRefundsForPayment(state, createdPayment, user, new Date().toISOString());
+
           console.log(`[BillingService] checkout.session.completed: Allocated ${creditAllocation} credits to ${userId} for plan ${planId}`);
           break;
         }
@@ -1455,17 +1971,54 @@ export class BillingService {
 
               const user = state.users[sub.userId];
               if (user) {
+                const isRenewal = invoice.billing_reason === 'subscription_cycle';
+                const hasPriorFullRefund = this.hasSucceededFullRefund(state, {
+                  paymentIntentId: invoicePaymentIntentId,
+                  chargeId: invoiceChargeId,
+                  invoiceId: invoice.id,
+                });
+
+                if (hasPriorFullRefund) {
+                  sub.status = 'canceled';
+                  user.subscriptionStatus = 'canceled';
+                  user.plan = 'free';
+                  const refundedInvPayment = this.upsertStripePayment(state, {
+                    id: `pay_inv_${invoice.id || event.id}`,
+                    userId: sub.userId,
+                    paymentIntentId: invoicePaymentIntentId,
+                    chargeId: invoiceChargeId,
+                    invoiceId: invoice.id,
+                    subscriptionId: subId,
+                    customerId: invoiceCustomerId || user.stripeCustomerId,
+                    planId: sub.planId,
+                    creditsGranted: 0,
+                    amountTotal: typeof invoice.amount_paid === 'number' ? invoice.amount_paid : undefined,
+                    currency: invoice.currency || undefined,
+                    status: 'refunded',
+                  });
+                  this.reconcilePendingRefundsForPayment(state, refundedInvPayment, user, new Date().toISOString());
+                  state.webhookEvents[event.id] = {
+                    eventId: event.id,
+                    provider: 'stripe',
+                    eventType: event.type,
+                    processedAt: new Date().toISOString(),
+                    userId: sub.userId,
+                    creditsGranted: 0,
+                    planGranted: sub.planId,
+                  };
+                  return { alreadyProcessed: false };
+                }
+
                 user.subscriptionStatus = 'active';
                 user.plan = sub.planId as any;
 
-                const isRenewal = invoice.billing_reason === 'subscription_cycle';
                 const creditAllocation = isRenewal ? this.getPlanCreditAllocation(sub.planId) : 0;
 
                 if (isRenewal) {
                   user.creditsRemaining += creditAllocation;
                 }
 
-                this.upsertStripePayment(state, {
+                const invPayment = this.upsertStripePayment(state, {
                   id: `pay_inv_${invoice.id || event.id}`,
                   userId: sub.userId,
                   paymentIntentId: invoicePaymentIntentId,
@@ -1503,8 +2056,10 @@ export class BillingService {
                       chargeId: invoiceChargeId || null,
                     })
                   });
+                  this.reconcilePendingRefundsForPayment(state, invPayment, user, new Date().toISOString());
                   return { alreadyProcessed: false };
                 }
+                this.reconcilePendingRefundsForPayment(state, invPayment, user, new Date().toISOString());
               }
             }
           }
@@ -1918,7 +2473,7 @@ export class BillingService {
     const syncEventId = `sync_${session.id}`;
     const targetUserId = sessionUserId;
 
-    const updatedUser = await storage.runTransaction(async (state) => {
+    const updatedUser = await this.getActiveStorage().runTransaction(async (state) => {
       const user = state.users[targetUserId];
       if (!user) {
         throw new Error(`User not found: ${targetUserId}`);
@@ -1954,7 +2509,7 @@ export class BillingService {
           : session.subscription?.id;
 
         if (this.hasSucceededFullRefund(state, { paymentIntentId: sessionPaymentIntentId, invoiceId: sessionInvoiceId })) {
-          this.upsertStripePayment(state, {
+          const refundedSyncPayment = this.upsertStripePayment(state, {
             id: `pay_${session.id}`,
             userId: user.id,
             sessionId: session.id,
@@ -1968,6 +2523,24 @@ export class BillingService {
             currency: session.currency || undefined,
             status: 'refunded',
           });
+          if (sessionCustomerId) {
+            user.stripeCustomerId = sessionCustomerId;
+          }
+          if (sessionSubId && planId !== 'audit_once') {
+            const nowIso = new Date().toISOString();
+            user.subscriptionId = sessionSubId;
+            user.subscriptionStatus = 'canceled';
+            user.plan = 'free';
+            state.subscriptions[sessionSubId] = {
+              id: sessionSubId,
+              userId: user.id,
+              planId,
+              status: 'canceled',
+              createdAt: state.subscriptions[sessionSubId]?.createdAt || nowIso,
+              updatedAt: nowIso,
+            };
+          }
+          this.reconcilePendingRefundsForPayment(state, refundedSyncPayment, user, new Date().toISOString());
           state.webhookEvents[syncEventId] = {
             eventId: syncEventId,
             provider: 'stripe',
@@ -2007,7 +2580,7 @@ export class BillingService {
           };
         }
 
-        this.upsertStripePayment(state, {
+        const syncedPayment = this.upsertStripePayment(state, {
           id: `pay_${session.id}`,
           userId: user.id,
           sessionId: session.id,
@@ -2047,6 +2620,8 @@ export class BillingService {
             source: 'session_sync',
           })
         });
+
+        this.reconcilePendingRefundsForPayment(state, syncedPayment, user, new Date().toISOString());
       }
 
       return user;

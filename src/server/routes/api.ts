@@ -8,6 +8,7 @@ import net from 'net';
 import { storage } from '../storage';
 import { jobOrchestrator } from '../pipeline/jobOrchestrator';
 import { mediaInspector } from '../pipeline/mediaInspector';
+import { speechTranscriptionAdapter } from '../pipeline/audioProcessor';
 import { thumbnailInspector } from '../pipeline/thumbnailInspector';
 import { creditService } from '../services/creditService';
 import { billingService, ALLOWED_PAID_PLANS } from '../services/billingService';
@@ -1304,9 +1305,81 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
     }
   };
 
+  // 4. Optional Whisper STT readiness check (cached compatibility initialization; never blocks core readiness)
+  try {
+    const sttValidation = await speechTranscriptionAdapter.validateRuntime();
+    if (sttValidation.status === 'UNCONFIGURED') {
+      checks.whisperStt = {
+        status: 'healthy',
+        message: 'Optional local Whisper STT not configured; acoustic speech analysis remains active.',
+        details: {
+          configured: false,
+          runtimeType: sttValidation.runtimeType,
+          diagnosticCode: sttValidation.diagnosticCode || 'UNCONFIGURED',
+          compatibilityVerified: false
+        }
+      };
+    } else if (sttValidation.status !== 'READY') {
+      checks.whisperStt = {
+        status: 'degraded',
+        message: sttValidation.details || `Whisper STT preflight check reported ${sttValidation.status}.`,
+        details: {
+          configured: true,
+          runtimeType: sttValidation.runtimeType,
+          validationStatus: sttValidation.status,
+          diagnosticCode: sttValidation.diagnosticCode || 'IDENTITY_CONTRACT_MISMATCH',
+          compatibilityVerified: false
+        }
+      };
+    } else {
+      const compat = await speechTranscriptionAdapter.initializeRuntime();
+      if (compat.compatible) {
+        checks.whisperStt = {
+          status: 'healthy',
+          message: `Whisper STT runtime (${compat.runtimeType}) verified on speech fixture.`,
+          details: {
+            configured: true,
+            runtimeType: compat.runtimeType,
+            diagnosticCode: compat.diagnosticCode,
+            compatibilityVerified: true,
+            fromCache: Boolean(compat.fromCache)
+          }
+        };
+      } else if (compat.diagnosticCode === 'SPEECH_FIXTURE_NOT_FOUND') {
+        checks.whisperStt = {
+          status: 'healthy',
+          message: `Whisper STT runtime (${sttValidation.runtimeType}) preflight ready; speech compatibility fixture not configured.`,
+          details: {
+            configured: true,
+            runtimeType: sttValidation.runtimeType,
+            diagnosticCode: compat.diagnosticCode,
+            compatibilityVerified: false
+          }
+        };
+      } else {
+        checks.whisperStt = {
+          status: 'degraded',
+          message: compat.details || `Whisper STT compatibility check failed (${compat.diagnosticCode}).`,
+          details: {
+            configured: true,
+            runtimeType: compat.runtimeType,
+            diagnosticCode: compat.diagnosticCode,
+            compatibilityVerified: false
+          }
+        };
+      }
+    }
+  } catch (err: any) {
+    checks.whisperStt = {
+      status: 'degraded',
+      message: 'Whisper STT readiness check encountered an unexpected error.',
+      details: { configured: true, compatibilityVerified: false }
+    };
+  }
+
   // Overall readiness logic:
   // Core readiness (database + writeable storage) must be healthy for app to serve requests.
-  // In production, degraded billing does not bring down core application if optional/unconfigured.
+  // In production, degraded billing or optional Whisper STT does not bring down core application if optional/unconfigured.
   const isReady = isCoreReady && (isProd ? (checks.billing.status !== 'unhealthy') : true);
   const statusCode = isReady ? 200 : 503;
 
@@ -1722,7 +1795,7 @@ apiRouter.post('/billing/checkout', async (req: Request, res: Response) => {
 
     const trustedOrigin = billingService.resolveTrustedCheckoutOrigin({
       requestedOrigin: req.headers.origin,
-      bodyOrigin: typeof originUrl === 'string' ? originUrl : undefined,
+      bodyOrigin: originUrl !== undefined && originUrl !== null ? originUrl : undefined,
     });
 
     const session = await billingService.createCheckoutSession({

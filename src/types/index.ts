@@ -695,6 +695,14 @@ export interface StripePaymentRecord {
   updatedAt: string;
 }
 
+export type StripeRefundStatus =
+  | 'pending'
+  | 'requires_action'
+  | 'succeeded'
+  | 'failed'
+  | 'canceled'
+  | 'unknown';
+
 export interface StripeRefundRecord {
   refundId: string;
   paymentId?: string;
@@ -707,7 +715,9 @@ export interface StripeRefundRecord {
   amountRefunded: number;
   totalAmount?: number;
   isFullRefund: boolean;
-  status: 'pending' | 'succeeded' | 'failed' | 'canceled';
+  status: StripeRefundStatus;
+  rawStatus?: string;
+  reconciled?: boolean;
   creditsAdjusted: number;
   failureReason?: string;
   eventId: string;

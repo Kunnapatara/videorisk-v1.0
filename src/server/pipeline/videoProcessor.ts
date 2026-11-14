@@ -12,10 +12,23 @@ import {
 
 const execFileAsync = promisify(execFile);
 
+export type VideoProcessingFailureCategory =
+  | 'MISSING_EXECUTABLE'
+  | 'NON_EXECUTABLE'
+  | 'TIMEOUT'
+  | 'PROCESS_TERMINATED'
+  | 'NON_ZERO_EXIT'
+  | 'EMPTY_OUTPUT'
+  | 'INVALID_OUTPUT'
+  | 'INVALID_INPUT';
+
 export class VideoProcessingError extends Error {
-  constructor(message: string) {
+  public readonly category?: VideoProcessingFailureCategory;
+
+  constructor(message: string, category?: VideoProcessingFailureCategory) {
     super(message);
     this.name = 'VideoProcessingError';
+    this.category = category;
   }
 }
 
@@ -327,12 +340,15 @@ export class VideoProcessor {
     const startTime = Date.now();
 
     if (!fs.existsSync(videoPath)) {
-      throw new VideoProcessingError(`Video file not found at ${videoPath}`);
+      throw new VideoProcessingError(`Video file not found at ${videoPath}`, 'INVALID_INPUT');
     }
 
     const stats = await fs.promises.stat(videoPath);
+    if (!stats.isFile()) {
+      throw new VideoProcessingError(`Video path is not a regular file: ${videoPath}`, 'INVALID_INPUT');
+    }
     if (stats.size === 0) {
-      throw new VideoProcessingError('Video file is empty (0 bytes).');
+      throw new VideoProcessingError('Video file is empty (0 bytes).', 'INVALID_INPUT');
     }
 
     // Audio-only input: No video stream to sample
@@ -382,6 +398,43 @@ export class VideoProcessor {
       : Math.max(1, parseFloat((dur / Math.min(targetSamples, Math.ceil(dur / 2))).toFixed(2)));
     const expectedSamples = Math.min(targetSamples, Math.max(1, Math.ceil(dur / sampleInterval)));
 
+    const ffmpegBin = process.env.FFMPEG_PATH || 'ffmpeg';
+
+    const classifyFfmpegError = (err: any, stage: string): VideoProcessingError => {
+      if (err instanceof VideoProcessingError) {
+        return err;
+      }
+      const errCodeStr = typeof err?.code === 'string' ? err.code : '';
+      if (errCodeStr === 'ENOENT') {
+        return new VideoProcessingError(`FFmpeg executable not found (${ffmpegBin}) during ${stage}.`, 'MISSING_EXECUTABLE');
+      }
+      if (errCodeStr === 'EACCES' || errCodeStr === 'EPERM' || errCodeStr === 'EISDIR') {
+        return new VideoProcessingError(`FFmpeg path is not executable (${errCodeStr}) during ${stage}.`, 'NON_EXECUTABLE');
+      }
+      if (
+        err?.killed === true ||
+        err?.signal === 'SIGTERM' ||
+        errCodeStr === 'ETIMEDOUT' ||
+        /timed?\s*out/i.test(String(err?.message || ''))
+      ) {
+        return new VideoProcessingError(`FFmpeg ${stage} timed out.`, 'TIMEOUT');
+      }
+      if (err?.signal) {
+        return new VideoProcessingError(`FFmpeg process terminated unexpectedly (${err.signal}) during ${stage}.`, 'PROCESS_TERMINATED');
+      }
+      const exitCode = typeof err?.code === 'number' ? err.code : null;
+      const stderrLine = String(err?.stderr || err?.message || 'FFmpeg process error')
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .slice(-2)
+        .join(' | ')
+        .slice(0, 180);
+      if (exitCode !== null) {
+        return new VideoProcessingError(`FFmpeg exited with code ${exitCode} during ${stage}: ${stderrLine}`, 'NON_ZERO_EXIT');
+      }
+      return new VideoProcessingError(`FFmpeg ${stage} failed: ${stderrLine}`, 'NON_ZERO_EXIT');
+    };
+
     try {
       // 1. Extract sampled visual preview JPEG frames for disk evidence
       const extractArgs = [
@@ -392,14 +445,18 @@ export class VideoProcessor {
         path.join(tempDir, 'frame_%03d.jpg')
       ];
 
-      await execFileAsync('ffmpeg', extractArgs, { timeout: 45000 });
+      try {
+        await execFileAsync(ffmpegBin, extractArgs, { timeout: 45000 });
+      } catch (err: any) {
+        throw classifyFfmpegError(err, 'frame extraction');
+      }
 
       // Read extracted frames from disk
       const frameFiles = fs.readdirSync(tempDir).filter(f => f.endsWith('.jpg')).sort();
       const framesCount = frameFiles.length;
 
       if (framesCount === 0) {
-        throw new VideoProcessingError('Failed to extract visual frames from video stream.');
+        throw new VideoProcessingError('Failed to extract visual frames from video stream.', 'EMPTY_OUTPUT');
       }
 
       // 2. Extract 8x8 raw RGB bytes for perceptual similarity and repetition analysis
@@ -416,14 +473,24 @@ export class VideoProcessor {
 
       let rawFramesBuffer: Buffer = Buffer.alloc(0);
       try {
-        const rawRes = await execFileAsync('ffmpeg', rawSampleArgs, { 
+        const rawRes = await execFileAsync(ffmpegBin, rawSampleArgs, { 
           encoding: 'buffer', 
           maxBuffer: 10 * 1024 * 1024,
           timeout: 45000 
         });
         rawFramesBuffer = rawRes.stdout as unknown as Buffer;
       } catch (err: any) {
-        throw new VideoProcessingError(`Failed to extract perceptual frame stream: ${err?.message || err}`);
+        throw classifyFfmpegError(err, 'perceptual frame extraction');
+      }
+
+      if (!Buffer.isBuffer(rawFramesBuffer) || rawFramesBuffer.length === 0) {
+        throw new VideoProcessingError('FFmpeg perceptual frame stream produced empty output.', 'EMPTY_OUTPUT');
+      }
+      if (rawFramesBuffer.length < bytesPerFrame || rawFramesBuffer.length % bytesPerFrame !== 0) {
+        throw new VideoProcessingError(
+          `FFmpeg perceptual frame stream produced invalid RGB byte count (${rawFramesBuffer.length} bytes, expected positive multiple of ${bytesPerFrame}).`,
+          'INVALID_OUTPUT'
+        );
       }
 
       const totalRawFrames = Math.floor(rawFramesBuffer.length / bytesPerFrame);
@@ -438,7 +505,13 @@ export class VideoProcessor {
         '-'
       ];
 
-      const { stdout: sceneStdout } = await execFileAsync('ffmpeg', sceneArgs, { timeout: 45000 });
+      let sceneStdout = '';
+      try {
+        const sceneRes = await execFileAsync(ffmpegBin, sceneArgs, { timeout: 45000 });
+        sceneStdout = sceneRes.stdout || '';
+      } catch (err: any) {
+        throw classifyFfmpegError(err, 'scene cut detection');
+      }
       const sceneDetectMs = Date.now() - sceneDetectStart;
 
       // Parse detected scene cut timestamps
@@ -933,9 +1006,7 @@ export class VideoProcessor {
       if (err instanceof VideoProcessingError) {
         throw err;
       }
-      throw new VideoProcessingError(
-        `Video scene analysis failed: ${err?.message || 'FFmpeg process error'}`
-      );
+      throw classifyFfmpegError(err, 'video scene analysis');
     }
   }
 

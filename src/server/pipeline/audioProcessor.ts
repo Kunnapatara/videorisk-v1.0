@@ -56,6 +56,8 @@ export interface LocalTranscriptionResult {
   status: DetectorExecutionStatus;
   transcriptText?: string;
   segments?: Array<{ start: number; end: number; text: string; confidence?: number }>;
+  diagnosticCode?: WhisperDiagnosticCode;
+  compatibilityVerified?: boolean;
   failureReason?: string;
   limitations: string;
   executionDurationMs: number;
@@ -71,6 +73,9 @@ export type WhisperDiagnosticCode =
   | 'MODEL_NOT_FOUND'
   | 'MODEL_NOT_READABLE'
   | 'MODEL_INCOMPATIBLE'
+  | 'RUNTIME_INIT_FAILED'
+  | 'SPEECH_FIXTURE_NOT_FOUND'
+  | 'SPEECH_FIXTURE_INVALID'
   | 'TRANSCRIPTION_TIMEOUT'
   | 'TRANSCRIPTION_FAILED'
   | 'EMPTY_TRANSCRIPTION_OUTPUT'
@@ -100,6 +105,10 @@ export interface WhisperCompatibilityResult {
   validation: WhisperRuntimeValidation;
   transcriptText?: string;
   segmentsCount?: number;
+  audioFixturePath?: string;
+  referenceTranscript?: string;
+  referenceMatched?: boolean;
+  fromCache?: boolean;
   executionDurationMs: number;
   details: string;
 }
@@ -129,6 +138,166 @@ const OPENAI_WHISPER_MODEL_NAMES = new Set<string>([
  * Never relies on executable basename heuristics, generic fallbacks, or unverified model files.
  */
 export class SpeechTranscriptionAdapter {
+  private compatibilityCache = new Map<string, WhisperCompatibilityResult>();
+
+  public clearCompatibilityCache(): void {
+    this.compatibilityCache.clear();
+  }
+
+  private getRuntimeFingerprint(validation: WhisperRuntimeValidation, fixturePath: string, expectedTranscript?: string): string {
+    const safeStatKey = (p?: string): string => {
+      if (!p) return 'none';
+      try {
+        const s = fs.statSync(p);
+        return `${p}:${s.size}:${Math.trunc(s.mtimeMs)}`;
+      } catch {
+        return p;
+      }
+    };
+    return [
+      validation.runtimeType,
+      safeStatKey(validation.executablePath),
+      safeStatKey(validation.modelPath),
+      safeStatKey(fixturePath),
+      expectedTranscript || ''
+    ].join('|');
+  }
+
+  /**
+   * Validates that an external audio fixture is a readable 16kHz mono 16-bit PCM WAV containing non-silent audio.
+   */
+  private validateSpeechWavFixture(fixturePath: string): { valid: boolean; reason?: string; durationSeconds?: number; rms?: number } {
+    let buf: Buffer;
+    try {
+      const stat = fs.statSync(fixturePath);
+      if (!stat.isFile()) {
+        return { valid: false, reason: `Speech fixture path is not a regular file: ${fixturePath}` };
+      }
+      if (stat.size < 44) {
+        return { valid: false, reason: `Speech fixture WAV is truncated (${stat.size} bytes)` };
+      }
+      buf = fs.readFileSync(fixturePath);
+    } catch (err: any) {
+      return { valid: false, reason: `Unable to read speech fixture at ${fixturePath}: ${err?.message || err}` };
+    }
+
+    if (buf.subarray(0, 4).toString('ascii') !== 'RIFF' || buf.subarray(8, 12).toString('ascii') !== 'WAVE') {
+      return { valid: false, reason: 'Speech fixture is not a valid RIFF/WAVE container.' };
+    }
+
+    let offset = 12;
+    let audioFormat: number | null = null;
+    let numChannels: number | null = null;
+    let sampleRate: number | null = null;
+    let bitsPerSample: number | null = null;
+    let dataOffset = -1;
+    let dataSize = 0;
+
+    while (offset + 8 <= buf.length) {
+      const chunkId = buf.subarray(offset, offset + 4).toString('ascii');
+      const chunkSize = buf.readUInt32LE(offset + 4);
+      const chunkStart = offset + 8;
+
+      if (chunkId === 'fmt ' && chunkSize >= 16 && chunkStart + 16 <= buf.length) {
+        audioFormat = buf.readUInt16LE(chunkStart);
+        numChannels = buf.readUInt16LE(chunkStart + 2);
+        sampleRate = buf.readUInt32LE(chunkStart + 4);
+        bitsPerSample = buf.readUInt16LE(chunkStart + 14);
+      } else if (chunkId === 'data') {
+        dataOffset = chunkStart;
+        dataSize = Math.min(chunkSize, Math.max(0, buf.length - chunkStart));
+      }
+
+      offset = chunkStart + chunkSize + (chunkSize % 2);
+    }
+
+    if (audioFormat !== 1 || numChannels !== 1 || sampleRate !== 16000 || bitsPerSample !== 16) {
+      return {
+        valid: false,
+        reason: `Speech fixture must be 16kHz mono 16-bit PCM WAV (got format=${audioFormat}, channels=${numChannels}, rate=${sampleRate}, bits=${bitsPerSample}).`
+      };
+    }
+
+    if (dataOffset < 0 || dataSize < 3200) {
+      return {
+        valid: false,
+        reason: 'Speech fixture WAV contains insufficient PCM audio samples (minimum 0.1s required).'
+      };
+    }
+
+    const totalSamples = Math.floor(dataSize / 2);
+    let sumSq = 0;
+    for (let i = 0; i < totalSamples; i++) {
+      const sample = buf.readInt16LE(dataOffset + i * 2) / 32768;
+      sumSq += sample * sample;
+    }
+    const rms = Math.sqrt(sumSq / totalSamples);
+    if (rms < 0.0005) {
+      return {
+        valid: false,
+        reason: 'Speech fixture WAV is near-silent and cannot verify real speech transcription.'
+      };
+    }
+
+    return {
+      valid: true,
+      durationSeconds: parseFloat((totalSamples / 16000).toFixed(3)),
+      rms: parseFloat(rms.toFixed(4))
+    };
+  }
+
+  private classifyWhisperProcessError(
+    execErr: any,
+    timeoutMs: number
+  ): { diagnosticCode: WhisperDiagnosticCode; details: string } {
+    const combinedErr = `${execErr?.stderr || ''}\n${execErr?.message || ''}`.trim();
+    const isTimeout = Boolean(
+      execErr?.killed === true ||
+      execErr?.signal === 'SIGTERM' ||
+      execErr?.code === 'ETIMEDOUT' ||
+      /timed?\s*out/i.test(combinedErr)
+    );
+    if (isTimeout) {
+      return {
+        diagnosticCode: 'TRANSCRIPTION_TIMEOUT',
+        details: `Whisper execution timed out after ${timeoutMs}ms.`
+      };
+    }
+
+    if (execErr?.code === 'ENOENT') {
+      return {
+        diagnosticCode: 'BINARY_NOT_FOUND',
+        details: 'Whisper executable became unavailable during execution (ENOENT).'
+      };
+    }
+
+    if (execErr?.code === 'EACCES' || execErr?.code === 'EPERM' || execErr?.code === 'EISDIR') {
+      return {
+        diagnosticCode: 'BINARY_NOT_EXECUTABLE',
+        details: `Whisper executable failed permission check (${execErr.code}).`
+      };
+    }
+
+    if (/invalid\s+model|failed\s+to\s+(init|initialize|load).*model|unknown\s+model|incompatible\s+model|corrupt(ed)?\s+model|ggml.*magic|unexpected\s+eof.*model/i.test(combinedErr)) {
+      return {
+        diagnosticCode: 'MODEL_INCOMPATIBLE',
+        details: combinedErr.split(/\r?\n/).filter(Boolean).slice(-2).join(' | ').slice(0, 220) || 'Whisper model initialization failed: incompatible or corrupt model.'
+      };
+    }
+
+    if (/dlopen|error while loading shared libraries|cannot open shared object|segmentation fault|sigsegv|illegal instruction|cuda.*error|metal.*error|vulkan.*error|failed\s+to\s+(init|initialize)\s+whisper/i.test(combinedErr)) {
+      return {
+        diagnosticCode: 'RUNTIME_INIT_FAILED',
+        details: combinedErr.split(/\r?\n/).filter(Boolean).slice(-2).join(' | ').slice(0, 220) || 'Whisper native runtime failed initialization.'
+      };
+    }
+
+    return {
+      diagnosticCode: 'TRANSCRIPTION_FAILED',
+      details: combinedErr.split(/\r?\n/).filter(Boolean).slice(-2).join(' | ').slice(0, 220) || 'Whisper transcription execution failed.'
+    };
+  }
+
   /**
    * Validates local Whisper runtime installation, executable status, CLI identity contract, and model validity.
    */
@@ -493,12 +662,32 @@ export class SpeechTranscriptionAdapter {
   }
 
   /**
+   * Cached initialization wrapper around `verifyRuntimeCompatibility()` for readiness checks and repeated scans.
+   * Re-verifies automatically if executable or model files change on disk or when `forceRefresh: true`.
+   */
+  public async initializeRuntime(options?: {
+    audioFixturePath?: string;
+    expectedTranscript?: string;
+    timeoutMs?: number;
+    forceRefresh?: boolean;
+  }): Promise<WhisperCompatibilityResult> {
+    return this.verifyRuntimeCompatibility({
+      audioFixturePath: options?.audioFixturePath,
+      expectedTranscript: options?.expectedTranscript,
+      timeoutMs: options?.timeoutMs,
+      useCache: !options?.forceRefresh,
+    });
+  }
+
+  /**
    * Executes an actual runtime compatibility smoke test against a configured Whisper binary + model
-   * using a short 16kHz mono PCM WAV audio fixture and verifies non-empty transcript output.
+   * using a real 16kHz mono PCM WAV speech audio fixture (never a synthetic sine tone).
    */
   public async verifyRuntimeCompatibility(options?: {
     audioFixturePath?: string;
+    expectedTranscript?: string;
     timeoutMs?: number;
+    useCache?: boolean;
   }): Promise<WhisperCompatibilityResult> {
     const startTime = Date.now();
     const timeoutMs = options?.timeoutMs ?? 20000;
@@ -527,52 +716,57 @@ export class SpeechTranscriptionAdapter {
       };
     }
 
+    const defaultCheckedInSpeechFixture = path.resolve(process.cwd(), 'tests', 'fixtures', 'speech', 'whisper_speech_16k.wav');
+    const resolvedFixturePath = options?.audioFixturePath || process.env.WHISPER_COMPAT_AUDIO_PATH || (fs.existsSync(defaultCheckedInSpeechFixture) ? defaultCheckedInSpeechFixture : undefined);
+
+    if (!resolvedFixturePath || !fs.existsSync(resolvedFixturePath)) {
+      return {
+        compatible: false,
+        diagnosticCode: 'SPEECH_FIXTURE_NOT_FOUND',
+        runtimeType: validation.runtimeType,
+        validation,
+        executionDurationMs: Date.now() - startTime,
+        details: 'No real speech 16kHz mono PCM WAV fixture is configured or present on disk (set WHISPER_COMPAT_AUDIO_PATH or provide audioFixturePath). Synthetic sine tones cannot verify speech recognition.'
+      };
+    }
+
+    const expectedTranscript = options?.expectedTranscript ?? process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT;
+    const fingerprint = this.getRuntimeFingerprint(validation, resolvedFixturePath, expectedTranscript);
+
+    if (options?.useCache) {
+      const cached = this.compatibilityCache.get(fingerprint);
+      if (cached) {
+        return {
+          ...cached,
+          fromCache: true,
+          executionDurationMs: 0,
+        };
+      }
+    }
+
+    const wavCheck = this.validateSpeechWavFixture(resolvedFixturePath);
+    if (!wavCheck.valid) {
+      return {
+        compatible: false,
+        diagnosticCode: 'SPEECH_FIXTURE_INVALID',
+        runtimeType: validation.runtimeType,
+        validation,
+        audioFixturePath: resolvedFixturePath,
+        executionDurationMs: Date.now() - startTime,
+        details: wavCheck.reason || `Invalid speech WAV fixture at ${resolvedFixturePath}.`
+      };
+    }
+
     const sttPath = validation.executablePath!;
     const modelPath = validation.modelPath;
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vr_whisper_compat_'));
 
-    const buildMono16kWav = (destPath: string, durationSec: number = 1.2) => {
-      const sampleRate = 16000;
-      const numChannels = 1;
-      const bitsPerSample = 16;
-      const numSamples = Math.floor(sampleRate * durationSec);
-      const dataSize = numSamples * numChannels * (bitsPerSample / 8);
-      const buffer = Buffer.alloc(44 + dataSize);
-
-      buffer.write('RIFF', 0, 'ascii');
-      buffer.writeUInt32LE(36 + dataSize, 4);
-      buffer.write('WAVE', 8, 'ascii');
-      buffer.write('fmt ', 12, 'ascii');
-      buffer.writeUInt32LE(16, 16); // PCM subchunk size
-      buffer.writeUInt16LE(1, 20);  // AudioFormat = PCM (1)
-      buffer.writeUInt16LE(numChannels, 22);
-      buffer.writeUInt32LE(sampleRate, 24);
-      buffer.writeUInt32LE(sampleRate * numChannels * (bitsPerSample / 8), 28);
-      buffer.writeUInt16LE(numChannels * (bitsPerSample / 8), 32);
-      buffer.writeUInt16LE(bitsPerSample, 34);
-      buffer.write('data', 36, 'ascii');
-      buffer.writeUInt32LE(dataSize, 40);
-
-      for (let i = 0; i < numSamples; i++) {
-        const t = i / sampleRate;
-        const amp = Math.sin(2 * Math.PI * 440 * t) * 12000;
-        buffer.writeInt16LE(Math.round(amp), 44 + i * 2);
-      }
-      fs.writeFileSync(destPath, buffer);
-    };
-
     try {
-      let fixturePath = options?.audioFixturePath;
-      if (!fixturePath || !fs.existsSync(fixturePath)) {
-        fixturePath = path.join(tmpDir, 'whisper_compat_16k.wav');
-        buildMono16kWav(fixturePath, 1.2);
-      }
-
       const outPrefix = path.join(tmpDir, 'whisper_out');
       const cliArgs: string[] = validation.runtimeType === 'whisper_cpp'
-        ? ['-m', modelPath!, '-f', fixturePath, '--output-json', '-of', outPrefix]
+        ? ['-m', modelPath!, '-f', resolvedFixturePath, '--output-json', '-of', outPrefix]
         : [
-            fixturePath,
+            resolvedFixturePath,
             '--output_format', 'json',
             '--output_dir', tmpDir,
             ...(modelPath ? ['--model', modelPath] : [])
@@ -586,63 +780,28 @@ export class SpeechTranscriptionAdapter {
         stderr = res.stderr || '';
       } catch (execErr: any) {
         const elapsed = Date.now() - startTime;
-        const combinedErr = `${execErr?.stderr || ''}\n${execErr?.message || ''}`.trim();
-        const isTimeout = Boolean(
-          execErr?.killed === true ||
-          execErr?.signal === 'SIGTERM' ||
-          execErr?.code === 'ETIMEDOUT' ||
-          /timed?\s*out/i.test(combinedErr)
-        );
-        if (isTimeout) {
-          return {
-            compatible: false,
-            diagnosticCode: 'TRANSCRIPTION_TIMEOUT',
-            runtimeType: validation.runtimeType,
-            validation,
-            executionDurationMs: elapsed,
-            details: `Whisper compatibility execution timed out after ${timeoutMs}ms.`
-          };
-        }
-
-        if (execErr?.code === 'ENOENT') {
-          return {
-            compatible: false,
-            diagnosticCode: 'BINARY_NOT_FOUND',
-            runtimeType: validation.runtimeType,
-            validation,
-            executionDurationMs: elapsed,
-            details: `Whisper executable became unavailable during execution.`
-          };
-        }
-
-        if (execErr?.code === 'EACCES' || execErr?.code === 'EPERM') {
-          return {
-            compatible: false,
-            diagnosticCode: 'BINARY_NOT_EXECUTABLE',
-            runtimeType: validation.runtimeType,
-            validation,
-            executionDurationMs: elapsed,
-            details: `Whisper executable failed permission check during execution.`
-          };
-        }
-
-        const isModelError = /invalid\s+model|failed\s+to\s+(init|initialize|load).*model|unknown\s+model|incompatible\s+model|corrupt(ed)?\s+model|ggml.*magic|unexpected\s+eof.*model/i.test(combinedErr);
-        return {
+        const classified = this.classifyWhisperProcessError(execErr, timeoutMs);
+        const failResult: WhisperCompatibilityResult = {
           compatible: false,
-          diagnosticCode: isModelError ? 'MODEL_INCOMPATIBLE' : 'TRANSCRIPTION_FAILED',
+          diagnosticCode: classified.diagnosticCode,
           runtimeType: validation.runtimeType,
           validation,
+          audioFixturePath: resolvedFixturePath,
           executionDurationMs: elapsed,
-          details: combinedErr.split(/\r?\n/).filter(Boolean).slice(-2).join(' | ').slice(0, 220) || 'Whisper transcription execution failed.'
+          details: classified.details
         };
+        if (options?.useCache) {
+          this.compatibilityCache.set(fingerprint, failResult);
+        }
+        return failResult;
       }
 
       const elapsed = Date.now() - startTime;
-      const baseWav = path.basename(fixturePath, path.extname(fixturePath));
+      const baseWav = path.basename(resolvedFixturePath, path.extname(resolvedFixturePath));
       const candidateJsonPaths = [
         `${outPrefix}.json`,
-        `${fixturePath}.json`,
-        path.join(tmpDir, `${path.basename(fixturePath)}.json`),
+        `${resolvedFixturePath}.json`,
+        path.join(tmpDir, `${path.basename(resolvedFixturePath)}.json`),
         path.join(tmpDir, `${baseWav}.json`)
       ];
 
@@ -671,6 +830,7 @@ export class SpeechTranscriptionAdapter {
             diagnosticCode: 'TRANSCRIPTION_FAILED',
             runtimeType: validation.runtimeType,
             validation,
+            audioFixturePath: resolvedFixturePath,
             executionDurationMs: elapsed,
             details: 'Whisper executable produced malformed JSON output during compatibility probe.'
           };
@@ -704,21 +864,60 @@ export class SpeechTranscriptionAdapter {
           diagnosticCode: 'EMPTY_TRANSCRIPTION_OUTPUT',
           runtimeType: validation.runtimeType,
           validation,
+          audioFixturePath: resolvedFixturePath,
           executionDurationMs: elapsed,
-          details: `Whisper executable ran without error but produced empty transcription output.${stderr ? ' Check audio fixture or model configuration.' : ''}`
+          details: `Whisper executable ran without error on speech fixture but produced empty transcription output.${stderr ? ' Check speech audio fixture or model configuration.' : ''}`
         };
       }
 
-      return {
+      let referenceMatched: boolean | undefined;
+      if (expectedTranscript && expectedTranscript.trim().length > 0) {
+        const normalizeTokens = (txt: string) =>
+          txt
+            .toLowerCase()
+            .replace(/[^a-z0-9\u0e00-\u0e7f\s]/g, ' ')
+            .split(/\s+/)
+            .filter(Boolean);
+        const expectedTokens = normalizeTokens(expectedTranscript);
+        const actualTokens = new Set(normalizeTokens(extractedText));
+        const matchedCount = expectedTokens.filter(t => actualTokens.has(t)).length;
+        referenceMatched = expectedTokens.length > 0 && matchedCount / expectedTokens.length >= 0.5;
+        if (!referenceMatched) {
+          return {
+            compatible: false,
+            diagnosticCode: 'TRANSCRIPTION_FAILED',
+            runtimeType: validation.runtimeType,
+            validation,
+            audioFixturePath: resolvedFixturePath,
+            transcriptText: extractedText,
+            segmentsCount,
+            referenceTranscript: expectedTranscript,
+            referenceMatched: false,
+            executionDurationMs: elapsed,
+            details: `Transcript output did not match reference speech transcript ('${expectedTranscript}' vs '${extractedText.slice(0, 120)}').`
+          };
+        }
+      }
+
+      const passResult: WhisperCompatibilityResult = {
         compatible: true,
         diagnosticCode: 'VERIFICATION_PASSED',
         runtimeType: validation.runtimeType,
         validation,
+        audioFixturePath: resolvedFixturePath,
         transcriptText: extractedText,
         segmentsCount,
+        ...(expectedTranscript ? { referenceTranscript: expectedTranscript, referenceMatched: referenceMatched ?? true } : {}),
+        fromCache: false,
         executionDurationMs: elapsed,
-        details: `Verified real ${validation.runtimeType} binary and model execution on 16kHz mono WAV fixture.`
+        details: `Verified real ${validation.runtimeType} binary and model execution on 16kHz mono speech WAV fixture (${wavCheck.durationSeconds}s).`
       };
+
+      if (options?.useCache) {
+        this.compatibilityCache.set(fingerprint, passResult);
+      }
+
+      return passResult;
     } finally {
       try {
         if (fs.existsSync(tmpDir)) {
@@ -730,7 +929,16 @@ export class SpeechTranscriptionAdapter {
     }
   }
 
-  public async transcribe(videoPath: string, durationSeconds: number): Promise<LocalTranscriptionResult> {
+  public async transcribe(
+    videoPath: string,
+    durationSeconds: number,
+    options?: {
+      verifyCompatibility?: boolean;
+      audioFixturePath?: string;
+      expectedTranscript?: string;
+      forceRefreshCompatibility?: boolean;
+    }
+  ): Promise<LocalTranscriptionResult> {
     const startTime = Date.now();
 
     // Enforce preflight runtime validation before transcription
@@ -738,6 +946,7 @@ export class SpeechTranscriptionAdapter {
     if (validation.status === 'UNCONFIGURED') {
       return {
         status: 'NOT_ASSESSED',
+        diagnosticCode: 'UNCONFIGURED',
         limitations: 'Local speech-to-text executable (WHISPER_PATH or LOCAL_STT_PATH) not configured. Speech detection is acoustic-only without automated transcription.',
         executionDurationMs: 0
       };
@@ -755,10 +964,39 @@ export class SpeechTranscriptionAdapter {
 
       return {
         status: 'ANALYSIS_UNAVAILABLE',
+        diagnosticCode: validation.diagnosticCode,
+        compatibilityVerified: false,
         failureReason,
         limitations: `Whisper runtime validation failed with status ${validation.status}.`,
         executionDurationMs: Date.now() - startTime
       };
+    }
+
+    // Run cached compatibility check when explicitly requested or when a model + speech fixture are configured
+    const hasSpeechFixtureEnv = Boolean(options?.audioFixturePath || process.env.WHISPER_COMPAT_AUDIO_PATH);
+    const shouldVerifyCompatibility =
+      options?.verifyCompatibility === true ||
+      process.env.WHISPER_VERIFY_COMPATIBILITY === 'true' ||
+      (validation.modelConfigured && hasSpeechFixtureEnv);
+
+    let compatibilityVerified = false;
+    if (shouldVerifyCompatibility) {
+      const compat = await this.initializeRuntime({
+        audioFixturePath: options?.audioFixturePath,
+        expectedTranscript: options?.expectedTranscript,
+        forceRefresh: options?.forceRefreshCompatibility
+      });
+      if (!compat.compatible) {
+        return {
+          status: 'ANALYSIS_UNAVAILABLE',
+          diagnosticCode: compat.diagnosticCode,
+          compatibilityVerified: false,
+          failureReason: compat.details,
+          limitations: `Whisper runtime compatibility verification failed (${compat.diagnosticCode}).`,
+          executionDurationMs: Date.now() - startTime
+        };
+      }
+      compatibilityVerified = true;
     }
 
     const sttPath = validation.executablePath!;
@@ -771,6 +1009,7 @@ export class SpeechTranscriptionAdapter {
         if (!modelPath) {
           return {
             status: 'ANALYSIS_UNAVAILABLE',
+            diagnosticCode: 'MODEL_NOT_CONFIGURED',
             failureReason: 'whisper_cpp runtime requires a valid WHISPER_MODEL_PATH.',
             limitations: 'Whisper model path missing.',
             executionDurationMs: Date.now() - startTime
@@ -795,6 +1034,8 @@ export class SpeechTranscriptionAdapter {
           status: 'INSUFFICIENT_EVIDENCE',
           transcriptText: '',
           segments: [],
+          diagnosticCode: 'EMPTY_TRANSCRIPTION_OUTPUT',
+          compatibilityVerified,
           failureReason: 'STT executable completed with empty output',
           limitations: 'STT executable produced empty output; cannot verify presence or absence of speech without transcript data.',
           executionDurationMs: elapsed
@@ -813,6 +1054,8 @@ export class SpeechTranscriptionAdapter {
           // Output attempted JSON formatting but is malformed
           return {
             status: 'ANALYSIS_UNAVAILABLE',
+            diagnosticCode: 'TRANSCRIPTION_FAILED',
+            compatibilityVerified,
             failureReason: 'Malformed JSON output from STT executable',
             limitations: 'STT executable produced invalid JSON structure that could not be parsed.',
             executionDurationMs: elapsed
@@ -827,6 +1070,7 @@ export class SpeechTranscriptionAdapter {
           status: rawOutput.length > 0 ? 'DETECTED' : 'INSUFFICIENT_EVIDENCE',
           transcriptText: rawOutput,
           segments: [], // Segments MUST remain empty when timestamps are absent
+          compatibilityVerified,
           limitations: 'Plain text transcript returned without segment timestamps; segment-level timestamps are unavailable and were not fabricated.',
           executionDurationMs: elapsed
         };
@@ -836,6 +1080,8 @@ export class SpeechTranscriptionAdapter {
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
         return {
           status: 'ANALYSIS_UNAVAILABLE',
+          diagnosticCode: 'TRANSCRIPTION_FAILED',
+          compatibilityVerified,
           failureReason: 'STT executable returned invalid JSON structure (expected JSON object)',
           limitations: 'STT JSON output did not contain an object payload.',
           executionDurationMs: elapsed
@@ -846,6 +1092,8 @@ export class SpeechTranscriptionAdapter {
       if (typeof parsed.text !== 'string' && !Array.isArray(parsed.segments)) {
         return {
           status: 'ANALYSIS_UNAVAILABLE',
+          diagnosticCode: 'TRANSCRIPTION_FAILED',
+          compatibilityVerified,
           failureReason: 'STT JSON output missing both text and segments fields',
           limitations: 'STT executable output did not contain usable text or segments fields.',
           executionDurationMs: elapsed
@@ -913,14 +1161,18 @@ export class SpeechTranscriptionAdapter {
         status,
         transcriptText,
         segments: validSegments,
+        compatibilityVerified,
         ...(failureReason ? { failureReason } : {}),
         limitations: limitationNotes,
         executionDurationMs: elapsed
       };
     } catch (err: any) {
+      const classified = this.classifyWhisperProcessError(err, 60000);
       return {
         status: 'ANALYSIS_UNAVAILABLE',
-        failureReason: `Local STT process execution failed: ${err?.message || err}`,
+        diagnosticCode: classified.diagnosticCode,
+        compatibilityVerified,
+        failureReason: `Local STT process execution failed [${classified.diagnosticCode}]: ${classified.details}`,
         limitations: 'Speech transcription failed during local execution.',
         executionDurationMs: Date.now() - startTime
       };
@@ -2046,3 +2298,4 @@ export class AudioProcessor {
 }
 
 export const audioProcessor = new AudioProcessor();
+export const speechTranscriptionAdapter = new SpeechTranscriptionAdapter();

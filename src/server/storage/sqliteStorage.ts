@@ -262,6 +262,8 @@ export class SqliteStorageRepository implements IStorageRepository {
           totalAmount: row.total_amount !== null && row.total_amount !== undefined ? Number(row.total_amount) : undefined,
           isFullRefund: Boolean(row.is_full_refund),
           status: row.status,
+          rawStatus: row.raw_status || undefined,
+          reconciled: Boolean(row.reconciled),
           creditsAdjusted: Number(row.credits_adjusted || 0),
           failureReason: row.failure_reason || undefined,
           eventId: row.event_id,
@@ -273,9 +275,9 @@ export class SqliteStorageRepository implements IStorageRepository {
         this.db.prepare(`
           INSERT INTO stripe_refunds (
             refund_id, payment_id, user_id, charge_id, payment_intent_id, invoice_id, subscription_id,
-            plan_id, amount_refunded, total_amount, is_full_refund, status, credits_adjusted,
-            failure_reason, event_id, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            plan_id, amount_refunded, total_amount, is_full_refund, status, raw_status, reconciled,
+            credits_adjusted, failure_reason, event_id, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(refund_id) DO UPDATE SET
             payment_id = COALESCE(excluded.payment_id, stripe_refunds.payment_id),
             user_id = COALESCE(excluded.user_id, stripe_refunds.user_id),
@@ -288,6 +290,8 @@ export class SqliteStorageRepository implements IStorageRepository {
             total_amount = COALESCE(excluded.total_amount, stripe_refunds.total_amount),
             is_full_refund = excluded.is_full_refund,
             status = excluded.status,
+            raw_status = COALESCE(excluded.raw_status, stripe_refunds.raw_status),
+            reconciled = excluded.reconciled,
             credits_adjusted = excluded.credits_adjusted,
             failure_reason = COALESCE(excluded.failure_reason, stripe_refunds.failure_reason),
             event_id = excluded.event_id,
@@ -305,6 +309,8 @@ export class SqliteStorageRepository implements IStorageRepository {
           val.totalAmount ?? null,
           val.isFullRefund ? 1 : 0,
           val.status,
+          val.rawStatus || null,
+          val.reconciled ? 1 : 0,
           val.creditsAdjusted || 0,
           val.failureReason || null,
           val.eventId,
@@ -758,6 +764,28 @@ export class SqliteStorageRepository implements IStorageRepository {
       } catch (err) {
         this.db.exec('ROLLBACK;');
         throw new Error(`Failed to apply migration 6: ${err}`);
+      }
+    }
+
+    // Migration 7: Refund reconciliation state and raw status audit columns
+    if (!appliedVersions.has(7)) {
+      this.db.exec('BEGIN IMMEDIATE;');
+      try {
+        const refundCols = this.db.prepare('PRAGMA table_info(stripe_refunds)').all() as Array<{ name: string }>;
+        if (!refundCols.some(c => c.name === 'raw_status')) {
+          this.db.exec('ALTER TABLE stripe_refunds ADD COLUMN raw_status TEXT;');
+        }
+        if (!refundCols.some(c => c.name === 'reconciled')) {
+          this.db.exec('ALTER TABLE stripe_refunds ADD COLUMN reconciled INTEGER NOT NULL DEFAULT 0;');
+        }
+        this.db.exec(`
+          INSERT INTO schema_migrations (version, name, applied_at)
+          VALUES (7, '007_stripe_refunds_reconciliation_metadata', datetime('now'));
+        `);
+        this.db.exec('COMMIT;');
+      } catch (err) {
+        this.db.exec('ROLLBACK;');
+        throw new Error(`Failed to apply migration 7: ${err}`);
       }
     }
   }
