@@ -11,7 +11,8 @@ import {
 } from '../src/server/pipeline/videoProcessor';
 import { thumbnailInspector } from '../src/server/pipeline/thumbnailInspector';
 import { mediaInspector, MediaInspectionError } from '../src/server/pipeline/mediaInspector';
-import { SpeechTranscriptionAdapter, speechTranscriptionAdapter } from '../src/server/pipeline/audioProcessor';
+import os from 'os';
+import { SpeechTranscriptionAdapter, speechTranscriptionAdapter, audioProcessor } from '../src/server/pipeline/audioProcessor';
 import { policyIntelligenceEngine } from '../src/server/intelligence/policyIntelligence';
 import { billingService } from '../src/server/services/billingService';
 import { JobOrchestrator, mapVideoOcrDetectorReport } from '../src/server/pipeline/jobOrchestrator';
@@ -459,7 +460,7 @@ printf "5\\t1\\t1\\t1\\t1\\t1\\t10abc\\t10\\t50\\t20\\t90xyz\\tSAMPLE\\n"
     process.env.WHISPER_MODEL_PATH = fakeTextModel;
     assert.strictEqual((await stt.verifyRuntimeCompatibility()).diagnosticCode, 'MODEL_INCOMPATIBLE', '3.22 Compatibility probe: header MODEL_INCOMPATIBLE');
 
-    // Runtime execution tests for whisper_cpp contract
+    // Runtime execution tests for whisper_cpp contract (fail closed if -of is omitted)
     const compatWhisperCppBin = path.resolve(testDir, 'compat_whisper_cpp.sh');
     fs.writeFileSync(
       compatWhisperCppBin,
@@ -474,6 +475,10 @@ for arg in "$@"; do
   if [ "$PREV" = "-of" ]; then OUT_PREFIX="$arg"; fi
   PREV="$arg"
 done
+if [ -z "$OUT_PREFIX" ]; then
+  echo "error: missing required -of output prefix argument" >&2
+  exit 2
+fi
 case "\${COMPAT_MODE:-pass}" in
   timeout)
     sleep 2
@@ -548,16 +553,20 @@ esac
     process.env.WHISPER_MODEL_PATH = validModel;
     delete process.env.WHISPER_COMPAT_AUDIO_PATH;
     delete process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT;
+    delete process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE;
     stt.clearCompatibilityCache();
 
     // 3.23a Fails closed with SPEECH_FIXTURE_NOT_FOUND when no audio fixture is configured (no sine-tone fabrication)
     const missingFixtureRes = await stt.verifyRuntimeCompatibility();
     assert.strictEqual(missingFixtureRes.compatible, false, '3.23a No speech fixture fails closed');
     assert.strictEqual(missingFixtureRes.diagnosticCode, 'SPEECH_FIXTURE_NOT_FOUND', '3.23b Reports SPEECH_FIXTURE_NOT_FOUND without synthetic fallback');
+    assert.strictEqual(missingFixtureRes.runtimeExecutionStatus, 'UNVERIFIED', '3.23b1 Missing fixture keeps runtimeExecutionStatus UNVERIFIED');
+    assert.strictEqual(missingFixtureRes.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_UNVERIFIED', '3.23b2 Missing fixture keeps speechTranscriptStatus UNVERIFIED');
 
     // 3.23c Rejects silent or wrong-sample-rate WAV fixtures
     const silentFixtureRes = await stt.verifyRuntimeCompatibility({ audioFixturePath: silentWav });
     assert.strictEqual(silentFixtureRes.diagnosticCode, 'SPEECH_FIXTURE_INVALID', '3.23c Silent WAV rejected as SPEECH_FIXTURE_INVALID');
+    assert.strictEqual(silentFixtureRes.runtimeExecutionStatus, 'FAILED', '3.23c1 Invalid fixture marks runtimeExecutionStatus FAILED');
     const wrongRateRes = await stt.verifyRuntimeCompatibility({ audioFixturePath: wrongRateWav });
     assert.strictEqual(wrongRateRes.diagnosticCode, 'SPEECH_FIXTURE_INVALID', '3.23d Non-16kHz WAV rejected as SPEECH_FIXTURE_INVALID');
 
@@ -565,6 +574,7 @@ esac
     const compatTimeout = await stt.verifyRuntimeCompatibility({ timeoutMs: 120, audioFixturePath: mockSpeechWav });
     assert.strictEqual(compatTimeout.compatible, false);
     assert.strictEqual(compatTimeout.diagnosticCode, 'TRANSCRIPTION_TIMEOUT', '3.23 Compatibility probe: TRANSCRIPTION_TIMEOUT');
+    assert.strictEqual(compatTimeout.runtimeExecutionStatus, 'FAILED', '3.23t Timeout marks runtimeExecutionStatus FAILED');
 
     process.env.COMPAT_MODE = 'bad_model';
     const compatBadModel = await stt.verifyRuntimeCompatibility({ audioFixturePath: mockSpeechWav });
@@ -583,19 +593,48 @@ esac
     assert.strictEqual(compatEmpty.diagnosticCode, 'EMPTY_TRANSCRIPTION_OUTPUT', '3.26 Compatibility probe: EMPTY_TRANSCRIPTION_OUTPUT');
 
     process.env.COMPAT_MODE = 'pass';
+    // Runtime execution WITHOUT expectedTranscript -> RUNTIME_EXECUTION_VERIFIED + SPEECH_TRANSCRIPT_UNVERIFIED
+    const runtimeOnlyCpp = await stt.verifyRuntimeCompatibility({ audioFixturePath: mockSpeechWav });
+    assert.strictEqual(runtimeOnlyCpp.compatible, true, '3.26a1 Runtime execution without expected transcript succeeds');
+    assert.strictEqual(runtimeOnlyCpp.runtimeExecutionStatus, 'RUNTIME_EXECUTION_VERIFIED', '3.26a2 Marks runtimeExecutionStatus RUNTIME_EXECUTION_VERIFIED');
+    assert.strictEqual(runtimeOnlyCpp.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_UNVERIFIED', '3.26a3 Keeps speechTranscriptStatus SPEECH_TRANSCRIPT_UNVERIFIED when no reference provided');
+    assert.strictEqual(runtimeOnlyCpp.transcriptComparison?.compared, false, '3.26a4 transcriptComparison.compared is false');
+
+    // Empty / punctuation-only expectedTranscript -> fails closed as SPEECH_TRANSCRIPT_FAILED
+    const compatEmptyRef = await stt.verifyRuntimeCompatibility({
+      audioFixturePath: mockSpeechWav,
+      expectedTranscript: '!!! ---   '
+    });
+    assert.strictEqual(compatEmptyRef.compatible, false, '3.26a5 Punctuation-only expected transcript fails closed');
+    assert.strictEqual(compatEmptyRef.runtimeExecutionStatus, 'RUNTIME_EXECUTION_VERIFIED', '3.26a6 Runtime execution succeeded even though reference failed');
+    assert.strictEqual(compatEmptyRef.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_FAILED', '3.26a7 Punctuation-only expected transcript yields SPEECH_TRANSCRIPT_FAILED');
+    assert.strictEqual(compatEmptyRef.transcriptComparison?.expectedTokenCount, 0, '3.26a8 Records expectedTokenCount=0');
+
+    const compatBlankRef = await stt.verifyRuntimeCompatibility({
+      audioFixturePath: mockSpeechWav,
+      expectedTranscript: ''
+    });
+    assert.strictEqual(compatBlankRef.compatible, false, '3.26a9 Explicit empty expected transcript fails closed');
+    assert.strictEqual(compatBlankRef.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_FAILED', '3.26a10 Explicit empty expected transcript yields SPEECH_TRANSCRIPT_FAILED');
+
     const compatMismatch = await stt.verifyRuntimeCompatibility({
       audioFixturePath: mockSpeechWav,
       expectedTranscript: 'completely unrelated reference phrase'
     });
     assert.strictEqual(compatMismatch.compatible, false, '3.26b Completely incorrect transcript fails closed');
     assert.strictEqual(compatMismatch.diagnosticCode, 'TRANSCRIPTION_FAILED', '3.26c Mismatch classifies as TRANSCRIPTION_FAILED');
+    assert.strictEqual(compatMismatch.runtimeExecutionStatus, 'RUNTIME_EXECUTION_VERIFIED', '3.26c1 Preserves RUNTIME_EXECUTION_VERIFIED alongside transcript failure');
+    assert.strictEqual(compatMismatch.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_FAILED', '3.26c2 Sets SPEECH_TRANSCRIPT_FAILED on mismatch');
     assert.strictEqual(compatMismatch.referenceMatched, false, '3.26d Records referenceMatched=false');
+    assert.strictEqual(compatMismatch.transcriptComparison?.passed, false, '3.26d1 transcriptComparison.passed=false');
+    assert.strictEqual(compatMismatch.transcriptComparison?.matchedTokenCount, 0, '3.26d2 Records 0 matched tokens');
 
     const compatMissingWords = await stt.verifyRuntimeCompatibility({
       audioFixturePath: mockSpeechWav,
       expectedTranscript: 'hello compat test missing expected words'
     });
     assert.strictEqual(compatMissingWords.compatible, false, '3.26e Missing expected words fail closed');
+    assert.strictEqual(compatMissingWords.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_FAILED', '3.26e1 Missing expected words set SPEECH_TRANSCRIPT_FAILED');
 
     const compatWordOrderMismatch = await stt.verifyRuntimeCompatibility({
       audioFixturePath: mockSpeechWav,
@@ -609,6 +648,7 @@ esac
       expectedTranscript: 'hello compat test'
     });
     assert.strictEqual(compatNoisyWords.compatible, false, '3.26g Excessive unexpected words fail closed');
+    assert.ok((compatNoisyWords.transcriptComparison?.precision ?? 1) < 0.8, '3.26g1 Records failing precision < 0.80');
 
     process.env.COMPAT_MODE = 'pass';
     const compatPunctPass = await stt.verifyRuntimeCompatibility({
@@ -617,6 +657,22 @@ esac
     });
     assert.strictEqual(compatPunctPass.compatible, true, '3.26h Punctuation/casing/whitespace differences tolerated');
     assert.strictEqual(compatPunctPass.referenceMatched, true, '3.26i Records referenceMatched=true on normalized match');
+    assert.strictEqual(compatPunctPass.runtimeExecutionStatus, 'RUNTIME_EXECUTION_VERIFIED', '3.26i1 Sets RUNTIME_EXECUTION_VERIFIED');
+    assert.strictEqual(compatPunctPass.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_VERIFIED', '3.26i2 Sets SPEECH_TRANSCRIPT_VERIFIED');
+    assert.strictEqual(compatPunctPass.transcriptComparison?.recall, 1, '3.26i3 Records recall=1');
+    assert.strictEqual(compatPunctPass.transcriptComparison?.precision, 1, '3.26i4 Records precision=1');
+    assert.strictEqual(compatPunctPass.transcriptComparison?.score, 1, '3.26i5 Records score=1');
+
+    // Synthetic/mock fixture guard: CANNOT grant SPEECH_TRANSCRIPT_VERIFIED
+    const compatSyntheticGuard = await stt.verifyRuntimeCompatibility({
+      audioFixturePath: mockSpeechWav,
+      expectedTranscript: 'hello compat test',
+      isSyntheticFixture: true
+    });
+    assert.strictEqual(compatSyntheticGuard.compatible, true, '3.26j1 Synthetic fixture still passes runtime execution check');
+    assert.strictEqual(compatSyntheticGuard.runtimeExecutionStatus, 'RUNTIME_EXECUTION_VERIFIED', '3.26j2 Sets RUNTIME_EXECUTION_VERIFIED');
+    assert.strictEqual(compatSyntheticGuard.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_UNVERIFIED', '3.26j3 Synthetic fixture NEVER receives SPEECH_TRANSCRIPT_VERIFIED');
+    assert.strictEqual(compatSyntheticGuard.transcriptComparison?.passed, false, '3.26j4 transcriptComparison.passed=false for synthetic fixture');
 
     const compatPassCpp = await stt.verifyRuntimeCompatibility({
       audioFixturePath: mockSpeechWav,
@@ -627,6 +683,7 @@ esac
     assert.strictEqual(compatPassCpp.transcriptText, 'hello compat test', '3.29 whisper_cpp extracts non-empty transcriptText');
     assert.strictEqual(compatPassCpp.segmentsCount, 1, '3.30 whisper_cpp records segment count');
     assert.strictEqual(compatPassCpp.referenceMatched, true, '3.30a Reference transcript match verified');
+    assert.strictEqual(compatPassCpp.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_VERIFIED', '3.30a1 SPEECH_TRANSCRIPT_VERIFIED set');
 
     // Cached initializeRuntime() hit & fingerprint invalidation when model changes
     stt.clearCompatibilityCache();
@@ -670,10 +727,12 @@ esac
       forceRefreshCompatibility: true
     });
     assert.strictEqual(recoveredTranscribe.compatibilityVerified, true, '3.30i transcribe succeeds and records compatibilityVerified=true once runtime issue is fixed');
+    assert.strictEqual(recoveredTranscribe.runtimeExecutionStatus, 'RUNTIME_EXECUTION_VERIFIED', '3.30i1 Records runtimeExecutionStatus=RUNTIME_EXECUTION_VERIFIED');
+    assert.strictEqual(recoveredTranscribe.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_UNVERIFIED', '3.30i2 Records speechTranscriptStatus=SPEECH_TRANSCRIPT_UNVERIFIED without expectedTranscript');
 
     delete process.env.COMPAT_MODE;
 
-    // Runtime execution pass test for openai_whisper contract
+    // Runtime execution pass test for openai_whisper contract (fail closed if --output_dir is omitted)
     const compatOpenAiBin = path.resolve(testDir, 'compat_openai_whisper.sh');
     fs.writeFileSync(
       compatOpenAiBin,
@@ -689,8 +748,17 @@ for arg in "$@"; do
   if [ "$PREV" = "--output_dir" ]; then OUT_DIR="$arg"; fi
   PREV="$arg"
 done
+if [ -z "$OUT_DIR" ]; then
+  echo "error: missing required --output_dir argument" >&2
+  exit 2
+fi
 BASE=$(basename "$AUDIO" .wav)
-echo '{"text":"openai whisper test","segments":[{"start":0,"end":1.1,"text":"openai whisper test"}]}' > "\${OUT_DIR}/\${BASE}.json"
+BASE_MP4=$(basename "$AUDIO" .mp4)
+OUT_NAME="$BASE"
+if [ "$BASE" = "$AUDIO" ] || [ -n "$(echo "$AUDIO" | grep '\\.mp4$')" ]; then
+  OUT_NAME="$BASE_MP4"
+fi
+echo '{"text":"openai whisper test","segments":[{"start":0,"end":1.1,"text":"openai whisper test"}]}' > "\${OUT_DIR}/\${OUT_NAME}.json"
 exit 0
 `,
       { mode: 0o755 }
@@ -703,15 +771,18 @@ exit 0
     const compatPassOpenAi = await stt.verifyRuntimeCompatibility({ audioFixturePath: mockSpeechWav });
     assert.strictEqual(compatPassOpenAi.compatible, true, '3.31 openai_whisper compatibility passes with JSON output_dir artifact');
     assert.strictEqual(compatPassOpenAi.diagnosticCode, 'VERIFICATION_PASSED', '3.32 openai_whisper reports VERIFICATION_PASSED');
+    assert.strictEqual(compatPassOpenAi.runtimeExecutionStatus, 'RUNTIME_EXECUTION_VERIFIED', '3.32a openai_whisper sets RUNTIME_EXECUTION_VERIFIED');
+    assert.strictEqual(compatPassOpenAi.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_UNVERIFIED', '3.32b openai_whisper without expectedTranscript stays SPEECH_TRANSCRIPT_UNVERIFIED');
     assert.strictEqual(compatPassOpenAi.transcriptText, 'openai whisper test', '3.33 openai_whisper parses direct text output');
 
     delete process.env.WHISPER_PATH;
     delete process.env.WHISPER_MODEL_PATH;
     delete process.env.WHISPER_COMPAT_AUDIO_PATH;
     delete process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT;
+    delete process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE;
     stt.clearCompatibilityCache();
     console.log('  [Boundary Notice] Real Whisper binary+model human speech transcription: NOT VERIFIED in container (no Whisper binary/model or TTS/speech WAV installed; verified via mocked whisper_cpp/openai_whisper CLI contracts).');
-    console.log('  ✅ PASS: Whisper STT strict runtime identity, model header & compatibility verification complete');
+    console.log('  ✅ PASS: Whisper STT strict runtime identity, model header & two-tier compatibility verification complete');
 
     // -------------------------------------------------------------------------
     // 4. THUMBNAIL CONTRAST EVALUATION CONTRACT
@@ -967,23 +1038,31 @@ exit 0
     const prevWhisperPathReadiness = process.env.WHISPER_PATH;
     const prevWhisperModelReadiness = process.env.WHISPER_MODEL_PATH;
     const prevWhisperAudioReadiness = process.env.WHISPER_COMPAT_AUDIO_PATH;
+    const prevWhisperExpectedReadiness = process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT;
     const prevWhisperVerifyReadiness = process.env.WHISPER_VERIFY_COMPATIBILITY;
+    const prevWhisperSyntheticReadiness = process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE;
     try {
-      process.env.WHISPER_PATH = '/path/to/nonexistent_whisper_readiness';
+      process.env.WHISPER_PATH = '/secret/host/dir/nonexistent_whisper_readiness';
       const degradedWhisperReadiness = await invokeReadiness();
       assert.strictEqual(degradedWhisperReadiness.statusCode, 200, '7.6b Degraded optional Whisper STT does not bring down core readiness');
       assert.strictEqual(degradedWhisperReadiness.body.checks?.whisperStt?.status, 'degraded', '7.6c Invalid WHISPER_PATH surfaces degraded whisperStt check');
       assert.strictEqual(degradedWhisperReadiness.body.checks?.whisperStt?.details?.diagnosticCode, 'BINARY_NOT_FOUND', '7.6d Surfaces BINARY_NOT_FOUND diagnostic code');
       assert.strictEqual(degradedWhisperReadiness.body.checks?.whisperStt?.details?.compatibilityStatus, 'FAILED', '7.6e Failed preflight sets compatibilityStatus FAILED');
+      assert.strictEqual(degradedWhisperReadiness.body.checks?.whisperStt?.details?.binaryStatus, 'MISSING_EXECUTABLE', '7.6e1 Exposes binaryStatus MISSING_EXECUTABLE');
+      assert.ok(!String(degradedWhisperReadiness.body.checks?.whisperStt?.details?.failureReason || '').includes('/secret/host/dir'), '7.6e2 failureReason sanitizes full host filesystem directory paths');
 
       // Configured READY preflight without speech fixture -> UNVERIFIED (and degraded when WHISPER_VERIFY_COMPATIBILITY=true)
       process.env.WHISPER_PATH = compatWhisperCppBin;
       process.env.WHISPER_MODEL_PATH = validModel;
       delete process.env.WHISPER_COMPAT_AUDIO_PATH;
+      delete process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT;
+      delete process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE;
       delete process.env.WHISPER_VERIFY_COMPATIBILITY;
       speechTranscriptionAdapter.clearCompatibilityCache();
       const unverifiedReadiness = await invokeReadiness();
       assert.strictEqual(unverifiedReadiness.body.checks?.whisperStt?.details?.compatibilityStatus, 'UNVERIFIED', '7.6f Missing fixture marks compatibilityStatus UNVERIFIED');
+      assert.strictEqual(unverifiedReadiness.body.checks?.whisperStt?.details?.runtimeExecutionStatus, 'UNVERIFIED', '7.6f1 runtimeExecutionStatus is UNVERIFIED');
+      assert.strictEqual(unverifiedReadiness.body.checks?.whisperStt?.details?.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_UNVERIFIED', '7.6f2 speechTranscriptStatus is SPEECH_TRANSCRIPT_UNVERIFIED');
       assert.strictEqual(unverifiedReadiness.body.checks?.whisperStt?.details?.compatibilityVerified, false, '7.6g Missing fixture marks compatibilityVerified false');
 
       process.env.WHISPER_VERIFY_COMPATIBILITY = 'true';
@@ -991,14 +1070,48 @@ exit 0
       assert.strictEqual(requiredMissingFixtureReadiness.body.checks?.whisperStt?.status, 'degraded', '7.6h WHISPER_VERIFY_COMPATIBILITY=true with missing fixture marks whisperStt degraded');
       assert.strictEqual(requiredMissingFixtureReadiness.body.checks?.whisperStt?.details?.compatibilityRequired, true, '7.6i Marks compatibilityRequired=true');
 
-      // Configured + valid speech fixture -> VERIFIED / healthy; incompatible -> FAILED / degraded
+      // Configured + WAV fixture WITHOUT expected transcript -> RUNTIME_EXECUTION_VERIFIED (NOT 'VERIFIED') + SPEECH_TRANSCRIPT_UNVERIFIED
       process.env.WHISPER_COMPAT_AUDIO_PATH = mockSpeechWav;
       process.env.COMPAT_MODE = 'pass';
       speechTranscriptionAdapter.clearCompatibilityCache();
-      const verifiedReadiness = await invokeReadiness();
-      assert.strictEqual(verifiedReadiness.body.checks?.whisperStt?.status, 'healthy', '7.6j Verified Whisper runtime is healthy');
-      assert.strictEqual(verifiedReadiness.body.checks?.whisperStt?.details?.compatibilityStatus, 'VERIFIED', '7.6k Marks compatibilityStatus VERIFIED');
-      assert.strictEqual(verifiedReadiness.body.checks?.whisperStt?.details?.compatibilityVerified, true, '7.6l Marks compatibilityVerified true');
+      const runtimeOnlyReadiness = await invokeReadiness();
+      assert.strictEqual(runtimeOnlyReadiness.body.checks?.whisperStt?.status, 'healthy', '7.6j Runtime-only verified Whisper runtime is healthy');
+      assert.strictEqual(runtimeOnlyReadiness.body.checks?.whisperStt?.details?.runtimeExecutionStatus, 'RUNTIME_EXECUTION_VERIFIED', '7.6k1 Marks runtimeExecutionStatus RUNTIME_EXECUTION_VERIFIED');
+      assert.strictEqual(runtimeOnlyReadiness.body.checks?.whisperStt?.details?.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_UNVERIFIED', '7.6k2 Keeps speechTranscriptStatus SPEECH_TRANSCRIPT_UNVERIFIED');
+      assert.strictEqual(runtimeOnlyReadiness.body.checks?.whisperStt?.details?.compatibilityStatus, 'RUNTIME_EXECUTION_VERIFIED', '7.6k3 Never emits ambiguous VERIFIED without transcript match');
+      assert.strictEqual(runtimeOnlyReadiness.body.checks?.whisperStt?.details?.runtimeExecutionVerified, true, '7.6k4 runtimeExecutionVerified=true');
+      assert.strictEqual(runtimeOnlyReadiness.body.checks?.whisperStt?.details?.speechTranscriptVerified, false, '7.6k5 speechTranscriptVerified=false');
+      assert.strictEqual(runtimeOnlyReadiness.body.checks?.whisperStt?.details?.compatibilityVerified, false, '7.6l compatibilityVerified remains false without speech transcript verification');
+      assert.ok(runtimeOnlyReadiness.body.checks?.whisperStt?.details?.lastVerification?.timestamp, '7.6l1 lastVerification timestamp exposed');
+
+      // Configured + WAV fixture WITH matching expected transcript -> SPEECH_TRANSCRIPT_VERIFIED
+      process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT = 'hello compat test';
+      speechTranscriptionAdapter.clearCompatibilityCache();
+      const speechVerifiedReadiness = await invokeReadiness();
+      assert.strictEqual(speechVerifiedReadiness.body.checks?.whisperStt?.status, 'healthy', '7.6l2 Speech-verified Whisper runtime is healthy');
+      assert.strictEqual(speechVerifiedReadiness.body.checks?.whisperStt?.details?.compatibilityStatus, 'SPEECH_TRANSCRIPT_VERIFIED', '7.6l3 compatibilityStatus is SPEECH_TRANSCRIPT_VERIFIED');
+      assert.strictEqual(speechVerifiedReadiness.body.checks?.whisperStt?.details?.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_VERIFIED', '7.6l4 speechTranscriptStatus is SPEECH_TRANSCRIPT_VERIFIED');
+      assert.strictEqual(speechVerifiedReadiness.body.checks?.whisperStt?.details?.compatibilityVerified, true, '7.6l5 compatibilityVerified=true when both runtime and transcript verified');
+      assert.strictEqual(speechVerifiedReadiness.body.checks?.whisperStt?.details?.transcriptComparison?.passed, true, '7.6l6 Exposes transcriptComparison metrics');
+
+      // Synthetic fixture flag blocks SPEECH_TRANSCRIPT_VERIFIED on readiness even with matching expected transcript
+      process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE = 'true';
+      speechTranscriptionAdapter.clearCompatibilityCache();
+      const syntheticReadiness = await invokeReadiness();
+      assert.strictEqual(syntheticReadiness.body.checks?.whisperStt?.details?.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_UNVERIFIED', '7.6l7 Synthetic fixture cannot emit SPEECH_TRANSCRIPT_VERIFIED');
+      assert.strictEqual(syntheticReadiness.body.checks?.whisperStt?.details?.compatibilityStatus, 'RUNTIME_EXECUTION_VERIFIED', '7.6l8 compatibilityStatus capped at RUNTIME_EXECUTION_VERIFIED');
+      assert.strictEqual(syntheticReadiness.body.checks?.whisperStt?.details?.compatibilityVerified, false, '7.6l9 compatibilityVerified=false for synthetic fixture');
+      delete process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE;
+
+      // Transcript mismatch -> runtimeExecutionStatus=RUNTIME_EXECUTION_VERIFIED, speechTranscriptStatus=SPEECH_TRANSCRIPT_FAILED, degraded
+      process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT = 'completely different words';
+      speechTranscriptionAdapter.clearCompatibilityCache();
+      const mismatchReadiness = await invokeReadiness();
+      assert.strictEqual(mismatchReadiness.body.checks?.whisperStt?.status, 'degraded', '7.6m1 Transcript mismatch marks whisperStt degraded');
+      assert.strictEqual(mismatchReadiness.body.checks?.whisperStt?.details?.runtimeExecutionStatus, 'RUNTIME_EXECUTION_VERIFIED', '7.6m2 runtimeExecutionStatus stays RUNTIME_EXECUTION_VERIFIED');
+      assert.strictEqual(mismatchReadiness.body.checks?.whisperStt?.details?.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_FAILED', '7.6m3 speechTranscriptStatus is SPEECH_TRANSCRIPT_FAILED');
+      assert.strictEqual(mismatchReadiness.body.checks?.whisperStt?.details?.compatibilityStatus, 'FAILED', '7.6m4 compatibilityStatus is FAILED');
+      delete process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT;
 
       process.env.COMPAT_MODE = 'bad_model';
       speechTranscriptionAdapter.clearCompatibilityCache();
@@ -1014,8 +1127,12 @@ exit 0
       else process.env.WHISPER_MODEL_PATH = prevWhisperModelReadiness;
       if (prevWhisperAudioReadiness === undefined) delete process.env.WHISPER_COMPAT_AUDIO_PATH;
       else process.env.WHISPER_COMPAT_AUDIO_PATH = prevWhisperAudioReadiness;
+      if (prevWhisperExpectedReadiness === undefined) delete process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT;
+      else process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT = prevWhisperExpectedReadiness;
       if (prevWhisperVerifyReadiness === undefined) delete process.env.WHISPER_VERIFY_COMPATIBILITY;
       else process.env.WHISPER_VERIFY_COMPATIBILITY = prevWhisperVerifyReadiness;
+      if (prevWhisperSyntheticReadiness === undefined) delete process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE;
+      else process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE = prevWhisperSyntheticReadiness;
     }
 
     const prevNodeEnv = process.env.NODE_ENV;
@@ -1646,6 +1763,174 @@ esac
     }
 
     console.log('  ✅ PASS: FFprobe & analyzeVideo FFmpeg failure diagnostics and temp cleanup verified');
+
+    // -------------------------------------------------------------------------
+    // 12. WORKSTREAM 2 & 3: WHISPER TEMP DIR ISOLATION + MEDIA EDGE CASES
+    // -------------------------------------------------------------------------
+    console.log('\n[12. WS2 Whisper Output Isolation / Cleanup & WS3 Additional Media Edge Cases]');
+
+    const cwdBeforeWhisper = new Set(fs.readdirSync(process.cwd()));
+    const tmpBeforeWhisper = new Set(fs.readdirSync(os.tmpdir()).filter(n => n.startsWith('vr_whisper_')));
+
+    const prevWs2Path = process.env.WHISPER_PATH;
+    const prevWs2Model = process.env.WHISPER_MODEL_PATH;
+    const prevWs2Compat = process.env.WHISPER_VERIFY_COMPATIBILITY;
+    try {
+      process.env.WHISPER_VERIFY_COMPATIBILITY = 'false';
+
+      // 12.1 whisper_cpp file output isolation, cleanup & parallel safety
+      process.env.WHISPER_PATH = compatWhisperCppBin;
+      process.env.WHISPER_MODEL_PATH = validModel;
+      process.env.COMPAT_MODE = 'pass';
+      const cppTxSingle = await stt.transcribe(dummyVideoPath, 3.0);
+      assert.strictEqual(cppTxSingle.status, 'DETECTED', '12.1 whisper_cpp transcribe reads isolated -of JSON file');
+      assert.strictEqual(cppTxSingle.transcriptText, 'hello compat test', '12.2 whisper_cpp transcribe extracts text cleanly');
+      assert.strictEqual(cppTxSingle.segments?.length, 1, '12.3 whisper_cpp transcribe parses timestamps into segment');
+
+      // Parallel calls should never collide or leave files in cwd/tmpdir
+      const parallelCpp = await Promise.all([
+        stt.transcribe(dummyVideoPath, 3.0),
+        stt.transcribe(dummyVideoPath, 3.0),
+        stt.transcribe(dummyVideoPath, 3.0)
+      ]);
+      assert.ok(parallelCpp.every(r => r.status === 'DETECTED' && r.transcriptText === 'hello compat test'), '12.4 Parallel whisper_cpp transcribe calls isolate temp dirs without collision');
+
+      // Failure mode cleanup
+      process.env.COMPAT_MODE = 'fail_exit';
+      const failedCppTx = await stt.transcribe(dummyVideoPath, 3.0);
+      assert.strictEqual(failedCppTx.status, 'ANALYSIS_UNAVAILABLE', '12.5 Failed whisper_cpp transcribe returns ANALYSIS_UNAVAILABLE');
+      delete process.env.COMPAT_MODE;
+
+      // 12.2 openai_whisper --output_dir isolation + parallel safety
+      process.env.WHISPER_PATH = compatOpenAiBin;
+      process.env.WHISPER_MODEL_PATH = validPtModel;
+      const parallelOpenAi = await Promise.all([
+        stt.transcribe(dummyVideoPath, 3.0),
+        stt.transcribe(dummyVideoPath, 3.0)
+      ]);
+      assert.ok(parallelOpenAi.every(r => r.status === 'DETECTED' && r.transcriptText === 'openai whisper test'), '12.6 Parallel openai_whisper transcribe calls isolate --output_dir cleanly');
+
+      const cwdAfterWhisper = fs.readdirSync(process.cwd()).filter(n => !cwdBeforeWhisper.has(n));
+      assert.strictEqual(cwdAfterWhisper.length, 0, `12.7 Zero artifacts created in repository root during Whisper calls (found: ${cwdAfterWhisper.join(', ')})`);
+      assert.strictEqual(fs.existsSync(path.resolve(process.cwd(), '.json')), false, '12.8 Repository root .json artifact must never be created');
+
+      const tmpAfterWhisper = fs.readdirSync(os.tmpdir()).filter(n => n.startsWith('vr_whisper_') && !tmpBeforeWhisper.has(n));
+      assert.strictEqual(tmpAfterWhisper.length, 0, `12.9 Zero leftover vr_whisper_* temp dirs in os.tmpdir() (found: ${tmpAfterWhisper.join(', ')})`);
+    } finally {
+      delete process.env.COMPAT_MODE;
+      if (prevWs2Path === undefined) delete process.env.WHISPER_PATH;
+      else process.env.WHISPER_PATH = prevWs2Path;
+      if (prevWs2Model === undefined) delete process.env.WHISPER_MODEL_PATH;
+      else process.env.WHISPER_MODEL_PATH = prevWs2Model;
+      if (prevWs2Compat === undefined) delete process.env.WHISPER_VERIFY_COMPATIBILITY;
+      else process.env.WHISPER_VERIFY_COMPATIBILITY = prevWs2Compat;
+    }
+
+    // 12.10-12.18 Additional MediaInspector / VideoProcessor / AudioProcessor / Tesseract edge cases
+    const zeroBytePath = path.resolve(testDir, 'zero_byte.mp4');
+    fs.writeFileSync(zeroBytePath, Buffer.alloc(0));
+    generatedFiles.push(zeroBytePath);
+    await assert.rejects(
+      () => mediaInspector.inspect(zeroBytePath, 'zero_byte.mp4'),
+      (err: any) => err instanceof MediaInspectionError && err.category === 'INVALID_MEDIA_METADATA',
+      '12.10 Zero-byte file rejected cleanly as INVALID_MEDIA_METADATA'
+    );
+
+    const badDurationFfprobe = path.resolve(testDir, 'mock_ffprobe_bad_dur.sh');
+    fs.writeFileSync(
+      badDurationFfprobe,
+      `#!/bin/sh
+if [ "\${BAD_DUR_MODE:-zero}" = "zero" ]; then
+  echo '{"format":{"duration":"0"},"streams":[{"codec_type":"video","codec_name":"h264","width":320,"height":240,"r_frame_rate":"30/1"}]}'
+else
+  echo '{"format":{"duration":"N/A"},"streams":[{"codec_type":"video","codec_name":"h264","width":320,"height":240,"r_frame_rate":"30/1"}]}'
+fi
+`,
+      { mode: 0o755 }
+    );
+    generatedFiles.push(badDurationFfprobe);
+
+    const prevFfprobeEdge = process.env.FFPROBE_PATH;
+    try {
+      process.env.FFPROBE_PATH = badDurationFfprobe;
+      process.env.BAD_DUR_MODE = 'zero';
+      await assert.rejects(
+        () => mediaInspector.inspect(dummyVideoPath, 'dummy_ocr.mp4'),
+        (err: any) => err instanceof MediaInspectionError && err.category === 'INVALID_MEDIA_METADATA',
+        '12.11 Zero-duration container rejected cleanly as INVALID_MEDIA_METADATA'
+      );
+      process.env.BAD_DUR_MODE = 'na';
+      await assert.rejects(
+        () => mediaInspector.inspect(dummyVideoPath, 'dummy_ocr.mp4'),
+        (err: any) => err instanceof MediaInspectionError && err.category === 'INVALID_MEDIA_METADATA',
+        '12.12 Non-numeric N/A duration metadata rejected cleanly as INVALID_MEDIA_METADATA'
+      );
+    } finally {
+      delete process.env.BAD_DUR_MODE;
+      if (prevFfprobeEdge === undefined) delete process.env.FFPROBE_PATH;
+      else process.env.FFPROBE_PATH = prevFfprobeEdge;
+    }
+
+    // Audio-only container & video-only container handling
+    const audioOnlyPath = path.resolve(testDir, 'audio_only.mp4');
+    await execFileAsync('ffmpeg', [
+      '-y', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=3',
+      '-c:a', 'aac', audioOnlyPath
+    ]);
+    generatedFiles.push(audioOnlyPath);
+
+    const audioOnlyMeta = await mediaInspector.inspect(audioOnlyPath, 'audio_only.mp4');
+    assert.strictEqual(audioOnlyMeta.hasAudio, true, '12.13 Audio-only container reports hasAudio=true');
+    assert.strictEqual(audioOnlyMeta.width, 0, '12.14 Audio-only container reports width=0');
+
+    process.env.TESSERACT_PATH = '/usr/bin/tesseract';
+    const audioOnlyOcr = await videoProcessor.performVideoOcr(audioOnlyPath, audioOnlyMeta);
+    assert.strictEqual(audioOnlyOcr.status, 'NOT_PROVIDED', '12.15 Audio-only OCR safely returns NOT_PROVIDED');
+    const audioOnlyVid = await videoProcessor.analyzeVideo(audioOnlyPath, audioOnlyMeta, 'standard');
+    assert.strictEqual(audioOnlyVid.framesSampled, 0, '12.16 Audio-only analyzeVideo samples 0 video frames');
+
+    const videoOnlyAudioRes = await audioProcessor.analyzeAudio(dummyVideoPath, meta3s);
+    assert.strictEqual(videoOnlyAudioRes.speechAnalysisStatus, 'NOT_PROVIDED', '12.17 Video-only container safely returns NOT_PROVIDED for audio');
+
+    // Long-duration sampling bounds (10 hours = 36000s)
+    const longStd = calculateOcrSamplingTimestamps(36000, 15);
+    const longDeep = calculateOcrSamplingTimestamps(36000, 30);
+    assert.strictEqual(longStd.length, 15, '12.18 Long-duration standard sampling bounded to 15');
+    assert.strictEqual(longDeep.length, 30, '12.19 Long-duration deep sampling bounded to 30');
+    assert.ok(longDeep[0] === 0 && longDeep[29] < 36000 && new Set(longDeep).size === 30, '12.20 Long-duration samples unique & within [0, duration)');
+
+    // Corrupt image frame submitted to real /usr/bin/tesseract must count as framesOcrFailed > 0 (never NO_SIGNAL_DETECTED)
+    const corruptFramePath = path.resolve(testDir, 'corrupt_frame.png');
+    fs.writeFileSync(corruptFramePath, 'NOT_A_VALID_PNG_IMAGE_PAYLOAD');
+    generatedFiles.push(corruptFramePath);
+
+    const corruptFrameFfmpeg = path.resolve(testDir, 'corrupt_frame_ffmpeg.sh');
+    fs.writeFileSync(
+      corruptFrameFfmpeg,
+      `#!/bin/sh
+OUT=""
+for arg in "$@"; do OUT="$arg"; done
+cp "${corruptFramePath}" "$OUT"
+exit 0
+`,
+      { mode: 0o755 }
+    );
+    generatedFiles.push(corruptFrameFfmpeg);
+
+    const prevFfmpegCorrupt = process.env.FFMPEG_PATH;
+    try {
+      process.env.FFMPEG_PATH = corruptFrameFfmpeg;
+      const corruptImgOcr = await videoProcessor.performVideoOcr(dummyVideoPath, meta3s, { maxFrames: 2 });
+      assert.strictEqual(corruptImgOcr.framesOcrFailed, 2, '12.21 Invalid PNG submitted to real Tesseract increments framesOcrFailed=2');
+      assert.strictEqual(corruptImgOcr.framesSucceeded, 0, '12.22 Invalid PNG never increments framesSucceeded');
+      assert.strictEqual(corruptImgOcr.status, 'INSUFFICIENT_EVIDENCE', '12.23 All-failed OCR returns INSUFFICIENT_EVIDENCE (never NO_SIGNAL_DETECTED)');
+    } finally {
+      if (prevFfmpegCorrupt === undefined) delete process.env.FFMPEG_PATH;
+      else process.env.FFMPEG_PATH = prevFfmpegCorrupt;
+      delete process.env.TESSERACT_PATH;
+    }
+
+    console.log('  ✅ PASS: WS2 Whisper isolation/cleanup & WS3 edge cases verified');
 
     console.log('\n======================================================');
     console.log('🎉 ALL TARGETED REMEDIATION REGRESSION TESTS PASSED!');

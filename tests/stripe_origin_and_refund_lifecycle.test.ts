@@ -1680,6 +1680,148 @@ export async function runStripeOriginAndRefundLifecycleTests() {
 
     console.log('  ✅ PASS: 20-case refund matrix, 12-scenario monotonic out-of-order protection, & SQLite/InMemory parity verified');
 
+    // =========================================================================
+    // PART B2: SQLITE RESTART PERSISTENCE & CONCURRENT WEBHOOK RACE PROTECTION
+    // =========================================================================
+    console.log('\n[B2. SQLite Restart Persistence & Concurrent Refund Webhook Ordering]');
+
+    const restartDbPath = path.join(tempSqliteDir, 'refund_restart_persist.db');
+    let persistUserId = '';
+    let persistPi = '';
+    const persistRef = `re_restart_${Date.now()}`;
+    const persistBaseTs = 1800000000;
+
+    {
+      const repo1 = new SqliteStorageRepository(restartDbPath);
+      billingService.setStorageForTest(repo1);
+      try {
+        const u = await repo1.users.createUser(`restart_${Date.now()}@videorisk.test`, 'hash', 'salt', 10, 'free');
+        persistUserId = u.id;
+        persistPi = `pi_restart_${Date.now()}`;
+        const payEv = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+          id: `evt_restart_pay_${Date.now()}`,
+          created: persistBaseTs,
+          type: 'checkout.session.completed',
+          data: {
+            object: {
+              id: `cs_restart_${Date.now()}`,
+              payment_status: 'paid',
+              payment_intent: persistPi,
+              amount_total: 1900,
+              currency: 'usd',
+              metadata: { userId: u.id, planId: 'pro' },
+            },
+          },
+        });
+        await billingService.handleWebhook(payEv.rawBody, payEv.signature);
+
+        const sucEv = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+          id: `evt_restart_suc_${Date.now()}`,
+          created: persistBaseTs + 20,
+          type: 'refund.updated',
+          data: { object: { id: persistRef, payment_intent: persistPi, amount: 1900, status: 'succeeded' } },
+        });
+        await billingService.handleWebhook(sucEv.rawBody, sucEv.signature);
+        assert.strictEqual((await repo1.users.getUser(u.id))?.creditsRemaining, 10, 'B2.1 Pre-restart succeeded refund deducted 75 credits (85 -> 10)');
+      } finally {
+        billingService.setStorageForTest(null);
+        (repo1 as any).db.close();
+      }
+    }
+
+    // Reopen fresh SqliteStorageRepository instance from disk (simulating process restart)
+    {
+      const repo2 = new SqliteStorageRepository(restartDbPath);
+      billingService.setStorageForTest(repo2);
+      try {
+        const stalePendingAfterRestart = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+          id: `evt_restart_stale_pending_${Date.now()}`,
+          created: persistBaseTs + 5,
+          type: 'refund.created',
+          data: { object: { id: persistRef, payment_intent: persistPi, amount: 1900, status: 'pending' } },
+        });
+        await billingService.handleWebhook(stalePendingAfterRestart.rawBody, stalePendingAfterRestart.signature);
+
+        const staleFailedAfterRestart = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+          id: `evt_restart_stale_failed_${Date.now()}`,
+          created: persistBaseTs + 10,
+          type: 'refund.failed',
+          data: { object: { id: persistRef, payment_intent: persistPi, amount: 1900, status: 'failed' } },
+        });
+        await billingService.handleWebhook(staleFailedAfterRestart.rawBody, staleFailedAfterRestart.signature);
+
+        const db2 = (repo2 as any).db;
+        const row = db2.prepare('SELECT * FROM stripe_refunds WHERE refund_id = ?').get(persistRef) as any;
+        assert.strictEqual(row.status, 'succeeded', 'B2.2 Persisted succeeded status survives DB restart and blocks older pending/failed');
+        assert.strictEqual(Number(row.last_event_created), persistBaseTs + 20, 'B2.3 Persisted last_event_created survives DB restart');
+        assert.strictEqual(Number(row.credits_adjusted), 75, 'B2.4 Persisted credits_adjusted remains 75');
+        assert.strictEqual(Boolean(row.reconciled), true, 'B2.5 Persisted reconciled remains true');
+        assert.strictEqual((await repo2.users.getUser(persistUserId))?.creditsRemaining, 10, 'B2.6 User balance unchanged across restart stale events');
+
+        // Concurrent Promise.all race: pending (T+5), succeeded (T+20), duplicate succeeded (T+21, new event.id), failed (T+10)
+        const raceUser = await repo2.users.createUser(`race_${Date.now()}@videorisk.test`, 'hash', 'salt', 10, 'free');
+        const racePi = `pi_race_${Date.now()}`;
+        const racePay = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+          id: `evt_race_pay_${Date.now()}`,
+          created: persistBaseTs,
+          type: 'checkout.session.completed',
+          data: {
+            object: {
+              id: `cs_race_${Date.now()}`,
+              payment_status: 'paid',
+              payment_intent: racePi,
+              amount_total: 1900,
+              currency: 'usd',
+              metadata: { userId: raceUser.id, planId: 'pro' },
+            },
+          },
+        });
+        await billingService.handleWebhook(racePay.rawBody, racePay.signature);
+
+        const raceRef = `re_race_${Date.now()}`;
+        const racePayloads = [
+          buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+            id: `evt_race_pend_${Date.now()}`,
+            created: persistBaseTs + 5,
+            type: 'refund.created',
+            data: { object: { id: raceRef, payment_intent: racePi, amount: 1900, status: 'pending' } },
+          }),
+          buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+            id: `evt_race_suc1_${Date.now()}`,
+            created: persistBaseTs + 20,
+            type: 'refund.updated',
+            data: { object: { id: raceRef, payment_intent: racePi, amount: 1900, status: 'succeeded' } },
+          }),
+          buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+            id: `evt_race_suc2_${Date.now()}`,
+            created: persistBaseTs + 21,
+            type: 'refund.updated',
+            data: { object: { id: raceRef, payment_intent: racePi, amount: 1900, status: 'succeeded' } },
+          }),
+          buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+            id: `evt_race_fail_${Date.now()}`,
+            created: persistBaseTs + 10,
+            type: 'refund.failed',
+            data: { object: { id: raceRef, payment_intent: racePi, amount: 1900, status: 'failed' } },
+          }),
+        ];
+
+        await Promise.all(racePayloads.map(p => billingService.handleWebhook(p.rawBody, p.signature)));
+
+        const raceRow = db2.prepare('SELECT * FROM stripe_refunds WHERE refund_id = ?').get(raceRef) as any;
+        const raceTxCount = Number((db2.prepare("SELECT COUNT(*) as c FROM credit_transactions WHERE user_id = ? AND type = 'STRIPE_PAYMENT_REFUND'").get(raceUser.id) as any).c);
+        assert.strictEqual(raceRow.status, 'succeeded', 'B2.7 Concurrent race settles deterministically at terminal succeeded');
+        assert.strictEqual(Number(raceRow.credits_adjusted), 75, 'B2.8 Concurrent race deducts credits exactly once (75)');
+        assert.strictEqual(raceTxCount, 1, 'B2.9 Concurrent race records exactly 1 STRIPE_PAYMENT_REFUND ledger row');
+        assert.strictEqual((await repo2.users.getUser(raceUser.id))?.creditsRemaining, 10, 'B2.10 Concurrent race leaves exact balance 10');
+      } finally {
+        billingService.setStorageForTest(null);
+        (repo2 as any).db.close();
+      }
+    }
+
+    console.log('  ✅ PASS: SQLite restart persistence & concurrent refund webhook race protection verified');
+
     console.log('\n======================================================');
     console.log('🎉 ALL CHECKOUT ORIGIN & STRIPE REFUND TESTS PASSED!');
     console.log('======================================================\n');

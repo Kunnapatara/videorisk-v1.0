@@ -52,12 +52,41 @@ export interface AudioAnalysisResult {
   detectors?: Record<string, DetectorReport>;
 }
 
+export type WhisperRuntimeExecutionStatus =
+  | 'UNCONFIGURED'
+  | 'UNVERIFIED'
+  | 'RUNTIME_EXECUTION_VERIFIED'
+  | 'FAILED';
+
+export type WhisperSpeechTranscriptStatus =
+  | 'SPEECH_TRANSCRIPT_UNVERIFIED'
+  | 'SPEECH_TRANSCRIPT_VERIFIED'
+  | 'SPEECH_TRANSCRIPT_FAILED';
+
+export interface WhisperTranscriptComparison {
+  compared: boolean;
+  expectedTranscriptPresent: boolean;
+  passed?: boolean;
+  expectedTokenCount: number;
+  actualTokenCount: number;
+  matchedTokenCount: number;
+  recall?: number;
+  precision?: number;
+  score?: number;
+  minRecallThreshold: number;
+  minPrecisionThreshold: number;
+  isSyntheticFixture?: boolean;
+  reason?: string;
+}
+
 export interface LocalTranscriptionResult {
   status: DetectorExecutionStatus;
   transcriptText?: string;
   segments?: Array<{ start: number; end: number; text: string; confidence?: number }>;
   diagnosticCode?: WhisperDiagnosticCode;
   compatibilityVerified?: boolean;
+  runtimeExecutionStatus?: WhisperRuntimeExecutionStatus;
+  speechTranscriptStatus?: WhisperSpeechTranscriptStatus;
   failureReason?: string;
   limitations: string;
   executionDurationMs: number;
@@ -101,6 +130,8 @@ export interface WhisperRuntimeValidation {
 export interface WhisperCompatibilityResult {
   compatible: boolean;
   diagnosticCode: WhisperDiagnosticCode;
+  runtimeExecutionStatus: WhisperRuntimeExecutionStatus;
+  speechTranscriptStatus: WhisperSpeechTranscriptStatus;
   runtimeType: 'openai_whisper' | 'whisper_cpp' | 'unconfigured';
   validation: WhisperRuntimeValidation;
   transcriptText?: string;
@@ -108,6 +139,9 @@ export interface WhisperCompatibilityResult {
   audioFixturePath?: string;
   referenceTranscript?: string;
   referenceMatched?: boolean;
+  transcriptComparison?: WhisperTranscriptComparison;
+  isSyntheticFixture?: boolean;
+  verifiedAt?: string;
   fromCache?: boolean;
   executionDurationMs: number;
   details: string;
@@ -144,7 +178,12 @@ export class SpeechTranscriptionAdapter {
     this.compatibilityCache.clear();
   }
 
-  private getRuntimeFingerprint(validation: WhisperRuntimeValidation, fixturePath: string, expectedTranscript?: string): string {
+  private getRuntimeFingerprint(
+    validation: WhisperRuntimeValidation,
+    fixturePath: string,
+    expectedTranscript?: string,
+    isSyntheticFixture?: boolean
+  ): string {
     const safeStatKey = (p?: string): string => {
       if (!p) return 'none';
       try {
@@ -159,7 +198,8 @@ export class SpeechTranscriptionAdapter {
       safeStatKey(validation.executablePath),
       safeStatKey(validation.modelPath),
       safeStatKey(fixturePath),
-      expectedTranscript || ''
+      expectedTranscript !== undefined ? `exp:${expectedTranscript}` : 'exp:unset',
+      isSyntheticFixture ? 'synthetic:1' : 'synthetic:0'
     ].join('|');
   }
 
@@ -670,27 +710,38 @@ export class SpeechTranscriptionAdapter {
     expectedTranscript?: string;
     timeoutMs?: number;
     forceRefresh?: boolean;
+    isSyntheticFixture?: boolean;
   }): Promise<WhisperCompatibilityResult> {
     return this.verifyRuntimeCompatibility({
       audioFixturePath: options?.audioFixturePath,
       expectedTranscript: options?.expectedTranscript,
       timeoutMs: options?.timeoutMs,
       useCache: !options?.forceRefresh,
+      isSyntheticFixture: options?.isSyntheticFixture
     });
   }
 
   /**
    * Executes an actual runtime compatibility smoke test against a configured Whisper binary + model
-   * using a real 16kHz mono PCM WAV speech audio fixture (never a synthetic sine tone).
+   * using a 16kHz mono PCM WAV speech audio fixture.
+   *
+   * Strictly separates:
+   * - `runtimeExecutionStatus`: whether the binary + model executed cleanly on audio and produced non-empty parseable output
+   * - `speechTranscriptStatus`: whether output matched an explicit expected reference transcript on real speech audio
    */
   public async verifyRuntimeCompatibility(options?: {
     audioFixturePath?: string;
     expectedTranscript?: string;
     timeoutMs?: number;
     useCache?: boolean;
+    isSyntheticFixture?: boolean;
   }): Promise<WhisperCompatibilityResult> {
     const startTime = Date.now();
     const timeoutMs = options?.timeoutMs ?? 20000;
+    const isSyntheticFixture = Boolean(
+      options?.isSyntheticFixture ||
+      (process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE || '').trim().toLowerCase() === 'true'
+    );
     const validation = await this.validateRuntime();
 
     if (validation.status !== 'READY' || (validation.runtimeType !== 'whisper_cpp' && validation.runtimeType !== 'openai_whisper')) {
@@ -709,8 +760,12 @@ export class SpeechTranscriptionAdapter {
       return {
         compatible: false,
         diagnosticCode: code,
+        runtimeExecutionStatus: validation.status === 'UNCONFIGURED' ? 'UNCONFIGURED' : 'FAILED',
+        speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
         runtimeType: validation.runtimeType,
         validation,
+        isSyntheticFixture,
+        verifiedAt: new Date().toISOString(),
         executionDurationMs: Date.now() - startTime,
         details: validation.details || `Whisper runtime preflight failed with status ${validation.status}.`
       };
@@ -723,15 +778,26 @@ export class SpeechTranscriptionAdapter {
       return {
         compatible: false,
         diagnosticCode: 'SPEECH_FIXTURE_NOT_FOUND',
+        runtimeExecutionStatus: 'UNVERIFIED',
+        speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
         runtimeType: validation.runtimeType,
         validation,
+        isSyntheticFixture,
+        verifiedAt: new Date().toISOString(),
         executionDurationMs: Date.now() - startTime,
         details: 'No real speech 16kHz mono PCM WAV fixture is configured or present on disk (set WHISPER_COMPAT_AUDIO_PATH or provide audioFixturePath). Synthetic sine tones cannot verify speech recognition.'
       };
     }
 
-    const expectedTranscript = options?.expectedTranscript ?? process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT;
-    const fingerprint = this.getRuntimeFingerprint(validation, resolvedFixturePath, expectedTranscript);
+    const hasExplicitOptionExpected = options?.expectedTranscript !== undefined;
+    const rawEnvExpected = process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT;
+    const hasNonEmptyEnvExpected = typeof rawEnvExpected === 'string' && rawEnvExpected.trim().length > 0;
+    const expectedProvided = hasExplicitOptionExpected || hasNonEmptyEnvExpected;
+    const expectedTranscript = hasExplicitOptionExpected
+      ? options!.expectedTranscript!
+      : (hasNonEmptyEnvExpected ? rawEnvExpected! : undefined);
+
+    const fingerprint = this.getRuntimeFingerprint(validation, resolvedFixturePath, expectedTranscript, isSyntheticFixture);
 
     if (options?.useCache) {
       const cached = this.compatibilityCache.get(fingerprint);
@@ -749,9 +815,13 @@ export class SpeechTranscriptionAdapter {
       return {
         compatible: false,
         diagnosticCode: 'SPEECH_FIXTURE_INVALID',
+        runtimeExecutionStatus: 'FAILED',
+        speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
         runtimeType: validation.runtimeType,
         validation,
         audioFixturePath: resolvedFixturePath,
+        isSyntheticFixture,
+        verifiedAt: new Date().toISOString(),
         executionDurationMs: Date.now() - startTime,
         details: wavCheck.reason || `Invalid speech WAV fixture at ${resolvedFixturePath}.`
       };
@@ -775,7 +845,7 @@ export class SpeechTranscriptionAdapter {
       let stdout = '';
       let stderr = '';
       try {
-        const res = await execFileAsync(sttPath, cliArgs, { timeout: timeoutMs });
+        const res = await execFileAsync(sttPath, cliArgs, { timeout: timeoutMs, cwd: tmpDir });
         stdout = res.stdout || '';
         stderr = res.stderr || '';
       } catch (execErr: any) {
@@ -784,9 +854,14 @@ export class SpeechTranscriptionAdapter {
         const failResult: WhisperCompatibilityResult = {
           compatible: false,
           diagnosticCode: classified.diagnosticCode,
+          runtimeExecutionStatus: 'FAILED',
+          speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
           runtimeType: validation.runtimeType,
           validation,
           audioFixturePath: resolvedFixturePath,
+          isSyntheticFixture,
+          verifiedAt: new Date().toISOString(),
+          fromCache: false,
           executionDurationMs: elapsed,
           details: classified.details
         };
@@ -828,9 +903,14 @@ export class SpeechTranscriptionAdapter {
           return {
             compatible: false,
             diagnosticCode: 'TRANSCRIPTION_FAILED',
+            runtimeExecutionStatus: 'FAILED',
+            speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
             runtimeType: validation.runtimeType,
             validation,
             audioFixturePath: resolvedFixturePath,
+            isSyntheticFixture,
+            verifiedAt: new Date().toISOString(),
+            fromCache: false,
             executionDurationMs: elapsed,
             details: 'Whisper executable produced malformed JSON output during compatibility probe.'
           };
@@ -862,61 +942,78 @@ export class SpeechTranscriptionAdapter {
         return {
           compatible: false,
           diagnosticCode: 'EMPTY_TRANSCRIPTION_OUTPUT',
+          runtimeExecutionStatus: 'FAILED',
+          speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
           runtimeType: validation.runtimeType,
           validation,
           audioFixturePath: resolvedFixturePath,
+          isSyntheticFixture,
+          verifiedAt: new Date().toISOString(),
+          fromCache: false,
           executionDurationMs: elapsed,
           details: `Whisper executable ran without error on speech fixture but produced empty transcription output.${stderr ? ' Check speech audio fixture or model configuration.' : ''}`
         };
       }
 
-      let referenceMatched: boolean | undefined;
-      if (expectedTranscript && expectedTranscript.trim().length > 0) {
-        const normalizeTranscriptTokens = (txt: string): string[] =>
-          txt
-            .toLowerCase()
-            .normalize('NFKC')
-            .replace(/[^\p{L}\p{N}\s]/gu, ' ')
-            .split(/\s+/)
-            .filter(Boolean);
+      const normalizeTranscriptTokens = (txt: string): string[] =>
+        txt
+          .toLowerCase()
+          .normalize('NFKC')
+          .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+          .split(/\s+/)
+          .filter(Boolean);
 
-        const expectedTokens = normalizeTranscriptTokens(expectedTranscript);
-        const actualTokens = normalizeTranscriptTokens(extractedText);
+      const MIN_RECALL_THRESHOLD = 0.85;
+      const MIN_PRECISION_THRESHOLD = 0.80;
+      const actualTokens = normalizeTranscriptTokens(extractedText);
+
+      let speechTranscriptStatus: WhisperSpeechTranscriptStatus = 'SPEECH_TRANSCRIPT_UNVERIFIED';
+      let referenceMatched: boolean | undefined;
+      let transcriptComparison: WhisperTranscriptComparison;
+      const verifiedAt = new Date().toISOString();
+
+      if (!expectedProvided) {
+        transcriptComparison = {
+          compared: false,
+          expectedTranscriptPresent: false,
+          expectedTokenCount: 0,
+          actualTokenCount: actualTokens.length,
+          matchedTokenCount: 0,
+          minRecallThreshold: MIN_RECALL_THRESHOLD,
+          minPrecisionThreshold: MIN_PRECISION_THRESHOLD,
+          isSyntheticFixture,
+          reason: 'No expected reference transcript configured; runtime execution verified, but speech transcript accuracy remains unverified.'
+        };
+      } else {
+        const expectedTokens = normalizeTranscriptTokens(expectedTranscript || '');
 
         if (expectedTokens.length === 0 || actualTokens.length === 0) {
           referenceMatched = false;
-        } else {
-          // Speech-fixture compatibility smoke check using ordered token Longest Common Subsequence (LCS).
-          // Tolerates punctuation, casing, and whitespace differences while rejecting incorrect transcripts,
-          // missing expected words, excessive unexpected words, and major word-order mismatches.
-          // Note: This is a runtime compatibility smoke check, NOT a general WER benchmark.
-          const m = expectedTokens.length;
-          const n = actualTokens.length;
-          let prev = new Array<number>(n + 1).fill(0);
-          let curr = new Array<number>(n + 1).fill(0);
-          for (let i = 1; i <= m; i++) {
-            for (let j = 1; j <= n; j++) {
-              if (expectedTokens[i - 1] === actualTokens[j - 1]) {
-                curr[j] = prev[j - 1] + 1;
-              } else {
-                curr[j] = prev[j] >= curr[j - 1] ? prev[j] : curr[j - 1];
-              }
-            }
-            const tmp = prev;
-            prev = curr;
-            curr = tmp;
-            curr.fill(0);
-          }
-          const lcsLen = prev[n];
-          const recall = lcsLen / m;
-          const precision = lcsLen / n;
-          referenceMatched = recall >= 0.85 && precision >= 0.8;
-        }
+          speechTranscriptStatus = 'SPEECH_TRANSCRIPT_FAILED';
+          const reason = expectedTokens.length === 0
+            ? 'Expected transcript contains zero alphanumeric speech tokens after normalization.'
+            : 'Extracted transcript contains zero alphanumeric speech tokens after normalization.';
+          transcriptComparison = {
+            compared: true,
+            expectedTranscriptPresent: true,
+            passed: false,
+            expectedTokenCount: expectedTokens.length,
+            actualTokenCount: actualTokens.length,
+            matchedTokenCount: 0,
+            recall: 0,
+            precision: 0,
+            score: 0,
+            minRecallThreshold: MIN_RECALL_THRESHOLD,
+            minPrecisionThreshold: MIN_PRECISION_THRESHOLD,
+            isSyntheticFixture,
+            reason
+          };
 
-        if (!referenceMatched) {
           return {
             compatible: false,
             diagnosticCode: 'TRANSCRIPTION_FAILED',
+            runtimeExecutionStatus: 'RUNTIME_EXECUTION_VERIFIED',
+            speechTranscriptStatus,
             runtimeType: validation.runtimeType,
             validation,
             audioFixturePath: resolvedFixturePath,
@@ -924,8 +1021,122 @@ export class SpeechTranscriptionAdapter {
             segmentsCount,
             referenceTranscript: expectedTranscript,
             referenceMatched: false,
+            transcriptComparison,
+            isSyntheticFixture,
+            verifiedAt,
+            fromCache: false,
             executionDurationMs: elapsed,
-            details: `Transcript output did not match expected speech smoke-check transcript ('${expectedTranscript}' vs '${extractedText.slice(0, 120)}').`
+            details: `${reason} (runtime execution succeeded, speech transcript verification failed).`
+          };
+        }
+
+        // Speech-fixture compatibility smoke check using ordered token Longest Common Subsequence (LCS).
+        // Tolerates punctuation, casing, and whitespace differences while rejecting incorrect transcripts,
+        // missing expected words, excessive unexpected words, and major word-order mismatches.
+        // Note: This is a runtime compatibility smoke check, NOT a general WER benchmark.
+        const m = expectedTokens.length;
+        const n = actualTokens.length;
+        let prev = new Array<number>(n + 1).fill(0);
+        let curr = new Array<number>(n + 1).fill(0);
+        for (let i = 1; i <= m; i++) {
+          for (let j = 1; j <= n; j++) {
+            if (expectedTokens[i - 1] === actualTokens[j - 1]) {
+              curr[j] = prev[j - 1] + 1;
+            } else {
+              curr[j] = prev[j] >= curr[j - 1] ? prev[j] : curr[j - 1];
+            }
+          }
+          const tmp = prev;
+          prev = curr;
+          curr = tmp;
+          curr.fill(0);
+        }
+        const lcsLen = prev[n];
+        const rawRecall = lcsLen / m;
+        const rawPrecision = lcsLen / n;
+        const recall = parseFloat(rawRecall.toFixed(4));
+        const precision = parseFloat(rawPrecision.toFixed(4));
+        const score = rawRecall + rawPrecision > 0
+          ? parseFloat(((2 * rawRecall * rawPrecision) / (rawRecall + rawPrecision)).toFixed(4))
+          : 0;
+        const lcsPassed = rawRecall >= MIN_RECALL_THRESHOLD && rawPrecision >= MIN_PRECISION_THRESHOLD;
+
+        if (!lcsPassed) {
+          referenceMatched = false;
+          speechTranscriptStatus = 'SPEECH_TRANSCRIPT_FAILED';
+          const reason = `Ordered token LCS check failed (recall=${recall} < ${MIN_RECALL_THRESHOLD} or precision=${precision} < ${MIN_PRECISION_THRESHOLD}).`;
+          transcriptComparison = {
+            compared: true,
+            expectedTranscriptPresent: true,
+            passed: false,
+            expectedTokenCount: m,
+            actualTokenCount: n,
+            matchedTokenCount: lcsLen,
+            recall,
+            precision,
+            score,
+            minRecallThreshold: MIN_RECALL_THRESHOLD,
+            minPrecisionThreshold: MIN_PRECISION_THRESHOLD,
+            isSyntheticFixture,
+            reason
+          };
+
+          return {
+            compatible: false,
+            diagnosticCode: 'TRANSCRIPTION_FAILED',
+            runtimeExecutionStatus: 'RUNTIME_EXECUTION_VERIFIED',
+            speechTranscriptStatus,
+            runtimeType: validation.runtimeType,
+            validation,
+            audioFixturePath: resolvedFixturePath,
+            transcriptText: extractedText,
+            segmentsCount,
+            referenceTranscript: expectedTranscript,
+            referenceMatched: false,
+            transcriptComparison,
+            isSyntheticFixture,
+            verifiedAt,
+            fromCache: false,
+            executionDurationMs: elapsed,
+            details: `Transcript output did not match expected speech smoke-check transcript ('${expectedTranscript}' vs '${extractedText.slice(0, 120)}'). ${reason}`
+          };
+        }
+
+        if (isSyntheticFixture) {
+          referenceMatched = false;
+          speechTranscriptStatus = 'SPEECH_TRANSCRIPT_UNVERIFIED';
+          transcriptComparison = {
+            compared: true,
+            expectedTranscriptPresent: true,
+            passed: false,
+            expectedTokenCount: m,
+            actualTokenCount: n,
+            matchedTokenCount: lcsLen,
+            recall,
+            precision,
+            score,
+            minRecallThreshold: MIN_RECALL_THRESHOLD,
+            minPrecisionThreshold: MIN_PRECISION_THRESHOLD,
+            isSyntheticFixture: true,
+            reason: 'Synthetic or mock audio fixture cannot grant SPEECH_TRANSCRIPT_VERIFIED status; real human speech audio is required.'
+          };
+        } else {
+          referenceMatched = true;
+          speechTranscriptStatus = 'SPEECH_TRANSCRIPT_VERIFIED';
+          transcriptComparison = {
+            compared: true,
+            expectedTranscriptPresent: true,
+            passed: true,
+            expectedTokenCount: m,
+            actualTokenCount: n,
+            matchedTokenCount: lcsLen,
+            recall,
+            precision,
+            score,
+            minRecallThreshold: MIN_RECALL_THRESHOLD,
+            minPrecisionThreshold: MIN_PRECISION_THRESHOLD,
+            isSyntheticFixture: false,
+            reason: 'Ordered token LCS comparison met recall and precision thresholds.'
           };
         }
       }
@@ -933,15 +1144,22 @@ export class SpeechTranscriptionAdapter {
       const passResult: WhisperCompatibilityResult = {
         compatible: true,
         diagnosticCode: 'VERIFICATION_PASSED',
+        runtimeExecutionStatus: 'RUNTIME_EXECUTION_VERIFIED',
+        speechTranscriptStatus,
         runtimeType: validation.runtimeType,
         validation,
         audioFixturePath: resolvedFixturePath,
         transcriptText: extractedText,
         segmentsCount,
-        ...(expectedTranscript ? { referenceTranscript: expectedTranscript, referenceMatched: referenceMatched ?? true } : {}),
+        ...(expectedProvided ? { referenceTranscript: expectedTranscript, referenceMatched } : {}),
+        transcriptComparison,
+        isSyntheticFixture,
+        verifiedAt,
         fromCache: false,
         executionDurationMs: elapsed,
-        details: `Verified real ${validation.runtimeType} binary and model execution on 16kHz mono speech WAV fixture (${wavCheck.durationSeconds}s).`
+        details: speechTranscriptStatus === 'SPEECH_TRANSCRIPT_VERIFIED'
+          ? `Verified ${validation.runtimeType} runtime execution and expected speech transcript match on 16kHz mono WAV fixture (${wavCheck.durationSeconds}s).`
+          : `Verified ${validation.runtimeType} runtime binary/model execution on 16kHz mono WAV fixture (${wavCheck.durationSeconds}s); speech transcript accuracy remains unverified.`
       };
 
       if (options?.useCache) {
@@ -968,6 +1186,7 @@ export class SpeechTranscriptionAdapter {
       audioFixturePath?: string;
       expectedTranscript?: string;
       forceRefreshCompatibility?: boolean;
+      isSyntheticFixture?: boolean;
     }
   ): Promise<LocalTranscriptionResult> {
     const startTime = Date.now();
@@ -978,6 +1197,8 @@ export class SpeechTranscriptionAdapter {
       return {
         status: 'NOT_ASSESSED',
         diagnosticCode: 'UNCONFIGURED',
+        runtimeExecutionStatus: 'UNCONFIGURED',
+        speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
         limitations: 'Local speech-to-text executable (WHISPER_PATH or LOCAL_STT_PATH) not configured. Speech detection is acoustic-only without automated transcription.',
         executionDurationMs: 0
       };
@@ -997,6 +1218,8 @@ export class SpeechTranscriptionAdapter {
         status: 'ANALYSIS_UNAVAILABLE',
         diagnosticCode: validation.diagnosticCode,
         compatibilityVerified: false,
+        runtimeExecutionStatus: 'FAILED',
+        speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
         failureReason,
         limitations: `Whisper runtime validation failed with status ${validation.status}.`,
         executionDurationMs: Date.now() - startTime
@@ -1017,17 +1240,25 @@ export class SpeechTranscriptionAdapter {
       ));
 
     let compatibilityVerified = false;
+    let runtimeExecutionStatus: WhisperRuntimeExecutionStatus = 'UNVERIFIED';
+    let speechTranscriptStatus: WhisperSpeechTranscriptStatus = 'SPEECH_TRANSCRIPT_UNVERIFIED';
+
     if (shouldVerifyCompatibility) {
       const compat = await this.initializeRuntime({
         audioFixturePath: options?.audioFixturePath,
         expectedTranscript: options?.expectedTranscript,
-        forceRefresh: options?.forceRefreshCompatibility
+        forceRefresh: options?.forceRefreshCompatibility,
+        isSyntheticFixture: options?.isSyntheticFixture
       });
+      runtimeExecutionStatus = compat.runtimeExecutionStatus;
+      speechTranscriptStatus = compat.speechTranscriptStatus;
       if (!compat.compatible) {
         return {
           status: 'ANALYSIS_UNAVAILABLE',
           diagnosticCode: compat.diagnosticCode,
           compatibilityVerified: false,
+          runtimeExecutionStatus: compat.runtimeExecutionStatus,
+          speechTranscriptStatus: compat.speechTranscriptStatus,
           failureReason: compat.details,
           limitations: `Whisper runtime compatibility verification failed (${compat.diagnosticCode}).`,
           executionDurationMs: Date.now() - startTime
@@ -1038,33 +1269,62 @@ export class SpeechTranscriptionAdapter {
 
     const sttPath = validation.executablePath!;
     const modelPath = validation.modelPath;
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vr_whisper_tx_'));
 
     try {
-      // Build strict runtime-specific CLI argument list
+      const outPrefix = path.join(tmpDir, 'whisper_out');
+      // Build strict runtime-specific CLI argument list with isolated temporary output directory
       let cliArgs: string[];
       if (validation.runtimeType === 'whisper_cpp') {
         if (!modelPath) {
           return {
             status: 'ANALYSIS_UNAVAILABLE',
             diagnosticCode: 'MODEL_NOT_CONFIGURED',
+            runtimeExecutionStatus: 'FAILED',
+            speechTranscriptStatus,
             failureReason: 'whisper_cpp runtime requires a valid WHISPER_MODEL_PATH.',
             limitations: 'Whisper model path missing.',
             executionDurationMs: Date.now() - startTime
           };
         }
-        cliArgs = ['-m', modelPath, '-f', videoPath, '--output-json'];
+        cliArgs = ['-m', modelPath, '-f', videoPath, '--output-json', '-of', outPrefix];
       } else {
         // Verified openai_whisper CLI
-        cliArgs = [videoPath, '--output_format', 'json'];
+        cliArgs = [videoPath, '--output_format', 'json', '--output_dir', tmpDir];
         if (modelPath) {
           cliArgs.push('--model', modelPath);
         }
       }
 
-      // Execute local STT binary safely without shell expansion
-      const { stdout } = await execFileAsync(sttPath, cliArgs, { timeout: 60000 });
+      // Execute local STT binary safely without shell expansion inside isolated tmpDir
+      const { stdout } = await execFileAsync(sttPath, cliArgs, { timeout: 60000, cwd: tmpDir });
       const elapsed = Date.now() - startTime;
-      const rawOutput = (stdout || '').trim();
+
+      const baseVideo = path.basename(videoPath, path.extname(videoPath));
+      const candidateJsonPaths = [
+        `${outPrefix}.json`,
+        path.join(tmpDir, `${path.basename(videoPath)}.json`),
+        path.join(tmpDir, `${baseVideo}.json`)
+      ];
+
+      let rawOutput = '';
+      for (const jsonPath of candidateJsonPaths) {
+        if (fs.existsSync(jsonPath)) {
+          try {
+            const content = fs.readFileSync(jsonPath, 'utf-8').trim();
+            if (content) {
+              rawOutput = content;
+              break;
+            }
+          } catch {
+            // Fall through to next candidate or stdout
+          }
+        }
+      }
+
+      if (!rawOutput) {
+        rawOutput = (stdout || '').trim();
+      }
 
       if (!rawOutput) {
         return {
@@ -1073,6 +1333,8 @@ export class SpeechTranscriptionAdapter {
           segments: [],
           diagnosticCode: 'EMPTY_TRANSCRIPTION_OUTPUT',
           compatibilityVerified,
+          runtimeExecutionStatus,
+          speechTranscriptStatus,
           failureReason: 'STT executable completed with empty output',
           limitations: 'STT executable produced empty output; cannot verify presence or absence of speech without transcript data.',
           executionDurationMs: elapsed
@@ -1093,6 +1355,8 @@ export class SpeechTranscriptionAdapter {
             status: 'ANALYSIS_UNAVAILABLE',
             diagnosticCode: 'TRANSCRIPTION_FAILED',
             compatibilityVerified,
+            runtimeExecutionStatus,
+            speechTranscriptStatus,
             failureReason: 'Malformed JSON output from STT executable',
             limitations: 'STT executable produced invalid JSON structure that could not be parsed.',
             executionDurationMs: elapsed
@@ -1108,6 +1372,8 @@ export class SpeechTranscriptionAdapter {
           transcriptText: rawOutput,
           segments: [], // Segments MUST remain empty when timestamps are absent
           compatibilityVerified,
+          runtimeExecutionStatus,
+          speechTranscriptStatus,
           limitations: 'Plain text transcript returned without segment timestamps; segment-level timestamps are unavailable and were not fabricated.',
           executionDurationMs: elapsed
         };
@@ -1119,26 +1385,58 @@ export class SpeechTranscriptionAdapter {
           status: 'ANALYSIS_UNAVAILABLE',
           diagnosticCode: 'TRANSCRIPTION_FAILED',
           compatibilityVerified,
+          runtimeExecutionStatus,
+          speechTranscriptStatus,
           failureReason: 'STT executable returned invalid JSON structure (expected JSON object)',
           limitations: 'STT JSON output did not contain an object payload.',
           executionDurationMs: elapsed
         };
       }
 
-      // Verify that at least text string or segments array is present
-      if (typeof parsed.text !== 'string' && !Array.isArray(parsed.segments)) {
+      // Support both OpenAI Whisper (`segments`) and whisper.cpp (`transcription`) JSON payloads
+      const hasSegmentsArray = Array.isArray(parsed.segments);
+      const hasCppTranscriptionArray = Array.isArray(parsed.transcription);
+
+      if (typeof parsed.text !== 'string' && !hasSegmentsArray && !hasCppTranscriptionArray) {
         return {
           status: 'ANALYSIS_UNAVAILABLE',
           diagnosticCode: 'TRANSCRIPTION_FAILED',
           compatibilityVerified,
-          failureReason: 'STT JSON output missing both text and segments fields',
+          runtimeExecutionStatus,
+          speechTranscriptStatus,
+          failureReason: 'STT JSON output missing text, segments, and transcription fields',
           limitations: 'STT executable output did not contain usable text or segments fields.',
           executionDurationMs: elapsed
         };
       }
 
-      // Process and validate JSON segments
-      const rawSegments = Array.isArray(parsed.segments) ? parsed.segments : [];
+      const parseWhisperCppTimestamp = (ts: unknown): number => {
+        if (typeof ts === 'number') return ts;
+        if (typeof ts !== 'string') return NaN;
+        const m = ts.trim().match(/^(\d{2}):(\d{2}):(\d{2})[,.](\d{1,3})$/);
+        if (!m) return parseFloat(ts);
+        const hrs = parseInt(m[1], 10);
+        const mins = parseInt(m[2], 10);
+        const secs = parseInt(m[3], 10);
+        const ms = parseInt(m[4].padEnd(3, '0'), 10);
+        return hrs * 3600 + mins * 60 + secs + ms / 1000;
+      };
+
+      const rawSegments = hasSegmentsArray
+        ? parsed.segments
+        : hasCppTranscriptionArray
+          ? parsed.transcription.map((item: any) => ({
+              start: typeof item?.offsets?.from === 'number'
+                ? item.offsets.from / 1000
+                : parseWhisperCppTimestamp(item?.timestamps?.from),
+              end: typeof item?.offsets?.to === 'number'
+                ? item.offsets.to / 1000
+                : parseWhisperCppTimestamp(item?.timestamps?.to),
+              text: item?.text,
+              confidence: item?.confidence
+            }))
+          : [];
+
       const validSegments: Array<{ start: number; end: number; text: string; confidence?: number }> = [];
       let rejectedTimestampsCount = 0;
 
@@ -1174,7 +1472,7 @@ export class SpeechTranscriptionAdapter {
 
       const transcriptText = typeof parsed.text === 'string' 
         ? parsed.text.trim() 
-        : validSegments.map(s => s.text).join(' ');
+        : validSegments.map(s => s.text).join(' ').trim();
 
       let limitationNotes = 'Transcribed via local STT executable; automated transcripts may contain phonetic inaccuracies.';
       if (rejectedTimestampsCount > 0) {
@@ -1199,6 +1497,8 @@ export class SpeechTranscriptionAdapter {
         transcriptText,
         segments: validSegments,
         compatibilityVerified,
+        runtimeExecutionStatus,
+        speechTranscriptStatus,
         ...(failureReason ? { failureReason } : {}),
         limitations: limitationNotes,
         executionDurationMs: elapsed
@@ -1209,10 +1509,20 @@ export class SpeechTranscriptionAdapter {
         status: 'ANALYSIS_UNAVAILABLE',
         diagnosticCode: classified.diagnosticCode,
         compatibilityVerified,
+        runtimeExecutionStatus,
+        speechTranscriptStatus,
         failureReason: `Local STT process execution failed [${classified.diagnosticCode}]: ${classified.details}`,
         limitations: 'Speech transcription failed during local execution.',
         executionDurationMs: Date.now() - startTime
       };
+    } finally {
+      try {
+        if (fs.existsSync(tmpDir)) {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+      } catch {
+        // Ignore temp cleanup failures
+      }
     }
   }
 }

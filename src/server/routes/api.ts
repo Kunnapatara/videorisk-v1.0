@@ -1306,11 +1306,48 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
   };
 
   // 4. Optional Whisper STT readiness check (cached compatibility initialization; never blocks core readiness)
+  const sanitizeReadinessText = (raw?: string | null): string | null => {
+    if (!raw || typeof raw !== 'string') return null;
+    const redacted = raw
+      .replace(/[A-Za-z]:\\(?:[^\\/:*?"<>|\r\n\s]+\\)+([^\\/:*?"<>|\r\n\s]+)/g, '[redacted-path]/$1')
+      .replace(/(?:\/[A-Za-z0-9._-]+){2,}/g, (match) => `[redacted-path]/${path.posix.basename(match)}`)
+      .trim();
+    return redacted.slice(0, 260) || null;
+  };
+
   try {
     const compatEnvFlag = (process.env.WHISPER_VERIFY_COMPATIBILITY || '').trim().toLowerCase();
     const compatExplicitlyDisabled = compatEnvFlag === 'false';
     const compatRequired = compatEnvFlag === 'true' || (isProd && !compatExplicitlyDisabled);
+    const defaultSpeechFixture = path.resolve(process.cwd(), 'tests', 'fixtures', 'speech', 'whisper_speech_16k.wav');
+    const configuredFixturePath = process.env.WHISPER_COMPAT_AUDIO_PATH;
+    const fixtureAvailable = Boolean(
+      (configuredFixturePath && fs.existsSync(configuredFixturePath)) ||
+      (!configuredFixturePath && fs.existsSync(defaultSpeechFixture))
+    );
+    const expectedTranscriptConfigured = Boolean((process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT || '').trim().length > 0);
+    const isSyntheticFixtureEnv = (process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE || '').trim().toLowerCase() === 'true';
+
     const sttValidation = await speechTranscriptionAdapter.validateRuntime();
+    const binaryStatus =
+      sttValidation.status === 'UNCONFIGURED'
+        ? 'UNCONFIGURED'
+        : !sttValidation.executableFound
+          ? 'MISSING_EXECUTABLE'
+          : !sttValidation.isExecutable
+            ? 'NON_EXECUTABLE'
+            : sttValidation.status === 'ERROR' && !sttValidation.modelFound && sttValidation.runtimeType === 'unconfigured'
+              ? 'ERROR'
+              : 'READY';
+    const modelStatus = !sttValidation.isConfigured
+      ? 'UNCONFIGURED'
+      : sttValidation.modelFound
+        ? 'READY'
+        : !sttValidation.modelConfigured
+          ? 'NOT_CONFIGURED'
+          : sttValidation.diagnosticCode === 'MODEL_INCOMPATIBLE' || sttValidation.diagnosticCode === 'MODEL_NOT_READABLE'
+            ? sttValidation.diagnosticCode
+            : 'MISSING_MODEL';
 
     if (sttValidation.status === 'UNCONFIGURED') {
       checks.whisperStt = {
@@ -1319,80 +1356,167 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
         details: {
           configured: false,
           runtimeType: sttValidation.runtimeType,
+          binaryStatus,
+          modelStatus,
+          runtimeExecutionStatus: 'UNCONFIGURED',
+          speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
+          fixtureAvailable,
+          expectedTranscriptConfigured,
+          transcriptComparison: null,
+          failureReason: null,
+          lastVerification: null,
           diagnosticCode: sttValidation.diagnosticCode || 'UNCONFIGURED',
           compatibilityStatus: 'UNCONFIGURED',
+          runtimeExecutionVerified: false,
+          speechTranscriptVerified: false,
           compatibilityVerified: false
         }
       };
     } else if (sttValidation.status !== 'READY') {
+      const safeReason = sanitizeReadinessText(sttValidation.details) || `Whisper STT preflight check reported ${sttValidation.status}.`;
       checks.whisperStt = {
         status: 'degraded',
-        message: sttValidation.details || `Whisper STT preflight check reported ${sttValidation.status}.`,
+        message: safeReason,
         details: {
           configured: true,
           runtimeType: sttValidation.runtimeType,
           validationStatus: sttValidation.status,
+          binaryStatus,
+          modelStatus,
+          runtimeExecutionStatus: 'FAILED',
+          speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
+          fixtureAvailable,
+          expectedTranscriptConfigured,
+          transcriptComparison: null,
+          failureReason: safeReason,
+          lastVerification: {
+            timestamp: new Date().toISOString(),
+            fromCache: false,
+            executionDurationMs: 0,
+            diagnosticCode: sttValidation.diagnosticCode || 'IDENTITY_CONTRACT_MISMATCH'
+          },
           diagnosticCode: sttValidation.diagnosticCode || 'IDENTITY_CONTRACT_MISMATCH',
           compatibilityStatus: 'FAILED',
+          runtimeExecutionVerified: false,
+          speechTranscriptVerified: false,
           compatibilityVerified: false
         }
       };
     } else if (compatExplicitlyDisabled) {
       checks.whisperStt = {
         status: 'healthy',
-        message: `Whisper STT runtime (${sttValidation.runtimeType}) binary/model preflight ready; compatibility verification disabled via WHISPER_VERIFY_COMPATIBILITY=false (execution compatibility UNVERIFIED).`,
+        message: `Whisper STT runtime (${sttValidation.runtimeType}) binary/model preflight ready; compatibility verification disabled via WHISPER_VERIFY_COMPATIBILITY=false (runtime execution and speech transcript UNVERIFIED).`,
         details: {
           configured: true,
           runtimeType: sttValidation.runtimeType,
           validationStatus: sttValidation.status,
+          binaryStatus,
+          modelStatus,
+          runtimeExecutionStatus: 'UNVERIFIED',
+          speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
+          fixtureAvailable,
+          expectedTranscriptConfigured,
+          transcriptComparison: null,
+          failureReason: null,
+          lastVerification: null,
           diagnosticCode: 'READY',
           compatibilityStatus: 'UNVERIFIED',
+          runtimeExecutionVerified: false,
+          speechTranscriptVerified: false,
           compatibilityVerified: false,
           compatibilityRequired: false
         }
       };
     } else {
-      const compat = await speechTranscriptionAdapter.initializeRuntime();
+      const compat = await speechTranscriptionAdapter.initializeRuntime({
+        isSyntheticFixture: isSyntheticFixtureEnv
+      });
+      const lastVerification = {
+        timestamp: compat.verifiedAt || new Date().toISOString(),
+        fromCache: Boolean(compat.fromCache),
+        executionDurationMs: compat.executionDurationMs,
+        diagnosticCode: compat.diagnosticCode
+      };
+
       if (compat.compatible) {
+        const speechVerified = compat.speechTranscriptStatus === 'SPEECH_TRANSCRIPT_VERIFIED';
+        const compatStatus = speechVerified ? 'SPEECH_TRANSCRIPT_VERIFIED' : 'RUNTIME_EXECUTION_VERIFIED';
         checks.whisperStt = {
           status: 'healthy',
-          message: `Whisper STT runtime (${compat.runtimeType}) verified on speech fixture.`,
+          message: speechVerified
+            ? `Whisper STT runtime (${compat.runtimeType}) verified for both runtime execution and expected speech transcript matching.`
+            : `Whisper STT runtime (${compat.runtimeType}) binary/model execution verified; speech transcript accuracy remains SPEECH_TRANSCRIPT_UNVERIFIED.`,
           details: {
             configured: true,
             runtimeType: compat.runtimeType,
             validationStatus: sttValidation.status,
+            binaryStatus,
+            modelStatus,
+            runtimeExecutionStatus: compat.runtimeExecutionStatus,
+            speechTranscriptStatus: compat.speechTranscriptStatus,
+            fixtureAvailable: true,
+            expectedTranscriptConfigured,
+            transcriptComparison: compat.transcriptComparison || null,
+            failureReason: null,
+            lastVerification,
             diagnosticCode: compat.diagnosticCode,
-            compatibilityStatus: 'VERIFIED',
-            compatibilityVerified: true,
+            compatibilityStatus: compatStatus,
+            runtimeExecutionVerified: compat.runtimeExecutionStatus === 'RUNTIME_EXECUTION_VERIFIED',
+            speechTranscriptVerified: speechVerified,
+            compatibilityVerified: speechVerified,
             fromCache: Boolean(compat.fromCache)
           }
         };
       } else if (compat.diagnosticCode === 'SPEECH_FIXTURE_NOT_FOUND') {
+        const safeReason = sanitizeReadinessText(compat.details);
         checks.whisperStt = {
           status: compatRequired ? 'degraded' : 'healthy',
           message: compatRequired
             ? `Whisper STT runtime (${sttValidation.runtimeType}) preflight passed, but speech compatibility fixture (WHISPER_COMPAT_AUDIO_PATH) is missing while verification is required.`
-            : `Whisper STT runtime (${sttValidation.runtimeType}) binary/model preflight ready; speech execution compatibility is UNVERIFIED (no speech compatibility fixture configured).`,
+            : `Whisper STT runtime (${sttValidation.runtimeType}) binary/model preflight ready; runtime execution and speech transcript remain UNVERIFIED (no speech compatibility fixture configured).`,
           details: {
             configured: true,
             runtimeType: sttValidation.runtimeType,
             validationStatus: sttValidation.status,
+            binaryStatus,
+            modelStatus,
+            runtimeExecutionStatus: 'UNVERIFIED',
+            speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
+            fixtureAvailable: false,
+            expectedTranscriptConfigured,
+            transcriptComparison: null,
+            failureReason: compatRequired ? safeReason : null,
+            lastVerification,
             diagnosticCode: compat.diagnosticCode,
             compatibilityStatus: 'UNVERIFIED',
+            runtimeExecutionVerified: false,
+            speechTranscriptVerified: false,
             compatibilityVerified: false,
             compatibilityRequired: compatRequired
           }
         };
       } else {
+        const safeReason = sanitizeReadinessText(compat.details) || `Whisper STT compatibility check failed (${compat.diagnosticCode}).`;
         checks.whisperStt = {
           status: 'degraded',
-          message: compat.details || `Whisper STT compatibility check failed (${compat.diagnosticCode}).`,
+          message: safeReason,
           details: {
             configured: true,
             runtimeType: compat.runtimeType,
             validationStatus: sttValidation.status,
+            binaryStatus,
+            modelStatus,
+            runtimeExecutionStatus: compat.runtimeExecutionStatus,
+            speechTranscriptStatus: compat.speechTranscriptStatus,
+            fixtureAvailable,
+            expectedTranscriptConfigured,
+            transcriptComparison: compat.transcriptComparison || null,
+            failureReason: safeReason,
+            lastVerification,
             diagnosticCode: compat.diagnosticCode,
             compatibilityStatus: 'FAILED',
+            runtimeExecutionVerified: compat.runtimeExecutionStatus === 'RUNTIME_EXECUTION_VERIFIED',
+            speechTranscriptVerified: false,
             compatibilityVerified: false
           }
         };
@@ -1402,7 +1526,16 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
     checks.whisperStt = {
       status: 'degraded',
       message: 'Whisper STT readiness check encountered an unexpected error.',
-      details: { configured: true, compatibilityStatus: 'FAILED', compatibilityVerified: false }
+      details: {
+        configured: true,
+        runtimeExecutionStatus: 'FAILED',
+        speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
+        failureReason: 'Unexpected readiness probe error.',
+        compatibilityStatus: 'FAILED',
+        runtimeExecutionVerified: false,
+        speechTranscriptVerified: false,
+        compatibilityVerified: false
+      }
     };
   }
 
