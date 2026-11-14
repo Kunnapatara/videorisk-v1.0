@@ -1307,7 +1307,11 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
 
   // 4. Optional Whisper STT readiness check (cached compatibility initialization; never blocks core readiness)
   try {
+    const compatEnvFlag = (process.env.WHISPER_VERIFY_COMPATIBILITY || '').trim().toLowerCase();
+    const compatExplicitlyDisabled = compatEnvFlag === 'false';
+    const compatRequired = compatEnvFlag === 'true' || (isProd && !compatExplicitlyDisabled);
     const sttValidation = await speechTranscriptionAdapter.validateRuntime();
+
     if (sttValidation.status === 'UNCONFIGURED') {
       checks.whisperStt = {
         status: 'healthy',
@@ -1316,6 +1320,7 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
           configured: false,
           runtimeType: sttValidation.runtimeType,
           diagnosticCode: sttValidation.diagnosticCode || 'UNCONFIGURED',
+          compatibilityStatus: 'UNCONFIGURED',
           compatibilityVerified: false
         }
       };
@@ -1328,7 +1333,22 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
           runtimeType: sttValidation.runtimeType,
           validationStatus: sttValidation.status,
           diagnosticCode: sttValidation.diagnosticCode || 'IDENTITY_CONTRACT_MISMATCH',
+          compatibilityStatus: 'FAILED',
           compatibilityVerified: false
+        }
+      };
+    } else if (compatExplicitlyDisabled) {
+      checks.whisperStt = {
+        status: 'healthy',
+        message: `Whisper STT runtime (${sttValidation.runtimeType}) binary/model preflight ready; compatibility verification disabled via WHISPER_VERIFY_COMPATIBILITY=false (execution compatibility UNVERIFIED).`,
+        details: {
+          configured: true,
+          runtimeType: sttValidation.runtimeType,
+          validationStatus: sttValidation.status,
+          diagnosticCode: 'READY',
+          compatibilityStatus: 'UNVERIFIED',
+          compatibilityVerified: false,
+          compatibilityRequired: false
         }
       };
     } else {
@@ -1340,20 +1360,27 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
           details: {
             configured: true,
             runtimeType: compat.runtimeType,
+            validationStatus: sttValidation.status,
             diagnosticCode: compat.diagnosticCode,
+            compatibilityStatus: 'VERIFIED',
             compatibilityVerified: true,
             fromCache: Boolean(compat.fromCache)
           }
         };
       } else if (compat.diagnosticCode === 'SPEECH_FIXTURE_NOT_FOUND') {
         checks.whisperStt = {
-          status: 'healthy',
-          message: `Whisper STT runtime (${sttValidation.runtimeType}) preflight ready; speech compatibility fixture not configured.`,
+          status: compatRequired ? 'degraded' : 'healthy',
+          message: compatRequired
+            ? `Whisper STT runtime (${sttValidation.runtimeType}) preflight passed, but speech compatibility fixture (WHISPER_COMPAT_AUDIO_PATH) is missing while verification is required.`
+            : `Whisper STT runtime (${sttValidation.runtimeType}) binary/model preflight ready; speech execution compatibility is UNVERIFIED (no speech compatibility fixture configured).`,
           details: {
             configured: true,
             runtimeType: sttValidation.runtimeType,
+            validationStatus: sttValidation.status,
             diagnosticCode: compat.diagnosticCode,
-            compatibilityVerified: false
+            compatibilityStatus: 'UNVERIFIED',
+            compatibilityVerified: false,
+            compatibilityRequired: compatRequired
           }
         };
       } else {
@@ -1363,7 +1390,9 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
           details: {
             configured: true,
             runtimeType: compat.runtimeType,
+            validationStatus: sttValidation.status,
             diagnosticCode: compat.diagnosticCode,
+            compatibilityStatus: 'FAILED',
             compatibilityVerified: false
           }
         };
@@ -1373,7 +1402,7 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
     checks.whisperStt = {
       status: 'degraded',
       message: 'Whisper STT readiness check encountered an unexpected error.',
-      details: { configured: true, compatibilityVerified: false }
+      details: { configured: true, compatibilityStatus: 'FAILED', compatibilityVerified: false }
     };
   }
 

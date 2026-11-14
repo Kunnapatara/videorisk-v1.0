@@ -11,7 +11,7 @@ import {
 } from '../src/server/pipeline/videoProcessor';
 import { thumbnailInspector } from '../src/server/pipeline/thumbnailInspector';
 import { mediaInspector, MediaInspectionError } from '../src/server/pipeline/mediaInspector';
-import { SpeechTranscriptionAdapter } from '../src/server/pipeline/audioProcessor';
+import { SpeechTranscriptionAdapter, speechTranscriptionAdapter } from '../src/server/pipeline/audioProcessor';
 import { policyIntelligenceEngine } from '../src/server/intelligence/policyIntelligence';
 import { billingService } from '../src/server/services/billingService';
 import { JobOrchestrator, mapVideoOcrDetectorReport } from '../src/server/pipeline/jobOrchestrator';
@@ -196,6 +196,26 @@ printf "5\\t1\\t1\\t1\\t1\\t1\\t10\\t10\\t50\\t20\\t95\\tSAMPLE\\n"
     assert.ok(Number(partialOcrRes.framesSucceeded) > 0, '2.9 Successful count recorded');
     assert.ok(typeof partialOcrRes.ocrExecutionSuccessRatio === 'number' && partialOcrRes.ocrExecutionSuccessRatio < 1.0, '2.10 Success ratio is under 100%');
     assert.strictEqual(partialOcrRes.framesExtractionFailed, 0, '2.11 OCR failure is NOT counted as extraction failure');
+
+    // Test 2.3a: Non-executable Tesseract & Tesseract Timeout must fail honestly, never NO_SIGNAL_DETECTED
+    const nonExecOcrScript = path.resolve(testDir, 'non_exec_ocr.sh');
+    fs.writeFileSync(nonExecOcrScript, '#!/bin/sh\nexit 0\n', { mode: 0o644 });
+    generatedFiles.push(nonExecOcrScript);
+    process.env.TESSERACT_PATH = nonExecOcrScript;
+    const nonExecOcrRes = await videoProcessor.performVideoOcr(dummyVideoPath, meta3s, { maxFrames: 2 });
+    assert.strictEqual(nonExecOcrRes.executionStatus, 'FAILED', '2.11-ne Non-executable Tesseract reports FAILED executionStatus');
+    assert.strictEqual(nonExecOcrRes.status, 'INSUFFICIENT_EVIDENCE', '2.11-ne Non-executable Tesseract returns INSUFFICIENT_EVIDENCE');
+    assert.notStrictEqual(nonExecOcrRes.status, 'NO_SIGNAL_DETECTED', '2.11-ne Non-executable Tesseract never claims NO_SIGNAL_DETECTED');
+    assert.strictEqual(nonExecOcrRes.framesSucceeded, 0, '2.11-ne Non-executable Tesseract records 0 succeeded frames');
+
+    const timeoutOcrScript = path.resolve(testDir, 'timeout_ocr.sh');
+    fs.writeFileSync(timeoutOcrScript, '#!/bin/sh\nsleep 2\nexit 0\n', { mode: 0o755 });
+    generatedFiles.push(timeoutOcrScript);
+    process.env.TESSERACT_PATH = timeoutOcrScript;
+    const timeoutOcrRes = await videoProcessor.performVideoOcr(dummyVideoPath, meta3s, { maxFrames: 2, timeoutMs: 120 });
+    assert.strictEqual(timeoutOcrRes.executionStatus, 'FAILED', '2.11-to Timeout Tesseract reports FAILED executionStatus');
+    assert.notStrictEqual(timeoutOcrRes.status, 'NO_SIGNAL_DETECTED', '2.11-to Timeout Tesseract never claims NO_SIGNAL_DETECTED');
+    assert.strictEqual(timeoutOcrRes.framesSucceeded, 0, '2.11-to Timeout Tesseract records 0 succeeded frames');
 
     // Test 2.3b: Malformed TSV returned with exit code 0 must be counted as framesOcrFailed, NEVER NO_SIGNAL_DETECTED
     const malformedTsvOcrScript = path.resolve(testDir, 'malformed_tsv_ocr.sh');
@@ -479,6 +499,10 @@ case "\${COMPAT_MODE:-pass}" in
     echo '{"transcription":[{"timestamps":{"from":"00:00:00,000","to":"00:00:01,000"},"text":" hello compat test"}]}' > "\${OUT_PREFIX}.json"
     exit 0
     ;;
+  noisy)
+    echo '{"transcription":[{"timestamps":{"from":"00:00:00,000","to":"00:00:01,000"},"text":" hello compat test extra garbage unrelated noise words"}]}' > "\${OUT_PREFIX}.json"
+    exit 0
+    ;;
 esac
 `,
       { mode: 0o755 }
@@ -563,9 +587,36 @@ esac
       audioFixturePath: mockSpeechWav,
       expectedTranscript: 'completely unrelated reference phrase'
     });
-    assert.strictEqual(compatMismatch.compatible, false, '3.26b Reference transcript mismatch fails closed');
+    assert.strictEqual(compatMismatch.compatible, false, '3.26b Completely incorrect transcript fails closed');
     assert.strictEqual(compatMismatch.diagnosticCode, 'TRANSCRIPTION_FAILED', '3.26c Mismatch classifies as TRANSCRIPTION_FAILED');
     assert.strictEqual(compatMismatch.referenceMatched, false, '3.26d Records referenceMatched=false');
+
+    const compatMissingWords = await stt.verifyRuntimeCompatibility({
+      audioFixturePath: mockSpeechWav,
+      expectedTranscript: 'hello compat test missing expected words'
+    });
+    assert.strictEqual(compatMissingWords.compatible, false, '3.26e Missing expected words fail closed');
+
+    const compatWordOrderMismatch = await stt.verifyRuntimeCompatibility({
+      audioFixturePath: mockSpeechWav,
+      expectedTranscript: 'test compat hello'
+    });
+    assert.strictEqual(compatWordOrderMismatch.compatible, false, '3.26f Major word-order mismatch fails closed');
+
+    process.env.COMPAT_MODE = 'noisy';
+    const compatNoisyWords = await stt.verifyRuntimeCompatibility({
+      audioFixturePath: mockSpeechWav,
+      expectedTranscript: 'hello compat test'
+    });
+    assert.strictEqual(compatNoisyWords.compatible, false, '3.26g Excessive unexpected words fail closed');
+
+    process.env.COMPAT_MODE = 'pass';
+    const compatPunctPass = await stt.verifyRuntimeCompatibility({
+      audioFixturePath: mockSpeechWav,
+      expectedTranscript: 'Hello,   COMPAT\n  test!'
+    });
+    assert.strictEqual(compatPunctPass.compatible, true, '3.26h Punctuation/casing/whitespace differences tolerated');
+    assert.strictEqual(compatPunctPass.referenceMatched, true, '3.26i Records referenceMatched=true on normalized match');
 
     const compatPassCpp = await stt.verifyRuntimeCompatibility({
       audioFixturePath: mockSpeechWav,
@@ -586,7 +637,22 @@ esac
     assert.strictEqual(initWarm.compatible, true, '3.30d Warm initializeRuntime succeeds');
     assert.strictEqual(initWarm.fromCache, true, '3.30e Warm run served from cache (fromCache=true)');
 
-    // Transcribe preflight compatibility gating
+    // WHISPER_VERIFY_COMPATIBILITY=true with missing fixture refuses silent bypass in transcribe()
+    const prevVerifyCompat = process.env.WHISPER_VERIFY_COMPATIBILITY;
+    try {
+      process.env.WHISPER_VERIFY_COMPATIBILITY = 'true';
+      delete process.env.WHISPER_COMPAT_AUDIO_PATH;
+      stt.clearCompatibilityCache();
+      const missingFixtureTranscribe = await stt.transcribe(dummyVideoPath, 10);
+      assert.strictEqual(missingFixtureTranscribe.status, 'ANALYSIS_UNAVAILABLE', '3.30f1 WHISPER_VERIFY_COMPATIBILITY=true without fixture fails closed');
+      assert.strictEqual(missingFixtureTranscribe.diagnosticCode, 'SPEECH_FIXTURE_NOT_FOUND', '3.30f2 Reports SPEECH_FIXTURE_NOT_FOUND without silent bypass');
+      assert.strictEqual(missingFixtureTranscribe.compatibilityVerified, false, '3.30f3 compatibilityVerified=false');
+    } finally {
+      if (prevVerifyCompat === undefined) delete process.env.WHISPER_VERIFY_COMPATIBILITY;
+      else process.env.WHISPER_VERIFY_COMPATIBILITY = prevVerifyCompat;
+    }
+
+    // Transcribe preflight compatibility gating + recovery after fix
     process.env.COMPAT_MODE = 'runtime_init';
     stt.clearCompatibilityCache();
     const blockedTranscribe = await stt.transcribe(dummyVideoPath, 10, {
@@ -596,6 +662,14 @@ esac
     assert.strictEqual(blockedTranscribe.status, 'ANALYSIS_UNAVAILABLE', '3.30f transcribe blocks on failed compatibility init');
     assert.strictEqual(blockedTranscribe.diagnosticCode, 'RUNTIME_INIT_FAILED', '3.30g Preserves RUNTIME_INIT_FAILED diagnosticCode');
     assert.strictEqual(blockedTranscribe.compatibilityVerified, false, '3.30h Records compatibilityVerified=false');
+
+    process.env.COMPAT_MODE = 'pass';
+    const recoveredTranscribe = await stt.transcribe(dummyVideoPath, 10, {
+      verifyCompatibility: true,
+      audioFixturePath: mockSpeechWav,
+      forceRefreshCompatibility: true
+    });
+    assert.strictEqual(recoveredTranscribe.compatibilityVerified, true, '3.30i transcribe succeeds and records compatibilityVerified=true once runtime issue is fixed');
 
     delete process.env.COMPAT_MODE;
 
@@ -887,18 +961,61 @@ exit 0
     assert.ok(currentReadiness.body.checks?.billing, '7.5 Billing check is included');
     assert.ok(currentReadiness.body.checks?.whisperStt, '7.5b Optional whisperStt check is exposed in readiness payload');
     assert.strictEqual(currentReadiness.body.checks?.whisperStt?.details?.diagnosticCode, 'UNCONFIGURED', '7.5c Unconfigured whisperStt reports UNCONFIGURED honestly');
+    assert.strictEqual(currentReadiness.body.checks?.whisperStt?.details?.compatibilityStatus, 'UNCONFIGURED', '7.5d Unconfigured whisperStt marks compatibilityStatus UNCONFIGURED');
     assert.strictEqual(currentReadiness.body.checks?.storage?.status, 'healthy', '7.6 Upload storage directory writeability probe succeeds');
 
     const prevWhisperPathReadiness = process.env.WHISPER_PATH;
+    const prevWhisperModelReadiness = process.env.WHISPER_MODEL_PATH;
+    const prevWhisperAudioReadiness = process.env.WHISPER_COMPAT_AUDIO_PATH;
+    const prevWhisperVerifyReadiness = process.env.WHISPER_VERIFY_COMPATIBILITY;
     try {
       process.env.WHISPER_PATH = '/path/to/nonexistent_whisper_readiness';
       const degradedWhisperReadiness = await invokeReadiness();
       assert.strictEqual(degradedWhisperReadiness.statusCode, 200, '7.6b Degraded optional Whisper STT does not bring down core readiness');
       assert.strictEqual(degradedWhisperReadiness.body.checks?.whisperStt?.status, 'degraded', '7.6c Invalid WHISPER_PATH surfaces degraded whisperStt check');
       assert.strictEqual(degradedWhisperReadiness.body.checks?.whisperStt?.details?.diagnosticCode, 'BINARY_NOT_FOUND', '7.6d Surfaces BINARY_NOT_FOUND diagnostic code');
+      assert.strictEqual(degradedWhisperReadiness.body.checks?.whisperStt?.details?.compatibilityStatus, 'FAILED', '7.6e Failed preflight sets compatibilityStatus FAILED');
+
+      // Configured READY preflight without speech fixture -> UNVERIFIED (and degraded when WHISPER_VERIFY_COMPATIBILITY=true)
+      process.env.WHISPER_PATH = compatWhisperCppBin;
+      process.env.WHISPER_MODEL_PATH = validModel;
+      delete process.env.WHISPER_COMPAT_AUDIO_PATH;
+      delete process.env.WHISPER_VERIFY_COMPATIBILITY;
+      speechTranscriptionAdapter.clearCompatibilityCache();
+      const unverifiedReadiness = await invokeReadiness();
+      assert.strictEqual(unverifiedReadiness.body.checks?.whisperStt?.details?.compatibilityStatus, 'UNVERIFIED', '7.6f Missing fixture marks compatibilityStatus UNVERIFIED');
+      assert.strictEqual(unverifiedReadiness.body.checks?.whisperStt?.details?.compatibilityVerified, false, '7.6g Missing fixture marks compatibilityVerified false');
+
+      process.env.WHISPER_VERIFY_COMPATIBILITY = 'true';
+      const requiredMissingFixtureReadiness = await invokeReadiness();
+      assert.strictEqual(requiredMissingFixtureReadiness.body.checks?.whisperStt?.status, 'degraded', '7.6h WHISPER_VERIFY_COMPATIBILITY=true with missing fixture marks whisperStt degraded');
+      assert.strictEqual(requiredMissingFixtureReadiness.body.checks?.whisperStt?.details?.compatibilityRequired, true, '7.6i Marks compatibilityRequired=true');
+
+      // Configured + valid speech fixture -> VERIFIED / healthy; incompatible -> FAILED / degraded
+      process.env.WHISPER_COMPAT_AUDIO_PATH = mockSpeechWav;
+      process.env.COMPAT_MODE = 'pass';
+      speechTranscriptionAdapter.clearCompatibilityCache();
+      const verifiedReadiness = await invokeReadiness();
+      assert.strictEqual(verifiedReadiness.body.checks?.whisperStt?.status, 'healthy', '7.6j Verified Whisper runtime is healthy');
+      assert.strictEqual(verifiedReadiness.body.checks?.whisperStt?.details?.compatibilityStatus, 'VERIFIED', '7.6k Marks compatibilityStatus VERIFIED');
+      assert.strictEqual(verifiedReadiness.body.checks?.whisperStt?.details?.compatibilityVerified, true, '7.6l Marks compatibilityVerified true');
+
+      process.env.COMPAT_MODE = 'bad_model';
+      speechTranscriptionAdapter.clearCompatibilityCache();
+      const failedCompatReadiness = await invokeReadiness();
+      assert.strictEqual(failedCompatReadiness.body.checks?.whisperStt?.status, 'degraded', '7.6m Incompatible Whisper runtime is degraded');
+      assert.strictEqual(failedCompatReadiness.body.checks?.whisperStt?.details?.compatibilityStatus, 'FAILED', '7.6n Marks compatibilityStatus FAILED');
     } finally {
+      delete process.env.COMPAT_MODE;
+      speechTranscriptionAdapter.clearCompatibilityCache();
       if (prevWhisperPathReadiness === undefined) delete process.env.WHISPER_PATH;
       else process.env.WHISPER_PATH = prevWhisperPathReadiness;
+      if (prevWhisperModelReadiness === undefined) delete process.env.WHISPER_MODEL_PATH;
+      else process.env.WHISPER_MODEL_PATH = prevWhisperModelReadiness;
+      if (prevWhisperAudioReadiness === undefined) delete process.env.WHISPER_COMPAT_AUDIO_PATH;
+      else process.env.WHISPER_COMPAT_AUDIO_PATH = prevWhisperAudioReadiness;
+      if (prevWhisperVerifyReadiness === undefined) delete process.env.WHISPER_VERIFY_COMPATIBILITY;
+      else process.env.WHISPER_VERIFY_COMPATIBILITY = prevWhisperVerifyReadiness;
     }
 
     const prevNodeEnv = process.env.NODE_ENV;
@@ -997,6 +1114,15 @@ esac
 
     const prevFfmpegPath = process.env.FFMPEG_PATH;
     process.env.FFMPEG_PATH = mockFfmpegScript;
+    const ocrFramesRoot = path.resolve(process.cwd(), 'uploads', 'ocr_frames');
+    const existingOcrDirs = new Set(fs.existsSync(ocrFramesRoot) ? fs.readdirSync(ocrFramesRoot) : []);
+    const assertNoOcrDirLeak = (stepLabel: string) => {
+      if (!fs.existsSync(ocrFramesRoot)) return;
+      const afterDirs = fs.readdirSync(ocrFramesRoot);
+      const leaked = afterDirs.filter(d => !existingOcrDirs.has(d));
+      assert.strictEqual(leaked.length, 0, `${stepLabel}: Zero temp ocr_frames directories leaked (found ${leaked.join(', ')})`);
+    };
+
     try {
       const diagRes = await videoProcessor.performVideoOcr(dummyVideoPath, meta3s, {
         timestamps: [0, 0.5, 1, 1.5, 2],
@@ -1014,6 +1140,7 @@ esac
       assert.strictEqual(diagRes.samplingCoverageRatio, 0.2, '8.17 Sampling fulfillment is 1/5 = 0.2');
       assert.strictEqual(diagRes.ocrExecutionSuccessRatio, 1.0, '8.18 OCR execution ratio on attempted frame is 1/1 = 1.0');
       assert.strictEqual(diagRes.timelineCoverageRatio, null, '8.19 Timeline coverage ratio remains null');
+      assertNoOcrDirLeak('8.19b');
 
       const cats = diagRes.extractionErrors?.map(e => e.category) || [];
       assert.ok(cats.includes('TIMEOUT'), '8.20 Distinguishes TIMEOUT extraction failure');
@@ -1032,6 +1159,7 @@ esac
         '8.28 Strict accounting invariant holds on MISSING_EXECUTABLE'
       );
       assert.strictEqual(missingFfmpegRes.extractionErrors?.[0]?.category, 'MISSING_EXECUTABLE', '8.29 Categorizes ENOENT strictly as MISSING_EXECUTABLE');
+      assertNoOcrDirLeak('8.29b');
 
       // 8.4 NON_EXECUTABLE (EACCES) breaks fast and distinguishes permission errors
       const nonExecFfmpeg = path.resolve(testDir, 'non_exec_ffmpeg.sh');
@@ -1046,6 +1174,7 @@ esac
         nonExecFfmpegRes.framesTargeted,
         '8.32 Strict accounting invariant holds on NON_EXECUTABLE'
       );
+      assertNoOcrDirLeak('8.32b');
     } finally {
       if (prevFfmpegPath === undefined) {
         delete process.env.FFMPEG_PATH;
@@ -1055,7 +1184,7 @@ esac
       delete process.env.TESSERACT_PATH;
     }
 
-    console.log('  ✅ PASS: Extraction failure categorization (MISSING_EXECUTABLE/NON_EXECUTABLE/TIMEOUT/NON_ZERO_EXIT/MISSING_OUTPUT/EMPTY_OUTPUT) & invariants verified');
+    console.log('  ✅ PASS: Extraction failure categorization (MISSING_EXECUTABLE/NON_EXECUTABLE/TIMEOUT/NON_ZERO_EXIT/MISSING_OUTPUT/EMPTY_OUTPUT), temp cleanup & invariants verified');
 
     // -------------------------------------------------------------------------
     // 9. FIX F: REAL PRODUCTION SAMPLING PATH THROUGH JobOrchestrator
@@ -1285,10 +1414,12 @@ esac
       await runRealPipelineCell('10m_deep', real10mPath, 'real_10m_600s.mp4', 'deep', 30, 599);
       await runRealPipelineCell('30m_standard', real30mPath, 'real_30m_1800s.mp4', 'standard', 15, 1799);
       await runRealPipelineCell('30m_deep', real30mPath, 'real_30m_1800s.mp4', 'deep', 30, 1799);
+      assertNoOcrDirLeak('10.e2e_ocr_frames');
     } finally {
       delete process.env.TESSERACT_PATH;
     }
 
+    console.log('  [Boundary Notice] 10m/30m E2E fixtures use synthetic FFmpeg lavfi/drawtext MP4s; verifies real container probing, frame extraction, sampling matrix, OCR execution & temp cleanup, not general real-world video moderation accuracy.');
     console.log('  ✅ PASS: All 4 real MP4 E2E sampling runs (10m/30m x standard/deep) verified with real FFmpeg, FFprobe & Tesseract');
 
     // -------------------------------------------------------------------------

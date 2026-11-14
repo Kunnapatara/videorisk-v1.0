@@ -267,6 +267,7 @@ export class SqliteStorageRepository implements IStorageRepository {
           creditsAdjusted: Number(row.credits_adjusted || 0),
           failureReason: row.failure_reason || undefined,
           eventId: row.event_id,
+          lastEventCreated: row.last_event_created !== null && row.last_event_created !== undefined ? Number(row.last_event_created) : undefined,
           createdAt: row.created_at,
           updatedAt: row.updated_at
         } as StripeRefundRecord;
@@ -276,8 +277,8 @@ export class SqliteStorageRepository implements IStorageRepository {
           INSERT INTO stripe_refunds (
             refund_id, payment_id, user_id, charge_id, payment_intent_id, invoice_id, subscription_id,
             plan_id, amount_refunded, total_amount, is_full_refund, status, raw_status, reconciled,
-            credits_adjusted, failure_reason, event_id, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            credits_adjusted, failure_reason, event_id, last_event_created, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(refund_id) DO UPDATE SET
             payment_id = COALESCE(excluded.payment_id, stripe_refunds.payment_id),
             user_id = COALESCE(excluded.user_id, stripe_refunds.user_id),
@@ -295,6 +296,11 @@ export class SqliteStorageRepository implements IStorageRepository {
             credits_adjusted = excluded.credits_adjusted,
             failure_reason = COALESCE(excluded.failure_reason, stripe_refunds.failure_reason),
             event_id = excluded.event_id,
+            last_event_created = CASE
+              WHEN excluded.last_event_created IS NULL THEN stripe_refunds.last_event_created
+              WHEN stripe_refunds.last_event_created IS NULL THEN excluded.last_event_created
+              ELSE MAX(stripe_refunds.last_event_created, excluded.last_event_created)
+            END,
             updated_at = excluded.updated_at
         `).run(
           prop,
@@ -314,6 +320,7 @@ export class SqliteStorageRepository implements IStorageRepository {
           val.creditsAdjusted || 0,
           val.failureReason || null,
           val.eventId,
+          val.lastEventCreated !== undefined && Number.isFinite(val.lastEventCreated) ? Math.trunc(val.lastEventCreated) : null,
           val.createdAt || new Date().toISOString(),
           val.updatedAt || new Date().toISOString()
         );
@@ -786,6 +793,25 @@ export class SqliteStorageRepository implements IStorageRepository {
       } catch (err) {
         this.db.exec('ROLLBACK;');
         throw new Error(`Failed to apply migration 7: ${err}`);
+      }
+    }
+
+    // Migration 8: Refund webhook event ordering timestamp column
+    if (!appliedVersions.has(8)) {
+      this.db.exec('BEGIN IMMEDIATE;');
+      try {
+        const refundCols = this.db.prepare('PRAGMA table_info(stripe_refunds)').all() as Array<{ name: string }>;
+        if (!refundCols.some(c => c.name === 'last_event_created')) {
+          this.db.exec('ALTER TABLE stripe_refunds ADD COLUMN last_event_created INTEGER;');
+        }
+        this.db.exec(`
+          INSERT INTO schema_migrations (version, name, applied_at)
+          VALUES (8, '008_stripe_refunds_event_ordering', datetime('now'));
+        `);
+        this.db.exec('COMMIT;');
+      } catch (err) {
+        this.db.exec('ROLLBACK;');
+        throw new Error(`Failed to apply migration 8: ${err}`);
       }
     }
   }

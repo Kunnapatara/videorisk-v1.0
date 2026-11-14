@@ -915,6 +915,7 @@ export class BillingService {
         creditsAdjusted: Number(row.credits_adjusted || 0),
         failureReason: row.failure_reason || undefined,
         eventId: row.event_id,
+        lastEventCreated: row.last_event_created !== null && row.last_event_created !== undefined ? Number(row.last_event_created) : undefined,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
       });
@@ -1267,6 +1268,10 @@ export class BillingService {
       ? (typeof obj?.amount === 'number' && Number.isFinite(obj.amount) ? Math.trunc(obj.amount) : payment?.amountTotal)
       : (payment?.amountTotal ?? undefined);
 
+    const eventCreated = typeof event.created === 'number' && Number.isFinite(event.created) && event.created > 0
+      ? Math.trunc(event.created)
+      : (typeof obj?.created === 'number' && Number.isFinite(obj.created) && obj.created > 0 ? Math.trunc(obj.created) : undefined);
+
     interface NormalizedRefundItem {
       refundId: string;
       amount: number;
@@ -1274,6 +1279,7 @@ export class BillingService {
       rawStatus?: string;
       failureReason?: string;
       isFull: boolean;
+      itemEventCreated?: number;
     }
 
     const itemsToProcess: NormalizedRefundItem[] = [];
@@ -1293,6 +1299,9 @@ export class BillingService {
             rAmount > 0 &&
             (chargeFullyRefunded ||
               (typeof totalPaymentAmount === 'number' && totalPaymentAmount > 0 && rAmount >= totalPaymentAmount));
+          const rCreated = typeof r?.created === 'number' && Number.isFinite(r.created) && r.created > 0
+            ? Math.trunc(r.created)
+            : undefined;
           itemsToProcess.push({
             refundId: r?.id || `chg_refund_${chargeId || paymentIntentId || event.id}_${rAmount}`,
             amount: rAmount,
@@ -1300,6 +1309,7 @@ export class BillingService {
             rawStatus,
             failureReason: r?.failure_reason || undefined,
             isFull: rIsFull,
+            itemEventCreated: eventCreated ?? rCreated,
           });
         }
       } else {
@@ -1314,6 +1324,7 @@ export class BillingService {
           rawStatus: hasValidChargeRefundSignal ? 'charge_summary_refunded' : 'missing_refund_summary',
           failureReason: hasValidChargeRefundSignal ? undefined : 'unknown_or_missing_refund_status: missing_charge_refund_summary',
           isFull: derivedStatus === 'succeeded' && effectiveAmount > 0 && (chargeFullyRefunded || (typeof totalPaymentAmount === 'number' && effectiveAmount >= totalPaymentAmount)),
+          itemEventCreated: eventCreated,
         });
       }
     } else {
@@ -1334,6 +1345,7 @@ export class BillingService {
         rawStatus,
         failureReason: obj?.failure_reason || undefined,
         isFull: rIsFull,
+        itemEventCreated: eventCreated,
       });
     }
 
@@ -1342,6 +1354,65 @@ export class BillingService {
 
     for (const item of itemsToProcess) {
       const existingRefund: StripeRefundRecord | undefined = state.stripeRefunds[item.refundId];
+      const nextLastEventCreated =
+        existingRefund?.lastEventCreated !== undefined && item.itemEventCreated !== undefined
+          ? Math.max(existingRefund.lastEventCreated, item.itemEventCreated)
+          : (item.itemEventCreated ?? existingRefund?.lastEventCreated);
+
+      // Monotonic Terminal Protection:
+      // A refund that has already reached 'succeeded' MUST NEVER be downgraded to any non-success state
+      // (pending, requires_action, failed, canceled, or unknown), nor have its creditsAdjusted / reconciled
+      // state reset, regardless of event ordering or missing/equal timestamps.
+      if (existingRefund && existingRefund.status === 'succeeded') {
+        if (item.status !== 'succeeded') {
+          console.warn(
+            `[BillingService] Ignored stale/out-of-order '${item.status}' refund event ${event.id} for already-succeeded refund ${item.refundId}.`
+          );
+          continue;
+        }
+        if (existingRefund.reconciled || !payment) {
+          // Already applied or recorded awaiting payment (duplicate succeeded delivery across event IDs or charge.refunded)
+          if (nextLastEventCreated !== undefined && existingRefund.lastEventCreated !== nextLastEventCreated) {
+            state.stripeRefunds[item.refundId] = {
+              ...existingRefund,
+              lastEventCreated: nextLastEventCreated,
+              updatedAt: nowIso,
+            };
+          }
+          continue;
+        }
+      }
+
+      // Out-of-Order Timestamp Protection for non-succeeded transitions:
+      // Reject older non-success events arriving after newer events for the same Refund ID.
+      if (
+        existingRefund &&
+        item.status !== 'succeeded' &&
+        item.itemEventCreated !== undefined &&
+        existingRefund.lastEventCreated !== undefined &&
+        item.itemEventCreated < existingRefund.lastEventCreated
+      ) {
+        console.warn(
+          `[BillingService] Ignored out-of-order '${item.status}' refund event ${event.id} (created=${item.itemEventCreated} < last=${existingRefund.lastEventCreated}) for refund ${item.refundId}.`
+        );
+        continue;
+      }
+
+      // Prevent terminal 'failed' / 'canceled' refunds from regressing to provisional 'pending'/'requires_action'/'unknown'
+      // when timestamps are equal or missing.
+      if (
+        existingRefund &&
+        (existingRefund.status === 'failed' || existingRefund.status === 'canceled') &&
+        (item.status === 'pending' || item.status === 'requires_action' || item.status === 'unknown') &&
+        (item.itemEventCreated === undefined ||
+          existingRefund.lastEventCreated === undefined ||
+          item.itemEventCreated <= existingRefund.lastEventCreated)
+      ) {
+        console.warn(
+          `[BillingService] Ignored regressive '${item.status}' refund event ${event.id} for terminal '${existingRefund.status}' refund ${item.refundId}.`
+        );
+        continue;
+      }
 
       // 1. Failed or Canceled Refund: never adjust credits or revoke plan
       if (item.status === 'failed' || item.status === 'canceled') {
@@ -1365,6 +1436,7 @@ export class BillingService {
           creditsAdjusted: 0,
           failureReason: item.failureReason || (item.status === 'canceled' ? 'refund_canceled' : 'refund_failed'),
           eventId: event.id,
+          lastEventCreated: nextLastEventCreated,
           createdAt: existingRefund?.createdAt || nowIso,
           updatedAt: nowIso,
         };
@@ -1409,6 +1481,7 @@ export class BillingService {
           reconciled: false,
           creditsAdjusted: 0,
           eventId: event.id,
+          lastEventCreated: nextLastEventCreated,
           createdAt: existingRefund?.createdAt || nowIso,
           updatedAt: nowIso,
         };
@@ -1435,15 +1508,10 @@ export class BillingService {
           creditsAdjusted: 0,
           failureReason: item.failureReason || `unknown_or_missing_refund_status: ${item.rawStatus || 'missing'}`,
           eventId: event.id,
+          lastEventCreated: nextLastEventCreated,
           createdAt: existingRefund?.createdAt || nowIso,
           updatedAt: nowIso,
         };
-        continue;
-      }
-
-      // 4. Succeeded Refund: idempotent deduplication check
-      if (existingRefund && existingRefund.status === 'succeeded' && (existingRefund.reconciled || !payment)) {
-        // Already applied (e.g. refund.created arrived before charge.refunded or duplicate delivery)
         continue;
       }
 
@@ -1467,6 +1535,7 @@ export class BillingService {
           creditsAdjusted: 0,
           failureReason: item.amount < 0 ? 'invalid_negative_refund_amount' : 'zero_refund_amount',
           eventId: event.id,
+          lastEventCreated: nextLastEventCreated,
           createdAt: existingRefund?.createdAt || nowIso,
           updatedAt: nowIso,
         };
@@ -1501,6 +1570,7 @@ export class BillingService {
           reconciled: false,
           creditsAdjusted: 0,
           eventId: event.id,
+          lastEventCreated: nextLastEventCreated,
           createdAt: existingRefund?.createdAt || nowIso,
           updatedAt: nowIso,
         };
@@ -1566,6 +1636,7 @@ export class BillingService {
           reconciled: true,
           creditsAdjusted: 0,
           eventId: event.id,
+          lastEventCreated: nextLastEventCreated,
           createdAt: existingRefund?.createdAt || nowIso,
           updatedAt: nowIso,
         };
@@ -1675,6 +1746,7 @@ export class BillingService {
         reconciled: true,
         creditsAdjusted: actualDeduction,
         eventId: event.id,
+        lastEventCreated: nextLastEventCreated,
         createdAt: existingRefund?.createdAt || nowIso,
         updatedAt: nowIso,
       };

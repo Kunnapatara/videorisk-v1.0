@@ -657,7 +657,7 @@ export class SpeechTranscriptionAdapter {
       supportedLanguages: ['en', 'th'],
       status: 'READY',
       diagnosticCode: 'READY',
-      details: `Verified ${runtimeType} executable and model requirements.`
+      details: `Verified ${runtimeType} binary and model preflight requirements (speech execution compatibility must be verified separately via verifyRuntimeCompatibility).`
     };
   }
 
@@ -872,16 +872,47 @@ export class SpeechTranscriptionAdapter {
 
       let referenceMatched: boolean | undefined;
       if (expectedTranscript && expectedTranscript.trim().length > 0) {
-        const normalizeTokens = (txt: string) =>
+        const normalizeTranscriptTokens = (txt: string): string[] =>
           txt
             .toLowerCase()
-            .replace(/[^a-z0-9\u0e00-\u0e7f\s]/g, ' ')
+            .normalize('NFKC')
+            .replace(/[^\p{L}\p{N}\s]/gu, ' ')
             .split(/\s+/)
             .filter(Boolean);
-        const expectedTokens = normalizeTokens(expectedTranscript);
-        const actualTokens = new Set(normalizeTokens(extractedText));
-        const matchedCount = expectedTokens.filter(t => actualTokens.has(t)).length;
-        referenceMatched = expectedTokens.length > 0 && matchedCount / expectedTokens.length >= 0.5;
+
+        const expectedTokens = normalizeTranscriptTokens(expectedTranscript);
+        const actualTokens = normalizeTranscriptTokens(extractedText);
+
+        if (expectedTokens.length === 0 || actualTokens.length === 0) {
+          referenceMatched = false;
+        } else {
+          // Speech-fixture compatibility smoke check using ordered token Longest Common Subsequence (LCS).
+          // Tolerates punctuation, casing, and whitespace differences while rejecting incorrect transcripts,
+          // missing expected words, excessive unexpected words, and major word-order mismatches.
+          // Note: This is a runtime compatibility smoke check, NOT a general WER benchmark.
+          const m = expectedTokens.length;
+          const n = actualTokens.length;
+          let prev = new Array<number>(n + 1).fill(0);
+          let curr = new Array<number>(n + 1).fill(0);
+          for (let i = 1; i <= m; i++) {
+            for (let j = 1; j <= n; j++) {
+              if (expectedTokens[i - 1] === actualTokens[j - 1]) {
+                curr[j] = prev[j - 1] + 1;
+              } else {
+                curr[j] = prev[j] >= curr[j - 1] ? prev[j] : curr[j - 1];
+              }
+            }
+            const tmp = prev;
+            prev = curr;
+            curr = tmp;
+            curr.fill(0);
+          }
+          const lcsLen = prev[n];
+          const recall = lcsLen / m;
+          const precision = lcsLen / n;
+          referenceMatched = recall >= 0.85 && precision >= 0.8;
+        }
+
         if (!referenceMatched) {
           return {
             compatible: false,
@@ -894,7 +925,7 @@ export class SpeechTranscriptionAdapter {
             referenceTranscript: expectedTranscript,
             referenceMatched: false,
             executionDurationMs: elapsed,
-            details: `Transcript output did not match reference speech transcript ('${expectedTranscript}' vs '${extractedText.slice(0, 120)}').`
+            details: `Transcript output did not match expected speech smoke-check transcript ('${expectedTranscript}' vs '${extractedText.slice(0, 120)}').`
           };
         }
       }
@@ -972,12 +1003,18 @@ export class SpeechTranscriptionAdapter {
       };
     }
 
-    // Run cached compatibility check when explicitly requested or when a model + speech fixture are configured
+    // Enforce runtime compatibility verification when explicitly required (WHISPER_VERIFY_COMPATIBILITY=true
+    // or verifyCompatibility=true), in production unless explicitly disabled, or when a speech fixture is configured.
     const hasSpeechFixtureEnv = Boolean(options?.audioFixturePath || process.env.WHISPER_COMPAT_AUDIO_PATH);
+    const compatEnvFlag = (process.env.WHISPER_VERIFY_COMPATIBILITY || '').trim().toLowerCase();
+    const compatExplicitlyDisabled = options?.verifyCompatibility === false || compatEnvFlag === 'false';
+    const compatExplicitlyRequired = options?.verifyCompatibility === true || compatEnvFlag === 'true';
     const shouldVerifyCompatibility =
-      options?.verifyCompatibility === true ||
-      process.env.WHISPER_VERIFY_COMPATIBILITY === 'true' ||
-      (validation.modelConfigured && hasSpeechFixtureEnv);
+      compatExplicitlyRequired ||
+      (!compatExplicitlyDisabled && (
+        process.env.NODE_ENV === 'production' ||
+        (validation.modelConfigured && hasSpeechFixtureEnv)
+      ));
 
     let compatibilityVerified = false;
     if (shouldVerifyCompatibility) {

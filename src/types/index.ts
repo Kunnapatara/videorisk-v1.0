@@ -721,6 +721,7 @@ export interface StripeRefundRecord {
   creditsAdjusted: number;
   failureReason?: string;
   eventId: string;
+  lastEventCreated?: number;
   createdAt: string;
   updatedAt: string;
 }

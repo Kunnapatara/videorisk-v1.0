@@ -1311,6 +1311,335 @@ export async function runStripeOriginAndRefundLifecycleTests() {
         assert.strictEqual(retryRes.alreadyProcessed, false, `${backendLabel} 4.2H Retry after rollback processes cleanly`);
         assert.strictEqual((await repo.users.getUser(userH.id))?.creditsRemaining, 10, `${backendLabel} 4.2H Retry deducts 75 credits cleanly`);
         assert.strictEqual((await repo.users.getUser(userH.id))?.plan, 'free', `${backendLabel} 4.2H Retry downgrades plan to free`);
+
+        // I. Workstream A4 — Monotonic & Out-of-Order Refund Webhook Protection (12 Scenarios across SQLite & InMemory)
+        // Helper to provision a paid Pro user (85 credits = 10 initial + 75 Pro, $19.00 = 1900 cents)
+        const setupPaidProUser = async (suffix: string) => {
+          const u = await repo.users.createUser(`${backendLabel}_mono_${suffix}_${Date.now()}@videorisk.test`, 'h', 's', 10, 'free');
+          const pi = `pi_${backendLabel}_mono_${suffix}_${Date.now()}`;
+          const chg = `ch_${backendLabel}_mono_${suffix}_${Date.now()}`;
+          const sub = `sub_${backendLabel}_mono_${suffix}_${Date.now()}`;
+          const chk = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+            id: `evt_${backendLabel}_mono_chk_${suffix}_${Date.now()}`,
+            created: nextTs(),
+            type: 'checkout.session.completed',
+            data: {
+              object: {
+                id: `cs_${backendLabel}_mono_${suffix}`,
+                client_reference_id: u.id,
+                customer: `cus_${backendLabel}_mono_${suffix}`,
+                subscription: sub,
+                payment_intent: pi,
+                payment_status: 'paid',
+                amount_total: 1900,
+                currency: 'usd',
+                metadata: { userId: u.id, planId: 'pro' },
+              },
+            },
+          });
+          await billingService.handleWebhook(chk.rawBody, chk.signature);
+          return { user: u, pi, chg, sub };
+        };
+
+        // Scenarios 1–6: pending -> succeeded -> stale [pending, requires_action, failed, canceled, unknown/missing] -> duplicate succeeded (distinct event.id)
+        const staleTransitions: Array<{ label: string; statusVal: any; evtType?: string }> = [
+          { label: 'stale_pending', statusVal: 'pending' },
+          { label: 'stale_requires_action', statusVal: 'requires_action' },
+          { label: 'stale_failed', statusVal: 'failed', evtType: 'refund.failed' },
+          { label: 'stale_canceled', statusVal: 'canceled' },
+          { label: 'stale_unknown', statusVal: 'unexpected_gateway_status' },
+          { label: 'stale_missing_status', statusVal: undefined },
+        ];
+
+        for (const stCase of staleTransitions) {
+          const { user: uI, pi: piI, chg: chgI } = await setupPaidProUser(stCase.label);
+          const refI = `re_${backendLabel}_${stCase.label}_${Date.now()}`;
+          const tsBase = nextTs();
+          const tsPending = tsBase;
+          const tsSucceeded = tsBase + 20;
+          const tsStale = tsBase + 5; // Older than succeeded, arrives AFTER succeeded
+
+          // 1) Legitimate initial pending event
+          const evPending = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+            id: `evt_${backendLabel}_${stCase.label}_1_pend`,
+            created: tsPending,
+            type: 'refund.created',
+            data: { object: { id: refI, payment_intent: piI, charge: chgI, amount: 1900, status: 'pending' } },
+          });
+          await billingService.handleWebhook(evPending.rawBody, evPending.signature);
+          assert.strictEqual((await inspectState()).getRefund(refI)?.status, 'pending', `${backendLabel} A4.${stCase.label}: initial pending recorded`);
+          assert.strictEqual((await repo.users.getUser(uI.id))?.creditsRemaining, 85, `${backendLabel} A4.${stCase.label}: pending does not deduct credits`);
+
+          // 2) Succeeded event arrives
+          const evSucc = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+            id: `evt_${backendLabel}_${stCase.label}_2_succ`,
+            created: tsSucceeded,
+            type: 'refund.updated',
+            data: { object: { id: refI, payment_intent: piI, charge: chgI, amount: 1900, status: 'succeeded' } },
+          });
+          await billingService.handleWebhook(evSucc.rawBody, evSucc.signature);
+          const txCountAfterSucc = (await inspectState()).countCreditTxs(uI.id);
+          assert.strictEqual((await repo.users.getUser(uI.id))?.creditsRemaining, 10, `${backendLabel} A4.${stCase.label}: succeeded deducts 75 credits`);
+          assert.strictEqual((await repo.users.getUser(uI.id))?.plan, 'free', `${backendLabel} A4.${stCase.label}: succeeded revokes plan`);
+
+          // 3) Stale non-success event arrives later with DIFFERENT event.id
+          const evStale = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+            id: `evt_${backendLabel}_${stCase.label}_3_stale`,
+            created: tsStale,
+            type: stCase.evtType || 'refund.updated',
+            data: {
+              object: {
+                id: refI,
+                payment_intent: piI,
+                charge: chgI,
+                amount: 1900,
+                ...(stCase.statusVal !== undefined ? { status: stCase.statusVal } : {}),
+              },
+            },
+          });
+          await billingService.handleWebhook(evStale.rawBody, evStale.signature);
+
+          const snapAfterStale = await inspectState();
+          const refundAfterStale = snapAfterStale.getRefund(refI);
+          assert.strictEqual(refundAfterStale?.status, 'succeeded', `${backendLabel} A4.${stCase.label}: refund stays succeeded`);
+          assert.strictEqual(refundAfterStale?.creditsAdjusted, 75, `${backendLabel} A4.${stCase.label}: creditsAdjusted preserved at 75`);
+          assert.strictEqual(refundAfterStale?.reconciled, true, `${backendLabel} A4.${stCase.label}: reconciled stays true`);
+          assert.strictEqual((await repo.users.getUser(uI.id))?.creditsRemaining, 10, `${backendLabel} A4.${stCase.label}: creditsRemaining unchanged`);
+          assert.strictEqual(snapAfterStale.countCreditTxs(uI.id), txCountAfterSucc, `${backendLabel} A4.${stCase.label}: zero spurious credit_transactions (no STRIPE_REFUND_FAILED)`);
+
+          // 4) Subsequent succeeded event with DIFFERENT event.id does NOT double-deduct
+          const evDupSucc = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+            id: `evt_${backendLabel}_${stCase.label}_4_dupsucc`,
+            created: tsSucceeded + 10,
+            type: 'refund.updated',
+            data: { object: { id: refI, payment_intent: piI, charge: chgI, amount: 1900, status: 'succeeded' } },
+          });
+          await billingService.handleWebhook(evDupSucc.rawBody, evDupSucc.signature);
+          assert.strictEqual((await repo.users.getUser(uI.id))?.creditsRemaining, 10, `${backendLabel} A4.${stCase.label}: subsequent succeeded with different event.id does not double-deduct`);
+          assert.strictEqual((await inspectState()).countCreditTxs(uI.id), txCountAfterSucc, `${backendLabel} A4.${stCase.label}: tx count unchanged after duplicate succeeded`);
+        }
+
+        // Scenario 7: charge.refunded carrying already-processed Refund ID (+ mixed new partial refund)
+        {
+          const { user: uChg, pi: piChg, chg: chgId } = await setupPaidProUser('charge_refunded_dedup');
+          const ref1 = `re_${backendLabel}_chg_1_${Date.now()}`;
+          const ref2 = `re_${backendLabel}_chg_2_${Date.now()}`;
+
+          // Process 50% partial refund first
+          const evP1 = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+            id: `evt_${backendLabel}_chg_p1`,
+            created: nextTs(),
+            type: 'refund.created',
+            data: { object: { id: ref1, payment_intent: piChg, charge: chgId, amount: 950, status: 'succeeded' } },
+          });
+          await billingService.handleWebhook(evP1.rawBody, evP1.signature);
+          assert.strictEqual((await repo.users.getUser(uChg.id))?.creditsRemaining, 48, `${backendLabel} A4.7: 50% partial deducts 37 via BigInt floor (85 -> 48)`);
+
+          // Duplicate charge.refunded containing ONLY ref1 with different event.id
+          const evChgDup = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+            id: `evt_${backendLabel}_chg_dup_only_ref1`,
+            created: nextTs(),
+            type: 'charge.refunded',
+            data: {
+              object: {
+                id: chgId,
+                payment_intent: piChg,
+                amount: 1900,
+                amount_refunded: 950,
+                refunded: false,
+                refunds: { data: [{ id: ref1, amount: 950, status: 'succeeded' }] },
+              },
+            },
+          });
+          await billingService.handleWebhook(evChgDup.rawBody, evChgDup.signature);
+          assert.strictEqual((await repo.users.getUser(uChg.id))?.creditsRemaining, 48, `${backendLabel} A4.7: charge.refunded with existing ref1 does not re-deduct`);
+
+          // Now charge.refunded carrying BOTH already-processed ref1 AND new ref2 completing 100%
+          const evChgMixed = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+            id: `evt_${backendLabel}_chg_mixed`,
+            created: nextTs(),
+            type: 'charge.refunded',
+            data: {
+              object: {
+                id: chgId,
+                payment_intent: piChg,
+                amount: 1900,
+                amount_refunded: 1900,
+                refunded: true,
+                refunds: {
+                  data: [
+                    { id: ref1, amount: 950, status: 'succeeded' },
+                    { id: ref2, amount: 950, status: 'succeeded' },
+                  ],
+                },
+              },
+            },
+          });
+          await billingService.handleWebhook(evChgMixed.rawBody, evChgMixed.signature);
+          assert.strictEqual((await repo.users.getUser(uChg.id))?.creditsRemaining, 10, `${backendLabel} A4.7: mixed charge.refunded only deducts net remaining 38 credits (48 -> 10)`);
+          assert.strictEqual((await repo.users.getUser(uChg.id))?.plan, 'free', `${backendLabel} A4.7: full cumulative refund revokes plan`);
+        }
+
+        // Scenarios 8 & 9: Out-of-order timestamps + Equal timestamps (same event.created) + missing timestamp protection
+        {
+          const { user: uTs, pi: piTs } = await setupPaidProUser('timestamps');
+          const refTs = `re_${backendLabel}_ts_${Date.now()}`;
+          const fixedTs = nextTs() + 100;
+
+          // Succeeded at fixedTs
+          const evSuccSameTs = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+            id: `evt_${backendLabel}_ts_succ`,
+            created: fixedTs,
+            type: 'refund.updated',
+            data: { object: { id: refTs, payment_intent: piTs, amount: 1900, status: 'succeeded' } },
+          });
+          await billingService.handleWebhook(evSuccSameTs.rawBody, evSuccSameTs.signature);
+          const txBeforeSameTs = (await inspectState()).countCreditTxs(uTs.id);
+
+          // Same timestamp (created === fixedTs) pending & failed & missing-timestamp unknown
+          for (const sameCase of [
+            { id: 'same_pending', status: 'pending', created: fixedTs },
+            { id: 'same_failed', status: 'failed', created: fixedTs },
+            { id: 'future_pending', status: 'pending', created: fixedTs + 50 }, // Even with clock skew, succeeded is terminal
+            { id: 'no_ts_unknown', status: undefined, created: 0 },
+          ]) {
+            const ev = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+              id: `evt_${backendLabel}_ts_${sameCase.id}`,
+              created: sameCase.created,
+              type: 'refund.updated',
+              data: {
+                object: {
+                  id: refTs,
+                  payment_intent: piTs,
+                  amount: 1900,
+                  ...(sameCase.status ? { status: sameCase.status } : {}),
+                },
+              },
+            });
+            await billingService.handleWebhook(ev.rawBody, ev.signature);
+          }
+
+          const snapTs = await inspectState();
+          assert.strictEqual(snapTs.getRefund(refTs)?.status, 'succeeded', `${backendLabel} A4.8/9: succeeded preserved across equal/skewed/missing timestamps`);
+          assert.strictEqual(snapTs.getRefund(refTs)?.creditsAdjusted, 75, `${backendLabel} A4.8/9: creditsAdjusted=75 preserved`);
+          assert.strictEqual(snapTs.getRefund(refTs)?.reconciled, true, `${backendLabel} A4.8/9: reconciled=true preserved`);
+          assert.strictEqual((await repo.users.getUser(uTs.id))?.creditsRemaining, 10, `${backendLabel} A4.8/9: balance=10 preserved`);
+          assert.strictEqual(snapTs.countCreditTxs(uTs.id), txBeforeSameTs, `${backendLabel} A4.8/9: no extra tx recorded`);
+
+          // Non-succeeded out-of-order: failed at T+10 must not regress to pending at T+5
+          const refFailOrder = `re_${backendLabel}_fail_ooo_${Date.now()}`;
+          const evFailNewer = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+            id: `evt_${backendLabel}_fail_newer`,
+            created: fixedTs + 10,
+            type: 'refund.failed',
+            data: { object: { id: refFailOrder, payment_intent: piTs, amount: 500, status: 'failed', failure_reason: 'expired_or_canceled_card' } },
+          });
+          await billingService.handleWebhook(evFailNewer.rawBody, evFailNewer.signature);
+
+          const evPendOlder = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+            id: `evt_${backendLabel}_pend_older`,
+            created: fixedTs + 5,
+            type: 'refund.created',
+            data: { object: { id: refFailOrder, payment_intent: piTs, amount: 500, status: 'pending' } },
+          });
+          await billingService.handleWebhook(evPendOlder.rawBody, evPendOlder.signature);
+          assert.strictEqual((await inspectState()).getRefund(refFailOrder)?.status, 'failed', `${backendLabel} A4.8: newer failed cannot regress to older pending`);
+        }
+
+        // Scenario 10: Transaction rollback followed by retry + stale protection post-retry
+        {
+          const { user: uRb, pi: piRb } = await setupPaidProUser('rb_retry');
+          const refRb = `re_${backendLabel}_rb_retry_${Date.now()}`;
+          const evtRb = `evt_${backendLabel}_rb_retry`;
+          const tsRb = nextTs();
+
+          await assert.rejects(
+            () => repo.runTransaction(async (state) => {
+              (billingService as any).processRefundWebhook(state, {
+                id: evtRb,
+                created: tsRb + 10,
+                type: 'refund.updated',
+                data: { object: { id: refRb, payment_intent: piRb, amount: 1900, status: 'succeeded' } },
+              });
+              throw new Error('SIMULATED_REFUND_ROLLBACK');
+            }),
+            /SIMULATED_REFUND_ROLLBACK/
+          );
+          assert.strictEqual((await repo.users.getUser(uRb.id))?.creditsRemaining, 85, `${backendLabel} A4.10: rollback leaves balance intact`);
+          assert.strictEqual((await inspectState()).getRefund(refRb), undefined, `${backendLabel} A4.10: rollback leaves no refund row`);
+
+          // Retry succeeds cleanly
+          const retryEv = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+            id: evtRb,
+            created: tsRb + 10,
+            type: 'refund.updated',
+            data: { object: { id: refRb, payment_intent: piRb, amount: 1900, status: 'succeeded' } },
+          });
+          await billingService.handleWebhook(retryEv.rawBody, retryEv.signature);
+          assert.strictEqual((await repo.users.getUser(uRb.id))?.creditsRemaining, 10, `${backendLabel} A4.10: retry after rollback deducts 75`);
+
+          // Late stale pending after rollback+retry must be ignored
+          const staleAfterRb = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+            id: `${evtRb}_stale_pend`,
+            created: tsRb,
+            type: 'refund.created',
+            data: { object: { id: refRb, payment_intent: piRb, amount: 1900, status: 'pending' } },
+          });
+          await billingService.handleWebhook(staleAfterRb.rawBody, staleAfterRb.signature);
+          const snapRb = await inspectState();
+          assert.strictEqual(snapRb.getRefund(refRb)?.status, 'succeeded', `${backendLabel} A4.10: stays succeeded post-retry`);
+          assert.strictEqual(snapRb.getRefund(refRb)?.creditsAdjusted, 75, `${backendLabel} A4.10: creditsAdjusted stays 75 post-retry`);
+        }
+
+        // Scenario 11 & 12: Sequential partial refunds completing full refund + late pending event
+        {
+          const { user: uSeq, pi: piSeq } = await setupPaidProUser('seq_partial');
+          const rPart1 = `re_${backendLabel}_seq_p1_${Date.now()}`;
+          const rPart2 = `re_${backendLabel}_seq_p2_${Date.now()}`;
+          const t0 = nextTs();
+
+          const evS1 = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+            id: `evt_${backendLabel}_seq_1`,
+            created: t0 + 1,
+            type: 'refund.updated',
+            data: { object: { id: rPart1, payment_intent: piSeq, amount: 760, status: 'succeeded' } }, // 40% => 30 credits
+          });
+          await billingService.handleWebhook(evS1.rawBody, evS1.signature);
+          assert.strictEqual((await repo.users.getUser(uSeq.id))?.creditsRemaining, 55, `${backendLabel} A4.11: 40% partial deducts 30 (85 -> 55)`);
+          assert.strictEqual((await inspectState()).getPaymentByIntent(piSeq)?.status, 'partially_refunded', `${backendLabel} A4.11: payment is partially_refunded`);
+
+          const evS2 = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+            id: `evt_${backendLabel}_seq_2`,
+            created: t0 + 2,
+            type: 'refund.updated',
+            data: { object: { id: rPart2, payment_intent: piSeq, amount: 1140, status: 'succeeded' } }, // +60% => remaining 45 credits
+          });
+          await billingService.handleWebhook(evS2.rawBody, evS2.signature);
+          const txAfterFullSeq = (await inspectState()).countCreditTxs(uSeq.id);
+          assert.strictEqual((await repo.users.getUser(uSeq.id))?.creditsRemaining, 10, `${backendLabel} A4.11: 40%+60% deducts total 75 (55 -> 10)`);
+          assert.strictEqual((await repo.users.getUser(uSeq.id))?.plan, 'free', `${backendLabel} A4.11: cumulative full refund revokes plan`);
+          assert.strictEqual((await inspectState()).getPaymentByIntent(piSeq)?.status, 'refunded', `${backendLabel} A4.11: payment is refunded`);
+
+          // Late stale pending events for BOTH rPart1 and rPart2
+          for (const [idx, refId] of [rPart1, rPart2].entries()) {
+            const evLatePend = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+              id: `evt_${backendLabel}_seq_late_pend_${idx}`,
+              created: t0,
+              type: 'refund.created',
+              data: { object: { id: refId, payment_intent: piSeq, amount: idx === 0 ? 760 : 1140, status: 'pending' } },
+            });
+            await billingService.handleWebhook(evLatePend.rawBody, evLatePend.signature);
+          }
+
+          const snapSeq = await inspectState();
+          assert.strictEqual(snapSeq.getRefund(rPart1)?.status, 'succeeded', `${backendLabel} A4.11/12: rPart1 stays succeeded`);
+          assert.strictEqual(snapSeq.getRefund(rPart1)?.creditsAdjusted, 30, `${backendLabel} A4.11/12: rPart1 creditsAdjusted stays 30`);
+          assert.strictEqual(snapSeq.getRefund(rPart1)?.reconciled, true, `${backendLabel} A4.11/12: rPart1 reconciled stays true`);
+          assert.strictEqual(snapSeq.getRefund(rPart2)?.status, 'succeeded', `${backendLabel} A4.11/12: rPart2 stays succeeded`);
+          assert.strictEqual(snapSeq.getRefund(rPart2)?.creditsAdjusted, 45, `${backendLabel} A4.11/12: rPart2 creditsAdjusted stays 45`);
+          assert.strictEqual(snapSeq.getRefund(rPart2)?.reconciled, true, `${backendLabel} A4.11/12: rPart2 reconciled stays true`);
+          assert.strictEqual(snapSeq.countCreditTxs(uSeq.id), txAfterFullSeq, `${backendLabel} A4.11/12: zero extra credit transactions`);
+        }
       } finally {
         billingService.setStorageForTest(null);
       }
@@ -1329,6 +1658,7 @@ export async function runStripeOriginAndRefundLifecycleTests() {
             rawStatus: r.raw_status || undefined,
             reconciled: Boolean(r.reconciled),
             creditsAdjusted: Number(r.credits_adjusted || 0),
+            lastEventCreated: r.last_event_created !== null && r.last_event_created !== undefined ? Number(r.last_event_created) : undefined,
           };
         },
         getPaymentByIntent: (pi: string) => db.prepare('SELECT * FROM stripe_payments WHERE payment_intent_id = ?').get(pi),
@@ -1348,7 +1678,7 @@ export async function runStripeOriginAndRefundLifecycleTests() {
       };
     });
 
-    console.log('  ✅ PASS: 20-case refund matrix, non-string originUrl rejection, & SQLite/InMemory rollback verified');
+    console.log('  ✅ PASS: 20-case refund matrix, 12-scenario monotonic out-of-order protection, & SQLite/InMemory parity verified');
 
     console.log('\n======================================================');
     console.log('🎉 ALL CHECKOUT ORIGIN & STRIPE REFUND TESTS PASSED!');
