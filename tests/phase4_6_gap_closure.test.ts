@@ -8,6 +8,7 @@ import { videoProcessor } from '../src/server/pipeline/videoProcessor';
 import { audioProcessor, SpeechTranscriptionAdapter } from '../src/server/pipeline/audioProcessor';
 import { policyIntelligenceEngine } from '../src/server/intelligence/policyIntelligence';
 import { MediaMetadata } from '../src/types';
+import { runFullVideoOcrRegressionTests } from './full_video_ocr_regression.test';
 
 const execFileAsync = promisify(execFile);
 
@@ -89,12 +90,12 @@ export async function runPhase456VerificationTests() {
     // -------------------------------------------------------------------------
     console.log('\n[2. Full-Video OCR Implementation & Bounded Execution]');
 
-    // Video 1: 3 seconds with text overlay appearing at 1.0s
+    // Video 1: 3 seconds with high-contrast text overlay appearing between 0.5s and 2.5s
     const textVideoPath = path.resolve(testDir, 'video_with_ocr.mp4');
     await execFileAsync('ffmpeg', [
       '-y',
       '-f', 'lavfi',
-      '-i', "testsrc=size=320x240:rate=10:duration=3,drawtext=text='SCENE TEXT':fontsize=32:fontcolor=yellow:x=(w-text_w)/2:y=(h-text_h)/2:enable='between(t,0.5,2.5)'",
+      '-i', "color=c=#0f172a:s=640x360:rate=10:duration=3,drawtext=text='SCENE TEXT':fontsize=40:fontcolor=white:box=1:boxcolor=black@0.95:boxborderw=10:x=(w-text_w)/2:y=(h-text_h)/2:enable='between(t,0.5,2.5)'",
       '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
       textVideoPath
     ]);
@@ -104,9 +105,9 @@ export async function runPhase456VerificationTests() {
       filename: 'video_with_ocr.mp4',
       originalSize: 100000,
       durationSeconds: 3.0,
-      width: 320,
-      height: 240,
-      resolutionLabel: '240p',
+      width: 640,
+      height: 360,
+      resolutionLabel: '360p',
       fps: 10,
       hasAudio: false,
       videoCodec: 'h264',
@@ -133,6 +134,41 @@ export async function runPhase456VerificationTests() {
     assert.ok(Number.isFinite(firstFrameOcr.timestamp), '2.6 Detected frame has valid numeric timestamp');
     assert.ok(firstFrameOcr.boundingBoxes.length > 0, '2.7 Frame OCR contains bounding boxes');
     assert.ok(typeof firstFrameOcr.confidence === 'number' && firstFrameOcr.confidence > 0, '2.8 Frame OCR confidence is genuine engine output');
+    assert.ok(
+      videoOcrRes.allExtractedText.some(t => t.includes('SCENE') && t.includes('TEXT')),
+      `2.8a Extracted text includes expected phrase (got ${JSON.stringify(videoOcrRes.allExtractedText)})`
+    );
+    assert.ok(
+      Array.isArray(videoOcrRes.frameDiagnostics) && videoOcrRes.frameDiagnostics.length === 3,
+      '2.8b Per-frame diagnostics recorded for all 3 sampled timestamps'
+    );
+    assert.ok(
+      videoOcrRes.frameDiagnostics!.every(d => d.extractionSuccess && d.extractedDimensions?.width === 640 && d.tesseractExitCode === 0 && d.tsvValid === true),
+      '2.8c Frame diagnostics record valid extracted dimensions, exitCode=0, and tsvValid=true'
+    );
+
+    // Explicit CI font check (DejaVu Sans used by ubuntu-latest fonts-dejavu-core)
+    const ciDejaVuFont = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
+    if (fs.existsSync(ciDejaVuFont)) {
+      const dejaVuVideoPath = path.resolve(testDir, 'video_with_ocr_dejavu.mp4');
+      await execFileAsync('ffmpeg', [
+        '-y',
+        '-f', 'lavfi',
+        '-i', `color=c=#0f172a:s=640x360:rate=10:duration=3,drawtext=fontfile=${ciDejaVuFont}:text='SCENE TEXT':fontsize=40:fontcolor=white:box=1:boxcolor=black@0.95:boxborderw=10:x=(w-text_w)/2:y=(h-text_h)/2:enable='between(t,0.5,2.5)'`,
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+        dejaVuVideoPath
+      ]);
+      generatedFiles.push(dejaVuVideoPath);
+      const dejaVuOcrRes = await videoProcessor.performVideoOcr(dejaVuVideoPath, mockVideoMeta, {
+        maxFrames: 5,
+        sampleIntervalSeconds: 1
+      });
+      assert.strictEqual(dejaVuOcrRes.status, 'DETECTED', '2.8d DejaVu Sans CI font renders readable text detected as DETECTED');
+      assert.ok(
+        dejaVuOcrRes.allExtractedText.some(t => t.includes('SCENE') && t.includes('TEXT')),
+        '2.8e DejaVu Sans video accurately extracts SCENE TEXT'
+      );
+    }
 
     // Video 2: Video without text
     const noTextVideoPath = path.resolve(testDir, 'video_no_text.mp4');
@@ -145,7 +181,7 @@ export async function runPhase456VerificationTests() {
     ]);
     generatedFiles.push(noTextVideoPath);
 
-    const mockNoTextMeta: MediaMetadata = { ...mockVideoMeta, durationSeconds: 2.0 };
+    const mockNoTextMeta: MediaMetadata = { ...mockVideoMeta, width: 320, height: 240, resolutionLabel: '240p', durationSeconds: 2.0 };
     const noTextOcrRes = await videoProcessor.performVideoOcr(noTextVideoPath, mockNoTextMeta);
     assert.strictEqual(noTextOcrRes.status, 'NO_SIGNAL_DETECTED', '2.9 Video without text returns NO_SIGNAL_DETECTED');
     assert.strictEqual(noTextOcrRes.detectedFrames.length, 0, '2.10 Zero frames detected for text-free video');
@@ -250,6 +286,7 @@ EOF
     assert.ok(firstOcrEv.details.includes('Confidence'), '4.5 Details include genuine engine confidence');
 
     console.log('  ✅ PASS: Timeline evidence integration & provenance verification complete');
+    await runFullVideoOcrRegressionTests();
     console.log('\n======================================================');
     console.log('🎉 ALL PHASE 4–6 GAP CLOSURE VERIFICATIONS PASSED!');
     console.log('======================================================\n');

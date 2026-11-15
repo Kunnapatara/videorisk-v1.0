@@ -172,6 +172,46 @@ function parseStrictFloat(raw: string): number | null {
  * (rejecting trailing junk like '10abc' and decimals), valid numeric confidence in [-1, 100],
  * and rejects header-only TSV output.
  */
+export interface OcrFrameDiagnostic {
+  frameIndex: number;
+  timestamp: number;
+  extractionSuccess: boolean;
+  extractedDimensions: { width: number; height: number } | null;
+  tesseractSuccess: boolean;
+  tesseractExitCode: number | null;
+  tsvValid: boolean | null;
+  recognizedWordCount: number;
+  validWordCount: number;
+  confidenceSummary: { min: number; max: number; mean: number } | null;
+  failureCategory?: string;
+  failureReason?: string;
+}
+
+function readPngDimensions(filePath: string): { isPngHeader: boolean; width: number; height: number } | null {
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const buf = Buffer.alloc(24);
+      const bytesRead = fs.readSync(fd, buf, 0, 24, 0);
+      if (bytesRead < 8) return null;
+      const pngMagic = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+      if (!buf.subarray(0, 8).equals(pngMagic)) {
+        return { isPngHeader: false, width: 0, height: 0 };
+      }
+      if (bytesRead < 24 || buf.subarray(12, 16).toString('ascii') !== 'IHDR') {
+        return { isPngHeader: true, width: 0, height: 0 };
+      }
+      const width = buf.readUInt32BE(16);
+      const height = buf.readUInt32BE(20);
+      return { isPngHeader: true, width, height };
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}
+
 export function validateTesseractTsv(stdout: string): {
   isValid: boolean;
   error?: string;
@@ -179,6 +219,7 @@ export function validateTesseractTsv(stdout: string): {
   words: string[];
   totalConf: number;
   wordCount: number;
+  recognizedWordCount?: number;
 } {
   // Split by newlines without stripping trailing tabs so trailing empty text columns retain 12 fields
   const lines = stdout.split(/\r?\n/).filter(l => l.length > 0);
@@ -221,6 +262,7 @@ export function validateTesseractTsv(stdout: string): {
   const words: string[] = [];
   let totalConf = 0;
   let wordCount = 0;
+  let recognizedWordCount = 0;
 
   for (let l = 0; l < dataLines.length; l++) {
     const rawLine = dataLines[l];
@@ -233,7 +275,8 @@ export function validateTesseractTsv(stdout: string): {
         boundingBoxes: [],
         words: [],
         totalConf: 0,
-        wordCount: 0
+        wordCount: 0,
+        recognizedWordCount: 0
       };
     }
 
@@ -246,7 +289,8 @@ export function validateTesseractTsv(stdout: string): {
         boundingBoxes: [],
         words: [],
         totalConf: 0,
-        wordCount: 0
+        wordCount: 0,
+        recognizedWordCount: 0
       };
     }
 
@@ -265,7 +309,8 @@ export function validateTesseractTsv(stdout: string): {
         boundingBoxes: [],
         words: [],
         totalConf: 0,
-        wordCount: 0
+        wordCount: 0,
+        recognizedWordCount: 0
       };
     }
 
@@ -281,7 +326,8 @@ export function validateTesseractTsv(stdout: string): {
         boundingBoxes: [],
         words: [],
         totalConf: 0,
-        wordCount: 0
+        wordCount: 0,
+        recognizedWordCount: 0
       };
     }
 
@@ -294,11 +340,15 @@ export function validateTesseractTsv(stdout: string): {
         boundingBoxes: [],
         words: [],
         totalConf: 0,
-        wordCount: 0
+        wordCount: 0,
+        recognizedWordCount: 0
       };
     }
 
     const wText = parts[11]?.trim() || '';
+    if (wText.length > 0) {
+      recognizedWordCount++;
+    }
     if (wText.length > 0 && conf >= 0) {
       words.push(wText);
       totalConf += conf;
@@ -319,7 +369,8 @@ export function validateTesseractTsv(stdout: string): {
     boundingBoxes,
     words,
     totalConf,
-    wordCount
+    wordCount,
+    recognizedWordCount
   };
 }
 
@@ -1256,7 +1307,7 @@ export class VideoProcessor {
       timestamps?: number[];
       perFrameTimeoutMs?: number;
     }
-  ): Promise<import('../../types').VideoOcrResult> {
+  ): Promise<import('../../types').VideoOcrResult & { frameDiagnostics?: OcrFrameDiagnostic[] }> {
     const startTime = Date.now();
     const dur = Math.max(0.1, metadata.durationSeconds || 0.1);
 
@@ -1356,7 +1407,7 @@ export class VideoProcessor {
 
     // Calculate candidate timestamps distributed deterministically across the entire duration [0, dur]
     const candidateTimestamps = (options?.timestamps && options.timestamps.length > 0)
-      ? options.timestamps.filter(t => t >= 0 && t <= dur).sort((a, b) => a - b)
+      ? Array.from(new Set(options.timestamps.filter(t => Number.isFinite(t) && t >= 0 && t <= dur))).sort((a, b) => a - b)
       : calculateOcrSamplingTimestamps(dur, maxFrames, options?.sampleIntervalSeconds);
     const totalCandidateFrames = candidateTimestamps.length;
     const framesTargeted = totalCandidateFrames;
@@ -1366,6 +1417,7 @@ export class VideoProcessor {
 
     const MAX_DIAGNOSTIC_ERRORS = 10;
     const extractionErrors: import('../../types').ExtractionFailureDiagnostic[] = [];
+    const frameDiagnosticsByIndex = new Map<number, OcrFrameDiagnostic>();
     const sanitizeReason = (raw: string): string =>
       raw
         .replace(/\/[^\s:'"]+\//g, '[path]/')
@@ -1379,7 +1431,7 @@ export class VideoProcessor {
       }
 
       // Extract candidate frames to disk via FFmpeg with categorized failure diagnostics
-      const extractedFrames: Array<{ timestamp: number; index: number; filePath: string }> = [];
+      const extractedFrames: Array<{ timestamp: number; index: number; filePath: string; dimensions: { width: number; height: number } | null }> = [];
       let extractionTimeouts = false;
       let extractionBinaryUnusable = false;
       let framesExtractionFailed = 0;
@@ -1400,6 +1452,7 @@ export class VideoProcessor {
             '-y',
             '-ss', String(ts),
             '-i', videoPath,
+            '-map', '0:v:0',
             '-vframes', '1',
             '-vf', 'scale=640:-2', // Standardize frame resolution for bounded OCR processing
             outPath
@@ -1407,28 +1460,77 @@ export class VideoProcessor {
 
           if (!fs.existsSync(outPath)) {
             framesExtractionFailed++;
+            const reason = `FFmpeg exited cleanly at ${ts}s without producing output image file.`;
+            frameDiagnosticsByIndex.set(i, {
+              frameIndex: i,
+              timestamp: ts,
+              extractionSuccess: false,
+              extractedDimensions: null,
+              tesseractSuccess: false,
+              tesseractExitCode: null,
+              tsvValid: null,
+              recognizedWordCount: 0,
+              validWordCount: 0,
+              confidenceSummary: null,
+              failureCategory: 'MISSING_OUTPUT',
+              failureReason: reason
+            });
             if (extractionErrors.length < MAX_DIAGNOSTIC_ERRORS) {
               extractionErrors.push({
                 frameIndex: i,
                 timestamp: ts,
                 category: 'MISSING_OUTPUT',
-                reason: `FFmpeg exited cleanly at ${ts}s without producing output image file.`
+                reason
               });
             }
           } else {
             const stat = fs.statSync(outPath);
-            if (stat.size <= 0) {
+            const pngInfo = stat.size > 0 ? readPngDimensions(outPath) : null;
+            const hasInvalidPngHeader = Boolean(pngInfo && pngInfo.isPngHeader && (pngInfo.width <= 0 || pngInfo.height <= 0));
+            if (stat.size <= 0 || hasInvalidPngHeader) {
               framesExtractionFailed++;
+              const reason = stat.size <= 0
+                ? `FFmpeg produced empty 0-byte frame image at ${ts}s.`
+                : `FFmpeg produced invalid PNG dimensions (${pngInfo?.width || 0}x${pngInfo?.height || 0}) at ${ts}s.`;
+              frameDiagnosticsByIndex.set(i, {
+                frameIndex: i,
+                timestamp: ts,
+                extractionSuccess: false,
+                extractedDimensions: null,
+                tesseractSuccess: false,
+                tesseractExitCode: null,
+                tsvValid: null,
+                recognizedWordCount: 0,
+                validWordCount: 0,
+                confidenceSummary: null,
+                failureCategory: 'EMPTY_OUTPUT',
+                failureReason: reason
+              });
               if (extractionErrors.length < MAX_DIAGNOSTIC_ERRORS) {
                 extractionErrors.push({
                   frameIndex: i,
                   timestamp: ts,
                   category: 'EMPTY_OUTPUT',
-                  reason: `FFmpeg produced empty 0-byte frame image at ${ts}s.`
+                  reason
                 });
               }
             } else {
-              extractedFrames.push({ timestamp: ts, index: i, filePath: outPath });
+              const dimensions = (pngInfo && pngInfo.isPngHeader && pngInfo.width > 0 && pngInfo.height > 0)
+                ? { width: pngInfo.width, height: pngInfo.height }
+                : null;
+              extractedFrames.push({ timestamp: ts, index: i, filePath: outPath, dimensions });
+              frameDiagnosticsByIndex.set(i, {
+                frameIndex: i,
+                timestamp: ts,
+                extractionSuccess: true,
+                extractedDimensions: dimensions,
+                tesseractSuccess: false,
+                tesseractExitCode: null,
+                tsvValid: null,
+                recognizedWordCount: 0,
+                validWordCount: 0,
+                confidenceSummary: null
+              });
             }
           }
         } catch (extErr: any) {
@@ -1467,13 +1569,29 @@ export class VideoProcessor {
                 : exitCode !== null
                   ? `FFmpeg exited with code ${exitCode} at ${ts}s: ${stderrLine}`
                   : `Frame extraction error at ${ts}s: ${stderrLine}`;
+          const sanitized = sanitizeReason(rawReason);
+
+          frameDiagnosticsByIndex.set(i, {
+            frameIndex: i,
+            timestamp: ts,
+            extractionSuccess: false,
+            extractedDimensions: null,
+            tesseractSuccess: false,
+            tesseractExitCode: null,
+            tsvValid: null,
+            recognizedWordCount: 0,
+            validWordCount: 0,
+            confidenceSummary: null,
+            failureCategory: category,
+            failureReason: sanitized
+          });
 
           if (extractionErrors.length < MAX_DIAGNOSTIC_ERRORS) {
             extractionErrors.push({
               frameIndex: i,
               timestamp: ts,
               category,
-              reason: sanitizeReason(rawReason)
+              reason: sanitized
             });
           }
 
@@ -1512,6 +1630,7 @@ export class VideoProcessor {
           extractedTimestamps: [],
           succeededTimestamps: [],
           extractionErrors: extractionErrors.length > 0 ? extractionErrors : undefined,
+          frameDiagnostics: Array.from(frameDiagnosticsByIndex.values()).sort((a, b) => a.frameIndex - b.frameIndex),
           framesTargeted,
           framesExtracted: 0,
           framesExtractionFailed,
@@ -1548,13 +1667,38 @@ export class VideoProcessor {
         }
 
         framesAttempted++;
+        const diag = frameDiagnosticsByIndex.get(ef.index) || {
+          frameIndex: ef.index,
+          timestamp: ef.timestamp,
+          extractionSuccess: true,
+          extractedDimensions: ef.dimensions,
+          tesseractSuccess: false,
+          tesseractExitCode: null,
+          tsvValid: null,
+          recognizedWordCount: 0,
+          validWordCount: 0,
+          confidenceSummary: null
+        };
+
         try {
-          const { stdout } = await execFileAsync(executable, [ef.filePath, 'stdout', '-l', langs, 'tsv'], { timeout: 15000 });
+          const remainingBudgetMs = Math.max(50, timeoutMs - (Date.now() - startTime));
+          const { stdout } = await execFileAsync(
+            executable,
+            [ef.filePath, 'stdout', '-l', langs, 'tsv'],
+            { timeout: Math.min(15000, remainingBudgetMs) }
+          );
+
+          diag.tesseractExitCode = 0;
 
           // Strict TSV structural validation: verify exact canonical header, exact row columns, hierarchy, geometry, and confidence
           const tsvValidation = validateTesseractTsv(stdout || '');
           if (!tsvValidation.isValid) {
             framesOcrFailed++;
+            diag.tesseractSuccess = false;
+            diag.tsvValid = false;
+            diag.failureCategory = 'INVALID_OUTPUT';
+            diag.failureReason = sanitizeReason(tsvValidation.error || 'Invalid TSV structure');
+            frameDiagnosticsByIndex.set(ef.index, diag);
             if (ocrErrors.length < MAX_DIAGNOSTIC_ERRORS) {
               ocrErrors.push(`Frame @ ${ef.timestamp}s: ${tsvValidation.error || 'Invalid TSV structure'}`);
             }
@@ -1564,11 +1708,26 @@ export class VideoProcessor {
           framesSucceeded++;
           succeededTimestamps.push(ef.timestamp);
 
-          const { words, boundingBoxes, totalConf, wordCount } = tsvValidation;
-          const frameText = words.join(' ').trim();
+          const { words, boundingBoxes, totalConf, wordCount, recognizedWordCount } = tsvValidation;
+          const confs = boundingBoxes.map(b => b.confidence);
+          const avgConf = wordCount > 0 ? parseFloat((totalConf / (wordCount * 100)).toFixed(3)) : undefined;
+
+          diag.tesseractSuccess = true;
+          diag.tsvValid = true;
+          diag.recognizedWordCount = recognizedWordCount ?? wordCount;
+          diag.validWordCount = wordCount;
+          diag.confidenceSummary = confs.length > 0 && avgConf !== undefined
+            ? {
+                min: Math.min(...confs),
+                max: Math.max(...confs),
+                mean: avgConf
+              }
+            : null;
+          frameDiagnosticsByIndex.set(ef.index, diag);
+
+          const frameText = words.join(' ').replace(/\s+/g, ' ').trim();
           if (frameText.length > 0) {
             // Deduplicate identical repeated text across immediately consecutive sampled frames
-            const avgConf = wordCount > 0 ? parseFloat((totalConf / (wordCount * 100)).toFixed(3)) : undefined;
             if (frameText !== previousFrameText) {
               detectedFrames.push({
                 timestamp: ef.timestamp,
@@ -1581,11 +1740,39 @@ export class VideoProcessor {
               allExtractedTextSet.add(frameText);
             }
             previousFrameText = frameText;
+          } else {
+            previousFrameText = '';
           }
         } catch (ocrErr: any) {
           framesOcrFailed++;
+          const errCodeStr = typeof ocrErr?.code === 'string' ? ocrErr.code : '';
+          const exitCode = typeof ocrErr?.code === 'number' ? ocrErr.code : null;
+          const isTimeout = Boolean(
+            ocrErr?.killed === true ||
+            ocrErr?.signal === 'SIGTERM' ||
+            errCodeStr === 'ETIMEDOUT' ||
+            /timed?\s*out/i.test(String(ocrErr?.message || ''))
+          );
+          if (isTimeout) {
+            executionTimedOut = true;
+          }
+          diag.tesseractSuccess = false;
+          diag.tesseractExitCode = exitCode;
+          diag.tsvValid = null;
+          diag.failureCategory = errCodeStr === 'ENOENT'
+            ? 'MISSING_EXECUTABLE'
+            : (errCodeStr === 'EACCES' || errCodeStr === 'EPERM' || errCodeStr === 'EISDIR')
+              ? 'NON_EXECUTABLE'
+              : isTimeout
+                ? 'TIMEOUT'
+                : exitCode !== null
+                  ? 'NON_ZERO_EXIT'
+                  : 'UNKNOWN_ERROR';
+          const sanitizedErr = sanitizeReason(String(ocrErr?.message || ocrErr));
+          diag.failureReason = sanitizedErr;
+          frameDiagnosticsByIndex.set(ef.index, diag);
           if (ocrErrors.length < MAX_DIAGNOSTIC_ERRORS) {
-            ocrErrors.push(`Frame @ ${ef.timestamp}s: ${sanitizeReason(String(ocrErr?.message || ocrErr))}`);
+            ocrErrors.push(`Frame @ ${ef.timestamp}s: ${sanitizedErr}`);
           }
         }
       }
@@ -1667,6 +1854,7 @@ export class VideoProcessor {
         extractedTimestamps,
         succeededTimestamps,
         extractionErrors: extractionErrors.length > 0 ? extractionErrors : undefined,
+        frameDiagnostics: Array.from(frameDiagnosticsByIndex.values()).sort((a, b) => a.frameIndex - b.frameIndex),
         framesTargeted,
         framesExtracted,
         framesExtractionFailed,
