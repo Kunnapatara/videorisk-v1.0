@@ -438,6 +438,254 @@ export async function runAuthAndOwnershipTests() {
       })
     });
     assert(userBScanWithAFile.status === 403, 'User B cannot reference User A uploaded file in /scans (403 Forbidden)');
+    const userBScanErrBody = await userBScanWithAFile.text();
+    assert(!userBScanErrBody.includes(userA.id) && !userBScanErrBody.includes(userA.email), '403 error does not leak User A identifiers or paths');
+
+    // WS3 Regression Suite: Fail-Closed Scan Creation Ownership & Path Enforcement
+    const ws3CleanupFiles: string[] = [fakeUploadFile];
+    const ws3CleanupUploadIds: string[] = [path.basename(fakeUploadFile)];
+    try {
+      const uploadsDir = path.resolve(process.cwd(), 'uploads');
+      const userBCreditsBefore = (await storage.users.getUser(userB.id))!.creditsRemaining;
+      const userBScansBefore = (await storage.scans.getAllScans(userB.id)).length;
+      const userACreditsBefore = (await storage.users.getUser(userA.id))!.creditsRemaining;
+
+      // Test 3.3 (WS3 Case 1): User A references untracked videoPath in uploads/ without UploadRecord -> 403
+      const untrackedVideoPath = path.resolve(uploadsDir, `untracked_ws3_${Date.now()}.mp4`);
+      fs.writeFileSync(untrackedVideoPath, 'UNTRACKED_ORPHAN_VIDEO_DATA');
+      ws3CleanupFiles.push(untrackedVideoPath);
+
+      const untrackedVideoRes = await fetch(`${baseUrl}/scans`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${activeTokenA}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          videoPath: untrackedVideoPath,
+          videoFilename: 'untracked.mp4'
+        })
+      });
+      assert(untrackedVideoRes.status === 403, 'WS3 Case 1: Untracked videoPath in uploads/ without upload record is rejected (403 Forbidden)');
+
+      // Create a real MP4 and JPEG thumbnail owned by User A via /uploads for subsequent tests
+      const realVideoTmp = path.resolve(uploadsDir, `ws3_gen_vid_${Date.now()}.mp4`);
+      const realThumbTmp = path.resolve(uploadsDir, `ws3_gen_thumb_${Date.now()}.jpg`);
+      ws3CleanupFiles.push(realVideoTmp, realThumbTmp);
+      execFileSync('ffmpeg', ['-y', '-f', 'lavfi', '-i', 'testsrc=duration=1:size=320x240:rate=5', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', realVideoTmp]);
+      execFileSync('ffmpeg', ['-y', '-f', 'lavfi', '-i', 'color=c=green:s=640x360:d=1', '-vframes', '1', realThumbTmp]);
+
+      const upVidFormA = new FormData();
+      upVidFormA.append('video', new Blob([fs.readFileSync(realVideoTmp)], { type: 'video/mp4' }), 'user_a_ws3.mp4');
+      const upVidResA = await fetch(`${baseUrl}/uploads`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${activeTokenA}` },
+        body: upVidFormA
+      });
+      assert(upVidResA.status === 200, 'WS3 setup: User A uploads valid MP4 (200 OK)');
+      const upVidDataA = await upVidResA.json();
+      ws3CleanupFiles.push(upVidDataA.filePath);
+      ws3CleanupUploadIds.push(upVidDataA.fileId);
+
+      const upThumbFormA = new FormData();
+      upThumbFormA.append('thumbnail', new Blob([fs.readFileSync(realThumbTmp)], { type: 'image/jpeg' }), 'user_a_ws3_thumb.jpg');
+      const upThumbResA = await fetch(`${baseUrl}/uploads/thumbnail`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${activeTokenA}` },
+        body: upThumbFormA
+      });
+      assert(upThumbResA.status === 200, 'WS3 setup: User A uploads valid JPG thumbnail (200 OK)');
+      const upThumbDataA = await upThumbResA.json();
+      ws3CleanupFiles.push(upThumbDataA.filePath);
+      ws3CleanupUploadIds.push(upThumbDataA.fileId);
+
+      // Give User B their own valid uploaded video for cross-resource conflict tests
+      const upVidFormB = new FormData();
+      upVidFormB.append('video', new Blob([fs.readFileSync(realVideoTmp)], { type: 'video/mp4' }), 'user_b_ws3.mp4');
+      const upVidResB = await fetch(`${baseUrl}/uploads`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${tokenB}` },
+        body: upVidFormB
+      });
+      assert(upVidResB.status === 200, 'WS3 setup: User B uploads valid MP4 (200 OK)');
+      const upVidDataB = await upVidResB.json();
+      ws3CleanupFiles.push(upVidDataB.filePath);
+      ws3CleanupUploadIds.push(upVidDataB.fileId);
+
+      // Test 3.4 (WS3 Case 2): User A uses own videoPath + untracked thumbnailPath -> 403
+      const untrackedThumbPath = path.resolve(uploadsDir, `untracked_thumb_ws3_${Date.now()}.jpg`);
+      fs.writeFileSync(untrackedThumbPath, fs.readFileSync(realThumbTmp));
+      ws3CleanupFiles.push(untrackedThumbPath);
+
+      const untrackedThumbRes = await fetch(`${baseUrl}/scans`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${activeTokenA}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          videoPath: upVidDataA.filePath,
+          videoFilename: 'user_a_ws3.mp4',
+          thumbnailPath: untrackedThumbPath,
+          thumbnailFilename: 'untracked_thumb.jpg'
+        })
+      });
+      assert(untrackedThumbRes.status === 403, 'WS3 Case 2: Valid videoPath + untracked thumbnailPath is rejected (403 Forbidden)');
+
+      // Test 3.5 (WS3 Case 3 & 4): User B uses own videoPath + User A thumbnailPath -> 403 (and no User A leak)
+      const crossThumbRes = await fetch(`${baseUrl}/scans`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${tokenB}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          videoPath: upVidDataB.filePath,
+          videoFilename: 'user_b_ws3.mp4',
+          thumbnailPath: upThumbDataA.filePath,
+          thumbnailFilename: 'stolen_thumb.jpg'
+        })
+      });
+      assert(crossThumbRes.status === 403, 'WS3 Case 4: User B using User A thumbnailPath with own video is rejected (403 Forbidden)');
+      const crossThumbBody = await crossThumbRes.text();
+      assert(!crossThumbBody.includes(userA.id) && !crossThumbBody.includes(userA.email), 'Cross-user thumbnail 403 does not leak User A identity');
+
+      // Test 3.6 (WS3 Case 5): User B supplies User A parentScanId even with User B's own videoPath -> 403
+      const crossParentRes = await fetch(`${baseUrl}/scans`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${tokenB}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          videoPath: upVidDataB.filePath,
+          videoFilename: 'user_b_ws3.mp4',
+          parentScanId: scanA.id,
+          isRescan: true
+        })
+      });
+      assert(crossParentRes.status === 403, 'WS3 Case 5: parentScanId owned by another user is rejected (403 Forbidden)');
+
+      // Test 3.7 (WS3 Case 6a): Symlink inside uploads/ pointing outside allowed root (/etc/passwd) -> 403
+      const externalSymlink = path.resolve(uploadsDir, `ext_symlink_ws3_${Date.now()}.mp4`);
+      if (fs.existsSync('/etc/hosts')) {
+        fs.symlinkSync('/etc/hosts', externalSymlink);
+        ws3CleanupFiles.push(externalSymlink);
+        const symlinkOutsideRes = await fetch(`${baseUrl}/scans`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${activeTokenA}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            videoPath: externalSymlink,
+            videoFilename: 'hosts.mp4'
+          })
+        });
+        assert(symlinkOutsideRes.status === 403, 'WS3 Case 6a: Symlink in uploads/ escaping outside allowed directory is rejected (403 Forbidden)');
+      }
+
+      // Test 3.8 (WS3 Case 6b): Symlink inside uploads/ pointing to User A's uploaded video accessed by User B -> 403
+      const aliasSymlink = path.resolve(uploadsDir, `alias_symlink_ws3_${Date.now()}.mp4`);
+      fs.symlinkSync(upVidDataA.filePath, aliasSymlink);
+      ws3CleanupFiles.push(aliasSymlink);
+      const symlinkCrossUserRes = await fetch(`${baseUrl}/scans`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${tokenB}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          videoPath: aliasSymlink,
+          videoFilename: 'alias.mp4'
+        })
+      });
+      assert(symlinkCrossUserRes.status === 403, 'WS3 Case 6b: Symlink resolving to User A upload is rejected for User B (403 Forbidden)');
+
+      // Test 3.9 (WS3 Case 8): Client-supplied forged userId rejected even if videoPath is owned by requester
+      const forgedUserIdRes = await fetch(`${baseUrl}/scans`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${tokenB}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          userId: userA.id,
+          videoPath: upVidDataB.filePath,
+          videoFilename: 'user_b_ws3.mp4'
+        })
+      });
+      assert(forgedUserIdRes.status === 403, 'WS3 Case 8: Forged client-supplied userId in /scans payload is rejected (403 Forbidden)');
+
+      // Also verify POST /scans/:id/rescan rejects untracked req.body.videoPath fail-closed
+      const rescanUntrackedRes = await fetch(`${baseUrl}/scans/${scanA.id}/rescan`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${activeTokenA}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          videoPath: untrackedVideoPath,
+          videoFilename: 'untracked.mp4'
+        })
+      });
+      assert(rescanUntrackedRes.status === 403, 'WS3 Rescan: Untracked req.body.videoPath in POST /scans/:id/rescan is rejected fail-closed (403 Forbidden)');
+
+      // Test 3.10 (WS3 Case 9): Verify rejected requests executed BEFORE mediaInspector, credit deduction, or job creation
+      // untrackedVideoPath contained non-video bytes; returning 403 (NOT 400/500) proves mediaInspector never ran.
+      const userBCreditsAfter = (await storage.users.getUser(userB.id))!.creditsRemaining;
+      const userBScansAfter = (await storage.scans.getAllScans(userB.id)).length;
+      const userACreditsAfter = (await storage.users.getUser(userA.id))!.creditsRemaining;
+      assert(userBCreditsAfter === userBCreditsBefore, 'WS3 Case 9a: User B credits untouched after rejected scan attempts');
+      assert(userBScansAfter === userBScansBefore, 'WS3 Case 9b: Zero scan jobs created for User B on rejected attempts');
+      assert(userACreditsAfter === userACreditsBefore, 'WS3 Case 9c: User A credits untouched after rejected untracked attempts');
+
+      // Test 3.11 (WS3 Case 10): Positive Control — User A creates scan with own legitimately uploaded video + thumbnail -> 201
+      const positiveScanRes = await fetch(`${baseUrl}/scans`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${activeTokenA}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          videoPath: upVidDataA.filePath,
+          videoFilename: 'user_a_ws3.mp4',
+          thumbnailPath: upThumbDataA.filePath,
+          thumbnailFilename: 'user_a_ws3_thumb.jpg',
+          videoTitle: 'WS3 Authorized Positive Control Scan',
+          scanMode: 'standard'
+        })
+      });
+      assert(positiveScanRes.status === 201, 'WS3 Case 10: User A creates scan with own uploaded video + thumbnail (201 Created)');
+      const positiveScanJob = await positiveScanRes.json();
+      assert(positiveScanJob.userId === userA.id, 'WS3 Case 10b: Created scan is attributed strictly to authenticated User A');
+      assert(positiveScanJob.id && positiveScanJob.status === 'QUEUED', 'WS3 Case 10c: Scan queued properly');
+
+      // Poll briefly for background job completion so temp artifacts can be cleaned up cleanly
+      for (let i = 0; i < 40; i++) {
+        const s = await storage.scans.getScan(positiveScanJob.id);
+        if (s && (s.status === 'COMPLETED' || s.status === 'FAILED')) {
+          if (s.proxyPath) ws3CleanupFiles.push(s.proxyPath);
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      const framesSubdir = path.resolve(uploadsDir, 'frames', positiveScanJob.id);
+      if (fs.existsSync(framesSubdir)) {
+        try { fs.rmSync(framesSubdir, { recursive: true, force: true }); } catch {}
+      }
+      await storage.scans.deleteScan?.(positiveScanJob.id);
+    } finally {
+      for (const uid of ws3CleanupUploadIds) {
+        try { await storage.uploads.deleteUpload(uid); } catch {}
+      }
+      for (const f of ws3CleanupFiles) {
+        try {
+          const st = fs.lstatSync(f, { throwIfNoEntry: false });
+          if (st) fs.unlinkSync(f);
+        } catch {}
+      }
+    }
 
     // ---------------------------------------------------------
     // 3b. SECURE UPLOAD MIDDLEWARE & PRE-UPLOAD AUTHORIZATION

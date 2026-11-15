@@ -31,18 +31,22 @@ jobs:
       - name: Run linter and typecheck
         run: npm run lint
 
-      - name: Install system dependencies (FFmpeg & Tesseract OCR + eng/tha)
+      - name: Install system dependencies (FFmpeg, Tesseract OCR + eng/tha, Fontconfig + DejaVu fonts)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg tesseract-ocr tesseract-ocr-eng tesseract-ocr-tha
+          sudo apt-get install -y --no-install-recommends ffmpeg tesseract-ocr tesseract-ocr-eng tesseract-ocr-tha fontconfig fonts-dejavu-core
+          sudo fc-cache -f
 
-      - name: Verify native media binaries and OCR languages
+      - name: Verify native media binaries, fonts, and OCR languages
         run: |
           ffmpeg -version
           ffprobe -version
           tesseract --version
           tesseract --list-langs | grep -qx 'eng'
           tesseract --list-langs | grep -qx 'tha'
+          fc-match Sans
+          ffmpeg -y -f lavfi -i "color=c=black:s=640x360:d=1,drawtext=text='CI FONT CHECK':fontsize=32:fontcolor=white" -vframes 1 /tmp/ci_drawtext_probe.png
+          rm -f /tmp/ci_drawtext_probe.png
 
       - name: Validate environment and plan configuration
         run: npx tsx scripts/validate-env.ts --mode=ci

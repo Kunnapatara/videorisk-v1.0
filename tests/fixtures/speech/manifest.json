@@ -1,0 +1,5 @@
+{
+  "manifestVersion": "1.0.0",
+  "description": "Trusted Human Speech Fixture Manifest for Whisper STT verification. Only verified non-synthetic human speech WAV files with SHA-256 checksums, source provenance metadata, and reviewed verbatim transcripts may be registered here.",
+  "fixtures": []
+}

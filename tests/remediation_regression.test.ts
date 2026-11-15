@@ -1,6 +1,7 @@
 import assert from 'assert';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { promisify } from 'util';
 import { execFile } from 'child_process';
 import {
@@ -12,7 +13,12 @@ import {
 import { thumbnailInspector } from '../src/server/pipeline/thumbnailInspector';
 import { mediaInspector, MediaInspectionError } from '../src/server/pipeline/mediaInspector';
 import os from 'os';
-import { SpeechTranscriptionAdapter, speechTranscriptionAdapter, audioProcessor } from '../src/server/pipeline/audioProcessor';
+import {
+  SpeechTranscriptionAdapter,
+  speechTranscriptionAdapter,
+  audioProcessor,
+  TrustedSpeechFixtureManifest
+} from '../src/server/pipeline/audioProcessor';
 import { policyIntelligenceEngine } from '../src/server/intelligence/policyIntelligence';
 import { billingService } from '../src/server/services/billingService';
 import { JobOrchestrator, mapVideoOcrDetectorReport } from '../src/server/pipeline/jobOrchestrator';
@@ -650,33 +656,199 @@ esac
     assert.strictEqual(compatNoisyWords.compatible, false, '3.26g Excessive unexpected words fail closed');
     assert.ok((compatNoisyWords.transcriptComparison?.precision ?? 1) < 0.8, '3.26g1 Records failing precision < 0.80');
 
+    const computeSha = (p: string) => crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+    const mockSpeechSha = computeSha(mockSpeechWav);
+    const buildTrustedManifest = (
+      wavPath: string,
+      overrides: Partial<TrustedSpeechFixtureManifest['fixtures'][0]> = {}
+    ): TrustedSpeechFixtureManifest => ({
+      manifestVersion: '1.0.0',
+      fixtures: [
+        {
+          fixtureId: 'contract_test_fixture_01',
+          filePath: wavPath,
+          sha256: computeSha(wavPath),
+          sourceDescription: 'Isolated contract test audio fixture (NOT a checked-in real human recording)',
+          recordingOrigin: 'HUMAN_SPEECH_RECORDING',
+          humanSpeechVerificationStatus: 'VERIFIED_HUMAN_SPEECH',
+          expectedTranscript: 'hello compat test',
+          transcriptLanguage: 'en',
+          transcriptReviewEvidence: 'Verified verbatim reference transcript in isolated test contract',
+          verificationMetadata: {
+            verifiedBy: 'qa-contract-test',
+            verifiedAt: '2026-11-14T00:00:00Z'
+          },
+          ...overrides
+        }
+      ]
+    });
+
     process.env.COMPAT_MODE = 'pass';
-    const compatPunctPass = await stt.verifyRuntimeCompatibility({
+
+    // WS2 Negative Test 5: Unmanifested WAV with matching expectedTranscript MUST NOT grant SPEECH_TRANSCRIPT_VERIFIED
+    const compatUnmanifested = await stt.verifyRuntimeCompatibility({
       audioFixturePath: mockSpeechWav,
       expectedTranscript: 'Hello,   COMPAT\n  test!'
     });
+    assert.strictEqual(compatUnmanifested.compatible, true, '3.26h0 Runtime execution still compatible for unmanifested valid WAV');
+    assert.strictEqual(compatUnmanifested.compatibilityVerified, true, '3.26h1 compatibilityVerified means runtime compatibility ONLY');
+    assert.strictEqual(compatUnmanifested.runtimeExecutionStatus, 'RUNTIME_EXECUTION_VERIFIED', '3.26h2 Sets RUNTIME_EXECUTION_VERIFIED');
+    assert.strictEqual(compatUnmanifested.humanSpeechProvenanceStatus, 'UNTRUSTED_NO_MANIFEST_ENTRY', '3.26h3 Unmanifested WAV yields UNTRUSTED_NO_MANIFEST_ENTRY');
+    assert.strictEqual(compatUnmanifested.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_UNVERIFIED', '3.26h4 Unmanifested WAV NEVER grants SPEECH_TRANSCRIPT_VERIFIED');
+    assert.strictEqual(compatUnmanifested.speechTranscriptVerified, false, '3.26h5 speechTranscriptVerified=false without trusted manifest entry');
+
+    // WS2 Negative Test 3: Synthetic WAV WITHOUT isSyntheticFixture flag MUST remain SPEECH_TRANSCRIPT_UNVERIFIED
+    const synthNoFlagWav = path.resolve(testDir, 'synth_without_flag_16k.wav');
+    writeTestPcmWav(synthNoFlagWav, 16000, 0.25);
+    const synthWithoutFlagRes = await stt.verifyRuntimeCompatibility({
+      audioFixturePath: synthNoFlagWav,
+      expectedTranscript: 'hello compat test'
+    });
+    assert.strictEqual(synthWithoutFlagRes.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_UNVERIFIED', '3.26h6 Synthetic WAV without synthetic flag MUST remain SPEECH_TRANSCRIPT_UNVERIFIED');
+    assert.strictEqual(synthWithoutFlagRes.humanSpeechProvenanceStatus, 'UNTRUSTED_NO_MANIFEST_ENTRY', '3.26h7 Defaults to UNTRUSTED_NO_MANIFEST_ENTRY');
+
+    // WS2 Negative Test 7: WAV with manifest entry marked UNVERIFIED / incomplete provenance -> UNTRUSTED_PROVENANCE_UNVERIFIED
+    const unverifiedProvManifest = buildTrustedManifest(mockSpeechWav, {
+      humanSpeechVerificationStatus: 'UNVERIFIED',
+      transcriptReviewEvidence: ''
+    });
+    const compatUnverifiedProv = await stt.verifyRuntimeCompatibility({
+      audioFixturePath: mockSpeechWav,
+      expectedTranscript: 'hello compat test',
+      trustedManifest: unverifiedProvManifest
+    });
+    assert.strictEqual(compatUnverifiedProv.compatible, true, '3.26h8 Runtime compatibility passes even when provenance is unverified');
+    assert.strictEqual(compatUnverifiedProv.compatibilityVerified, true, '3.26h9 compatibilityVerified stays scoped to runtime compatibility');
+    assert.strictEqual(compatUnverifiedProv.humanSpeechProvenanceStatus, 'UNTRUSTED_PROVENANCE_UNVERIFIED', '3.26h10 Reports UNTRUSTED_PROVENANCE_UNVERIFIED');
+    assert.strictEqual(compatUnverifiedProv.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_UNVERIFIED', '3.26h11 Unverified provenance NEVER grants SPEECH_TRANSCRIPT_VERIFIED');
+    assert.strictEqual(compatUnverifiedProv.speechTranscriptVerified, false, '3.26h12 speechTranscriptVerified=false');
+
+    // WS2 Test 1: Valid trusted manifest entry + matching SHA-256 + matching LCS -> SPEECH_TRANSCRIPT_VERIFIED
+    const validContractManifest = buildTrustedManifest(mockSpeechWav, { sha256: mockSpeechSha });
+    const compatPunctPass = await stt.verifyRuntimeCompatibility({
+      audioFixturePath: mockSpeechWav,
+      expectedTranscript: 'Hello,   COMPAT\n  test!',
+      trustedManifest: validContractManifest
+    });
     assert.strictEqual(compatPunctPass.compatible, true, '3.26h Punctuation/casing/whitespace differences tolerated');
+    assert.strictEqual(compatPunctPass.compatibilityVerified, true, '3.26h_cv compatibilityVerified=true');
     assert.strictEqual(compatPunctPass.referenceMatched, true, '3.26i Records referenceMatched=true on normalized match');
     assert.strictEqual(compatPunctPass.runtimeExecutionStatus, 'RUNTIME_EXECUTION_VERIFIED', '3.26i1 Sets RUNTIME_EXECUTION_VERIFIED');
+    assert.strictEqual(compatPunctPass.humanSpeechProvenanceStatus, 'VERIFIED_HUMAN_SPEECH', '3.26i1b Sets VERIFIED_HUMAN_SPEECH from manifest');
+    assert.strictEqual(compatPunctPass.transcriptComparisonStatus, 'PASSED', '3.26i1c Sets transcriptComparisonStatus PASSED');
     assert.strictEqual(compatPunctPass.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_VERIFIED', '3.26i2 Sets SPEECH_TRANSCRIPT_VERIFIED');
+    assert.strictEqual(compatPunctPass.speechTranscriptVerified, true, '3.26i2b Sets speechTranscriptVerified=true');
     assert.strictEqual(compatPunctPass.transcriptComparison?.recall, 1, '3.26i3 Records recall=1');
     assert.strictEqual(compatPunctPass.transcriptComparison?.precision, 1, '3.26i4 Records precision=1');
     assert.strictEqual(compatPunctPass.transcriptComparison?.score, 1, '3.26i5 Records score=1');
 
-    // Synthetic/mock fixture guard: CANNOT grant SPEECH_TRANSCRIPT_VERIFIED
+    // WS2 Test 2 & Test 6: Hash mismatch in manifest AND transcript modification after manifest -> fail closed
+    const badHashManifest = buildTrustedManifest(mockSpeechWav, {
+      sha256: '0'.repeat(64)
+    });
+    const hashMismatchRes = await stt.verifyRuntimeCompatibility({
+      audioFixturePath: mockSpeechWav,
+      expectedTranscript: 'hello compat test',
+      trustedManifest: badHashManifest
+    });
+    assert.strictEqual(hashMismatchRes.compatible, false, '3.26i6 SHA-256 mismatch in manifest fails closed');
+    assert.strictEqual(hashMismatchRes.compatibilityVerified, false, '3.26i7 compatibilityVerified=false on manifest integrity mismatch');
+    assert.strictEqual(hashMismatchRes.humanSpeechProvenanceStatus, 'UNTRUSTED_HASH_MISMATCH', '3.26i8 Reports UNTRUSTED_HASH_MISMATCH');
+    assert.strictEqual(hashMismatchRes.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_FAILED', '3.26i9 Reports SPEECH_TRANSCRIPT_FAILED');
+    assert.strictEqual(hashMismatchRes.speechTranscriptVerified, false, '3.26i10 speechTranscriptVerified=false');
+
+    // Modified expected transcript against valid manifest entry -> fail closed
+    const modifiedTranscriptRes = await stt.verifyRuntimeCompatibility({
+      audioFixturePath: mockSpeechWav,
+      expectedTranscript: 'different expected transcript override',
+      trustedManifest: validContractManifest
+    });
+    assert.strictEqual(modifiedTranscriptRes.compatible, false, '3.26i11 Modified expected transcript conflicting with manifest fails closed');
+    assert.strictEqual(modifiedTranscriptRes.humanSpeechProvenanceStatus, 'UNTRUSTED_HASH_MISMATCH', '3.26i12 Conflicting transcript flagged UNTRUSTED_HASH_MISMATCH');
+    assert.strictEqual(modifiedTranscriptRes.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_FAILED', '3.26i13 speechTranscriptStatus is SPEECH_TRANSCRIPT_FAILED');
+
+    // Modified fixture file after manifest creation -> fail closed
+    const mutableWav = path.resolve(testDir, 'mutable_fixture_16k.wav');
+    writeTestPcmWav(mutableWav, 16000, 0.25);
+    const mutableManifest = buildTrustedManifest(mutableWav);
+    const passBeforeModify = await stt.verifyRuntimeCompatibility({
+      audioFixturePath: mutableWav,
+      trustedManifest: mutableManifest,
+      useCache: true
+    });
+    assert.strictEqual(passBeforeModify.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_VERIFIED', '3.26i14 Initial unmodified manifest fixture verified');
+    // Modify audio bytes on disk -> must bypass cache (sha changes) AND fail closed with UNTRUSTED_HASH_MISMATCH
+    writeTestPcmWav(mutableWav, 16000, 0.5);
+    const failAfterModify = await stt.verifyRuntimeCompatibility({
+      audioFixturePath: mutableWav,
+      trustedManifest: mutableManifest,
+      useCache: true
+    });
+    assert.strictEqual(failAfterModify.compatible, false, '3.26i15 Modified fixture after manifest fails closed immediately');
+    assert.strictEqual(failAfterModify.humanSpeechProvenanceStatus, 'UNTRUSTED_HASH_MISMATCH', '3.26i16 Modified fixture reports UNTRUSTED_HASH_MISMATCH');
+
+    // WS2 Test 4: Synthetic/mock fixture guard: CANNOT grant SPEECH_TRANSCRIPT_VERIFIED even with manifest
     const compatSyntheticGuard = await stt.verifyRuntimeCompatibility({
       audioFixturePath: mockSpeechWav,
       expectedTranscript: 'hello compat test',
-      isSyntheticFixture: true
+      isSyntheticFixture: true,
+      trustedManifest: validContractManifest
     });
     assert.strictEqual(compatSyntheticGuard.compatible, true, '3.26j1 Synthetic fixture still passes runtime execution check');
+    assert.strictEqual(compatSyntheticGuard.compatibilityVerified, true, '3.26j1b compatibilityVerified reflects runtime compatibility ONLY');
     assert.strictEqual(compatSyntheticGuard.runtimeExecutionStatus, 'RUNTIME_EXECUTION_VERIFIED', '3.26j2 Sets RUNTIME_EXECUTION_VERIFIED');
+    assert.strictEqual(compatSyntheticGuard.humanSpeechProvenanceStatus, 'SYNTHETIC_FIXTURE', '3.26j2b Reports SYNTHETIC_FIXTURE provenance');
     assert.strictEqual(compatSyntheticGuard.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_UNVERIFIED', '3.26j3 Synthetic fixture NEVER receives SPEECH_TRANSCRIPT_VERIFIED');
+    assert.strictEqual(compatSyntheticGuard.speechTranscriptVerified, false, '3.26j3b speechTranscriptVerified=false');
     assert.strictEqual(compatSyntheticGuard.transcriptComparison?.passed, false, '3.26j4 transcriptComparison.passed=false for synthetic fixture');
+
+    // WS2 Test 12: TOCTOU mid-execution tampering detection -> fail closed immediately
+    const toctouWav = path.resolve(testDir, 'toctou_fixture_16k.wav');
+    writeTestPcmWav(toctouWav, 16000, 0.25);
+    const toctouManifest = buildTrustedManifest(toctouWav);
+    const toctouBin = path.resolve(testDir, 'toctou_whisper_cpp.sh');
+    fs.writeFileSync(
+      toctouBin,
+      `#!/bin/sh
+if [ "$1" = "--help" ] || [ "$1" = "--version" ]; then
+  echo "whisper.cpp -m <model> -f <file> --output-json"
+  exit 0
+fi
+OUT_PREFIX=""
+PREV=""
+for arg in "$@"; do
+  if [ "$PREV" = "-of" ]; then OUT_PREFIX="$arg"; fi
+  PREV="$arg"
+done
+# Tamper with the fixture mid-execution (TOCTOU attack)
+printf '\\x01\\x02\\x03\\x04' >> "${toctouWav}"
+echo '{"transcription":[{"timestamps":{"from":"00:00:00,000","to":"00:00:01,000"},"text":" hello compat test"}]}' > "\${OUT_PREFIX}.json"
+exit 0
+`,
+      { mode: 0o755 }
+    );
+    generatedFiles.push(toctouBin);
+    process.env.WHISPER_PATH = toctouBin;
+    stt.clearCompatibilityCache();
+    const toctouRes = await stt.verifyRuntimeCompatibility({
+      audioFixturePath: toctouWav,
+      trustedManifest: toctouManifest
+    });
+    assert.strictEqual(toctouRes.compatible, false, '3.26k1 TOCTOU fixture tampering mid-execution fails closed');
+    assert.strictEqual(toctouRes.compatibilityVerified, false, '3.26k2 compatibilityVerified=false on TOCTOU tampering');
+    assert.strictEqual(toctouRes.diagnosticCode, 'SPEECH_FIXTURE_INVALID', '3.26k3 Reports SPEECH_FIXTURE_INVALID');
+    assert.strictEqual(toctouRes.humanSpeechProvenanceStatus, 'UNTRUSTED_HASH_MISMATCH', '3.26k4 Reports UNTRUSTED_HASH_MISMATCH');
+    assert.strictEqual(toctouRes.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_FAILED', '3.26k5 Sets SPEECH_TRANSCRIPT_FAILED');
+    assert.strictEqual(toctouRes.speechTranscriptVerified, false, '3.26k6 speechTranscriptVerified=false');
+
+    // Restore mock whisper.cpp binary
+    process.env.WHISPER_PATH = compatWhisperCppBin;
+    stt.clearCompatibilityCache();
 
     const compatPassCpp = await stt.verifyRuntimeCompatibility({
       audioFixturePath: mockSpeechWav,
-      expectedTranscript: 'hello compat test'
+      expectedTranscript: 'hello compat test',
+      trustedManifest: validContractManifest
     });
     assert.strictEqual(compatPassCpp.compatible, true, '3.27 whisper_cpp compatibility passes with JSON transcript');
     assert.strictEqual(compatPassCpp.diagnosticCode, 'VERIFICATION_PASSED', '3.28 whisper_cpp reports VERIFICATION_PASSED');
@@ -685,12 +857,20 @@ esac
     assert.strictEqual(compatPassCpp.referenceMatched, true, '3.30a Reference transcript match verified');
     assert.strictEqual(compatPassCpp.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_VERIFIED', '3.30a1 SPEECH_TRANSCRIPT_VERIFIED set');
 
-    // Cached initializeRuntime() hit & fingerprint invalidation when model changes
+    // Cached initializeRuntime() hit & fingerprint invalidation
     stt.clearCompatibilityCache();
-    const initCold = await stt.initializeRuntime({ audioFixturePath: mockSpeechWav, expectedTranscript: 'hello compat test' });
+    const initCold = await stt.initializeRuntime({
+      audioFixturePath: mockSpeechWav,
+      expectedTranscript: 'hello compat test',
+      trustedManifest: validContractManifest
+    });
     assert.strictEqual(initCold.compatible, true, '3.30b Cold initializeRuntime succeeds');
     assert.strictEqual(initCold.fromCache, false, '3.30c Cold run has fromCache=false');
-    const initWarm = await stt.initializeRuntime({ audioFixturePath: mockSpeechWav, expectedTranscript: 'hello compat test' });
+    const initWarm = await stt.initializeRuntime({
+      audioFixturePath: mockSpeechWav,
+      expectedTranscript: 'hello compat test',
+      trustedManifest: validContractManifest
+    });
     assert.strictEqual(initWarm.compatible, true, '3.30d Warm initializeRuntime succeeds');
     assert.strictEqual(initWarm.fromCache, true, '3.30e Warm run served from cache (fromCache=true)');
 
@@ -726,9 +906,10 @@ esac
       audioFixturePath: mockSpeechWav,
       forceRefreshCompatibility: true
     });
-    assert.strictEqual(recoveredTranscribe.compatibilityVerified, true, '3.30i transcribe succeeds and records compatibilityVerified=true once runtime issue is fixed');
+    assert.strictEqual(recoveredTranscribe.compatibilityVerified, true, '3.30i transcribe succeeds and records compatibilityVerified=true once runtime compatibility passes');
     assert.strictEqual(recoveredTranscribe.runtimeExecutionStatus, 'RUNTIME_EXECUTION_VERIFIED', '3.30i1 Records runtimeExecutionStatus=RUNTIME_EXECUTION_VERIFIED');
-    assert.strictEqual(recoveredTranscribe.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_UNVERIFIED', '3.30i2 Records speechTranscriptStatus=SPEECH_TRANSCRIPT_UNVERIFIED without expectedTranscript');
+    assert.strictEqual(recoveredTranscribe.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_UNVERIFIED', '3.30i2 Records speechTranscriptStatus=SPEECH_TRANSCRIPT_UNVERIFIED without verified speech manifest');
+    assert.strictEqual(recoveredTranscribe.speechTranscriptVerified, false, '3.30i3 Records speechTranscriptVerified=false');
 
     delete process.env.COMPAT_MODE;
 
@@ -772,7 +953,7 @@ exit 0
     assert.strictEqual(compatPassOpenAi.compatible, true, '3.31 openai_whisper compatibility passes with JSON output_dir artifact');
     assert.strictEqual(compatPassOpenAi.diagnosticCode, 'VERIFICATION_PASSED', '3.32 openai_whisper reports VERIFICATION_PASSED');
     assert.strictEqual(compatPassOpenAi.runtimeExecutionStatus, 'RUNTIME_EXECUTION_VERIFIED', '3.32a openai_whisper sets RUNTIME_EXECUTION_VERIFIED');
-    assert.strictEqual(compatPassOpenAi.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_UNVERIFIED', '3.32b openai_whisper without expectedTranscript stays SPEECH_TRANSCRIPT_UNVERIFIED');
+    assert.strictEqual(compatPassOpenAi.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_UNVERIFIED', '3.32b openai_whisper without verified manifest stays SPEECH_TRANSCRIPT_UNVERIFIED');
     assert.strictEqual(compatPassOpenAi.transcriptText, 'openai whisper test', '3.33 openai_whisper parses direct text output');
 
     delete process.env.WHISPER_PATH;
@@ -780,9 +961,10 @@ exit 0
     delete process.env.WHISPER_COMPAT_AUDIO_PATH;
     delete process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT;
     delete process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE;
+    delete process.env.WHISPER_SPEECH_MANIFEST_PATH;
     stt.clearCompatibilityCache();
-    console.log('  [Boundary Notice] Real Whisper binary+model human speech transcription: NOT VERIFIED in container (no Whisper binary/model or TTS/speech WAV installed; verified via mocked whisper_cpp/openai_whisper CLI contracts).');
-    console.log('  ✅ PASS: Whisper STT strict runtime identity, model header & two-tier compatibility verification complete');
+    console.log('  [Boundary Notice] Real Whisper binary+model human speech transcription: NOT VERIFIED in container (no Whisper binary/model or real human speech WAV installed; checked-in manifest tests/fixtures/speech/manifest.json has 0 registered fixtures).');
+    console.log('  ✅ PASS: Whisper STT strict runtime identity, trusted SHA-256 manifest provenance, TOCTOU check & separated verification states complete');
 
     // -------------------------------------------------------------------------
     // 4. THUMBNAIL CONTRAST EVALUATION CONTRACT
@@ -1041,6 +1223,7 @@ exit 0
     const prevWhisperExpectedReadiness = process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT;
     const prevWhisperVerifyReadiness = process.env.WHISPER_VERIFY_COMPATIBILITY;
     const prevWhisperSyntheticReadiness = process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE;
+    const prevWhisperManifestReadiness = process.env.WHISPER_SPEECH_MANIFEST_PATH;
     try {
       process.env.WHISPER_PATH = '/secret/host/dir/nonexistent_whisper_readiness';
       const degradedWhisperReadiness = await invokeReadiness();
@@ -1058,9 +1241,11 @@ exit 0
       delete process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT;
       delete process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE;
       delete process.env.WHISPER_VERIFY_COMPATIBILITY;
+      delete process.env.WHISPER_SPEECH_MANIFEST_PATH;
       speechTranscriptionAdapter.clearCompatibilityCache();
       const unverifiedReadiness = await invokeReadiness();
       assert.strictEqual(unverifiedReadiness.body.checks?.whisperStt?.details?.compatibilityStatus, 'UNVERIFIED', '7.6f Missing fixture marks compatibilityStatus UNVERIFIED');
+      assert.strictEqual(unverifiedReadiness.body.checks?.whisperStt?.details?.runtimeCompatibilityStatus, 'UNVERIFIED', '7.6f0 runtimeCompatibilityStatus is UNVERIFIED');
       assert.strictEqual(unverifiedReadiness.body.checks?.whisperStt?.details?.runtimeExecutionStatus, 'UNVERIFIED', '7.6f1 runtimeExecutionStatus is UNVERIFIED');
       assert.strictEqual(unverifiedReadiness.body.checks?.whisperStt?.details?.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_UNVERIFIED', '7.6f2 speechTranscriptStatus is SPEECH_TRANSCRIPT_UNVERIFIED');
       assert.strictEqual(unverifiedReadiness.body.checks?.whisperStt?.details?.compatibilityVerified, false, '7.6g Missing fixture marks compatibilityVerified false');
@@ -1070,38 +1255,56 @@ exit 0
       assert.strictEqual(requiredMissingFixtureReadiness.body.checks?.whisperStt?.status, 'degraded', '7.6h WHISPER_VERIFY_COMPATIBILITY=true with missing fixture marks whisperStt degraded');
       assert.strictEqual(requiredMissingFixtureReadiness.body.checks?.whisperStt?.details?.compatibilityRequired, true, '7.6i Marks compatibilityRequired=true');
 
-      // Configured + WAV fixture WITHOUT expected transcript -> RUNTIME_EXECUTION_VERIFIED (NOT 'VERIFIED') + SPEECH_TRANSCRIPT_UNVERIFIED
+      // Configured + WAV fixture WITHOUT expected transcript -> RUNTIME_COMPATIBLE / RUNTIME_EXECUTION_VERIFIED + SPEECH_TRANSCRIPT_UNVERIFIED
       process.env.WHISPER_COMPAT_AUDIO_PATH = mockSpeechWav;
       process.env.COMPAT_MODE = 'pass';
       speechTranscriptionAdapter.clearCompatibilityCache();
       const runtimeOnlyReadiness = await invokeReadiness();
       assert.strictEqual(runtimeOnlyReadiness.body.checks?.whisperStt?.status, 'healthy', '7.6j Runtime-only verified Whisper runtime is healthy');
+      assert.strictEqual(runtimeOnlyReadiness.body.checks?.whisperStt?.details?.runtimeCompatibilityStatus, 'RUNTIME_COMPATIBLE', '7.6k0 Marks runtimeCompatibilityStatus RUNTIME_COMPATIBLE');
       assert.strictEqual(runtimeOnlyReadiness.body.checks?.whisperStt?.details?.runtimeExecutionStatus, 'RUNTIME_EXECUTION_VERIFIED', '7.6k1 Marks runtimeExecutionStatus RUNTIME_EXECUTION_VERIFIED');
       assert.strictEqual(runtimeOnlyReadiness.body.checks?.whisperStt?.details?.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_UNVERIFIED', '7.6k2 Keeps speechTranscriptStatus SPEECH_TRANSCRIPT_UNVERIFIED');
-      assert.strictEqual(runtimeOnlyReadiness.body.checks?.whisperStt?.details?.compatibilityStatus, 'RUNTIME_EXECUTION_VERIFIED', '7.6k3 Never emits ambiguous VERIFIED without transcript match');
+      assert.strictEqual(runtimeOnlyReadiness.body.checks?.whisperStt?.details?.compatibilityStatus, 'RUNTIME_EXECUTION_VERIFIED', '7.6k3 Never emits SPEECH_TRANSCRIPT_VERIFIED without transcript & provenance match');
       assert.strictEqual(runtimeOnlyReadiness.body.checks?.whisperStt?.details?.runtimeExecutionVerified, true, '7.6k4 runtimeExecutionVerified=true');
       assert.strictEqual(runtimeOnlyReadiness.body.checks?.whisperStt?.details?.speechTranscriptVerified, false, '7.6k5 speechTranscriptVerified=false');
-      assert.strictEqual(runtimeOnlyReadiness.body.checks?.whisperStt?.details?.compatibilityVerified, false, '7.6l compatibilityVerified remains false without speech transcript verification');
+      assert.strictEqual(runtimeOnlyReadiness.body.checks?.whisperStt?.details?.compatibilityVerified, true, '7.6l compatibilityVerified reflects runtime compatibility ONLY (never speech verification)');
       assert.ok(runtimeOnlyReadiness.body.checks?.whisperStt?.details?.lastVerification?.timestamp, '7.6l1 lastVerification timestamp exposed');
 
-      // Configured + WAV fixture WITH matching expected transcript -> SPEECH_TRANSCRIPT_VERIFIED
+      // Configured + unmanifested WAV fixture EVEN WITH matching expected transcript -> still SPEECH_TRANSCRIPT_UNVERIFIED
       process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT = 'hello compat test';
+      speechTranscriptionAdapter.clearCompatibilityCache();
+      const unmanifestedReadiness = await invokeReadiness();
+      assert.strictEqual(unmanifestedReadiness.body.checks?.whisperStt?.details?.compatibilityVerified, true, '7.6l1b Runtime compatibility passes');
+      assert.strictEqual(unmanifestedReadiness.body.checks?.whisperStt?.details?.humanSpeechProvenanceStatus, 'UNTRUSTED_NO_MANIFEST_ENTRY', '7.6l1c Exposes UNTRUSTED_NO_MANIFEST_ENTRY');
+      assert.strictEqual(unmanifestedReadiness.body.checks?.whisperStt?.details?.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_UNVERIFIED', '7.6l1d Unmanifested WAV stays SPEECH_TRANSCRIPT_UNVERIFIED');
+      assert.strictEqual(unmanifestedReadiness.body.checks?.whisperStt?.details?.speechTranscriptVerified, false, '7.6l1e speechTranscriptVerified remains false');
+
+      // Configured + trusted manifest-verified WAV fixture WITH matching expected transcript -> SPEECH_TRANSCRIPT_VERIFIED
+      const readinessManifestPath = path.resolve(testDir, 'readiness_speech_manifest.json');
+      fs.writeFileSync(readinessManifestPath, JSON.stringify(buildTrustedManifest(mockSpeechWav), null, 2));
+      generatedFiles.push(readinessManifestPath);
+      process.env.WHISPER_SPEECH_MANIFEST_PATH = readinessManifestPath;
       speechTranscriptionAdapter.clearCompatibilityCache();
       const speechVerifiedReadiness = await invokeReadiness();
       assert.strictEqual(speechVerifiedReadiness.body.checks?.whisperStt?.status, 'healthy', '7.6l2 Speech-verified Whisper runtime is healthy');
       assert.strictEqual(speechVerifiedReadiness.body.checks?.whisperStt?.details?.compatibilityStatus, 'SPEECH_TRANSCRIPT_VERIFIED', '7.6l3 compatibilityStatus is SPEECH_TRANSCRIPT_VERIFIED');
+      assert.strictEqual(speechVerifiedReadiness.body.checks?.whisperStt?.details?.humanSpeechProvenanceStatus, 'VERIFIED_HUMAN_SPEECH', '7.6l3b humanSpeechProvenanceStatus is VERIFIED_HUMAN_SPEECH');
       assert.strictEqual(speechVerifiedReadiness.body.checks?.whisperStt?.details?.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_VERIFIED', '7.6l4 speechTranscriptStatus is SPEECH_TRANSCRIPT_VERIFIED');
-      assert.strictEqual(speechVerifiedReadiness.body.checks?.whisperStt?.details?.compatibilityVerified, true, '7.6l5 compatibilityVerified=true when both runtime and transcript verified');
+      assert.strictEqual(speechVerifiedReadiness.body.checks?.whisperStt?.details?.speechTranscriptVerified, true, '7.6l4b speechTranscriptVerified=true when provenance + transcript pass');
+      assert.strictEqual(speechVerifiedReadiness.body.checks?.whisperStt?.details?.compatibilityVerified, true, '7.6l5 compatibilityVerified=true');
       assert.strictEqual(speechVerifiedReadiness.body.checks?.whisperStt?.details?.transcriptComparison?.passed, true, '7.6l6 Exposes transcriptComparison metrics');
 
-      // Synthetic fixture flag blocks SPEECH_TRANSCRIPT_VERIFIED on readiness even with matching expected transcript
+      // Synthetic fixture flag blocks SPEECH_TRANSCRIPT_VERIFIED on readiness even with matching expected transcript and manifest
       process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE = 'true';
       speechTranscriptionAdapter.clearCompatibilityCache();
       const syntheticReadiness = await invokeReadiness();
+      assert.strictEqual(syntheticReadiness.body.checks?.whisperStt?.details?.humanSpeechProvenanceStatus, 'SYNTHETIC_FIXTURE', '7.6l6b Synthetic fixture provenance reported');
       assert.strictEqual(syntheticReadiness.body.checks?.whisperStt?.details?.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_UNVERIFIED', '7.6l7 Synthetic fixture cannot emit SPEECH_TRANSCRIPT_VERIFIED');
       assert.strictEqual(syntheticReadiness.body.checks?.whisperStt?.details?.compatibilityStatus, 'RUNTIME_EXECUTION_VERIFIED', '7.6l8 compatibilityStatus capped at RUNTIME_EXECUTION_VERIFIED');
-      assert.strictEqual(syntheticReadiness.body.checks?.whisperStt?.details?.compatibilityVerified, false, '7.6l9 compatibilityVerified=false for synthetic fixture');
+      assert.strictEqual(syntheticReadiness.body.checks?.whisperStt?.details?.speechTranscriptVerified, false, '7.6l8b speechTranscriptVerified=false for synthetic fixture');
+      assert.strictEqual(syntheticReadiness.body.checks?.whisperStt?.details?.compatibilityVerified, true, '7.6l9 compatibilityVerified stays scoped to runtime compatibility ONLY');
       delete process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE;
+      delete process.env.WHISPER_SPEECH_MANIFEST_PATH;
 
       // Transcript mismatch -> runtimeExecutionStatus=RUNTIME_EXECUTION_VERIFIED, speechTranscriptStatus=SPEECH_TRANSCRIPT_FAILED, degraded
       process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT = 'completely different words';
@@ -1133,6 +1336,8 @@ exit 0
       else process.env.WHISPER_VERIFY_COMPATIBILITY = prevWhisperVerifyReadiness;
       if (prevWhisperSyntheticReadiness === undefined) delete process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE;
       else process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE = prevWhisperSyntheticReadiness;
+      if (prevWhisperManifestReadiness === undefined) delete process.env.WHISPER_SPEECH_MANIFEST_PATH;
+      else process.env.WHISPER_SPEECH_MANIFEST_PATH = prevWhisperManifestReadiness;
     }
 
     const prevNodeEnv = process.env.NODE_ENV;

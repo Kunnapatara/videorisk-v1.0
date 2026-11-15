@@ -1358,8 +1358,13 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
           runtimeType: sttValidation.runtimeType,
           binaryStatus,
           modelStatus,
+          runtimeCompatibilityStatus: 'UNCONFIGURED',
+          runtimeCompatible: false,
           runtimeExecutionStatus: 'UNCONFIGURED',
+          transcriptComparisonStatus: 'NOT_COMPARED',
+          humanSpeechProvenanceStatus: 'UNTRUSTED_NO_MANIFEST_ENTRY',
           speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
+          fixtureProvenance: null,
           fixtureAvailable,
           expectedTranscriptConfigured,
           transcriptComparison: null,
@@ -1383,8 +1388,13 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
           validationStatus: sttValidation.status,
           binaryStatus,
           modelStatus,
+          runtimeCompatibilityStatus: 'FAILED',
+          runtimeCompatible: false,
           runtimeExecutionStatus: 'FAILED',
+          transcriptComparisonStatus: 'NOT_COMPARED',
+          humanSpeechProvenanceStatus: isSyntheticFixtureEnv ? 'SYNTHETIC_FIXTURE' : 'UNTRUSTED_NO_MANIFEST_ENTRY',
           speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
+          fixtureProvenance: null,
           fixtureAvailable,
           expectedTranscriptConfigured,
           transcriptComparison: null,
@@ -1405,15 +1415,20 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
     } else if (compatExplicitlyDisabled) {
       checks.whisperStt = {
         status: 'healthy',
-        message: `Whisper STT runtime (${sttValidation.runtimeType}) binary/model preflight ready; compatibility verification disabled via WHISPER_VERIFY_COMPATIBILITY=false (runtime execution and speech transcript UNVERIFIED).`,
+        message: `Whisper STT runtime (${sttValidation.runtimeType}) binary/model preflight ready; runtime compatibility verification disabled via WHISPER_VERIFY_COMPATIBILITY=false (runtime execution and speech transcript remain UNVERIFIED).`,
         details: {
           configured: true,
           runtimeType: sttValidation.runtimeType,
           validationStatus: sttValidation.status,
           binaryStatus,
           modelStatus,
+          runtimeCompatibilityStatus: 'UNVERIFIED',
+          runtimeCompatible: false,
           runtimeExecutionStatus: 'UNVERIFIED',
+          transcriptComparisonStatus: 'NOT_COMPARED',
+          humanSpeechProvenanceStatus: isSyntheticFixtureEnv ? 'SYNTHETIC_FIXTURE' : 'UNTRUSTED_NO_MANIFEST_ENTRY',
           speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
+          fixtureProvenance: null,
           fixtureAvailable,
           expectedTranscriptConfigured,
           transcriptComparison: null,
@@ -1439,21 +1454,26 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
       };
 
       if (compat.compatible) {
-        const speechVerified = compat.speechTranscriptStatus === 'SPEECH_TRANSCRIPT_VERIFIED';
+        const speechVerified = compat.speechTranscriptVerified === true && compat.speechTranscriptStatus === 'SPEECH_TRANSCRIPT_VERIFIED';
         const compatStatus = speechVerified ? 'SPEECH_TRANSCRIPT_VERIFIED' : 'RUNTIME_EXECUTION_VERIFIED';
         checks.whisperStt = {
           status: 'healthy',
           message: speechVerified
-            ? `Whisper STT runtime (${compat.runtimeType}) verified for both runtime execution and expected speech transcript matching.`
-            : `Whisper STT runtime (${compat.runtimeType}) binary/model execution verified; speech transcript accuracy remains SPEECH_TRANSCRIPT_UNVERIFIED.`,
+            ? `Whisper STT runtime (${compat.runtimeType}) verified for both runtime execution and human speech transcript matching.`
+            : `Whisper STT runtime (${compat.runtimeType}) compatibility/execution verified ONLY; speech transcript verification remains SPEECH_TRANSCRIPT_UNVERIFIED (${compat.humanSpeechProvenanceStatus}).`,
           details: {
             configured: true,
             runtimeType: compat.runtimeType,
             validationStatus: sttValidation.status,
             binaryStatus,
             modelStatus,
+            runtimeCompatibilityStatus: compat.runtimeCompatibilityStatus,
+            runtimeCompatible: compat.runtimeCompatible,
             runtimeExecutionStatus: compat.runtimeExecutionStatus,
+            transcriptComparisonStatus: compat.transcriptComparisonStatus,
+            humanSpeechProvenanceStatus: compat.humanSpeechProvenanceStatus,
             speechTranscriptStatus: compat.speechTranscriptStatus,
+            fixtureProvenance: compat.fixtureProvenance || null,
             fixtureAvailable: true,
             expectedTranscriptConfigured,
             transcriptComparison: compat.transcriptComparison || null,
@@ -1463,7 +1483,7 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
             compatibilityStatus: compatStatus,
             runtimeExecutionVerified: compat.runtimeExecutionStatus === 'RUNTIME_EXECUTION_VERIFIED',
             speechTranscriptVerified: speechVerified,
-            compatibilityVerified: speechVerified,
+            compatibilityVerified: compat.compatibilityVerified, // Runtime compatibility ONLY
             fromCache: Boolean(compat.fromCache)
           }
         };
@@ -1480,8 +1500,13 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
             validationStatus: sttValidation.status,
             binaryStatus,
             modelStatus,
+            runtimeCompatibilityStatus: compat.runtimeCompatibilityStatus,
+            runtimeCompatible: false,
             runtimeExecutionStatus: 'UNVERIFIED',
+            transcriptComparisonStatus: 'NOT_COMPARED',
+            humanSpeechProvenanceStatus: compat.humanSpeechProvenanceStatus,
             speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
+            fixtureProvenance: compat.fixtureProvenance || null,
             fixtureAvailable: false,
             expectedTranscriptConfigured,
             transcriptComparison: null,
@@ -1506,8 +1531,13 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
             validationStatus: sttValidation.status,
             binaryStatus,
             modelStatus,
+            runtimeCompatibilityStatus: compat.runtimeCompatibilityStatus,
+            runtimeCompatible: false,
             runtimeExecutionStatus: compat.runtimeExecutionStatus,
+            transcriptComparisonStatus: compat.transcriptComparisonStatus,
+            humanSpeechProvenanceStatus: compat.humanSpeechProvenanceStatus,
             speechTranscriptStatus: compat.speechTranscriptStatus,
+            fixtureProvenance: compat.fixtureProvenance || null,
             fixtureAvailable,
             expectedTranscriptConfigured,
             transcriptComparison: compat.transcriptComparison || null,
@@ -1528,8 +1558,13 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
       message: 'Whisper STT readiness check encountered an unexpected error.',
       details: {
         configured: true,
+        runtimeCompatibilityStatus: 'FAILED',
+        runtimeCompatible: false,
         runtimeExecutionStatus: 'FAILED',
+        transcriptComparisonStatus: 'NOT_COMPARED',
+        humanSpeechProvenanceStatus: 'UNTRUSTED_NO_MANIFEST_ENTRY',
         speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
+        fixtureProvenance: null,
         failureReason: 'Unexpected readiness probe error.',
         compatibilityStatus: 'FAILED',
         runtimeExecutionVerified: false,
@@ -2451,69 +2486,178 @@ apiRouter.get('/channel/temporal', async (req: Request, res: Response) => {
   }
 });
 
-// 7. Create Scan (with Path Traversal, Ownership & Credit Checks)
+async function resolveCanonicalUploadRecord(candidatePath: string) {
+  let canonicalPath: string;
+  try {
+    canonicalPath = fs.existsSync(candidatePath) ? fs.realpathSync(candidatePath) : path.resolve(candidatePath);
+  } catch {
+    canonicalPath = path.resolve(candidatePath);
+  }
+
+  let uploadRecord = await storage.uploads.getUploadByPath(canonicalPath);
+  if (!uploadRecord) {
+    const resolvedInput = path.resolve(candidatePath);
+    if (resolvedInput !== canonicalPath) {
+      const altRecord = await storage.uploads.getUploadByPath(resolvedInput);
+      if (altRecord) {
+        let altCanonical: string;
+        try {
+          altCanonical = fs.existsSync(altRecord.filePath)
+            ? fs.realpathSync(altRecord.filePath)
+            : path.resolve(altRecord.filePath);
+        } catch {
+          altCanonical = path.resolve(altRecord.filePath);
+        }
+        if (altCanonical === canonicalPath) {
+          uploadRecord = altRecord;
+        }
+      }
+    }
+  }
+
+  return { canonicalPath, uploadRecord };
+}
+
+// 7. Create Scan (Fail-Closed Path Traversal, Canonical Ownership, Parent Scan & Credit Checks)
 apiRouter.post('/scans', async (req: Request, res: Response) => {
   try {
     const user = await requireAuth(req, res);
     if (!user) return;
 
-    const { 
-      videoPath, 
-      videoFilename, 
-      videoTitle, 
-      videoDescription, 
+    const {
+      videoPath,
+      videoFilename,
+      videoTitle,
+      videoDescription,
       videoTags,
       thumbnailPath,
       thumbnailFilename,
       scanMode = 'standard',
       parentScanId,
-      isRescan = false
+      isRescan = false,
+      userId: clientSuppliedUserId
     } = req.body;
 
-    if (!videoPath || typeof videoPath !== 'string') {
+    // Security: Strictly ignore/reject client-supplied userId overrides
+    if (
+      clientSuppliedUserId !== undefined &&
+      clientSuppliedUserId !== null &&
+      String(clientSuppliedUserId).trim() !== '' &&
+      String(clientSuppliedUserId) !== user.id
+    ) {
+      return res.status(403).json({ error: 'Access denied: Invalid user attribution.' });
+    }
+
+    if (!videoPath || typeof videoPath !== 'string' || !videoPath.trim()) {
       return res.status(400).json({ error: 'Valid video file path is required.' });
     }
 
-    // Security: Safe Upload Path Traversal Check
-    if (!isSafeUploadPath(videoPath)) {
+    // Security: Strict Safe Upload Path Traversal & Symlink Check (before any file/media inspection)
+    const videoPathValidation = validateSafeStoragePath(videoPath, { mustExist: true });
+    if (!videoPathValidation.isSafe) {
       return res.status(403).json({ error: 'Access denied: Invalid or unauthorized video path.' });
     }
 
-    // Security: Ownership verification of uploaded video file
-    const videoUploadRecord = await storage.uploads.getUploadByPath(videoPath);
-    if (videoUploadRecord && videoUploadRecord.userId !== user.id) {
-      return res.status(403).json({ error: 'Access denied: Uploaded video file belongs to another user.' });
+    const { canonicalPath: canonicalVideoPath, uploadRecord: videoUploadRecord } =
+      await resolveCanonicalUploadRecord(videoPathValidation.resolvedPath);
+
+    // Reject internal derived proxy/frame artifacts from being submitted directly as new upload inputs
+    const proxiesDir = path.resolve(uploadDir, 'proxies');
+    const framesDir = path.resolve(uploadDir, 'frames');
+    if (
+      canonicalVideoPath === proxiesDir ||
+      canonicalVideoPath.startsWith(proxiesDir + path.sep) ||
+      canonicalVideoPath === framesDir ||
+      canonicalVideoPath.startsWith(framesDir + path.sep)
+    ) {
+      return res.status(403).json({ error: 'Access denied: Unauthorized video resource.' });
     }
 
-    // Security: Path Traversal & Ownership check for optional thumbnail
-    if (thumbnailPath) {
-      if (!isSafeUploadPath(thumbnailPath)) {
-        return res.status(403).json({ error: 'Access denied: Invalid or unauthorized thumbnail path.' });
+    // Validate parentScanId ownership first if supplied
+    let parentScan: ScanJob | null = null;
+    if (parentScanId !== undefined && parentScanId !== null && String(parentScanId).trim() !== '') {
+      if (typeof parentScanId !== 'string') {
+        return res.status(400).json({ error: 'Invalid parentScanId.' });
       }
-      const thumbUploadRecord = await storage.uploads.getUploadByPath(thumbnailPath);
-      if (thumbUploadRecord && thumbUploadRecord.userId !== user.id) {
-        return res.status(403).json({ error: 'Access denied: Uploaded thumbnail file belongs to another user.' });
-      }
-    }
-
-    // If re-scan, verify that parent scan belongs to this authenticated user
-    if (parentScanId) {
-      const parentScan = await storage.scans.getScan(parentScanId);
+      parentScan = await storage.scans.getScan(parentScanId);
       if (!parentScan) {
         return res.status(404).json({ error: 'Parent scan not found.' });
       }
       if (parentScan.userId !== user.id) {
-        return res.status(403).json({ error: 'Access denied: Parent scan belongs to another user.' });
+        return res.status(403).json({ error: 'Access denied: Parent scan is not owned by the authenticated user.' });
       }
     }
 
-    // Authoritative media inspection & credit preflight before queuing work
+    // Fail-closed ownership verification of video file:
+    // Require either a valid upload record owned by user.id OR an authorized rescan explicitly reusing parentScan's own videoPath.
+    let videoAuthorized = false;
+    if (videoUploadRecord) {
+      if (videoUploadRecord.userId !== user.id) {
+        return res.status(403).json({ error: 'Access denied: Unauthorized video resource.' });
+      }
+      if (videoUploadRecord.type && videoUploadRecord.type !== 'video') {
+        return res.status(403).json({ error: 'Access denied: Referenced asset is not an authorized video upload.' });
+      }
+      videoAuthorized = true;
+    } else if (parentScan && isRescan === true && parentScan.videoPath) {
+      let parentCanonicalPath: string;
+      try {
+        parentCanonicalPath = fs.existsSync(parentScan.videoPath)
+          ? fs.realpathSync(parentScan.videoPath)
+          : path.resolve(parentScan.videoPath);
+      } catch {
+        parentCanonicalPath = path.resolve(parentScan.videoPath);
+      }
+      if (parentScan.userId === user.id && parentCanonicalPath === canonicalVideoPath) {
+        videoAuthorized = true;
+      }
+    }
+
+    if (!videoAuthorized) {
+      return res.status(403).json({ error: 'Access denied: Video asset has no trusted ownership record for the authenticated user.' });
+    }
+
+    // Defense-in-depth: detect any conflicting scan ownership record referencing the exact canonical video path
+    const canonicalVideoOwner = await getMediaOwner(canonicalVideoPath);
+    if (canonicalVideoOwner && canonicalVideoOwner.userId !== user.id) {
+      return res.status(403).json({ error: 'Access denied: Conflicting ownership for referenced video resource.' });
+    }
+
+    // Security: Path Traversal, Symlink & Fail-Closed Ownership check for optional thumbnail
+    let verifiedThumbnailPath: string | undefined;
+    if (thumbnailPath !== undefined && thumbnailPath !== null && String(thumbnailPath).trim() !== '') {
+      if (typeof thumbnailPath !== 'string') {
+        return res.status(400).json({ error: 'Invalid thumbnail path.' });
+      }
+      const thumbPathValidation = validateSafeStoragePath(thumbnailPath, { mustExist: true });
+      if (!thumbPathValidation.isSafe) {
+        return res.status(403).json({ error: 'Access denied: Invalid or unauthorized thumbnail path.' });
+      }
+
+      const { canonicalPath: canonicalThumbPath, uploadRecord: thumbUploadRecord } =
+        await resolveCanonicalUploadRecord(thumbPathValidation.resolvedPath);
+
+      if (!thumbUploadRecord || thumbUploadRecord.userId !== user.id) {
+        return res.status(403).json({ error: 'Access denied: Thumbnail asset has no trusted ownership record for the authenticated user.' });
+      }
+      if (thumbUploadRecord.type && thumbUploadRecord.type !== 'thumbnail') {
+        return res.status(403).json({ error: 'Access denied: Referenced thumbnail asset is not an authorized thumbnail upload.' });
+      }
+
+      const canonicalThumbOwner = await getMediaOwner(canonicalThumbPath);
+      if (canonicalThumbOwner && canonicalThumbOwner.userId !== user.id) {
+        return res.status(403).json({ error: 'Access denied: Conflicting ownership for referenced thumbnail resource.' });
+      }
+      verifiedThumbnailPath = canonicalThumbPath;
+    }
+
+    // Authoritative media inspection & credit preflight ONLY AFTER all ownership/path checks succeed
     const effectiveScanMode = (scanMode === 'deep' ? 'deep' : 'standard') as ScanMode;
-    const metadata = await mediaInspector.inspect(videoPath, videoFilename || path.basename(videoPath));
+    const metadata = await mediaInspector.inspect(canonicalVideoPath, videoFilename || path.basename(canonicalVideoPath));
     const requiredCredits = creditService.calculateRequiredCredits(metadata.durationSeconds, effectiveScanMode);
 
     if (user.creditsRemaining < requiredCredits) {
-      return res.status(402).json({ 
+      return res.status(402).json({
         error: `Insufficient credits. Required: ${requiredCredits} credit(s), but available balance is ${user.creditsRemaining}.`,
         requiredCredits,
         creditsRemaining: user.creditsRemaining
@@ -2528,9 +2672,9 @@ apiRouter.post('/scans', async (req: Request, res: Response) => {
       videoTitle: videoTitle || videoFilename || 'Untitled Video',
       videoDescription: videoDescription || '',
       videoTags: Array.isArray(videoTags) ? videoTags : undefined,
-      videoFilename: videoFilename || path.basename(videoPath),
-      videoPath,
-      thumbnailPath: thumbnailPath || undefined,
+      videoFilename: videoFilename || path.basename(canonicalVideoPath),
+      videoPath: canonicalVideoPath,
+      thumbnailPath: verifiedThumbnailPath,
       thumbnailFilename: thumbnailFilename || undefined,
       scanMode: effectiveScanMode,
       status: 'QUEUED',
@@ -2538,7 +2682,7 @@ apiRouter.post('/scans', async (req: Request, res: Response) => {
       completedStages: ['Upload'],
       creditsUsed: requiredCredits,
       createdAt: new Date().toISOString(),
-      parentScanId,
+      parentScanId: parentScan?.id,
       isRescan: !!isRescan
     };
 
@@ -2788,13 +2932,20 @@ apiRouter.post('/scans/:id/rescan', requireAuthMiddleware, validateRescanAuthori
         type: 'video',
         createdAt: new Date().toISOString()
       });
-    } else if (req.body.videoPath && isSafeUploadPath(req.body.videoPath)) {
-      filePath = req.body.videoPath;
-      filename = req.body.videoFilename || path.basename(filePath);
-      const uploadRec = await storage.uploads.getUploadByPath(filePath);
-      if (uploadRec && uploadRec.userId !== user.id) {
-        return res.status(403).json({ error: 'Access denied: Video file belongs to another user.' });
+    } else if (req.body.videoPath !== undefined && req.body.videoPath !== null && String(req.body.videoPath).trim() !== '') {
+      if (typeof req.body.videoPath !== 'string' || !isSafeUploadPath(req.body.videoPath)) {
+        return res.status(403).json({ error: 'Access denied: Invalid or unauthorized video path.' });
       }
+      const { canonicalPath: canonicalRescanPath, uploadRecord: uploadRec } =
+        await resolveCanonicalUploadRecord(req.body.videoPath);
+      if (!uploadRec || uploadRec.userId !== user.id) {
+        return res.status(403).json({ error: 'Access denied: Video asset has no trusted ownership record for the authenticated user.' });
+      }
+      if (uploadRec.type && uploadRec.type !== 'video') {
+        return res.status(403).json({ error: 'Access denied: Referenced asset is not an authorized video upload.' });
+      }
+      filePath = canonicalRescanPath;
+      filename = req.body.videoFilename || path.basename(filePath);
     } else if (parentScan.videoPath && fs.existsSync(parentScan.videoPath) && isSafeUploadPath(parentScan.videoPath)) {
       filePath = parentScan.videoPath;
       filename = `Revised_${parentScan.videoFilename}`;
