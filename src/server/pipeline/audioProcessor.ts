@@ -74,12 +74,34 @@ export type HumanSpeechProvenanceStatus =
   | 'SYNTHETIC_FIXTURE'
   | 'UNTRUSTED_NO_MANIFEST_ENTRY'
   | 'UNTRUSTED_HASH_MISMATCH'
-  | 'UNTRUSTED_PROVENANCE_UNVERIFIED';
+  | 'UNTRUSTED_PROVENANCE_UNVERIFIED'
+  | 'INVALID_PROVENANCE';
+
+export type ProvenanceTrustTier =
+  | 'UNTRUSTED'
+  | 'MAINTAINER_ATTESTED'
+  | 'CRYPTOGRAPHICALLY_VERIFIED';
+
+export type SpeechVerificationState =
+  | 'RUNTIME_COMPATIBLE'
+  | 'FIXTURE_INTEGRITY_VERIFIED'
+  | 'MAINTAINER_ATTESTED'
+  | 'CRYPTOGRAPHICALLY_VERIFIED'
+  | 'TRANSCRIPT_VERIFIED'
+  | 'NOT_VERIFIED'
+  | 'INVALID_PROVENANCE';
 
 export type TranscriptComparisonStatus =
   | 'NOT_COMPARED'
   | 'PASSED'
   | 'FAILED';
+
+export interface TrustedSpeechManifestSignature {
+  algorithm: 'ed25519';
+  keyId: string;
+  value: string;
+  signedAt?: string;
+}
 
 export interface TrustedSpeechFixtureManifestEntry {
   fixtureId: string;
@@ -95,6 +117,8 @@ export interface TrustedSpeechFixtureManifestEntry {
   verificationMetadata?: {
     verifiedBy?: string;
     verifiedAt?: string;
+    verificationMethod?: string;
+    hashAlgorithm?: string;
     [key: string]: unknown;
   };
 }
@@ -103,10 +127,13 @@ export interface TrustedSpeechFixtureManifest {
   manifestVersion: string;
   description?: string;
   fixtures: TrustedSpeechFixtureManifestEntry[];
+  signature?: TrustedSpeechManifestSignature;
 }
 
 export interface WhisperFixtureProvenanceReport {
   humanSpeechProvenanceStatus: HumanSpeechProvenanceStatus;
+  provenanceTrustTier: ProvenanceTrustTier;
+  verificationStates: SpeechVerificationState[];
   manifestPath?: string;
   fixtureId?: string;
   sha256?: string;
@@ -114,6 +141,11 @@ export interface WhisperFixtureProvenanceReport {
   recordingOrigin?: string;
   transcriptLanguage?: string;
   transcriptReviewEvidence?: string;
+  verificationMethod?: string;
+  hashAlgorithm?: string;
+  signatureVerified?: boolean;
+  signatureKeyId?: string;
+  strictAttestationMode?: boolean;
   verifiedHumanSpeech: boolean;
   reason: string;
 }
@@ -145,6 +177,8 @@ export interface LocalTranscriptionResult {
   runtimeExecutionStatus?: WhisperRuntimeExecutionStatus;
   transcriptComparisonStatus?: TranscriptComparisonStatus;
   humanSpeechProvenanceStatus?: HumanSpeechProvenanceStatus;
+  provenanceTrustTier?: ProvenanceTrustTier;
+  verificationStates?: SpeechVerificationState[];
   speechTranscriptStatus?: WhisperSpeechTranscriptStatus;
   speechTranscriptVerified?: boolean;
   failureReason?: string;
@@ -196,6 +230,8 @@ export interface WhisperCompatibilityResult {
   runtimeExecutionStatus: WhisperRuntimeExecutionStatus;
   transcriptComparisonStatus: TranscriptComparisonStatus;
   humanSpeechProvenanceStatus: HumanSpeechProvenanceStatus;
+  provenanceTrustTier: ProvenanceTrustTier;
+  verificationStates: SpeechVerificationState[];
   speechTranscriptStatus: WhisperSpeechTranscriptStatus;
   speechTranscriptVerified: boolean;
   runtimeType: 'openai_whisper' | 'whisper_cpp' | 'unconfigured';
@@ -212,6 +248,42 @@ export interface WhisperCompatibilityResult {
   fromCache?: boolean;
   executionDurationMs: number;
   details: string;
+}
+
+const SUPPORTED_SPEECH_MANIFEST_VERSIONS = new Set<string>(['1.0.0', '1.1.0']);
+const ISO_8601_UTC_OR_OFFSET_REGEX = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+const INVALID_VERIFICATION_METHODS = new Set<string>(['none', 'unknown', 'unverified', 'auto', 'mock', 'synthetic', 'skip', 'bypass']);
+
+function canonicalizeJsonValue(val: unknown): unknown {
+  if (Array.isArray(val)) {
+    return val.map(canonicalizeJsonValue);
+  }
+  if (val && typeof val === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(val as Record<string, unknown>).sort()) {
+      const child = (val as Record<string, unknown>)[key];
+      if (child !== undefined) {
+        out[key] = canonicalizeJsonValue(child);
+      }
+    }
+    return out;
+  }
+  return val;
+}
+
+/**
+ * Produces a canonical deterministic UTF-8 JSON payload for a Speech Fixture Manifest,
+ * stripping top-level `signature` and recursively sorting all object keys.
+ */
+export function canonicalizeSpeechManifestPayload(
+  manifest: TrustedSpeechFixtureManifest | Omit<TrustedSpeechFixtureManifest, 'signature'>
+): string {
+  const payload: Record<string, unknown> = {
+    manifestVersion: manifest.manifestVersion,
+    ...(manifest.description !== undefined ? { description: manifest.description } : {}),
+    fixtures: Array.isArray(manifest.fixtures) ? manifest.fixtures : []
+  };
+  return JSON.stringify(canonicalizeJsonValue(payload));
 }
 
 const VALID_GGML_GGUF_MAGICS = new Set<string>([
@@ -286,6 +358,47 @@ export class SpeechTranscriptionAdapter {
       .filter(Boolean);
   }
 
+  private parseTrustedPublicKeys(
+    overrideKeys?: Record<string, string>
+  ): { keys: Record<string, string>; error?: string } {
+    const merged: Record<string, string> = {};
+    const rawEnv = (process.env.WHISPER_TRUSTED_PUBLIC_KEYS || '').trim();
+    if (rawEnv.length > 0) {
+      try {
+        const parsed = JSON.parse(rawEnv);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          return { keys: {}, error: 'WHISPER_TRUSTED_PUBLIC_KEYS must be a JSON object mapping keyId to PEM public key.' };
+        }
+        for (const [k, v] of Object.entries(parsed)) {
+          if (typeof k === 'string' && k.trim().length > 0 && typeof v === 'string' && v.trim().length > 0) {
+            merged[k.trim()] = v.trim();
+          } else {
+            return { keys: {}, error: `WHISPER_TRUSTED_PUBLIC_KEYS contains invalid entry for keyId '${k}'.` };
+          }
+        }
+      } catch (err: any) {
+        return { keys: {}, error: `Malformed JSON in WHISPER_TRUSTED_PUBLIC_KEYS: ${err?.message || err}` };
+      }
+    }
+
+    if (overrideKeys) {
+      for (const [k, v] of Object.entries(overrideKeys)) {
+        if (typeof k === 'string' && k.trim().length > 0 && typeof v === 'string' && v.trim().length > 0) {
+          merged[k.trim()] = v.trim();
+        }
+      }
+    }
+    return { keys: merged };
+  }
+
+  private isValidIso8601Timestamp(val: unknown): boolean {
+    if (typeof val !== 'string') return false;
+    const trimmed = val.trim();
+    if (!ISO_8601_UTC_OR_OFFSET_REGEX.test(trimmed)) return false;
+    const ms = Date.parse(trimmed);
+    return Number.isFinite(ms) && !Number.isNaN(ms);
+  }
+
   private validateFixtureProvenance(
     canonicalFixturePath: string,
     fixtureSha256: string,
@@ -293,54 +406,265 @@ export class SpeechTranscriptionAdapter {
       isSyntheticFixture?: boolean;
       trustedManifestPath?: string;
       trustedManifest?: TrustedSpeechFixtureManifest;
+      trustedPublicKeys?: Record<string, string>;
+      strictAttestationMode?: boolean;
     }
   ): { report: WhisperFixtureProvenanceReport; manifestEntry?: TrustedSpeechFixtureManifestEntry; manifestDigest: string } {
     const defaultManifestPath = path.resolve(process.cwd(), 'tests', 'fixtures', 'speech', 'manifest.json');
     const resolvedManifestPath = path.resolve(
       options?.trustedManifestPath || process.env.WHISPER_SPEECH_MANIFEST_PATH || defaultManifestPath
     );
+    const manifestLabel = options?.trustedManifest ? 'inline-manifest' : resolvedManifestPath;
     const manifestDir = path.dirname(resolvedManifestPath);
-
-    let manifest: TrustedSpeechFixtureManifest | null = options?.trustedManifest || null;
-    let manifestDigest = 'inline';
-
-    if (manifest) {
-      manifestDigest = crypto.createHash('sha256').update(JSON.stringify(manifest)).digest('hex');
-    } else if (fs.existsSync(resolvedManifestPath)) {
-      try {
-        const raw = fs.readFileSync(resolvedManifestPath, 'utf-8');
-        manifestDigest = crypto.createHash('sha256').update(raw).digest('hex');
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === 'object' && Array.isArray(parsed.fixtures)) {
-          manifest = parsed as TrustedSpeechFixtureManifest;
-        }
-      } catch {
-        manifest = null;
-        manifestDigest = 'invalid-json';
-      }
-    } else {
-      manifestDigest = 'missing-manifest';
+    let realManifestDir = manifestDir;
+    try {
+      realManifestDir = fs.existsSync(manifestDir) ? fs.realpathSync(manifestDir) : path.resolve(manifestDir);
+    } catch {
+      realManifestDir = path.resolve(manifestDir);
     }
+
+    const strictMode = Boolean(
+      options?.strictAttestationMode ||
+      (process.env.WHISPER_STRICT_PROVENANCE || '').trim().toLowerCase() === 'true'
+    );
+
+    const invalidProvenanceResult = (
+      reason: string,
+      opts?: {
+        manifestDigest?: string;
+        entry?: TrustedSpeechFixtureManifestEntry;
+        signatureVerified?: boolean;
+        signatureKeyId?: string;
+      }
+    ) => ({
+      manifestEntry: opts?.entry,
+      manifestDigest: opts?.manifestDigest || 'invalid-provenance',
+      report: {
+        humanSpeechProvenanceStatus: 'INVALID_PROVENANCE' as HumanSpeechProvenanceStatus,
+        provenanceTrustTier: 'UNTRUSTED' as ProvenanceTrustTier,
+        verificationStates: ['INVALID_PROVENANCE', 'NOT_VERIFIED'] as SpeechVerificationState[],
+        manifestPath: manifestLabel,
+        ...(opts?.entry?.fixtureId ? { fixtureId: opts.entry.fixtureId } : {}),
+        sha256: fixtureSha256,
+        sourceDescription: opts?.entry?.sourceDescription,
+        recordingOrigin: opts?.entry?.recordingOrigin,
+        transcriptLanguage: opts?.entry?.transcriptLanguage,
+        transcriptReviewEvidence: opts?.entry?.transcriptReviewEvidence,
+        ...(opts?.signatureVerified !== undefined ? { signatureVerified: opts.signatureVerified } : {}),
+        ...(opts?.signatureKeyId ? { signatureKeyId: opts.signatureKeyId } : {}),
+        strictAttestationMode: strictMode,
+        verifiedHumanSpeech: false,
+        reason
+      }
+    });
 
     const explicitSynthetic = Boolean(
       options?.isSyntheticFixture ||
       (process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE || '').trim().toLowerCase() === 'true'
     );
 
-    const resolveEntryPath = (entry: TrustedSpeechFixtureManifestEntry): string | null => {
-      const candidate = entry.filePath || (entry.relativePath ? path.resolve(manifestDir, entry.relativePath) : '');
-      if (!candidate) return null;
-      try {
-        return fs.existsSync(candidate) ? fs.realpathSync(candidate) : path.resolve(candidate);
-      } catch {
-        return path.resolve(candidate);
-      }
-    };
+    let manifest: TrustedSpeechFixtureManifest | null = null;
+    let manifestDigest = 'missing-manifest';
 
-    const matchedEntry = manifest?.fixtures?.find((entry) => {
-      const resolvedEntry = resolveEntryPath(entry);
-      return resolvedEntry !== null && resolvedEntry === canonicalFixturePath;
-    });
+    if (options?.trustedManifest !== undefined) {
+      if (!options.trustedManifest || typeof options.trustedManifest !== 'object' || Array.isArray(options.trustedManifest)) {
+        return invalidProvenanceResult('Inline speech fixture manifest must be a valid JSON object.', { manifestDigest: 'invalid-manifest' });
+      }
+      manifest = options.trustedManifest;
+      manifestDigest = crypto.createHash('sha256').update(JSON.stringify(manifest)).digest('hex');
+    } else if (fs.existsSync(resolvedManifestPath)) {
+      let raw = '';
+      try {
+        raw = fs.readFileSync(resolvedManifestPath, 'utf-8');
+        manifestDigest = crypto.createHash('sha256').update(raw).digest('hex');
+      } catch (readErr: any) {
+        return invalidProvenanceResult(
+          `Unable to read speech fixture manifest at ${resolvedManifestPath}: ${readErr?.message || readErr}`,
+          { manifestDigest: 'unreadable-manifest' }
+        );
+      }
+      try {
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          return invalidProvenanceResult('Speech fixture manifest JSON must be a top-level object.', { manifestDigest: 'invalid-schema' });
+        }
+        manifest = parsed as TrustedSpeechFixtureManifest;
+      } catch (parseErr: any) {
+        return invalidProvenanceResult(
+          `Malformed JSON in speech fixture manifest (${resolvedManifestPath}): ${parseErr?.message || parseErr}`,
+          { manifestDigest: 'invalid-json' }
+        );
+      }
+    }
+
+    if (manifest) {
+      const versionStr = typeof manifest.manifestVersion === 'string' ? manifest.manifestVersion.trim() : '';
+      if (!SUPPORTED_SPEECH_MANIFEST_VERSIONS.has(versionStr)) {
+        return invalidProvenanceResult(
+          `Unsupported speech fixture manifestVersion '${String(manifest.manifestVersion)}'. Allowed versions: ${[...SUPPORTED_SPEECH_MANIFEST_VERSIONS].join(', ')}.`,
+          { manifestDigest }
+        );
+      }
+      if (!Array.isArray(manifest.fixtures)) {
+        return invalidProvenanceResult(
+          'Invalid speech fixture manifest schema: fixtures must be an array.',
+          { manifestDigest }
+        );
+      }
+    }
+
+    // Parse trusted Ed25519 public keys map
+    const parsedKeys = this.parseTrustedPublicKeys(options?.trustedPublicKeys);
+    if (parsedKeys.error && (manifest?.signature !== undefined || strictMode)) {
+      return invalidProvenanceResult(parsedKeys.error, { manifestDigest });
+    }
+
+    // Cryptographic signature verification (Option B)
+    let signatureVerified = false;
+    let signatureKeyId: string | undefined;
+
+    if (manifest?.signature !== undefined) {
+      const sig = manifest.signature;
+      if (!sig || typeof sig !== 'object' || Array.isArray(sig)) {
+        return invalidProvenanceResult('Malformed manifest signature object.', { manifestDigest, signatureVerified: false });
+      }
+      if (sig.algorithm !== 'ed25519') {
+        return invalidProvenanceResult(
+          `Unsupported manifest signature algorithm '${String((sig as any).algorithm)}'; only 'ed25519' is allowed.`,
+          { manifestDigest, signatureVerified: false }
+        );
+      }
+      const keyId = typeof sig.keyId === 'string' ? sig.keyId.trim() : '';
+      const sigValue = typeof sig.value === 'string' ? sig.value.trim() : '';
+      if (!keyId || !sigValue) {
+        return invalidProvenanceResult(
+          'Manifest signature must specify non-empty keyId and base64 signature value.',
+          { manifestDigest, signatureVerified: false }
+        );
+      }
+      if (sig.signedAt !== undefined && !this.isValidIso8601Timestamp(sig.signedAt)) {
+        return invalidProvenanceResult(
+          `Manifest signature signedAt '${String(sig.signedAt)}' is not a valid strict ISO-8601 timestamp.`,
+          { manifestDigest, signatureVerified: false, signatureKeyId: keyId }
+        );
+      }
+
+      const publicKeyPem = parsedKeys.keys[keyId];
+      if (!publicKeyPem) {
+        return invalidProvenanceResult(
+          `Manifest signed with unknown or untrusted keyId '${keyId}'.`,
+          { manifestDigest, signatureVerified: false, signatureKeyId: keyId }
+        );
+      }
+
+      try {
+        const canonicalPayload = Buffer.from(canonicalizeSpeechManifestPayload(manifest), 'utf8');
+        const sigBuf = Buffer.from(sigValue, 'base64');
+        const ok = sigBuf.length === 64 && crypto.verify(null, canonicalPayload, publicKeyPem, sigBuf);
+        if (!ok) {
+          return invalidProvenanceResult(
+            `Ed25519 signature verification failed for manifest keyId '${keyId}'.`,
+            { manifestDigest, signatureVerified: false, signatureKeyId: keyId }
+          );
+        }
+        signatureVerified = true;
+        signatureKeyId = keyId;
+      } catch (cryptoErr: any) {
+        return invalidProvenanceResult(
+          `Ed25519 signature verification error for keyId '${keyId}': ${cryptoErr?.message || cryptoErr}`,
+          { manifestDigest, signatureVerified: false, signatureKeyId: keyId }
+        );
+      }
+    }
+
+    // Validate ALL manifest entries for structural conflicts (duplicates, path traversal) BEFORE selecting a match
+    let matchedEntry: TrustedSpeechFixtureManifestEntry | undefined;
+
+    if (manifest) {
+      const seenFixtureIds = new Set<string>();
+      const seenCanonicalPaths = new Set<string>();
+
+      for (let i = 0; i < manifest.fixtures.length; i++) {
+        const entry = manifest.fixtures[i];
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+          return invalidProvenanceResult(`Invalid manifest entry object at index ${i}.`, {
+            manifestDigest,
+            signatureVerified,
+            signatureKeyId
+          });
+        }
+
+        const fid = typeof entry.fixtureId === 'string' ? entry.fixtureId.trim() : '';
+        if (fid.length > 0) {
+          if (seenFixtureIds.has(fid)) {
+            return invalidProvenanceResult(
+              `Duplicate fixtureId '${fid}' detected in speech fixture manifest.`,
+              { manifestDigest, entry, signatureVerified, signatureKeyId }
+            );
+          }
+          seenFixtureIds.add(fid);
+        }
+
+        // Reject relativePath traversal escaping manifestDir
+        if (typeof entry.relativePath === 'string' && entry.relativePath.trim().length > 0) {
+          const rawRel = entry.relativePath.trim();
+          if (path.isAbsolute(rawRel)) {
+            return invalidProvenanceResult(
+              `Manifest entry '${fid || i}' relativePath '${rawRel}' must not be an absolute path.`,
+              { manifestDigest, entry, signatureVerified, signatureKeyId }
+            );
+          }
+          const resolvedCandidate = path.resolve(manifestDir, rawRel);
+          const relFromDir = path.relative(manifestDir, resolvedCandidate);
+          if (relFromDir.startsWith('..') || path.isAbsolute(relFromDir)) {
+            return invalidProvenanceResult(
+              `Manifest entry '${fid || i}' relativePath '${rawRel}' escapes manifest directory.`,
+              { manifestDigest, entry, signatureVerified, signatureKeyId }
+            );
+          }
+          if (fs.existsSync(resolvedCandidate)) {
+            try {
+              const realCandidate = fs.realpathSync(resolvedCandidate);
+              const realRel = path.relative(realManifestDir, realCandidate);
+              if (realRel.startsWith('..') || path.isAbsolute(realRel)) {
+                return invalidProvenanceResult(
+                  `Manifest entry '${fid || i}' relativePath '${rawRel}' symlink escapes manifest directory.`,
+                  { manifestDigest, entry, signatureVerified, signatureKeyId }
+                );
+              }
+            } catch {
+              return invalidProvenanceResult(
+                `Failed resolving realpath for manifest entry '${fid || i}'.`,
+                { manifestDigest, entry, signatureVerified, signatureKeyId }
+              );
+            }
+          }
+        }
+
+        const rawPath = entry.filePath || (entry.relativePath ? path.resolve(manifestDir, entry.relativePath) : '');
+        let resolvedEntry: string | null = null;
+        if (rawPath) {
+          try {
+            resolvedEntry = fs.existsSync(rawPath) ? fs.realpathSync(rawPath) : path.resolve(rawPath);
+          } catch {
+            resolvedEntry = path.resolve(rawPath);
+          }
+        }
+
+        if (resolvedEntry) {
+          if (seenCanonicalPaths.has(resolvedEntry)) {
+            return invalidProvenanceResult(
+              `Duplicate canonical fixture path '${resolvedEntry}' detected in speech fixture manifest (conflicting entries rejected).`,
+              { manifestDigest, entry, signatureVerified, signatureKeyId }
+            );
+          }
+          seenCanonicalPaths.add(resolvedEntry);
+          if (resolvedEntry === canonicalFixturePath) {
+            matchedEntry = entry;
+          }
+        }
+      }
+    }
 
     const isEntryMarkedSynthetic = Boolean(
       matchedEntry && (
@@ -356,11 +680,16 @@ export class SpeechTranscriptionAdapter {
         manifestDigest,
         report: {
           humanSpeechProvenanceStatus: 'SYNTHETIC_FIXTURE',
-          manifestPath: options?.trustedManifest ? 'inline-manifest' : resolvedManifestPath,
+          provenanceTrustTier: 'UNTRUSTED',
+          verificationStates: ['NOT_VERIFIED'],
+          manifestPath: manifestLabel,
           ...(matchedEntry?.fixtureId ? { fixtureId: matchedEntry.fixtureId } : {}),
           sha256: fixtureSha256,
           sourceDescription: matchedEntry?.sourceDescription,
           recordingOrigin: matchedEntry?.recordingOrigin,
+          signatureVerified,
+          ...(signatureKeyId ? { signatureKeyId } : {}),
+          strictAttestationMode: strictMode,
           verifiedHumanSpeech: false,
           reason: 'Audio fixture is flagged or recorded as synthetic/mock audio and cannot grant SPEECH_TRANSCRIPT_VERIFIED.'
         }
@@ -368,16 +697,35 @@ export class SpeechTranscriptionAdapter {
     }
 
     if (!matchedEntry) {
+      if (strictMode && manifest && !signatureVerified) {
+        return invalidProvenanceResult(
+          'Strict provenance mode requires a cryptographically signed manifest; unsigned manifest rejected.',
+          { manifestDigest, signatureVerified: false }
+        );
+      }
       return {
         manifestDigest,
         report: {
           humanSpeechProvenanceStatus: 'UNTRUSTED_NO_MANIFEST_ENTRY',
-          manifestPath: options?.trustedManifest ? 'inline-manifest' : resolvedManifestPath,
+          provenanceTrustTier: 'UNTRUSTED',
+          verificationStates: ['NOT_VERIFIED'],
+          manifestPath: manifestLabel,
           sha256: fixtureSha256,
+          signatureVerified,
+          ...(signatureKeyId ? { signatureKeyId } : {}),
+          strictAttestationMode: strictMode,
           verifiedHumanSpeech: false,
           reason: 'Audio fixture has no registered entry in the trusted human speech fixture manifest.'
         }
       };
+    }
+
+    // Strict provenance mode rejects unsigned manifests even if all entry fields look valid
+    if (strictMode && !signatureVerified) {
+      return invalidProvenanceResult(
+        'Strict provenance mode (WHISPER_STRICT_PROVENANCE=true) rejects unsigned manifest entries; cryptographic Ed25519 signature required.',
+        { manifestDigest, entry: matchedEntry, signatureVerified: false }
+      );
     }
 
     const expectedSha = String(matchedEntry.sha256 || '').trim().toLowerCase();
@@ -387,15 +735,62 @@ export class SpeechTranscriptionAdapter {
         manifestDigest,
         report: {
           humanSpeechProvenanceStatus: 'UNTRUSTED_HASH_MISMATCH',
-          manifestPath: options?.trustedManifest ? 'inline-manifest' : resolvedManifestPath,
+          provenanceTrustTier: 'UNTRUSTED',
+          verificationStates: ['NOT_VERIFIED'],
+          manifestPath: manifestLabel,
           fixtureId: matchedEntry.fixtureId,
           sha256: fixtureSha256,
           sourceDescription: matchedEntry.sourceDescription,
           recordingOrigin: matchedEntry.recordingOrigin,
+          signatureVerified,
+          ...(signatureKeyId ? { signatureKeyId } : {}),
+          strictAttestationMode: strictMode,
           verifiedHumanSpeech: false,
           reason: `SHA-256 mismatch against trusted manifest entry '${matchedEntry.fixtureId || canonicalFixturePath}'.`
         }
       };
+    }
+
+    // Validate hashAlgorithm and verificationMethod explicitly when present or in strict mode
+    const rawHashAlg = matchedEntry.verificationMetadata?.hashAlgorithm;
+    const normalizedHashAlg = typeof rawHashAlg === 'string' ? rawHashAlg.trim().toLowerCase() : undefined;
+    if (rawHashAlg !== undefined && normalizedHashAlg !== 'sha256') {
+      return invalidProvenanceResult(
+        `Invalid hashAlgorithm '${String(rawHashAlg)}' in manifest entry '${matchedEntry.fixtureId}'; expected 'sha256'.`,
+        { manifestDigest, entry: matchedEntry, signatureVerified, signatureKeyId }
+      );
+    }
+    if (strictMode && normalizedHashAlg !== 'sha256') {
+      return invalidProvenanceResult(
+        `Strict provenance mode requires verificationMetadata.hashAlgorithm='sha256' on entry '${matchedEntry.fixtureId}'.`,
+        { manifestDigest, entry: matchedEntry, signatureVerified, signatureKeyId }
+      );
+    }
+
+    const rawVerMethod = matchedEntry.verificationMetadata?.verificationMethod;
+    const trimmedVerMethod = typeof rawVerMethod === 'string' ? rawVerMethod.trim() : undefined;
+    if (rawVerMethod !== undefined) {
+      if (!trimmedVerMethod || INVALID_VERIFICATION_METHODS.has(trimmedVerMethod.toLowerCase())) {
+        return invalidProvenanceResult(
+          `Invalid verificationMethod '${String(rawVerMethod)}' in manifest entry '${matchedEntry.fixtureId}'.`,
+          { manifestDigest, entry: matchedEntry, signatureVerified, signatureKeyId }
+        );
+      }
+    }
+    if (strictMode && !trimmedVerMethod) {
+      return invalidProvenanceResult(
+        `Strict provenance mode requires non-empty verificationMetadata.verificationMethod on entry '${matchedEntry.fixtureId}'.`,
+        { manifestDigest, entry: matchedEntry, signatureVerified, signatureKeyId }
+      );
+    }
+
+    // Strict ISO-8601 check on verifiedAt when provided
+    const rawVerifiedAt = matchedEntry.verificationMetadata?.verifiedAt;
+    if (rawVerifiedAt !== undefined && String(rawVerifiedAt).trim().length > 0 && !this.isValidIso8601Timestamp(rawVerifiedAt)) {
+      return invalidProvenanceResult(
+        `Invalid verificationMetadata.verifiedAt '${String(rawVerifiedAt)}' in manifest entry '${matchedEntry.fixtureId}'; strict ISO-8601 timestamp with timezone required.`,
+        { manifestDigest, entry: matchedEntry, signatureVerified, signatureKeyId }
+      );
     }
 
     const hasValidProvenanceFields = Boolean(
@@ -407,7 +802,7 @@ export class SpeechTranscriptionAdapter {
       typeof matchedEntry.transcriptLanguage === 'string' && matchedEntry.transcriptLanguage.trim().length > 0 &&
       typeof matchedEntry.transcriptReviewEvidence === 'string' && matchedEntry.transcriptReviewEvidence.trim().length > 0 &&
       typeof matchedEntry.verificationMetadata?.verifiedBy === 'string' && matchedEntry.verificationMetadata.verifiedBy.trim().length > 0 &&
-      typeof matchedEntry.verificationMetadata?.verifiedAt === 'string' && matchedEntry.verificationMetadata.verifiedAt.trim().length > 0
+      this.isValidIso8601Timestamp(rawVerifiedAt)
     );
 
     if (!hasValidProvenanceFields) {
@@ -416,33 +811,53 @@ export class SpeechTranscriptionAdapter {
         manifestDigest,
         report: {
           humanSpeechProvenanceStatus: 'UNTRUSTED_PROVENANCE_UNVERIFIED',
-          manifestPath: options?.trustedManifest ? 'inline-manifest' : resolvedManifestPath,
+          provenanceTrustTier: 'UNTRUSTED',
+          verificationStates: ['FIXTURE_INTEGRITY_VERIFIED', 'NOT_VERIFIED'],
+          manifestPath: manifestLabel,
           fixtureId: matchedEntry.fixtureId,
           sha256: fixtureSha256,
           sourceDescription: matchedEntry.sourceDescription,
           recordingOrigin: matchedEntry.recordingOrigin,
           transcriptLanguage: matchedEntry.transcriptLanguage,
           transcriptReviewEvidence: matchedEntry.transcriptReviewEvidence,
+          verificationMethod: trimmedVerMethod,
+          hashAlgorithm: normalizedHashAlg || 'sha256',
+          signatureVerified,
+          ...(signatureKeyId ? { signatureKeyId } : {}),
+          strictAttestationMode: strictMode,
           verifiedHumanSpeech: false,
           reason: 'Manifest entry lacks complete VERIFIED_HUMAN_SPEECH provenance, transcript review evidence, or verification metadata.'
         }
       };
     }
 
+    const trustTier: ProvenanceTrustTier = signatureVerified
+      ? 'CRYPTOGRAPHICALLY_VERIFIED'
+      : 'MAINTAINER_ATTESTED';
+
     return {
       manifestEntry: matchedEntry,
       manifestDigest,
       report: {
         humanSpeechProvenanceStatus: 'VERIFIED_HUMAN_SPEECH',
-        manifestPath: options?.trustedManifest ? 'inline-manifest' : resolvedManifestPath,
+        provenanceTrustTier: trustTier,
+        verificationStates: ['FIXTURE_INTEGRITY_VERIFIED', trustTier],
+        manifestPath: manifestLabel,
         fixtureId: matchedEntry.fixtureId,
         sha256: fixtureSha256,
         sourceDescription: matchedEntry.sourceDescription,
         recordingOrigin: matchedEntry.recordingOrigin,
         transcriptLanguage: matchedEntry.transcriptLanguage,
         transcriptReviewEvidence: matchedEntry.transcriptReviewEvidence,
+        verificationMethod: trimmedVerMethod,
+        hashAlgorithm: normalizedHashAlg || 'sha256',
+        signatureVerified,
+        ...(signatureKeyId ? { signatureKeyId } : {}),
+        strictAttestationMode: strictMode,
         verifiedHumanSpeech: true,
-        reason: 'Fixture SHA-256 and human speech provenance verified against trusted manifest.'
+        reason: signatureVerified
+          ? `Fixture SHA-256 and Ed25519 manifest signature (keyId=${signatureKeyId}) cryptographically verified.`
+          : 'Fixture SHA-256 and maintainer attestation metadata verified against unsigned manifest (MAINTAINER_ATTESTED).'
       }
     };
   }
@@ -957,6 +1372,8 @@ export class SpeechTranscriptionAdapter {
     isSyntheticFixture?: boolean;
     trustedManifestPath?: string;
     trustedManifest?: TrustedSpeechFixtureManifest;
+    trustedPublicKeys?: Record<string, string>;
+    strictAttestationMode?: boolean;
   }): Promise<WhisperCompatibilityResult> {
     return this.verifyRuntimeCompatibility({
       audioFixturePath: options?.audioFixturePath,
@@ -965,7 +1382,9 @@ export class SpeechTranscriptionAdapter {
       useCache: !options?.forceRefresh,
       isSyntheticFixture: options?.isSyntheticFixture,
       trustedManifestPath: options?.trustedManifestPath,
-      trustedManifest: options?.trustedManifest
+      trustedManifest: options?.trustedManifest,
+      trustedPublicKeys: options?.trustedPublicKeys,
+      strictAttestationMode: options?.strictAttestationMode
     });
   }
 
@@ -976,7 +1395,8 @@ export class SpeechTranscriptionAdapter {
    * Strictly separates:
    * - `runtimeCompatibilityStatus` / `compatibilityVerified`: Runtime compatibility ONLY (binary + model + non-empty execution).
    * - `runtimeExecutionStatus`: `UNCONFIGURED` | `UNVERIFIED` | `RUNTIME_EXECUTION_VERIFIED` | `FAILED`.
-   * - `humanSpeechProvenanceStatus`: Verified via SHA-256 against the Trusted Human Speech Fixture Manifest.
+   * - `humanSpeechProvenanceStatus`: Verified via SHA-256 + Two-Tier Trust Model against manifest.
+   * - `provenanceTrustTier`: `UNTRUSTED` | `MAINTAINER_ATTESTED` | `CRYPTOGRAPHICALLY_VERIFIED`.
    * - `transcriptComparisonStatus`: `NOT_COMPARED` | `PASSED` | `FAILED`.
    * - `speechTranscriptStatus` / `speechTranscriptVerified`: `SPEECH_TRANSCRIPT_VERIFIED` is ONLY granted when
    *   runtime execution succeeded, provenance is `VERIFIED_HUMAN_SPEECH`, TOCTOU SHA-256 check passed, and
@@ -990,6 +1410,8 @@ export class SpeechTranscriptionAdapter {
     isSyntheticFixture?: boolean;
     trustedManifestPath?: string;
     trustedManifest?: TrustedSpeechFixtureManifest;
+    trustedPublicKeys?: Record<string, string>;
+    strictAttestationMode?: boolean;
   }): Promise<WhisperCompatibilityResult> {
     const startTime = Date.now();
     const timeoutMs = options?.timeoutMs ?? 20000;
@@ -1028,6 +1450,8 @@ export class SpeechTranscriptionAdapter {
         runtimeExecutionStatus: validation.status === 'UNCONFIGURED' ? 'UNCONFIGURED' : 'FAILED',
         transcriptComparisonStatus: 'NOT_COMPARED',
         humanSpeechProvenanceStatus: defaultProvStatus,
+        provenanceTrustTier: 'UNTRUSTED',
+        verificationStates: ['NOT_VERIFIED'],
         speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
         speechTranscriptVerified: false,
         runtimeType: validation.runtimeType,
@@ -1052,6 +1476,8 @@ export class SpeechTranscriptionAdapter {
         runtimeExecutionStatus: 'UNVERIFIED',
         transcriptComparisonStatus: 'NOT_COMPARED',
         humanSpeechProvenanceStatus: defaultProvStatus,
+        provenanceTrustTier: 'UNTRUSTED',
+        verificationStates: ['NOT_VERIFIED'],
         speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
         speechTranscriptVerified: false,
         runtimeType: validation.runtimeType,
@@ -1074,6 +1500,8 @@ export class SpeechTranscriptionAdapter {
         runtimeExecutionStatus: 'FAILED',
         transcriptComparisonStatus: 'NOT_COMPARED',
         humanSpeechProvenanceStatus: isSyntheticFlag ? 'SYNTHETIC_FIXTURE' : 'UNTRUSTED_PROVENANCE_UNVERIFIED',
+        provenanceTrustTier: 'UNTRUSTED',
+        verificationStates: ['NOT_VERIFIED'],
         speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
         speechTranscriptVerified: false,
         runtimeType: validation.runtimeType,
@@ -1097,13 +1525,18 @@ export class SpeechTranscriptionAdapter {
     const provenanceResult = this.validateFixtureProvenance(canonicalFixturePath, preSha256, {
       isSyntheticFixture: isSyntheticFlag,
       trustedManifestPath: options?.trustedManifestPath,
-      trustedManifest: options?.trustedManifest
+      trustedManifest: options?.trustedManifest,
+      trustedPublicKeys: options?.trustedPublicKeys,
+      strictAttestationMode: options?.strictAttestationMode
     });
     const provenance = provenanceResult.report;
     const effectiveSynthetic = provenance.humanSpeechProvenanceStatus === 'SYNTHETIC_FIXTURE' || isSyntheticFlag;
 
-    // Fail closed immediately when a manifest entry exists for this fixture but SHA-256 mismatches
-    if (provenance.humanSpeechProvenanceStatus === 'UNTRUSTED_HASH_MISMATCH') {
+    // Fail closed immediately on manifest/signature/provenance corruption or hash mismatch
+    if (
+      provenance.humanSpeechProvenanceStatus === 'UNTRUSTED_HASH_MISMATCH' ||
+      provenance.humanSpeechProvenanceStatus === 'INVALID_PROVENANCE'
+    ) {
       return {
         compatible: false,
         runtimeCompatible: false,
@@ -1112,7 +1545,11 @@ export class SpeechTranscriptionAdapter {
         diagnosticCode: 'SPEECH_FIXTURE_INVALID',
         runtimeExecutionStatus: 'FAILED',
         transcriptComparisonStatus: 'FAILED',
-        humanSpeechProvenanceStatus: 'UNTRUSTED_HASH_MISMATCH',
+        humanSpeechProvenanceStatus: provenance.humanSpeechProvenanceStatus,
+        provenanceTrustTier: 'UNTRUSTED',
+        verificationStates: provenance.humanSpeechProvenanceStatus === 'INVALID_PROVENANCE'
+          ? ['INVALID_PROVENANCE', 'NOT_VERIFIED']
+          : ['NOT_VERIFIED'],
         speechTranscriptStatus: 'SPEECH_TRANSCRIPT_FAILED',
         speechTranscriptVerified: false,
         runtimeType: validation.runtimeType,
@@ -1153,6 +1590,8 @@ export class SpeechTranscriptionAdapter {
         const tamperedReport: WhisperFixtureProvenanceReport = {
           ...provenance,
           humanSpeechProvenanceStatus: 'UNTRUSTED_HASH_MISMATCH',
+          provenanceTrustTier: 'UNTRUSTED',
+          verificationStates: ['NOT_VERIFIED'],
           verifiedHumanSpeech: false,
           reason: `Expected transcript does not match trusted manifest transcript for '${provenanceResult.manifestEntry.fixtureId}'.`
         };
@@ -1165,6 +1604,8 @@ export class SpeechTranscriptionAdapter {
           runtimeExecutionStatus: 'FAILED',
           transcriptComparisonStatus: 'FAILED',
           humanSpeechProvenanceStatus: 'UNTRUSTED_HASH_MISMATCH',
+          provenanceTrustTier: 'UNTRUSTED',
+          verificationStates: ['NOT_VERIFIED'],
           speechTranscriptStatus: 'SPEECH_TRANSCRIPT_FAILED',
           speechTranscriptVerified: false,
           runtimeType: validation.runtimeType,
@@ -1181,12 +1622,14 @@ export class SpeechTranscriptionAdapter {
       }
     }
 
+    const strictEnvFlag = Boolean(options?.strictAttestationMode || (process.env.WHISPER_STRICT_PROVENANCE || '').trim().toLowerCase() === 'true');
+    const keysHash = crypto.createHash('sha256').update(JSON.stringify(this.parseTrustedPublicKeys(options?.trustedPublicKeys).keys)).digest('hex').slice(0, 12);
     const fingerprint = this.getRuntimeFingerprint(
       validation,
       canonicalFixturePath,
       preSha256,
       expectedTranscript,
-      `${provenanceResult.manifestDigest}:${provenance.humanSpeechProvenanceStatus}`
+      `${provenanceResult.manifestDigest}:${provenance.humanSpeechProvenanceStatus}:${provenance.provenanceTrustTier}:${strictEnvFlag}:${keysHash}`
     );
 
     if (options?.useCache) {
@@ -1233,6 +1676,8 @@ export class SpeechTranscriptionAdapter {
           runtimeExecutionStatus: 'FAILED',
           transcriptComparisonStatus: 'NOT_COMPARED',
           humanSpeechProvenanceStatus: provenance.humanSpeechProvenanceStatus,
+          provenanceTrustTier: provenance.provenanceTrustTier,
+          verificationStates: ['NOT_VERIFIED'],
           speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
           speechTranscriptVerified: false,
           runtimeType: validation.runtimeType,
@@ -1265,6 +1710,8 @@ export class SpeechTranscriptionAdapter {
         const toctouReport: WhisperFixtureProvenanceReport = {
           ...provenance,
           humanSpeechProvenanceStatus: 'UNTRUSTED_HASH_MISMATCH',
+          provenanceTrustTier: 'UNTRUSTED',
+          verificationStates: ['NOT_VERIFIED'],
           verifiedHumanSpeech: false,
           reason: toctouFailedReason
         };
@@ -1277,6 +1724,8 @@ export class SpeechTranscriptionAdapter {
           runtimeExecutionStatus: 'FAILED',
           transcriptComparisonStatus: 'FAILED',
           humanSpeechProvenanceStatus: 'UNTRUSTED_HASH_MISMATCH',
+          provenanceTrustTier: 'UNTRUSTED',
+          verificationStates: ['NOT_VERIFIED'],
           speechTranscriptStatus: 'SPEECH_TRANSCRIPT_FAILED',
           speechTranscriptVerified: false,
           runtimeType: validation.runtimeType,
@@ -1329,6 +1778,8 @@ export class SpeechTranscriptionAdapter {
             runtimeExecutionStatus: 'FAILED',
             transcriptComparisonStatus: 'FAILED',
             humanSpeechProvenanceStatus: provenance.humanSpeechProvenanceStatus,
+            provenanceTrustTier: provenance.provenanceTrustTier,
+            verificationStates: ['NOT_VERIFIED'],
             speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
             speechTranscriptVerified: false,
             runtimeType: validation.runtimeType,
@@ -1375,6 +1826,8 @@ export class SpeechTranscriptionAdapter {
           runtimeExecutionStatus: 'FAILED',
           transcriptComparisonStatus: 'NOT_COMPARED',
           humanSpeechProvenanceStatus: provenance.humanSpeechProvenanceStatus,
+          provenanceTrustTier: provenance.provenanceTrustTier,
+          verificationStates: ['NOT_VERIFIED'],
           speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
           speechTranscriptVerified: false,
           runtimeType: validation.runtimeType,
@@ -1437,6 +1890,12 @@ export class SpeechTranscriptionAdapter {
             reason
           };
 
+          const failStatesEmpty: SpeechVerificationState[] = ['RUNTIME_COMPATIBLE'];
+          if (provenance.verifiedHumanSpeech && provenance.provenanceTrustTier !== 'UNTRUSTED') {
+            failStatesEmpty.push('FIXTURE_INTEGRITY_VERIFIED', provenance.provenanceTrustTier);
+          }
+          failStatesEmpty.push('NOT_VERIFIED');
+
           return {
             compatible: false,
             runtimeCompatible: false,
@@ -1446,6 +1905,8 @@ export class SpeechTranscriptionAdapter {
             runtimeExecutionStatus: 'RUNTIME_EXECUTION_VERIFIED',
             transcriptComparisonStatus,
             humanSpeechProvenanceStatus: provenance.humanSpeechProvenanceStatus,
+            provenanceTrustTier: provenance.provenanceTrustTier,
+            verificationStates: failStatesEmpty,
             speechTranscriptStatus,
             speechTranscriptVerified: false,
             runtimeType: validation.runtimeType,
@@ -1466,9 +1927,6 @@ export class SpeechTranscriptionAdapter {
         }
 
         // Speech-fixture compatibility smoke check using ordered token Longest Common Subsequence (LCS).
-        // Tolerates punctuation, casing, and whitespace differences while rejecting incorrect transcripts,
-        // missing expected words, excessive unexpected words, and major word-order mismatches.
-        // Note: This is a runtime compatibility smoke check, NOT a general WER benchmark.
         const m = expectedTokens.length;
         const n = actualTokens.length;
         let prev = new Array<number>(n + 1).fill(0);
@@ -1517,6 +1975,12 @@ export class SpeechTranscriptionAdapter {
             reason
           };
 
+          const failStatesLcs: SpeechVerificationState[] = ['RUNTIME_COMPATIBLE'];
+          if (provenance.verifiedHumanSpeech && provenance.provenanceTrustTier !== 'UNTRUSTED') {
+            failStatesLcs.push('FIXTURE_INTEGRITY_VERIFIED', provenance.provenanceTrustTier);
+          }
+          failStatesLcs.push('NOT_VERIFIED');
+
           return {
             compatible: false,
             runtimeCompatible: false,
@@ -1526,6 +1990,8 @@ export class SpeechTranscriptionAdapter {
             runtimeExecutionStatus: 'RUNTIME_EXECUTION_VERIFIED',
             transcriptComparisonStatus,
             humanSpeechProvenanceStatus: provenance.humanSpeechProvenanceStatus,
+            provenanceTrustTier: provenance.provenanceTrustTier,
+            verificationStates: failStatesLcs,
             speechTranscriptStatus,
             speechTranscriptVerified: false,
             runtimeType: validation.runtimeType,
@@ -1582,12 +2048,20 @@ export class SpeechTranscriptionAdapter {
             minRecallThreshold: MIN_RECALL_THRESHOLD,
             minPrecisionThreshold: MIN_PRECISION_THRESHOLD,
             isSyntheticFixture: false,
-            reason: 'Ordered token LCS comparison met recall/precision thresholds on SHA-256 verified human speech fixture.'
+            reason: provenance.provenanceTrustTier === 'CRYPTOGRAPHICALLY_VERIFIED'
+              ? 'Ordered token LCS comparison met recall/precision thresholds on cryptographically verified (Ed25519 + SHA-256) human speech fixture.'
+              : 'Ordered token LCS comparison met recall/precision thresholds on maintainer-attested (SHA-256) human speech fixture.'
           };
         }
       }
 
       const speechVerified = speechTranscriptStatus === 'SPEECH_TRANSCRIPT_VERIFIED';
+      const verificationStates: SpeechVerificationState[] = ['RUNTIME_COMPATIBLE'];
+      if (provenance.verifiedHumanSpeech && provenance.provenanceTrustTier !== 'UNTRUSTED') {
+        verificationStates.push('FIXTURE_INTEGRITY_VERIFIED', provenance.provenanceTrustTier);
+      }
+      verificationStates.push(speechVerified ? 'TRANSCRIPT_VERIFIED' : 'NOT_VERIFIED');
+
       const passResult: WhisperCompatibilityResult = {
         compatible: true,
         runtimeCompatible: true,
@@ -1597,6 +2071,8 @@ export class SpeechTranscriptionAdapter {
         runtimeExecutionStatus: 'RUNTIME_EXECUTION_VERIFIED',
         transcriptComparisonStatus,
         humanSpeechProvenanceStatus: provenance.humanSpeechProvenanceStatus,
+        provenanceTrustTier: provenance.provenanceTrustTier,
+        verificationStates,
         speechTranscriptStatus,
         speechTranscriptVerified: speechVerified,
         runtimeType: validation.runtimeType,
@@ -1612,7 +2088,7 @@ export class SpeechTranscriptionAdapter {
         fromCache: false,
         executionDurationMs: elapsed,
         details: speechVerified
-          ? `Verified ${validation.runtimeType} runtime execution AND human speech transcript match on manifest-verified 16kHz mono WAV fixture (${wavCheck.durationSeconds}s).`
+          ? `Verified ${validation.runtimeType} runtime execution AND human speech transcript match (${provenance.provenanceTrustTier}) on 16kHz mono WAV fixture (${wavCheck.durationSeconds}s).`
           : `Verified ${validation.runtimeType} runtime compatibility/execution ONLY on 16kHz mono WAV fixture (${wavCheck.durationSeconds}s); speech transcript accuracy remains SPEECH_TRANSCRIPT_UNVERIFIED (${provenance.humanSpeechProvenanceStatus}).`
       };
 
@@ -1643,6 +2119,8 @@ export class SpeechTranscriptionAdapter {
       isSyntheticFixture?: boolean;
       trustedManifestPath?: string;
       trustedManifest?: TrustedSpeechFixtureManifest;
+      trustedPublicKeys?: Record<string, string>;
+      strictAttestationMode?: boolean;
     }
   ): Promise<LocalTranscriptionResult> {
     const startTime = Date.now();
@@ -1659,6 +2137,8 @@ export class SpeechTranscriptionAdapter {
         runtimeExecutionStatus: 'UNCONFIGURED',
         transcriptComparisonStatus: 'NOT_COMPARED',
         humanSpeechProvenanceStatus: 'UNTRUSTED_NO_MANIFEST_ENTRY',
+        provenanceTrustTier: 'UNTRUSTED',
+        verificationStates: ['NOT_VERIFIED'],
         speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
         speechTranscriptVerified: false,
         limitations: 'Local speech-to-text executable (WHISPER_PATH or LOCAL_STT_PATH) not configured. Speech detection is acoustic-only without automated transcription.',
@@ -1685,6 +2165,8 @@ export class SpeechTranscriptionAdapter {
         runtimeExecutionStatus: 'FAILED',
         transcriptComparisonStatus: 'NOT_COMPARED',
         humanSpeechProvenanceStatus: 'UNTRUSTED_NO_MANIFEST_ENTRY',
+        provenanceTrustTier: 'UNTRUSTED',
+        verificationStates: ['NOT_VERIFIED'],
         speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
         speechTranscriptVerified: false,
         failureReason,
@@ -1711,6 +2193,8 @@ export class SpeechTranscriptionAdapter {
     let runtimeExecutionStatus: WhisperRuntimeExecutionStatus = 'UNVERIFIED';
     let transcriptComparisonStatus: TranscriptComparisonStatus = 'NOT_COMPARED';
     let humanSpeechProvenanceStatus: HumanSpeechProvenanceStatus = 'UNTRUSTED_NO_MANIFEST_ENTRY';
+    let provenanceTrustTier: ProvenanceTrustTier = 'UNTRUSTED';
+    let verificationStates: SpeechVerificationState[] = ['NOT_VERIFIED'];
     let speechTranscriptStatus: WhisperSpeechTranscriptStatus = 'SPEECH_TRANSCRIPT_UNVERIFIED';
     let speechTranscriptVerified = false;
 
@@ -1721,12 +2205,16 @@ export class SpeechTranscriptionAdapter {
         forceRefresh: options?.forceRefreshCompatibility,
         isSyntheticFixture: options?.isSyntheticFixture,
         trustedManifestPath: options?.trustedManifestPath,
-        trustedManifest: options?.trustedManifest
+        trustedManifest: options?.trustedManifest,
+        trustedPublicKeys: options?.trustedPublicKeys,
+        strictAttestationMode: options?.strictAttestationMode
       });
       runtimeExecutionStatus = compat.runtimeExecutionStatus;
       runtimeCompatibilityStatus = compat.runtimeCompatibilityStatus;
       transcriptComparisonStatus = compat.transcriptComparisonStatus;
       humanSpeechProvenanceStatus = compat.humanSpeechProvenanceStatus;
+      provenanceTrustTier = compat.provenanceTrustTier;
+      verificationStates = compat.verificationStates;
       speechTranscriptStatus = compat.speechTranscriptStatus;
       speechTranscriptVerified = compat.speechTranscriptVerified;
       if (!compat.compatible) {
@@ -1739,6 +2227,8 @@ export class SpeechTranscriptionAdapter {
           runtimeExecutionStatus: compat.runtimeExecutionStatus,
           transcriptComparisonStatus: compat.transcriptComparisonStatus,
           humanSpeechProvenanceStatus: compat.humanSpeechProvenanceStatus,
+          provenanceTrustTier: compat.provenanceTrustTier,
+          verificationStates: compat.verificationStates,
           speechTranscriptStatus: compat.speechTranscriptStatus,
           speechTranscriptVerified: false,
           failureReason: compat.details,
@@ -1755,6 +2245,8 @@ export class SpeechTranscriptionAdapter {
 
     try {
       const outPrefix = path.join(tmpDir, 'whisper_out');
+      let sttInputPath = videoPath;
+
       // Build strict runtime-specific CLI argument list with isolated temporary output directory
       let cliArgs: string[];
       if (validation.runtimeType === 'whisper_cpp') {
@@ -1768,6 +2260,8 @@ export class SpeechTranscriptionAdapter {
             runtimeExecutionStatus: 'FAILED',
             transcriptComparisonStatus,
             humanSpeechProvenanceStatus,
+            provenanceTrustTier,
+            verificationStates,
             speechTranscriptStatus,
             speechTranscriptVerified,
             failureReason: 'whisper_cpp runtime requires a valid WHISPER_MODEL_PATH.',
@@ -1775,7 +2269,75 @@ export class SpeechTranscriptionAdapter {
             executionDurationMs: Date.now() - startTime
           };
         }
-        cliArgs = ['-m', modelPath, '-f', videoPath, '--output-json', '-of', outPrefix];
+
+        // Convert audio-bearing video inputs (e.g., .mp4, .mov, .mkv) to 16kHz mono 16-bit PCM WAV for real whisper.cpp binaries
+        const inputExt = path.extname(videoPath).toLowerCase();
+        if (inputExt !== '.wav' && fs.existsSync(videoPath)) {
+          let containerHasAudio = false;
+          try {
+            const ffprobeBin = process.env.FFPROBE_PATH || 'ffprobe';
+            const { stdout: probeOut } = await execFileAsync(
+              ffprobeBin,
+              ['-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', videoPath],
+              { timeout: 15000 }
+            );
+            containerHasAudio = String(probeOut || '').trim().length > 0;
+          } catch {
+            containerHasAudio = false;
+          }
+
+          if (containerHasAudio) {
+            const wavInputPath = path.join(tmpDir, 'whisper_input_16k.wav');
+            const ffmpegBin = process.env.FFMPEG_PATH || 'ffmpeg';
+            try {
+              await execFileAsync(
+                ffmpegBin,
+                ['-y', '-i', videoPath, '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', wavInputPath],
+                { timeout: 60000 }
+              );
+              if (!fs.existsSync(wavInputPath) || fs.statSync(wavInputPath).size < 44) {
+                return {
+                  status: 'ANALYSIS_UNAVAILABLE',
+                  diagnosticCode: 'TRANSCRIPTION_FAILED',
+                  compatibilityVerified,
+                  runtimeCompatible: compatibilityVerified,
+                  runtimeCompatibilityStatus,
+                  runtimeExecutionStatus,
+                  transcriptComparisonStatus,
+                  humanSpeechProvenanceStatus,
+                  provenanceTrustTier,
+                  verificationStates,
+                  speechTranscriptStatus,
+                  speechTranscriptVerified,
+                  failureReason: 'FFmpeg failed to extract a valid 16kHz mono PCM WAV track for whisper_cpp.',
+                  limitations: 'Audio extraction to 16kHz WAV failed prior to local transcription.',
+                  executionDurationMs: Date.now() - startTime
+                };
+              }
+              sttInputPath = wavInputPath;
+            } catch (ffmpegErr: any) {
+              return {
+                status: 'ANALYSIS_UNAVAILABLE',
+                diagnosticCode: 'TRANSCRIPTION_FAILED',
+                compatibilityVerified,
+                runtimeCompatible: compatibilityVerified,
+                runtimeCompatibilityStatus,
+                runtimeExecutionStatus,
+                transcriptComparisonStatus,
+                humanSpeechProvenanceStatus,
+                provenanceTrustTier,
+                verificationStates,
+                speechTranscriptStatus,
+                speechTranscriptVerified,
+                failureReason: `FFmpeg failed extracting 16kHz mono PCM WAV for whisper_cpp: ${ffmpegErr?.message || ffmpegErr}`,
+                limitations: 'Audio extraction to 16kHz WAV failed prior to local transcription.',
+                executionDurationMs: Date.now() - startTime
+              };
+            }
+          }
+        }
+
+        cliArgs = ['-m', modelPath, '-f', sttInputPath, '--output-json', '-of', outPrefix];
       } else {
         // Verified openai_whisper CLI
         cliArgs = [videoPath, '--output_format', 'json', '--output_dir', tmpDir];
@@ -1826,6 +2388,8 @@ export class SpeechTranscriptionAdapter {
           runtimeExecutionStatus,
           transcriptComparisonStatus,
           humanSpeechProvenanceStatus,
+          provenanceTrustTier,
+          verificationStates,
           speechTranscriptStatus,
           speechTranscriptVerified,
           failureReason: 'STT executable completed with empty output',
@@ -1853,6 +2417,8 @@ export class SpeechTranscriptionAdapter {
             runtimeExecutionStatus,
             transcriptComparisonStatus,
             humanSpeechProvenanceStatus,
+            provenanceTrustTier,
+            verificationStates,
             speechTranscriptStatus,
             speechTranscriptVerified,
             failureReason: 'Malformed JSON output from STT executable',
@@ -1875,6 +2441,8 @@ export class SpeechTranscriptionAdapter {
           runtimeExecutionStatus,
           transcriptComparisonStatus,
           humanSpeechProvenanceStatus,
+          provenanceTrustTier,
+          verificationStates,
           speechTranscriptStatus,
           speechTranscriptVerified,
           limitations: 'Plain text transcript returned without segment timestamps; segment-level timestamps are unavailable and were not fabricated.',
@@ -1893,6 +2461,8 @@ export class SpeechTranscriptionAdapter {
           runtimeExecutionStatus,
           transcriptComparisonStatus,
           humanSpeechProvenanceStatus,
+          provenanceTrustTier,
+          verificationStates,
           speechTranscriptStatus,
           speechTranscriptVerified,
           failureReason: 'STT executable returned invalid JSON structure (expected JSON object)',
@@ -1915,6 +2485,8 @@ export class SpeechTranscriptionAdapter {
           runtimeExecutionStatus,
           transcriptComparisonStatus,
           humanSpeechProvenanceStatus,
+          provenanceTrustTier,
+          verificationStates,
           speechTranscriptStatus,
           speechTranscriptVerified,
           failureReason: 'STT JSON output missing text, segments, and transcription fields',
@@ -2015,6 +2587,8 @@ export class SpeechTranscriptionAdapter {
         runtimeExecutionStatus,
         transcriptComparisonStatus,
         humanSpeechProvenanceStatus,
+        provenanceTrustTier,
+        verificationStates,
         speechTranscriptStatus,
         speechTranscriptVerified,
         ...(failureReason ? { failureReason } : {}),
@@ -2032,6 +2606,8 @@ export class SpeechTranscriptionAdapter {
         runtimeExecutionStatus,
         transcriptComparisonStatus,
         humanSpeechProvenanceStatus,
+        provenanceTrustTier,
+        verificationStates,
         speechTranscriptStatus,
         speechTranscriptVerified,
         failureReason: `Local STT process execution failed [${classified.diagnosticCode}]: ${classified.details}`,

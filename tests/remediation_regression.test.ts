@@ -17,7 +17,8 @@ import {
   SpeechTranscriptionAdapter,
   speechTranscriptionAdapter,
   audioProcessor,
-  TrustedSpeechFixtureManifest
+  TrustedSpeechFixtureManifest,
+  canonicalizeSpeechManifestPayload
 } from '../src/server/pipeline/audioProcessor';
 import { policyIntelligenceEngine } from '../src/server/intelligence/policyIntelligence';
 import { billingService } from '../src/server/services/billingService';
@@ -2136,6 +2137,539 @@ exit 0
     }
 
     console.log('  ✅ PASS: WS2 Whisper isolation/cleanup & WS3 edge cases verified');
+
+    // -------------------------------------------------------------------------
+    // 13. WS2 PROVENANCE TRUST HARDENING (SECTION 3.6 - 19 CASES) & WS5 MP4->WAV
+    // -------------------------------------------------------------------------
+    console.log('\n[13. WS2 Speech Provenance Trust Hardening (19 Cases) & WS5 MP4->16kHz WAV]');
+
+    const prevWs13Path = process.env.WHISPER_PATH;
+    const prevWs13Model = process.env.WHISPER_MODEL_PATH;
+    const prevWs13Keys = process.env.WHISPER_TRUSTED_PUBLIC_KEYS;
+    const prevWs13Strict = process.env.WHISPER_STRICT_PROVENANCE;
+    const prevWs13Compat = process.env.WHISPER_VERIFY_COMPATIBILITY;
+    const prevWs13Manifest = process.env.WHISPER_SPEECH_MANIFEST_PATH;
+    const prevWs13Audio = process.env.WHISPER_COMPAT_AUDIO_PATH;
+    const prevWs13Expected = process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT;
+    const prevWs13Synth = process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE;
+
+    try {
+      process.env.WHISPER_PATH = compatWhisperCppBin;
+      process.env.WHISPER_MODEL_PATH = validModel;
+      process.env.COMPAT_MODE = 'pass';
+      delete process.env.WHISPER_TRUSTED_PUBLIC_KEYS;
+      delete process.env.WHISPER_STRICT_PROVENANCE;
+      delete process.env.WHISPER_VERIFY_COMPATIBILITY;
+      delete process.env.WHISPER_SPEECH_MANIFEST_PATH;
+      delete process.env.WHISPER_COMPAT_AUDIO_PATH;
+      delete process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT;
+      delete process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE;
+
+      // Ephemeral Ed25519 keypairs (generated at runtime for test isolation ONLY)
+      const { publicKey: pubV1Obj, privateKey: privV1Obj } = crypto.generateKeyPairSync('ed25519');
+      const { publicKey: pubV2Obj, privateKey: privV2Obj } = crypto.generateKeyPairSync('ed25519');
+      const pubV1Pem = pubV1Obj.export({ type: 'spki', format: 'pem' }).toString();
+      const pubV2Pem = pubV2Obj.export({ type: 'spki', format: 'pem' }).toString();
+
+      const signManifest = (
+        baseManifest: Omit<TrustedSpeechFixtureManifest, 'signature'>,
+        keyId: string,
+        privKey: crypto.KeyObject
+      ): TrustedSpeechFixtureManifest => {
+        const payloadBuf = Buffer.from(canonicalizeSpeechManifestPayload(baseManifest), 'utf8');
+        const sigBase64 = crypto.sign(null, payloadBuf, privKey).toString('base64');
+        return {
+          ...baseManifest,
+          signature: {
+            algorithm: 'ed25519',
+            keyId,
+            value: sigBase64,
+            signedAt: '2026-11-15T00:00:00Z'
+          }
+        };
+      };
+
+      const provSpeechWav = path.resolve(testDir, 'ws2_prov_speech_16k.wav');
+      writeTestPcmWav(provSpeechWav, 16000, 0.25);
+      const provSha = crypto.createHash('sha256').update(fs.readFileSync(provSpeechWav)).digest('hex');
+
+      const buildSignableBase = (
+        wavPath: string,
+        entryOverrides: Partial<TrustedSpeechFixtureManifest['fixtures'][0]> = {}
+      ): Omit<TrustedSpeechFixtureManifest, 'signature'> => ({
+        manifestVersion: '1.0.0',
+        description: 'Isolated ephemeral Ed25519 provenance test manifest',
+        fixtures: [
+          {
+            fixtureId: 'ws2_prov_01',
+            relativePath: path.basename(wavPath),
+            sha256: crypto.createHash('sha256').update(fs.readFileSync(wavPath)).digest('hex'),
+            sourceDescription: 'Isolated test speech WAV fixture',
+            recordingOrigin: 'HUMAN_SPEECH_RECORDING',
+            humanSpeechVerificationStatus: 'VERIFIED_HUMAN_SPEECH',
+            expectedTranscript: 'hello compat test',
+            transcriptLanguage: 'en',
+            transcriptReviewEvidence: 'Verified verbatim transcript in WS2 contract test',
+            verificationMetadata: {
+              verifiedBy: 'ws2-qa-reviewer',
+              verifiedAt: '2026-11-15T00:00:00Z',
+              verificationMethod: 'manual_human_audit',
+              hashAlgorithm: 'sha256'
+            },
+            ...entryOverrides
+          }
+        ]
+      });
+
+      const signedManifestPath = path.resolve(testDir, 'ws2_signed_manifest.json');
+      const unsignedBase = buildSignableBase(provSpeechWav);
+      generatedFiles.push(signedManifestPath);
+
+      // 13.1 (3.6 #1) Maintainer-attested unsigned manifest reports MAINTAINER_ATTESTED (NEVER CRYPTOGRAPHICALLY_VERIFIED)
+      fs.writeFileSync(signedManifestPath, JSON.stringify(unsignedBase, null, 2));
+      stt.clearCompatibilityCache();
+      const tierARes = await stt.verifyRuntimeCompatibility({
+        audioFixturePath: provSpeechWav,
+        trustedManifestPath: signedManifestPath
+      });
+      assert.strictEqual(tierARes.compatible, true, '13.1 Unsigned valid manifest passes in non-strict mode');
+      assert.strictEqual(tierARes.provenanceTrustTier, 'MAINTAINER_ATTESTED', '13.1a Unsigned manifest trust tier is MAINTAINER_ATTESTED');
+      assert.strictEqual(tierARes.fixtureProvenance?.signatureVerified, false, '13.1b Unsigned manifest reports signatureVerified=false');
+      assert.ok(tierARes.verificationStates.includes('MAINTAINER_ATTESTED') && !tierARes.verificationStates.includes('CRYPTOGRAPHICALLY_VERIFIED'), '13.1c Verification states distinguish MAINTAINER_ATTESTED');
+
+      // 13.2 (3.6 #2) Valid Ed25519 signed manifest + WHISPER_TRUSTED_PUBLIC_KEYS -> CRYPTOGRAPHICALLY_VERIFIED
+      process.env.WHISPER_TRUSTED_PUBLIC_KEYS = JSON.stringify({ 'test-key-v1': pubV1Pem });
+      const signedManifestV1 = signManifest(unsignedBase, 'test-key-v1', privV1Obj);
+      fs.writeFileSync(signedManifestPath, JSON.stringify(signedManifestV1, null, 2));
+      stt.clearCompatibilityCache();
+      const tierBRes = await stt.verifyRuntimeCompatibility({
+        audioFixturePath: provSpeechWav,
+        trustedManifestPath: signedManifestPath
+      });
+      assert.strictEqual(tierBRes.compatible, true, '13.2 Valid Ed25519 signed manifest passes verification');
+      assert.strictEqual(tierBRes.provenanceTrustTier, 'CRYPTOGRAPHICALLY_VERIFIED', '13.2a Signed manifest trust tier is CRYPTOGRAPHICALLY_VERIFIED');
+      assert.strictEqual(tierBRes.fixtureProvenance?.signatureVerified, true, '13.2b signatureVerified=true');
+      assert.strictEqual(tierBRes.fixtureProvenance?.signatureKeyId, 'test-key-v1', '13.2c Records signatureKeyId');
+      assert.deepStrictEqual(
+        tierBRes.verificationStates,
+        ['RUNTIME_COMPATIBLE', 'FIXTURE_INTEGRITY_VERIFIED', 'CRYPTOGRAPHICALLY_VERIFIED', 'TRANSCRIPT_VERIFIED'],
+        '13.2d Complete verificationStates chain recorded'
+      );
+
+      // 13.3 (3.6 #3) Tampered signed manifest (expectedTranscript changed post-signing) -> INVALID_PROVENANCE
+      const tamperedManifest = JSON.parse(JSON.stringify(signedManifestV1)) as TrustedSpeechFixtureManifest;
+      tamperedManifest.fixtures[0].expectedTranscript = 'tampered phrase injected after signing';
+      stt.clearCompatibilityCache();
+      const tamperedManifestRes = await stt.verifyRuntimeCompatibility({
+        audioFixturePath: provSpeechWav,
+        trustedManifestPath: signedManifestPath,
+        trustedManifest: tamperedManifest
+      });
+      assert.strictEqual(tamperedManifestRes.compatible, false, '13.3 Tampered signed manifest fails closed');
+      assert.strictEqual(tamperedManifestRes.humanSpeechProvenanceStatus, 'INVALID_PROVENANCE', '13.3a Tampered signed manifest yields INVALID_PROVENANCE');
+      assert.strictEqual(tamperedManifestRes.provenanceTrustTier, 'UNTRUSTED', '13.3b Tampered signed manifest trust tier UNTRUSTED');
+
+      // 13.4 (3.6 #4) Tampered audio fixture on disk after signing -> UNTRUSTED_HASH_MISMATCH
+      const tamperWav = path.resolve(testDir, 'ws2_post_sign_tamper.wav');
+      writeTestPcmWav(tamperWav, 16000, 0.25);
+      const signedTamperWavManifest = signManifest(buildSignableBase(tamperWav), 'test-key-v1', privV1Obj);
+      writeTestPcmWav(tamperWav, 16000, 0.5); // Mutate WAV after signing
+      stt.clearCompatibilityCache();
+      const postSignWavTamperRes = await stt.verifyRuntimeCompatibility({
+        audioFixturePath: tamperWav,
+        trustedManifestPath: signedManifestPath,
+        trustedManifest: signedTamperWavManifest
+      });
+      assert.strictEqual(postSignWavTamperRes.compatible, false, '13.4 Post-sign mutated audio WAV fails closed');
+      assert.strictEqual(postSignWavTamperRes.humanSpeechProvenanceStatus, 'UNTRUSTED_HASH_MISMATCH', '13.4a Post-sign audio change yields UNTRUSTED_HASH_MISMATCH');
+
+      // 13.5 (3.6 #5) Corrupted / invalid Ed25519 signature bytes -> INVALID_PROVENANCE (never falls back to Option A!)
+      const badSigManifest = JSON.parse(JSON.stringify(signedManifestV1)) as TrustedSpeechFixtureManifest;
+      badSigManifest.signature!.value = Buffer.from('corrupted-invalid-signature-bytes'.padEnd(64, '0')).toString('base64');
+      stt.clearCompatibilityCache();
+      const badSigRes = await stt.verifyRuntimeCompatibility({
+        audioFixturePath: provSpeechWav,
+        trustedManifestPath: signedManifestPath,
+        trustedManifest: badSigManifest
+      });
+      assert.strictEqual(badSigRes.compatible, false, '13.5 Invalid Ed25519 signature fails closed in non-strict mode');
+      assert.strictEqual(badSigRes.humanSpeechProvenanceStatus, 'INVALID_PROVENANCE', '13.5a Invalid signature yields INVALID_PROVENANCE');
+
+      // 13.6 (3.6 #6) Unknown keyId -> INVALID_PROVENANCE
+      const unknownKeyManifest = signManifest(unsignedBase, 'untrusted-rogue-key', privV2Obj);
+      stt.clearCompatibilityCache();
+      const unknownKeyRes = await stt.verifyRuntimeCompatibility({
+        audioFixturePath: provSpeechWav,
+        trustedManifestPath: signedManifestPath,
+        trustedManifest: unknownKeyManifest
+      });
+      assert.strictEqual(unknownKeyRes.compatible, false, '13.6 Unknown keyId fails closed');
+      assert.strictEqual(unknownKeyRes.humanSpeechProvenanceStatus, 'INVALID_PROVENANCE', '13.6a Unknown keyId yields INVALID_PROVENANCE');
+
+      // 13.7 (3.6 #7) Key rotation across multiple active keyIds + revocation
+      process.env.WHISPER_TRUSTED_PUBLIC_KEYS = JSON.stringify({
+        'test-key-v1': pubV1Pem,
+        'test-key-v2': pubV2Pem
+      });
+      const signedManifestV2 = signManifest(unsignedBase, 'test-key-v2', privV2Obj);
+      stt.clearCompatibilityCache();
+      const rotV1 = await stt.verifyRuntimeCompatibility({
+        audioFixturePath: provSpeechWav,
+        trustedManifestPath: signedManifestPath,
+        trustedManifest: signedManifestV1
+      });
+      const rotV2 = await stt.verifyRuntimeCompatibility({
+        audioFixturePath: provSpeechWav,
+        trustedManifestPath: signedManifestPath,
+        trustedManifest: signedManifestV2
+      });
+      assert.strictEqual(rotV1.provenanceTrustTier, 'CRYPTOGRAPHICALLY_VERIFIED', '13.7a Old key-v1 verifies during rotation overlap');
+      assert.strictEqual(rotV2.provenanceTrustTier, 'CRYPTOGRAPHICALLY_VERIFIED', '13.7b New key-v2 verifies during rotation overlap');
+
+      // Revoke v1
+      process.env.WHISPER_TRUSTED_PUBLIC_KEYS = JSON.stringify({ 'test-key-v2': pubV2Pem });
+      stt.clearCompatibilityCache();
+      const revokedV1 = await stt.verifyRuntimeCompatibility({
+        audioFixturePath: provSpeechWav,
+        trustedManifestPath: signedManifestPath,
+        trustedManifest: signedManifestV1
+      });
+      const activeV2 = await stt.verifyRuntimeCompatibility({
+        audioFixturePath: provSpeechWav,
+        trustedManifestPath: signedManifestPath,
+        trustedManifest: signedManifestV2
+      });
+      assert.strictEqual(revokedV1.humanSpeechProvenanceStatus, 'INVALID_PROVENANCE', '13.7c Revoked key-v1 rejected after rotation');
+      assert.strictEqual(activeV2.provenanceTrustTier, 'CRYPTOGRAPHICALLY_VERIFIED', '13.7d Active key-v2 still verifies after v1 revocation');
+
+      // 13.8 (3.6 #8) Strict provenance mode rejects unsigned manifest
+      process.env.WHISPER_STRICT_PROVENANCE = 'true';
+      fs.writeFileSync(signedManifestPath, JSON.stringify(unsignedBase, null, 2));
+      stt.clearCompatibilityCache();
+      const strictUnsignedRes = await stt.verifyRuntimeCompatibility({
+        audioFixturePath: provSpeechWav,
+        trustedManifestPath: signedManifestPath
+      });
+      assert.strictEqual(strictUnsignedRes.compatible, false, '13.8 Strict mode rejects unsigned manifest');
+      assert.strictEqual(strictUnsignedRes.humanSpeechProvenanceStatus, 'INVALID_PROVENANCE', '13.8a Strict unsigned yields INVALID_PROVENANCE');
+
+      // Strict mode accepts validly signed manifest with required metadata
+      fs.writeFileSync(signedManifestPath, JSON.stringify(signedManifestV2, null, 2));
+      stt.clearCompatibilityCache();
+      const strictSignedRes = await stt.verifyRuntimeCompatibility({
+        audioFixturePath: provSpeechWav,
+        trustedManifestPath: signedManifestPath
+      });
+      assert.strictEqual(strictSignedRes.compatible, true, '13.8b Strict mode accepts valid signed manifest');
+      assert.strictEqual(strictSignedRes.provenanceTrustTier, 'CRYPTOGRAPHICALLY_VERIFIED', '13.8c Strict signed yields CRYPTOGRAPHICALLY_VERIFIED');
+      delete process.env.WHISPER_STRICT_PROVENANCE;
+
+      // 13.9 (3.6 #9) Malformed JSON in manifest file -> INVALID_PROVENANCE
+      const malformedManifestPath = path.resolve(testDir, 'ws2_malformed_manifest.json');
+      fs.writeFileSync(malformedManifestPath, '{ "manifestVersion": "1.0.0", "fixtures": [ BROKEN_JSON ');
+      generatedFiles.push(malformedManifestPath);
+      stt.clearCompatibilityCache();
+      const malformedRes = await stt.verifyRuntimeCompatibility({
+        audioFixturePath: provSpeechWav,
+        trustedManifestPath: malformedManifestPath
+      });
+      assert.strictEqual(malformedRes.compatible, false, '13.9 Malformed JSON manifest fails closed');
+      assert.strictEqual(malformedRes.humanSpeechProvenanceStatus, 'INVALID_PROVENANCE', '13.9a Malformed JSON yields INVALID_PROVENANCE');
+
+      // 13.10 (3.6 #10) Unsupported manifestVersion -> INVALID_PROVENANCE
+      const badVersionManifest = { ...unsignedBase, manifestVersion: '99.0.0' };
+      stt.clearCompatibilityCache();
+      const badVerRes = await stt.verifyRuntimeCompatibility({
+        audioFixturePath: provSpeechWav,
+        trustedManifestPath: signedManifestPath,
+        trustedManifest: badVersionManifest
+      });
+      assert.strictEqual(badVerRes.humanSpeechProvenanceStatus, 'INVALID_PROVENANCE', '13.10 Unsupported manifestVersion rejected as INVALID_PROVENANCE');
+
+      // 13.11 (3.6 #11) Duplicate fixtureId -> INVALID_PROVENANCE
+      const otherWav = path.resolve(testDir, 'ws2_other_16k.wav');
+      writeTestPcmWav(otherWav, 16000, 0.25);
+      const dupIdManifest: TrustedSpeechFixtureManifest = {
+        manifestVersion: '1.0.0',
+        fixtures: [
+          unsignedBase.fixtures[0],
+          { ...buildSignableBase(otherWav).fixtures[0], fixtureId: 'ws2_prov_01' }
+        ]
+      };
+      stt.clearCompatibilityCache();
+      const dupIdRes = await stt.verifyRuntimeCompatibility({
+        audioFixturePath: provSpeechWav,
+        trustedManifestPath: signedManifestPath,
+        trustedManifest: dupIdManifest
+      });
+      assert.strictEqual(dupIdRes.humanSpeechProvenanceStatus, 'INVALID_PROVENANCE', '13.11 Duplicate fixtureId rejected as INVALID_PROVENANCE');
+
+      // 13.12 (3.6 #12) Duplicate canonical fixture path / conflicting hashes or transcripts -> INVALID_PROVENANCE
+      const dupPathManifest: TrustedSpeechFixtureManifest = {
+        manifestVersion: '1.0.0',
+        fixtures: [
+          unsignedBase.fixtures[0],
+          {
+            ...unsignedBase.fixtures[0],
+            fixtureId: 'ws2_prov_02_alias',
+            relativePath: `./${path.basename(provSpeechWav)}`,
+            sha256: 'f'.repeat(64)
+          }
+        ]
+      };
+      stt.clearCompatibilityCache();
+      const dupPathRes = await stt.verifyRuntimeCompatibility({
+        audioFixturePath: provSpeechWav,
+        trustedManifestPath: signedManifestPath,
+        trustedManifest: dupPathManifest
+      });
+      assert.strictEqual(dupPathRes.humanSpeechProvenanceStatus, 'INVALID_PROVENANCE', '13.12 Duplicate canonical path / conflicting hashes rejected as INVALID_PROVENANCE');
+
+      // 13.13 (3.6 #13) Path traversal in relativePath -> INVALID_PROVENANCE
+      const traversalManifest: TrustedSpeechFixtureManifest = {
+        manifestVersion: '1.0.0',
+        fixtures: [
+          { ...unsignedBase.fixtures[0], relativePath: '../../etc/passwd' }
+        ]
+      };
+      stt.clearCompatibilityCache();
+      const traversalRes = await stt.verifyRuntimeCompatibility({
+        audioFixturePath: provSpeechWav,
+        trustedManifestPath: signedManifestPath,
+        trustedManifest: traversalManifest
+      });
+      assert.strictEqual(traversalRes.humanSpeechProvenanceStatus, 'INVALID_PROVENANCE', '13.13 Path traversal in relativePath rejected as INVALID_PROVENANCE');
+
+      // 13.14 (3.6 #14) Invalid verifiedAt timestamp -> INVALID_PROVENANCE
+      for (const badTs of ['not-a-timestamp', '2026-11-15', '2026/11/15T00:00:00Z']) {
+        const badTsManifest = buildSignableBase(provSpeechWav, {
+          verificationMetadata: {
+            verifiedBy: 'qa-user',
+            verifiedAt: badTs,
+            verificationMethod: 'manual_human_audit',
+            hashAlgorithm: 'sha256'
+          }
+        });
+        stt.clearCompatibilityCache();
+        const badTsRes = await stt.verifyRuntimeCompatibility({
+          audioFixturePath: provSpeechWav,
+          trustedManifestPath: signedManifestPath,
+          trustedManifest: badTsManifest
+        });
+        assert.strictEqual(badTsRes.humanSpeechProvenanceStatus, 'INVALID_PROVENANCE', `13.14 Invalid verifiedAt '${badTs}' rejected as INVALID_PROVENANCE`);
+      }
+
+      // 13.15 (3.6 #15) Missing in strict mode / invalid verificationMethod -> INVALID_PROVENANCE
+      const invalidMethodManifest = buildSignableBase(provSpeechWav, {
+        verificationMetadata: {
+          verifiedBy: 'qa-user',
+          verifiedAt: '2026-11-15T00:00:00Z',
+          verificationMethod: 'none',
+          hashAlgorithm: 'sha256'
+        }
+      });
+      stt.clearCompatibilityCache();
+      const invalidMethodRes = await stt.verifyRuntimeCompatibility({
+        audioFixturePath: provSpeechWav,
+        trustedManifestPath: signedManifestPath,
+        trustedManifest: invalidMethodManifest
+      });
+      assert.strictEqual(invalidMethodRes.humanSpeechProvenanceStatus, 'INVALID_PROVENANCE', '13.15 Invalid verificationMethod="none" rejected');
+
+      const missingMethodBase = buildSignableBase(provSpeechWav, {
+        verificationMetadata: {
+          verifiedBy: 'qa-user',
+          verifiedAt: '2026-11-15T00:00:00Z',
+          hashAlgorithm: 'sha256'
+        }
+      });
+      const signedMissingMethod = signManifest(missingMethodBase, 'test-key-v2', privV2Obj);
+      stt.clearCompatibilityCache();
+      const strictMissingMethodRes = await stt.verifyRuntimeCompatibility({
+        audioFixturePath: provSpeechWav,
+        trustedManifestPath: signedManifestPath,
+        trustedManifest: signedMissingMethod,
+        strictAttestationMode: true
+      });
+      assert.strictEqual(strictMissingMethodRes.humanSpeechProvenanceStatus, 'INVALID_PROVENANCE', '13.15b Missing verificationMethod in strict mode rejected');
+
+      // 13.16 (3.6 #16) Invalid hashAlgorithm -> INVALID_PROVENANCE
+      const badHashAlgManifest = buildSignableBase(provSpeechWav, {
+        verificationMetadata: {
+          verifiedBy: 'qa-user',
+          verifiedAt: '2026-11-15T00:00:00Z',
+          verificationMethod: 'manual_human_audit',
+          hashAlgorithm: 'md5'
+        }
+      });
+      stt.clearCompatibilityCache();
+      const badHashAlgRes = await stt.verifyRuntimeCompatibility({
+        audioFixturePath: provSpeechWav,
+        trustedManifestPath: signedManifestPath,
+        trustedManifest: badHashAlgManifest
+      });
+      assert.strictEqual(badHashAlgRes.humanSpeechProvenanceStatus, 'INVALID_PROVENANCE', '13.16 Non-sha256 hashAlgorithm rejected');
+
+      // 13.17 (3.6 #17) Synthetic fixture rejected even under signed manifest
+      const signedSynthManifest = signManifest(
+        buildSignableBase(provSpeechWav, {
+          humanSpeechVerificationStatus: 'SYNTHETIC',
+          recordingOrigin: 'SYNTHETIC_TTS_FIXTURE'
+        }),
+        'test-key-v2',
+        privV2Obj
+      );
+      stt.clearCompatibilityCache();
+      const signedSynthRes = await stt.verifyRuntimeCompatibility({
+        audioFixturePath: provSpeechWav,
+        trustedManifestPath: signedManifestPath,
+        trustedManifest: signedSynthManifest
+      });
+      assert.strictEqual(signedSynthRes.humanSpeechProvenanceStatus, 'SYNTHETIC_FIXTURE', '13.17 Signed synthetic fixture still flagged SYNTHETIC_FIXTURE');
+      assert.strictEqual(signedSynthRes.provenanceTrustTier, 'UNTRUSTED', '13.17a Synthetic fixture stays UNTRUSTED');
+      assert.strictEqual(signedSynthRes.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_UNVERIFIED', '13.17b Synthetic fixture NEVER grants SPEECH_TRANSCRIPT_VERIFIED');
+
+      // 13.18 (3.6 #18) TOCTOU mid-execution tampering on signed fixture -> fails closed UNTRUSTED_HASH_MISMATCH
+      const signedToctouWav = path.resolve(testDir, 'ws2_signed_toctou_16k.wav');
+      writeTestPcmWav(signedToctouWav, 16000, 0.25);
+      const signedToctouManifest = signManifest(buildSignableBase(signedToctouWav), 'test-key-v2', privV2Obj);
+      const signedToctouBin = path.resolve(testDir, 'ws2_signed_toctou_bin.sh');
+      fs.writeFileSync(
+        signedToctouBin,
+        `#!/bin/sh
+if [ "$1" = "--help" ] || [ "$1" = "--version" ]; then
+  echo "whisper.cpp -m <model> -f <file> --output-json"
+  exit 0
+fi
+OUT_PREFIX=""
+PREV=""
+for arg in "$@"; do
+  if [ "$PREV" = "-of" ]; then OUT_PREFIX="$arg"; fi
+  PREV="$arg"
+done
+printf '\\x09\\x08\\x07\\x06' >> "${signedToctouWav}"
+echo '{"transcription":[{"timestamps":{"from":"00:00:00,000","to":"00:00:01,000"},"text":" hello compat test"}]}' > "\${OUT_PREFIX}.json"
+exit 0
+`,
+        { mode: 0o755 }
+      );
+      generatedFiles.push(signedToctouBin);
+      process.env.WHISPER_PATH = signedToctouBin;
+      stt.clearCompatibilityCache();
+      const signedToctouRes = await stt.verifyRuntimeCompatibility({
+        audioFixturePath: signedToctouWav,
+        trustedManifestPath: signedManifestPath,
+        trustedManifest: signedToctouManifest
+      });
+      assert.strictEqual(signedToctouRes.compatible, false, '13.18 Signed TOCTOU attack fails closed');
+      assert.strictEqual(signedToctouRes.humanSpeechProvenanceStatus, 'UNTRUSTED_HASH_MISMATCH', '13.18a Signed TOCTOU reports UNTRUSTED_HASH_MISMATCH');
+
+      // 13.19 (3.6 #19) Verification state separation + Readiness endpoint fields check
+      process.env.WHISPER_PATH = compatWhisperCppBin;
+      process.env.WHISPER_SPEECH_MANIFEST_PATH = signedManifestPath;
+      process.env.WHISPER_COMPAT_AUDIO_PATH = provSpeechWav;
+      process.env.WHISPER_TRUSTED_PUBLIC_KEYS = JSON.stringify({ 'test-key-v2': pubV2Pem });
+      process.env.WHISPER_STRICT_PROVENANCE = 'true';
+      fs.writeFileSync(signedManifestPath, JSON.stringify(signedManifestV2, null, 2));
+      speechTranscriptionAdapter.clearCompatibilityCache();
+
+      // Spin up minimal express router to assert /api/health/readiness alignment
+      const expressMod = await import('express');
+      const healthApp = expressMod.default();
+      healthApp.use('/api', apiRouter);
+      const healthServer = await new Promise<import('http').Server>((resolve) => {
+        const s = healthApp.listen(0, '127.0.0.1', () => resolve(s));
+      });
+      try {
+        const addr = healthServer.address() as any;
+        const readinessRes = await fetch(`http://127.0.0.1:${addr.port}/api/health/readiness`);
+        const readinessJson = await readinessRes.json();
+        const wDetails = readinessJson?.checks?.whisperStt?.details;
+        assert.strictEqual(wDetails?.provenanceTrustTier, 'CRYPTOGRAPHICALLY_VERIFIED', '13.19a Readiness exposes provenanceTrustTier=CRYPTOGRAPHICALLY_VERIFIED');
+        assert.strictEqual(wDetails?.signatureVerified, true, '13.19b Readiness exposes signatureVerified=true');
+        assert.strictEqual(wDetails?.signatureKeyId, 'test-key-v2', '13.19c Readiness exposes signatureKeyId');
+        assert.strictEqual(wDetails?.strictProvenanceMode, true, '13.19d Readiness exposes strictProvenanceMode=true');
+        assert.ok(Array.isArray(wDetails?.verificationStates) && wDetails.verificationStates.includes('TRANSCRIPT_VERIFIED'), '13.19e Readiness exposes verificationStates array');
+        assert.strictEqual(wDetails?.speechTranscriptVerified, true, '13.19f Readiness reports speechTranscriptVerified=true');
+      } finally {
+        await new Promise<void>((resolve) => healthServer.close(() => resolve()));
+      }
+
+      // WS5: Real audio-containing MP4 -> FFmpeg 16kHz mono 16-bit PCM WAV conversion before whisper_cpp
+      const mp4WithAudio = path.resolve(testDir, 'ws5_audio_speech.mp4');
+      await execFileAsync('ffmpeg', [
+        '-y',
+        '-f', 'lavfi', '-i', 'color=c=black:s=160x120:d=2',
+        '-f', 'lavfi', '-i', 'sine=frequency=440:duration=2',
+        '-shortest', '-c:v', 'libx264', '-c:a', 'aac',
+        mp4WithAudio
+      ]);
+      generatedFiles.push(mp4WithAudio);
+
+      const inspectWavPathLog = path.resolve(testDir, 'ws5_received_input_info.txt');
+      const inspectWhisperCppBin = path.resolve(testDir, 'ws5_inspect_whisper_cpp.sh');
+      fs.writeFileSync(
+        inspectWhisperCppBin,
+        `#!/bin/sh
+if [ "$1" = "--help" ] || [ "$1" = "--version" ]; then
+  echo "whisper.cpp -m <model> -f <file> --output-json"
+  exit 0
+fi
+INPUT_F=""
+OUT_PREFIX=""
+PREV=""
+for arg in "$@"; do
+  if [ "$PREV" = "-f" ]; then INPUT_F="$arg"; fi
+  if [ "$PREV" = "-of" ]; then OUT_PREFIX="$arg"; fi
+  PREV="$arg"
+done
+printf "%s" "$INPUT_F" > "${inspectWavPathLog}"
+ffprobe -v error -select_streams a:0 -show_entries stream=codec_name,sample_rate,channels -of csv=p=0 "$INPUT_F" >> "${inspectWavPathLog}.probe"
+echo '{"transcription":[{"timestamps":{"from":"00:00:00,000","to":"00:00:01,500"},"text":" converted wav audio test"}]}' > "\${OUT_PREFIX}.json"
+exit 0
+`,
+        { mode: 0o755 }
+      );
+      generatedFiles.push(inspectWhisperCppBin, inspectWavPathLog, `${inspectWavPathLog}.probe`);
+
+      process.env.WHISPER_PATH = inspectWhisperCppBin;
+      process.env.WHISPER_MODEL_PATH = validModel;
+      process.env.WHISPER_VERIFY_COMPATIBILITY = 'false';
+      stt.clearCompatibilityCache();
+
+      const mp4Tx = await stt.transcribe(mp4WithAudio, 2.0);
+      assert.strictEqual(mp4Tx.status, 'DETECTED', 'WS5.1 whisper_cpp transcribes audio-bearing MP4 cleanly');
+      assert.strictEqual(mp4Tx.transcriptText, 'converted wav audio test', 'WS5.2 whisper_cpp transcript preserved');
+      const receivedInputPath = fs.readFileSync(inspectWavPathLog, 'utf8').trim();
+      const probeSummary = fs.readFileSync(`${inspectWavPathLog}.probe`, 'utf8').trim();
+      assert.ok(receivedInputPath.endsWith('.wav'), `WS5.3 whisper_cpp received 16kHz WAV input instead of MP4 (got ${receivedInputPath})`);
+      assert.ok(probeSummary.includes('pcm_s16le,16000,1'), `WS5.4 Extracted WAV is 16kHz mono pcm_s16le (got ${probeSummary})`);
+      assert.strictEqual(fs.existsSync(receivedInputPath), false, 'WS5.5 Temporary extracted WAV directory cleaned up after execution');
+      assert.ok(provSha.length === 64);
+    } finally {
+      delete process.env.COMPAT_MODE;
+      if (prevWs13Path === undefined) delete process.env.WHISPER_PATH;
+      else process.env.WHISPER_PATH = prevWs13Path;
+      if (prevWs13Model === undefined) delete process.env.WHISPER_MODEL_PATH;
+      else process.env.WHISPER_MODEL_PATH = prevWs13Model;
+      if (prevWs13Keys === undefined) delete process.env.WHISPER_TRUSTED_PUBLIC_KEYS;
+      else process.env.WHISPER_TRUSTED_PUBLIC_KEYS = prevWs13Keys;
+      if (prevWs13Strict === undefined) delete process.env.WHISPER_STRICT_PROVENANCE;
+      else process.env.WHISPER_STRICT_PROVENANCE = prevWs13Strict;
+      if (prevWs13Compat === undefined) delete process.env.WHISPER_VERIFY_COMPATIBILITY;
+      else process.env.WHISPER_VERIFY_COMPATIBILITY = prevWs13Compat;
+      if (prevWs13Manifest === undefined) delete process.env.WHISPER_SPEECH_MANIFEST_PATH;
+      else process.env.WHISPER_SPEECH_MANIFEST_PATH = prevWs13Manifest;
+      if (prevWs13Audio === undefined) delete process.env.WHISPER_COMPAT_AUDIO_PATH;
+      else process.env.WHISPER_COMPAT_AUDIO_PATH = prevWs13Audio;
+      if (prevWs13Expected === undefined) delete process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT;
+      else process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT = prevWs13Expected;
+      if (prevWs13Synth === undefined) delete process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE;
+      else process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE = prevWs13Synth;
+      speechTranscriptionAdapter.clearCompatibilityCache();
+    }
+
+    console.log('  ✅ PASS: WS2 Provenance Trust Hardening (19 cases) & WS5 MP4->16kHz WAV verified');
 
     console.log('\n======================================================');
     console.log('🎉 ALL TARGETED REMEDIATION REGRESSION TESTS PASSED!');

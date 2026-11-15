@@ -631,6 +631,43 @@ export async function runAuthAndOwnershipTests() {
       });
       assert(rescanUntrackedRes.status === 403, 'WS3 Rescan: Untracked req.body.videoPath in POST /scans/:id/rescan is rejected fail-closed (403 Forbidden)');
 
+      // Verify POST /scans/:id/rescan rejects forged client-supplied userId
+      const rescanSpoofUserRes = await fetch(`${baseUrl}/scans/${scanA.id}/rescan`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${activeTokenA}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          userId: userB.id,
+          videoPath: upVidDataA.filePath,
+          videoFilename: 'user_a_ws3.mp4'
+        })
+      });
+      assert(rescanSpoofUserRes.status === 403, 'WS3 Rescan: Forged userId in POST /scans/:id/rescan is rejected (403 Forbidden)');
+
+      // Verify POST /scans/:id/rescan rejects derived proxy path in req.body.videoPath
+      const rescanProxyDir = path.resolve(process.cwd(), 'uploads', 'proxies');
+      if (!fs.existsSync(rescanProxyDir)) fs.mkdirSync(rescanProxyDir, { recursive: true });
+      const rescanFakeProxyPath = path.resolve(rescanProxyDir, `ws3_proxy_probe_${Date.now()}.mp4`);
+      fs.writeFileSync(rescanFakeProxyPath, 'PROXY_BYTES');
+      try {
+        const rescanProxyRes = await fetch(`${baseUrl}/scans/${scanA.id}/rescan`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${activeTokenA}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            videoPath: rescanFakeProxyPath,
+            videoFilename: 'proxy.mp4'
+          })
+        });
+        assert(rescanProxyRes.status === 403, 'WS3 Rescan: Derived proxy path in POST /scans/:id/rescan is rejected (403 Forbidden)');
+      } finally {
+        try { if (fs.existsSync(rescanFakeProxyPath)) fs.rmSync(rescanFakeProxyPath); } catch {}
+      }
+
       // Test 3.10 (WS3 Case 9): Verify rejected requests executed BEFORE mediaInspector, credit deduction, or job creation
       // untrackedVideoPath contained non-video bytes; returning 403 (NOT 400/500) proves mediaInspector never ran.
       const userBCreditsAfter = (await storage.users.getUser(userB.id))!.creditsRemaining;

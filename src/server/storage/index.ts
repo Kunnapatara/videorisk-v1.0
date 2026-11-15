@@ -790,7 +790,15 @@ export class InMemoryStorageRepository implements IStorageRepository {
     },
 
     saveSubscription: async (sub: SubscriptionRecord) => {
-      this.state.subscriptions[sub.id] = sub;
+      const existing = this.state.subscriptions[sub.id];
+      const maxCreated = Math.max(
+        typeof existing?.lastEventCreated === 'number' ? existing.lastEventCreated : 0,
+        typeof sub.lastEventCreated === 'number' ? sub.lastEventCreated : 0
+      );
+      this.state.subscriptions[sub.id] = {
+        ...sub,
+        ...(maxCreated > 0 ? { lastEventCreated: maxCreated } : {}),
+      };
       this.save();
     },
 

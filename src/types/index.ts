@@ -649,6 +649,8 @@ export interface SubscriptionRecord {
   planId: string;
   status: 'active' | 'canceled' | 'past_due' | 'trialing' | 'incomplete';
   currentPeriodEnd?: string;
+  lastEventCreated?: number;
+  cancelAtPeriodEnd?: boolean;
   createdAt: string;
   updatedAt: string;
 }

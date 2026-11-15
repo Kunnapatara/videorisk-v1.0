@@ -1349,6 +1349,8 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
             ? sttValidation.diagnosticCode
             : 'MISSING_MODEL';
 
+    const strictProvenanceMode = (process.env.WHISPER_STRICT_PROVENANCE || '').trim().toLowerCase() === 'true';
+
     if (sttValidation.status === 'UNCONFIGURED') {
       checks.whisperStt = {
         status: 'healthy',
@@ -1363,6 +1365,11 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
           runtimeExecutionStatus: 'UNCONFIGURED',
           transcriptComparisonStatus: 'NOT_COMPARED',
           humanSpeechProvenanceStatus: 'UNTRUSTED_NO_MANIFEST_ENTRY',
+          provenanceTrustTier: 'UNTRUSTED',
+          verificationStates: ['NOT_VERIFIED'],
+          signatureVerified: false,
+          signatureKeyId: null,
+          strictProvenanceMode,
           speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
           fixtureProvenance: null,
           fixtureAvailable,
@@ -1393,6 +1400,11 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
           runtimeExecutionStatus: 'FAILED',
           transcriptComparisonStatus: 'NOT_COMPARED',
           humanSpeechProvenanceStatus: isSyntheticFixtureEnv ? 'SYNTHETIC_FIXTURE' : 'UNTRUSTED_NO_MANIFEST_ENTRY',
+          provenanceTrustTier: 'UNTRUSTED',
+          verificationStates: ['NOT_VERIFIED'],
+          signatureVerified: false,
+          signatureKeyId: null,
+          strictProvenanceMode,
           speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
           fixtureProvenance: null,
           fixtureAvailable,
@@ -1427,6 +1439,11 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
           runtimeExecutionStatus: 'UNVERIFIED',
           transcriptComparisonStatus: 'NOT_COMPARED',
           humanSpeechProvenanceStatus: isSyntheticFixtureEnv ? 'SYNTHETIC_FIXTURE' : 'UNTRUSTED_NO_MANIFEST_ENTRY',
+          provenanceTrustTier: 'UNTRUSTED',
+          verificationStates: ['NOT_VERIFIED'],
+          signatureVerified: false,
+          signatureKeyId: null,
+          strictProvenanceMode,
           speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
           fixtureProvenance: null,
           fixtureAvailable,
@@ -1459,7 +1476,7 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
         checks.whisperStt = {
           status: 'healthy',
           message: speechVerified
-            ? `Whisper STT runtime (${compat.runtimeType}) verified for both runtime execution and human speech transcript matching.`
+            ? `Whisper STT runtime (${compat.runtimeType}) verified for both runtime execution and human speech transcript matching (${compat.provenanceTrustTier}).`
             : `Whisper STT runtime (${compat.runtimeType}) compatibility/execution verified ONLY; speech transcript verification remains SPEECH_TRANSCRIPT_UNVERIFIED (${compat.humanSpeechProvenanceStatus}).`,
           details: {
             configured: true,
@@ -1472,6 +1489,11 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
             runtimeExecutionStatus: compat.runtimeExecutionStatus,
             transcriptComparisonStatus: compat.transcriptComparisonStatus,
             humanSpeechProvenanceStatus: compat.humanSpeechProvenanceStatus,
+            provenanceTrustTier: compat.provenanceTrustTier,
+            verificationStates: compat.verificationStates,
+            signatureVerified: Boolean(compat.fixtureProvenance?.signatureVerified),
+            signatureKeyId: compat.fixtureProvenance?.signatureKeyId || null,
+            strictProvenanceMode,
             speechTranscriptStatus: compat.speechTranscriptStatus,
             fixtureProvenance: compat.fixtureProvenance || null,
             fixtureAvailable: true,
@@ -1505,6 +1527,11 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
             runtimeExecutionStatus: 'UNVERIFIED',
             transcriptComparisonStatus: 'NOT_COMPARED',
             humanSpeechProvenanceStatus: compat.humanSpeechProvenanceStatus,
+            provenanceTrustTier: compat.provenanceTrustTier,
+            verificationStates: compat.verificationStates,
+            signatureVerified: Boolean(compat.fixtureProvenance?.signatureVerified),
+            signatureKeyId: compat.fixtureProvenance?.signatureKeyId || null,
+            strictProvenanceMode,
             speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
             fixtureProvenance: compat.fixtureProvenance || null,
             fixtureAvailable: false,
@@ -1536,6 +1563,11 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
             runtimeExecutionStatus: compat.runtimeExecutionStatus,
             transcriptComparisonStatus: compat.transcriptComparisonStatus,
             humanSpeechProvenanceStatus: compat.humanSpeechProvenanceStatus,
+            provenanceTrustTier: compat.provenanceTrustTier,
+            verificationStates: compat.verificationStates,
+            signatureVerified: Boolean(compat.fixtureProvenance?.signatureVerified),
+            signatureKeyId: compat.fixtureProvenance?.signatureKeyId || null,
+            strictProvenanceMode,
             speechTranscriptStatus: compat.speechTranscriptStatus,
             fixtureProvenance: compat.fixtureProvenance || null,
             fixtureAvailable,
@@ -1563,6 +1595,11 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
         runtimeExecutionStatus: 'FAILED',
         transcriptComparisonStatus: 'NOT_COMPARED',
         humanSpeechProvenanceStatus: 'UNTRUSTED_NO_MANIFEST_ENTRY',
+        provenanceTrustTier: 'UNTRUSTED',
+        verificationStates: ['NOT_VERIFIED'],
+        signatureVerified: false,
+        signatureKeyId: null,
+        strictProvenanceMode: (process.env.WHISPER_STRICT_PROVENANCE || '').trim().toLowerCase() === 'true',
         speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
         fixtureProvenance: null,
         failureReason: 'Unexpected readiness probe error.',
@@ -2903,6 +2940,19 @@ apiRouter.post('/scans/:id/rescan', requireAuthMiddleware, validateRescanAuthori
       return;
     }
 
+    const clientSuppliedUserId = req.body?.userId;
+    if (
+      clientSuppliedUserId !== undefined &&
+      clientSuppliedUserId !== null &&
+      String(clientSuppliedUserId).trim() !== '' &&
+      String(clientSuppliedUserId) !== user.id
+    ) {
+      if (req.file && fs.existsSync(req.file.path)) {
+        try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
+      }
+      return res.status(403).json({ error: 'Access denied: Invalid user attribution.' });
+    }
+
     const parentScan = (req as any).parentScan || await storage.scans.getScan(req.params.id);
     if (!parentScan) {
       if (req.file && fs.existsSync(req.file.path)) {
@@ -2916,6 +2966,14 @@ apiRouter.post('/scans/:id/rescan', requireAuthMiddleware, validateRescanAuthori
       }
       return res.status(403).json({ error: 'Access denied: Cannot re-scan video belonging to another user.' });
     }
+
+    const proxiesDir = path.resolve(uploadDir, 'proxies');
+    const framesDir = path.resolve(uploadDir, 'frames');
+    const isDerivedArtifactPath = (p: string): boolean =>
+      p === proxiesDir ||
+      p.startsWith(proxiesDir + path.sep) ||
+      p === framesDir ||
+      p.startsWith(framesDir + path.sep);
 
     let filePath = '';
     let filename = '';
@@ -2933,21 +2991,40 @@ apiRouter.post('/scans/:id/rescan', requireAuthMiddleware, validateRescanAuthori
         createdAt: new Date().toISOString()
       });
     } else if (req.body.videoPath !== undefined && req.body.videoPath !== null && String(req.body.videoPath).trim() !== '') {
-      if (typeof req.body.videoPath !== 'string' || !isSafeUploadPath(req.body.videoPath)) {
+      if (typeof req.body.videoPath !== 'string') {
+        return res.status(403).json({ error: 'Access denied: Invalid or unauthorized video path.' });
+      }
+      const rescanPathValidation = validateSafeStoragePath(req.body.videoPath, { mustExist: true });
+      if (!rescanPathValidation.isSafe) {
         return res.status(403).json({ error: 'Access denied: Invalid or unauthorized video path.' });
       }
       const { canonicalPath: canonicalRescanPath, uploadRecord: uploadRec } =
-        await resolveCanonicalUploadRecord(req.body.videoPath);
+        await resolveCanonicalUploadRecord(rescanPathValidation.resolvedPath);
+      if (isDerivedArtifactPath(canonicalRescanPath)) {
+        return res.status(403).json({ error: 'Access denied: Unauthorized video resource.' });
+      }
       if (!uploadRec || uploadRec.userId !== user.id) {
         return res.status(403).json({ error: 'Access denied: Video asset has no trusted ownership record for the authenticated user.' });
       }
       if (uploadRec.type && uploadRec.type !== 'video') {
         return res.status(403).json({ error: 'Access denied: Referenced asset is not an authorized video upload.' });
       }
+      const canonicalRescanOwner = await getMediaOwner(canonicalRescanPath);
+      if (canonicalRescanOwner && canonicalRescanOwner.userId !== user.id) {
+        return res.status(403).json({ error: 'Access denied: Conflicting ownership for referenced video resource.' });
+      }
       filePath = canonicalRescanPath;
       filename = req.body.videoFilename || path.basename(filePath);
-    } else if (parentScan.videoPath && fs.existsSync(parentScan.videoPath) && isSafeUploadPath(parentScan.videoPath)) {
-      filePath = parentScan.videoPath;
+    } else if (parentScan.videoPath && validateSafeStoragePath(parentScan.videoPath, { mustExist: true }).isSafe) {
+      const { canonicalPath: canonicalParentPath } = await resolveCanonicalUploadRecord(parentScan.videoPath);
+      if (isDerivedArtifactPath(canonicalParentPath)) {
+        return res.status(403).json({ error: 'Access denied: Unauthorized parent video resource.' });
+      }
+      const parentMediaOwner = await getMediaOwner(canonicalParentPath);
+      if (parentMediaOwner && parentMediaOwner.userId !== user.id) {
+        return res.status(403).json({ error: 'Access denied: Conflicting ownership for parent video resource.' });
+      }
+      filePath = canonicalParentPath;
       filename = `Revised_${parentScan.videoFilename}`;
     } else {
       return res.status(400).json({ 
@@ -3031,6 +3108,12 @@ apiRouter.get('/scans/:id/comparison', async (req: Request, res: Response) => {
     const comparison = await storage.scans.getComparison(req.params.id);
     if (!comparison) {
       return res.status(404).json({ error: 'Comparison delta not found for this scan.' });
+    }
+    if (comparison.originalScanId && comparison.originalScanId !== scan.id) {
+      const originalScan = await storage.scans.getScan(comparison.originalScanId);
+      if (originalScan && originalScan.userId !== user.id) {
+        return res.status(403).json({ error: 'Access denied: Original scan in comparison belongs to another user.' });
+      }
     }
     res.json(comparison);
   } catch (err: any) {

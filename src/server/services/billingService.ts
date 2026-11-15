@@ -1142,13 +1142,20 @@ export class BillingService {
       if (isCumulativeFull && isSubscriptionPurchase && payment.subscriptionId) {
         const targetSub = state.subscriptions[payment.subscriptionId];
         if (targetSub) {
-          targetSub.status = 'canceled';
-          targetSub.updatedAt = nowIso;
+          state.subscriptions[payment.subscriptionId] = {
+            ...targetSub,
+            status: 'canceled',
+            updatedAt: nowIso,
+          };
         }
-        if (user.subscriptionId === payment.subscriptionId || !user.subscriptionId) {
-          user.subscriptionStatus = 'canceled';
-          user.plan = 'free';
-        }
+        this.applyUserSubscriptionEntitlement(
+          state,
+          user,
+          payment.subscriptionId,
+          'canceled',
+          payment.planId || targetSub?.planId || 'free',
+          targetSub?.currentPeriodEnd
+        );
       }
 
       this.upsertStripePayment(state, {
@@ -1707,6 +1714,7 @@ export class BillingService {
           if (targetSub) {
             targetSub.status = 'canceled';
             targetSub.updatedAt = nowIso;
+            state.subscriptions[effectiveSubId] = targetSub;
           }
           if (user.subscriptionId === effectiveSubId || !user.subscriptionId) {
             user.subscriptionStatus = 'canceled';
@@ -1763,6 +1771,70 @@ export class BillingService {
     };
   }
 
+  private getUserSubscriptionsInState(state: any, userId: string): SubscriptionRecord[] {
+    if (state.prepare && typeof state.prepare === 'function') {
+      const rows = state.prepare('SELECT * FROM subscriptions WHERE user_id = ?').all(userId) as any[];
+      return rows.map((row: any) => ({
+        id: row.id,
+        userId: row.user_id,
+        planId: row.plan_id,
+        status: row.status,
+        currentPeriodEnd: row.current_period_end || undefined,
+        lastEventCreated: row.last_event_created !== null && row.last_event_created !== undefined ? Number(row.last_event_created) : undefined,
+        cancelAtPeriodEnd: row.cancel_at_period_end === 1,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      }));
+    }
+    return Object.values(state.subscriptions || {}).filter((s: any) => s && s.userId === userId) as SubscriptionRecord[];
+  }
+
+  private applyUserSubscriptionEntitlement(
+    state: any,
+    user: UserAccount,
+    subId: string,
+    subStatus: string,
+    planId: string,
+    currentPeriodEnd?: string
+  ): void {
+    const incomingEntitled = this.isSubscriptionEntitled(subStatus, currentPeriodEnd);
+
+    // If the user has a DIFFERENT primary subscription that is active/trialing (or entitled when incoming is not active/trialing),
+    // never allow a secondary degraded/canceled subscription (e.g., past_due within grace period) to hijack or downgrade it.
+    if (user.subscriptionId && user.subscriptionId !== subId) {
+      const primarySub = state.subscriptions[user.subscriptionId] as SubscriptionRecord | undefined;
+      if (primarySub && this.isSubscriptionEntitled(primarySub.status, primarySub.currentPeriodEnd)) {
+        const incomingIsActiveOrTrialing = subStatus === 'active' || subStatus === 'trialing';
+        const primaryIsActiveOrTrialing = primarySub.status === 'active' || primarySub.status === 'trialing';
+        if (!incomingEntitled || (primaryIsActiveOrTrialing && !incomingIsActiveOrTrialing)) {
+          return;
+        }
+      }
+    }
+
+    if (incomingEntitled) {
+      user.subscriptionId = subId;
+      user.subscriptionStatus = subStatus;
+      user.plan = planId as any;
+      return;
+    }
+
+    // Check if another active/trialing subscription remains entitled for this user
+    const otherEntitled = this.getUserSubscriptionsInState(state, user.id).find(
+      (s) => s.id !== subId && this.isSubscriptionEntitled(s.status, s.currentPeriodEnd)
+    );
+    if (otherEntitled) {
+      user.subscriptionId = otherEntitled.id;
+      user.subscriptionStatus = otherEntitled.status;
+      user.plan = otherEntitled.planId as any;
+      return;
+    }
+
+    user.subscriptionId = subId;
+    user.subscriptionStatus = subStatus;
+    user.plan = 'free';
+  }
+
   /**
    * Executes transactional state updates for verified webhook events
    */
@@ -1774,11 +1846,34 @@ export class BillingService {
         return { alreadyProcessed: true };
       }
 
-      const eventCreatedMs = (event.created || 0) * 1000;
-      const isOutOfOrder = (subRecord: any) => {
-        if (!subRecord || !subRecord.updatedAt || !event.created) return false;
-        const subUpdatedMs = new Date(subRecord.updatedAt).getTime();
-        return subUpdatedMs > 0 && eventCreatedMs < subUpdatedMs;
+      const eventCreatedSec = typeof event.created === 'number' && Number.isFinite(event.created) && event.created > 0
+        ? Math.floor(event.created)
+        : 0;
+      const eventCreatedMs = eventCreatedSec * 1000;
+
+      const isOutOfOrder = (subRecord: SubscriptionRecord | undefined, incomingStatus?: string): boolean => {
+        if (!subRecord) return false;
+        const prevCreated = typeof subRecord.lastEventCreated === 'number' && Number.isFinite(subRecord.lastEventCreated)
+          ? subRecord.lastEventCreated
+          : 0;
+        if (prevCreated > 0 && eventCreatedSec > 0 && eventCreatedSec < prevCreated) {
+          return true;
+        }
+        // Deterministic same-second tie-breaker: canceled is terminal on a given subscription ID
+        if (prevCreated > 0 && eventCreatedSec === prevCreated && incomingStatus) {
+          if (subRecord.status === 'canceled' && incomingStatus !== 'canceled') {
+            return true;
+          }
+        }
+        return false;
+      };
+
+      const mergeLastCreated = (prev?: number): number | undefined => {
+        const merged = Math.max(
+          typeof prev === 'number' && Number.isFinite(prev) ? prev : 0,
+          eventCreatedSec
+        );
+        return merged > 0 ? merged : undefined;
       };
 
       switch (event.type) {
@@ -1860,17 +1955,17 @@ export class BillingService {
             }
             if (sessionSubId && planId !== 'audit_once') {
               const nowIso = new Date().toISOString();
-              user.subscriptionId = sessionSubId;
-              user.subscriptionStatus = 'canceled';
-              user.plan = 'free';
+              const existingSub = state.subscriptions[sessionSubId];
               state.subscriptions[sessionSubId] = {
                 id: sessionSubId,
                 userId: user.id,
                 planId,
                 status: 'canceled',
-                createdAt: state.subscriptions[sessionSubId]?.createdAt || nowIso,
+                lastEventCreated: mergeLastCreated(existingSub?.lastEventCreated),
+                createdAt: existingSub?.createdAt || nowIso,
                 updatedAt: nowIso,
               };
+              this.applyUserSubscriptionEntitlement(state, user, sessionSubId, 'canceled', 'free');
             }
             this.reconcilePendingRefundsForPayment(state, refundedPayment, user, new Date().toISOString());
             state.webhookEvents[event.id] = {
@@ -1904,17 +1999,22 @@ export class BillingService {
               user.stripeCustomerId = sessionCustomerId;
             }
             if (sessionSubId) {
-              user.subscriptionId = sessionSubId;
-              user.subscriptionStatus = 'active';
-
-              state.subscriptions[sessionSubId] = {
-                id: sessionSubId,
-                userId: user.id,
-                planId,
-                status: 'active',
-                createdAt: new Date().toISOString(),
-                updatedAt: new Date(Math.max(Date.now(), eventCreatedMs)).toISOString(),
-              };
+              const existingSub = state.subscriptions[sessionSubId];
+              if (!existingSub || !isOutOfOrder(existingSub, 'active')) {
+                user.subscriptionId = sessionSubId;
+                user.subscriptionStatus = 'active';
+                state.subscriptions[sessionSubId] = {
+                  id: sessionSubId,
+                  userId: user.id,
+                  planId,
+                  status: 'active',
+                  currentPeriodEnd: existingSub?.currentPeriodEnd,
+                  cancelAtPeriodEnd: existingSub?.cancelAtPeriodEnd,
+                  lastEventCreated: mergeLastCreated(existingSub?.lastEventCreated),
+                  createdAt: existingSub?.createdAt || new Date().toISOString(),
+                  updatedAt: new Date(Math.max(Date.now(), eventCreatedMs)).toISOString(),
+                };
+              }
             }
             const existingOrSyncedPayment = this.upsertStripePayment(state, {
               id: `pay_${session.id}`,
@@ -1956,17 +2056,22 @@ export class BillingService {
             user.stripeCustomerId = sessionCustomerId;
           }
           if (sessionSubId) {
-            user.subscriptionId = sessionSubId;
-            user.subscriptionStatus = 'active';
-
-            state.subscriptions[sessionSubId] = {
-              id: sessionSubId,
-              userId: user.id,
-              planId,
-              status: 'active',
-              createdAt: new Date().toISOString(),
-              updatedAt: new Date(Math.max(Date.now(), eventCreatedMs)).toISOString(),
-            };
+            const existingSub = state.subscriptions[sessionSubId];
+            if (!existingSub || !isOutOfOrder(existingSub, 'active')) {
+              user.subscriptionId = sessionSubId;
+              user.subscriptionStatus = 'active';
+              state.subscriptions[sessionSubId] = {
+                id: sessionSubId,
+                userId: user.id,
+                planId,
+                status: 'active',
+                currentPeriodEnd: existingSub?.currentPeriodEnd,
+                cancelAtPeriodEnd: existingSub?.cancelAtPeriodEnd,
+                lastEventCreated: mergeLastCreated(existingSub?.lastEventCreated),
+                createdAt: existingSub?.createdAt || new Date().toISOString(),
+                updatedAt: new Date(Math.max(Date.now(), eventCreatedMs)).toISOString(),
+              };
+            }
           }
 
           const createdPayment = this.upsertStripePayment(state, {
@@ -2027,18 +2132,20 @@ export class BillingService {
           if (subId) {
             const sub = state.subscriptions[subId];
             if (sub) {
-              if (isOutOfOrder(sub)) {
+              if (isOutOfOrder(sub, 'active')) {
                 console.log(`[BillingService] Out-of-order invoice.paid event ${event.id} ignored.`);
                 state.webhookEvents[event.id] = {
                   eventId: event.id,
                   provider: 'stripe',
                   eventType: event.type,
                   processedAt: new Date().toISOString(),
+                  userId: sub.userId,
                 };
                 return { alreadyProcessed: false };
               }
 
               sub.status = 'active';
+              sub.lastEventCreated = mergeLastCreated(sub.lastEventCreated);
               sub.updatedAt = new Date(Math.max(Date.now(), eventCreatedMs)).toISOString();
 
               const user = state.users[sub.userId];
@@ -2052,8 +2159,9 @@ export class BillingService {
 
                 if (hasPriorFullRefund) {
                   sub.status = 'canceled';
-                  user.subscriptionStatus = 'canceled';
-                  user.plan = 'free';
+                  state.subscriptions[subId] = sub;
+                  this.applyUserSubscriptionEntitlement(state, user, subId, 'canceled', sub.planId, sub.currentPeriodEnd);
+
                   const refundedInvPayment = this.upsertStripePayment(state, {
                     id: `pay_inv_${invoice.id || event.id}`,
                     userId: sub.userId,
@@ -2081,12 +2189,31 @@ export class BillingService {
                   return { alreadyProcessed: false };
                 }
 
-                user.subscriptionStatus = 'active';
-                user.plan = sub.planId as any;
+                state.subscriptions[subId] = sub;
+                this.applyUserSubscriptionEntitlement(state, user, subId, 'active', sub.planId, sub.currentPeriodEnd);
 
-                const creditAllocation = isRenewal ? this.getPlanCreditAllocation(sub.planId) : 0;
+                const invDedupKey = invoice.id ? `inv_paid_${invoice.id}` : '';
+                let invoiceRenewalAlreadyCredited = Boolean(invDedupKey && state.webhookEvents[invDedupKey]);
+                if (!invoiceRenewalAlreadyCredited && invoice.id && isRenewal) {
+                  if (state.prepare && typeof state.prepare === 'function') {
+                    const row = state.prepare(
+                      `SELECT id FROM credit_transactions WHERE type = 'SUBSCRIPTION_RENEWAL' AND (reference_id = ? OR reference_id = ?)`
+                    ).get(invoice.id, invDedupKey) as any;
+                    if (row) invoiceRenewalAlreadyCredited = true;
+                  } else if (Array.isArray((state as any).creditTransactions)) {
+                    invoiceRenewalAlreadyCredited = (state as any).creditTransactions.some(
+                      (tx: any) =>
+                        tx.type === 'SUBSCRIPTION_RENEWAL' &&
+                        (tx.referenceId === invoice.id || tx.referenceId === invDedupKey)
+                    );
+                  }
+                }
 
-                if (isRenewal) {
+                const creditAllocation = isRenewal && !invoiceRenewalAlreadyCredited
+                  ? this.getPlanCreditAllocation(sub.planId)
+                  : 0;
+
+                if (isRenewal && !invoiceRenewalAlreadyCredited) {
                   user.creditsRemaining += creditAllocation;
                 }
 
@@ -2099,7 +2226,7 @@ export class BillingService {
                   subscriptionId: subId,
                   customerId: invoiceCustomerId || user.stripeCustomerId,
                   planId: sub.planId,
-                  creditsGranted: isRenewal ? creditAllocation : this.getPlanCreditAllocation(sub.planId),
+                  creditsGranted: isRenewal ? this.getPlanCreditAllocation(sub.planId) : this.getPlanCreditAllocation(sub.planId),
                   amountTotal: typeof invoice.amount_paid === 'number' ? invoice.amount_paid : undefined,
                   currency: invoice.currency || undefined,
                   status: 'paid',
@@ -2115,23 +2242,31 @@ export class BillingService {
                     creditsGranted: creditAllocation,
                     planGranted: sub.planId,
                   };
-                  recordCreditTx(state, {
-                    userId: sub.userId,
-                    delta: creditAllocation,
-                    balanceAfter: user.creditsRemaining,
-                    type: 'SUBSCRIPTION_RENEWAL',
-                    referenceId: event.id,
-                    metadataJson: JSON.stringify({
-                      planId: sub.planId,
-                      invoiceId: invoice.id,
-                      paymentIntentId: invoicePaymentIntentId || null,
-                      chargeId: invoiceChargeId || null,
-                    })
-                  });
+                  if (invDedupKey) {
+                    state.webhookEvents[invDedupKey] = state.webhookEvents[event.id];
+                  }
+                  if (!invoiceRenewalAlreadyCredited) {
+                    recordCreditTx(state, {
+                      userId: sub.userId,
+                      delta: creditAllocation,
+                      balanceAfter: user.creditsRemaining,
+                      type: 'SUBSCRIPTION_RENEWAL',
+                      referenceId: invoice.id || event.id,
+                      metadataJson: JSON.stringify({
+                        planId: sub.planId,
+                        invoiceId: invoice.id,
+                        eventId: event.id,
+                        paymentIntentId: invoicePaymentIntentId || null,
+                        chargeId: invoiceChargeId || null,
+                      })
+                    });
+                  }
                   this.reconcilePendingRefundsForPayment(state, invPayment, user, new Date().toISOString());
                   return { alreadyProcessed: false };
                 }
                 this.reconcilePendingRefundsForPayment(state, invPayment, user, new Date().toISOString());
+              } else {
+                state.subscriptions[subId] = sub;
               }
             }
           }
@@ -2159,12 +2294,13 @@ export class BillingService {
           const subId = subscription.id;
           const customerId = typeof subscription.customer === 'string' ? subscription.customer : subscription.customer?.id;
           const status = subscription.status;
+          const cancelAtPeriodEnd = Boolean((subscription as any).cancel_at_period_end);
           const currentPeriodEnd = (subscription as any).current_period_end 
             ? new Date((subscription as any).current_period_end * 1000).toISOString() 
             : undefined;
 
-          let sub = state.subscriptions[subId];
-          if (sub && isOutOfOrder(sub)) {
+          const sub = state.subscriptions[subId];
+          if (sub && isOutOfOrder(sub, status)) {
             console.log(`[BillingService] Out-of-order ${event.type} event ${event.id} ignored.`);
             state.webhookEvents[event.id] = {
               eventId: event.id,
@@ -2194,9 +2330,7 @@ export class BillingService {
           if (userId) {
             const user = state.users[userId];
             if (user) {
-              user.subscriptionStatus = status;
               if (customerId) user.stripeCustomerId = customerId;
-              user.subscriptionId = subId;
 
               const priceId = subscription.items?.data?.[0]?.price?.id;
               let mappedPlanId: AllowedPaidPlan | null = null;
@@ -2216,22 +2350,19 @@ export class BillingService {
                 mappedPlanId = 'pro';
               }
 
-              const entitled = this.isSubscriptionEntitled(status, currentPeriodEnd);
-              if (entitled) {
-                user.plan = mappedPlanId as any;
-              } else {
-                user.plan = 'free';
-              }
-
               state.subscriptions[subId] = {
                 id: subId,
                 userId: user.id,
                 planId: mappedPlanId,
                 status: status as any,
                 currentPeriodEnd,
+                cancelAtPeriodEnd,
+                lastEventCreated: mergeLastCreated(sub?.lastEventCreated),
                 createdAt: sub?.createdAt || new Date().toISOString(),
                 updatedAt: new Date(Math.max(Date.now(), eventCreatedMs)).toISOString(),
               };
+
+              this.applyUserSubscriptionEntitlement(state, user, subId, status, mappedPlanId, currentPeriodEnd);
             }
           }
 
@@ -2248,14 +2379,15 @@ export class BillingService {
         case 'customer.subscription.deleted': {
           const subscription = event.data.object as Stripe.Subscription;
           const customerId = typeof subscription.customer === 'string' ? subscription.customer : subscription.customer?.id;
-          let sub = state.subscriptions[subscription.id];
-          if (sub && isOutOfOrder(sub)) {
+          const sub = state.subscriptions[subscription.id];
+          if (sub && isOutOfOrder(sub, 'canceled')) {
             console.log(`[BillingService] Out-of-order customer.subscription.deleted event ${event.id} ignored.`);
             state.webhookEvents[event.id] = {
               eventId: event.id,
               provider: 'stripe',
               eventType: event.type,
               processedAt: new Date().toISOString(),
+              userId: sub.userId,
             };
             return { alreadyProcessed: false };
           }
@@ -2275,14 +2407,28 @@ export class BillingService {
             }
           }
 
-          const currentPeriodEnd = (subscription as any).current_period_end 
-            ? new Date((subscription as any).current_period_end * 1000).toISOString() 
+          const endedAtIso = (subscription as any).ended_at
+            ? new Date((subscription as any).ended_at * 1000).toISOString()
+            : new Date(Date.now() - 1000).toISOString();
+          const rawPeriodEndIso = (subscription as any).current_period_end
+            ? new Date((subscription as any).current_period_end * 1000).toISOString()
             : sub?.currentPeriodEnd;
+          // customer.subscription.deleted signals permanent termination (unlike customer.subscription.updated
+          // with status='canceled' which preserves prepaid access until current_period_end). Clamp to endedAtIso / now-1s
+          // if rawPeriodEndIso is missing or still in the future so deleted subs revoke entitlement immediately.
+          const rawPeriodEndMs = rawPeriodEndIso ? new Date(rawPeriodEndIso).getTime() : NaN;
+          const currentPeriodEnd = Number.isFinite(rawPeriodEndMs) && rawPeriodEndMs <= Date.now()
+            ? rawPeriodEndIso
+            : (new Date(endedAtIso).getTime() <= Date.now() ? endedAtIso : new Date(Date.now() - 1000).toISOString());
 
           if (sub) {
-            sub.status = 'canceled';
-            sub.currentPeriodEnd = currentPeriodEnd;
-            sub.updatedAt = new Date(Math.max(Date.now(), eventCreatedMs)).toISOString();
+            state.subscriptions[subscription.id] = {
+              ...sub,
+              status: 'canceled',
+              currentPeriodEnd,
+              lastEventCreated: mergeLastCreated(sub.lastEventCreated),
+              updatedAt: new Date(Math.max(Date.now(), eventCreatedMs)).toISOString(),
+            };
           } else if (userId) {
             state.subscriptions[subscription.id] = {
               id: subscription.id,
@@ -2290,6 +2436,7 @@ export class BillingService {
               planId: 'free',
               status: 'canceled',
               currentPeriodEnd,
+              lastEventCreated: mergeLastCreated(undefined),
               createdAt: new Date().toISOString(),
               updatedAt: new Date(Math.max(Date.now(), eventCreatedMs)).toISOString(),
             };
@@ -2298,11 +2445,7 @@ export class BillingService {
           if (userId) {
             const user = state.users[userId];
             if (user) {
-              user.subscriptionStatus = 'canceled';
-              const entitled = this.isSubscriptionEntitled('canceled', currentPeriodEnd);
-              if (!entitled) {
-                user.plan = 'free';
-              }
+              this.applyUserSubscriptionEntitlement(state, user, subscription.id, 'canceled', sub?.planId || 'free', currentPeriodEnd);
             }
           }
 
@@ -2320,7 +2463,7 @@ export class BillingService {
           const invoice = event.data.object as any;
           const subId = typeof invoice.subscription === 'string' ? invoice.subscription : invoice.subscription?.id;
           const customerId = typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id;
-          let sub = subId ? state.subscriptions[subId] : undefined;
+          const sub = subId ? state.subscriptions[subId] : undefined;
           let userId = sub?.userId;
 
           if (!userId && customerId) {
@@ -2334,32 +2477,38 @@ export class BillingService {
             }
           }
 
-          if (subId) {
-            if (sub) {
-              if (isOutOfOrder(sub)) {
-                console.log(`[BillingService] Out-of-order invoice.payment_failed event ${event.id} ignored.`);
-                state.webhookEvents[event.id] = {
-                  eventId: event.id,
-                  provider: 'stripe',
-                  eventType: event.type,
-                  processedAt: new Date().toISOString(),
-                };
-                return { alreadyProcessed: false };
-              }
-
-              sub.status = 'past_due';
-              sub.updatedAt = new Date(Math.max(Date.now(), eventCreatedMs)).toISOString();
+          if (subId && sub) {
+            if (isOutOfOrder(sub, 'past_due')) {
+              console.log(`[BillingService] Out-of-order invoice.payment_failed event ${event.id} ignored.`);
+              state.webhookEvents[event.id] = {
+                eventId: event.id,
+                provider: 'stripe',
+                eventType: event.type,
+                processedAt: new Date().toISOString(),
+                userId: sub.userId,
+              };
+              return { alreadyProcessed: false };
             }
+
+            state.subscriptions[subId] = {
+              ...sub,
+              status: 'past_due',
+              lastEventCreated: mergeLastCreated(sub.lastEventCreated),
+              updatedAt: new Date(Math.max(Date.now(), eventCreatedMs)).toISOString(),
+            };
           }
 
           if (userId) {
             const user = state.users[userId];
             if (user) {
-              user.subscriptionStatus = 'past_due';
-              const periodEnd = sub?.currentPeriodEnd;
-              if (!this.isSubscriptionEntitled('past_due', periodEnd)) {
-                user.plan = 'free';
-              }
+              this.applyUserSubscriptionEntitlement(
+                state,
+                user,
+                subId || user.subscriptionId || '',
+                'past_due',
+                sub?.planId || user.plan,
+                sub?.currentPeriodEnd
+              );
             }
           }
           state.webhookEvents[event.id] = {
@@ -2367,6 +2516,70 @@ export class BillingService {
             provider: 'stripe',
             eventType: event.type,
             processedAt: new Date().toISOString(),
+            userId: userId || undefined,
+          };
+          break;
+        }
+
+        case 'invoice.payment_action_required': {
+          const invoice = event.data.object as any;
+          const subId = typeof invoice.subscription === 'string' ? invoice.subscription : invoice.subscription?.id;
+          const customerId = typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id;
+          const sub = subId ? state.subscriptions[subId] : undefined;
+          let userId = sub?.userId;
+
+          if (!userId && customerId) {
+            if (state.prepare && typeof state.prepare === 'function') {
+              const row = state.prepare('SELECT id FROM users WHERE stripe_customer_id = ?').get(customerId) as any;
+              if (row) userId = row.id;
+            }
+            if (!userId) {
+              const userWithCustomer = Object.values(state.users).find((u: any) => u.stripeCustomerId === customerId);
+              if (userWithCustomer) userId = (userWithCustomer as any).id;
+            }
+          }
+
+          if (subId && sub) {
+            if (isOutOfOrder(sub, 'incomplete')) {
+              console.log(`[BillingService] Out-of-order invoice.payment_action_required event ${event.id} ignored.`);
+              state.webhookEvents[event.id] = {
+                eventId: event.id,
+                provider: 'stripe',
+                eventType: event.type,
+                processedAt: new Date().toISOString(),
+                userId: sub.userId,
+              };
+              return { alreadyProcessed: false };
+            }
+
+            state.subscriptions[subId] = {
+              ...sub,
+              status: 'incomplete',
+              lastEventCreated: mergeLastCreated(sub.lastEventCreated),
+              updatedAt: new Date(Math.max(Date.now(), eventCreatedMs)).toISOString(),
+            };
+          }
+
+          if (userId) {
+            const user = state.users[userId];
+            if (user) {
+              this.applyUserSubscriptionEntitlement(
+                state,
+                user,
+                subId || user.subscriptionId || '',
+                'incomplete',
+                sub?.planId || user.plan,
+                sub?.currentPeriodEnd
+              );
+            }
+          }
+
+          state.webhookEvents[event.id] = {
+            eventId: event.id,
+            provider: 'stripe',
+            eventType: event.type,
+            processedAt: new Date().toISOString(),
+            userId: userId || undefined,
           };
           break;
         }

@@ -1822,6 +1822,243 @@ export async function runStripeOriginAndRefundLifecycleTests() {
 
     console.log('  ✅ PASS: SQLite restart persistence & concurrent refund webhook race protection verified');
 
+    // =========================================================================
+    // PART C: WS4 SUBSCRIPTION ORDERING, MULTI-SUB ISOLATION, CANCEL_AT_PERIOD_END,
+    // INVOICE.PAYMENT_ACTION_REQUIRED & RENEWAL DEDUP (MOCKED SDK / REAL HMAC)
+    // =========================================================================
+    console.log('\n[C. WS4 Subscription Event Ordering, Multi-Sub Isolation & Renewal Dedup (Mocked Webhook Signatures)]');
+
+    const ws4DbPath = path.join(tempSqliteDir, 'ws4_sub_lifecycle.db');
+    const ws4Repo1 = new SqliteStorageRepository(ws4DbPath);
+    billingService.setStorageForTest(ws4Repo1);
+    const ws4BaseTs = 1900000000;
+
+    let subUserAId = '';
+    try {
+      const subUserA = await ws4Repo1.users.createUser(`ws4_sub_a_${Date.now()}@videorisk.test`, 'hash', 'salt', 10, 'free');
+      subUserAId = subUserA.id;
+      const subOldId = `sub_old_${Date.now()}`;
+      const subNewId = `sub_new_${Date.now()}`;
+
+      // C.1 Activate sub_old via checkout.session.completed (creator plan -> +25 credits = 35)
+      const evCheckoutOld = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_ws4_co_old_${Date.now()}`,
+        created: ws4BaseTs,
+        type: 'checkout.session.completed',
+        data: {
+          object: {
+            id: `cs_ws4_old_${Date.now()}`,
+            payment_status: 'paid',
+            payment_intent: `pi_ws4_old_${Date.now()}`,
+            subscription: subOldId,
+            customer: `cus_ws4_${subUserA.id}`,
+            amount_total: 900,
+            currency: 'usd',
+            metadata: { userId: subUserA.id, planId: 'creator' },
+          },
+        },
+      });
+      await billingService.handleWebhook(evCheckoutOld.rawBody, evCheckoutOld.signature);
+      assert.strictEqual((await ws4Repo1.users.getUser(subUserA.id))?.plan, 'creator', 'C.1 Initial subscription sets plan=creator');
+
+      // C.2 Cancel_at_period_end persisted while keeping plan active until period end
+      const evCancelAtPeriodEnd = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_ws4_cap_${Date.now()}`,
+        created: ws4BaseTs + 10,
+        type: 'customer.subscription.updated',
+        data: {
+          object: {
+            id: subOldId,
+            customer: `cus_ws4_${subUserA.id}`,
+            status: 'active',
+            cancel_at_period_end: true,
+            current_period_end: ws4BaseTs + 86400,
+            metadata: { userId: subUserA.id, planId: 'creator' },
+          },
+        },
+      });
+      await billingService.handleWebhook(evCancelAtPeriodEnd.rawBody, evCancelAtPeriodEnd.signature);
+      const subOldAfterCap = await ws4Repo1.billing.getSubscription(subOldId);
+      assert.strictEqual(subOldAfterCap?.cancelAtPeriodEnd, true, 'C.2a cancelAtPeriodEnd=true persisted in SQLite');
+      assert.strictEqual(subOldAfterCap?.lastEventCreated, ws4BaseTs + 10, 'C.2b lastEventCreated updated monotonically');
+      assert.strictEqual((await ws4Repo1.users.getUser(subUserA.id))?.plan, 'creator', 'C.2c Plan remains active before period end');
+
+      // C.3 Invoice renewal dedup across different event IDs with SAME invoice.id
+      const renewalInvId = `in_ws4_renewal_${Date.now()}`;
+      const evRen1 = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_ws4_ren_1_${Date.now()}`,
+        created: ws4BaseTs + 20,
+        type: 'invoice.paid',
+        data: {
+          object: {
+            id: renewalInvId,
+            subscription: subOldId,
+            customer: `cus_ws4_${subUserA.id}`,
+            billing_reason: 'subscription_cycle',
+            amount_paid: 900,
+            currency: 'usd',
+          },
+        },
+      });
+      const evRen2 = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_ws4_ren_2_${Date.now()}`,
+        created: ws4BaseTs + 21,
+        type: 'invoice.paid',
+        data: {
+          object: {
+            id: renewalInvId, // Same invoice ID delivered under new event ID
+            subscription: subOldId,
+            customer: `cus_ws4_${subUserA.id}`,
+            billing_reason: 'subscription_cycle',
+            amount_paid: 900,
+            currency: 'usd',
+          },
+        },
+      });
+      await billingService.handleWebhook(evRen1.rawBody, evRen1.signature);
+      const balAfterRen1 = (await ws4Repo1.users.getUser(subUserA.id))!.creditsRemaining;
+      assert.strictEqual(balAfterRen1, 70, 'C.3a First subscription_cycle invoice grants +30 creator credits (40 -> 70)');
+      await billingService.handleWebhook(evRen2.rawBody, evRen2.signature);
+      assert.strictEqual((await ws4Repo1.users.getUser(subUserA.id))?.creditsRemaining, 70, 'C.3b Duplicate invoice.id under new event.id does NOT double-credit');
+
+      // C.4 Out-of-order subscription transition: newer deleted (T+50) followed by older active updated (T+30) -> deleted wins!
+      const evDelNewer = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_ws4_del_newer_${Date.now()}`,
+        created: ws4BaseTs + 50,
+        type: 'customer.subscription.deleted',
+        data: {
+          object: {
+            id: subOldId,
+            customer: `cus_ws4_${subUserA.id}`,
+            status: 'canceled',
+            metadata: { userId: subUserA.id, planId: 'creator' },
+          },
+        },
+      });
+      const evUpdStale = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_ws4_upd_stale_${Date.now()}`,
+        created: ws4BaseTs + 30,
+        type: 'customer.subscription.updated',
+        data: {
+          object: {
+            id: subOldId,
+            customer: `cus_ws4_${subUserA.id}`,
+            status: 'active',
+            metadata: { userId: subUserA.id, planId: 'creator' },
+          },
+        },
+      });
+      await billingService.handleWebhook(evDelNewer.rawBody, evDelNewer.signature);
+      await billingService.handleWebhook(evUpdStale.rawBody, evUpdStale.signature);
+      assert.strictEqual((await ws4Repo1.billing.getSubscription(subOldId))?.status, 'canceled', 'C.4a Newer subscription.deleted survives older subscription.updated');
+      assert.strictEqual((await ws4Repo1.users.getUser(subUserA.id))?.plan, 'free', 'C.4b User downgraded to free after stale update ignored');
+
+      // C.5 Same-second tie-breaker: updated active at T+60 followed by deleted at T+60 -> canceled; plus payment_action_required -> incomplete
+      const evSub2Co = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_ws4_co_new_${Date.now()}`,
+        created: ws4BaseTs + 55,
+        type: 'checkout.session.completed',
+        data: {
+          object: {
+            id: `cs_ws4_new_${Date.now()}`,
+            payment_status: 'paid',
+            payment_intent: `pi_ws4_new_${Date.now()}`,
+            subscription: subNewId,
+            customer: `cus_ws4_${subUserA.id}`,
+            amount_total: 1900,
+            currency: 'usd',
+            metadata: { userId: subUserA.id, planId: 'pro' },
+          },
+        },
+      });
+      await billingService.handleWebhook(evSub2Co.rawBody, evSub2Co.signature);
+      assert.strictEqual((await ws4Repo1.users.getUser(subUserA.id))?.plan, 'pro', 'C.5a New subscription activates pro plan');
+
+      // C.6 Multi-subscription isolation: re-deliver canceled/failed event for subOldId MUST NOT downgrade active pro subNewId!
+      const evOldSubFail = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_ws4_old_fail_${Date.now()}`,
+        created: ws4BaseTs + 70,
+        type: 'invoice.payment_failed',
+        data: {
+          object: {
+            id: `in_ws4_old_fail_${Date.now()}`,
+            subscription: subOldId,
+            customer: `cus_ws4_${subUserA.id}`,
+          },
+        },
+      });
+      await billingService.handleWebhook(evOldSubFail.rawBody, evOldSubFail.signature);
+      const userAfterOldSubFail = await ws4Repo1.users.getUser(subUserA.id);
+      assert.strictEqual(userAfterOldSubFail?.plan, 'pro', 'C.6a Failure on old subscription does NOT downgrade active pro subscription');
+      assert.strictEqual(userAfterOldSubFail?.subscriptionId, subNewId, 'C.6b Primary subscriptionId preserved on subNewId');
+      assert.strictEqual(userAfterOldSubFail?.subscriptionStatus, 'active', 'C.6c Active status preserved');
+
+      // C.7 invoice.payment_action_required updates active subscription to 'incomplete' and persists lastEventCreated
+      const evActionReq = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_ws4_act_req_${Date.now()}`,
+        created: ws4BaseTs + 80,
+        type: 'invoice.payment_action_required',
+        data: {
+          object: {
+            id: `in_ws4_act_req_${Date.now()}`,
+            subscription: subNewId,
+            customer: `cus_ws4_${subUserA.id}`,
+          },
+        },
+      });
+      await billingService.handleWebhook(evActionReq.rawBody, evActionReq.signature);
+      const subNewAfterAction = await ws4Repo1.billing.getSubscription(subNewId);
+      assert.strictEqual(subNewAfterAction?.status, 'incomplete', 'C.7a invoice.payment_action_required transitions sub to incomplete');
+      assert.strictEqual(subNewAfterAction?.lastEventCreated, ws4BaseTs + 80, 'C.7b invoice.payment_action_required persists lastEventCreated');
+
+      // Same-second terminal canceled tie-breaker at T+90
+      const evSameSecActive = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_ws4_same_sec_act_${Date.now()}`,
+        created: ws4BaseTs + 90,
+        type: 'customer.subscription.updated',
+        data: {
+          object: {
+            id: subNewId,
+            customer: `cus_ws4_${subUserA.id}`,
+            status: 'active',
+            metadata: { userId: subUserA.id, planId: 'pro' },
+          },
+        },
+      });
+      const evSameSecCanceled = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_ws4_same_sec_del_${Date.now()}`,
+        created: ws4BaseTs + 90,
+        type: 'customer.subscription.deleted',
+        data: {
+          object: {
+            id: subNewId,
+            customer: `cus_ws4_${subUserA.id}`,
+            status: 'canceled',
+            metadata: { userId: subUserA.id, planId: 'pro' },
+          },
+        },
+      });
+      await billingService.handleWebhook(evSameSecCanceled.rawBody, evSameSecCanceled.signature);
+      await billingService.handleWebhook(evSameSecActive.rawBody, evSameSecActive.signature);
+      assert.strictEqual((await ws4Repo1.billing.getSubscription(subNewId))?.status, 'canceled', 'C.8 Same-second terminal canceled wins over active update at identical created timestamp');
+    } finally {
+      billingService.setStorageForTest(null);
+      (ws4Repo1 as any).db.close();
+    }
+
+    // Reopen SQLite DB from disk to confirm Migration 9 columns survived persistence cleanly
+    const ws4Repo2 = new SqliteStorageRepository(ws4DbPath);
+    try {
+      const subs = await ws4Repo2.billing.getSubscriptionsByUserId(subUserAId);
+      assert.ok(subs.length === 2, 'C.9a Both subscriptions persisted cleanly across SQLite restart');
+      assert.ok(subs.every(s => typeof s.lastEventCreated === 'number' && s.lastEventCreated > 0), 'C.9b last_event_created survives SQLite restart');
+      assert.ok(subs.some(s => s.cancelAtPeriodEnd === true), 'C.9c cancel_at_period_end survives SQLite restart');
+    } finally {
+      (ws4Repo2 as any).db.close();
+    }
+
+    console.log('  ✅ PASS: WS4 subscription event ordering, multi-sub isolation, cancel_at_period_end, & renewal dedup verified');
+
     console.log('\n======================================================');
     console.log('🎉 ALL CHECKOUT ORIGIN & STRIPE REFUND TESTS PASSED!');
     console.log('======================================================\n');

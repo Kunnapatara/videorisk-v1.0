@@ -159,20 +159,38 @@ export class SqliteStorageRepository implements IStorageRepository {
           planId: row.plan_id,
           status: row.status,
           currentPeriodEnd: row.current_period_end || undefined,
+          lastEventCreated: row.last_event_created !== null && row.last_event_created !== undefined ? Number(row.last_event_created) : undefined,
+          cancelAtPeriodEnd: row.cancel_at_period_end === 1,
           createdAt: row.created_at,
           updatedAt: row.updated_at
         };
       },
       set: (_target, prop: string, sub: any) => {
         this.db.prepare(`
-          INSERT INTO subscriptions (id, user_id, plan_id, status, current_period_end, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO subscriptions (id, user_id, plan_id, status, current_period_end, last_event_created, cancel_at_period_end, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(id) DO UPDATE SET 
             plan_id = excluded.plan_id,
             status = excluded.status,
             current_period_end = excluded.current_period_end,
+            last_event_created = CASE
+              WHEN excluded.last_event_created IS NULL THEN subscriptions.last_event_created
+              WHEN subscriptions.last_event_created IS NULL THEN excluded.last_event_created
+              ELSE MAX(subscriptions.last_event_created, excluded.last_event_created)
+            END,
+            cancel_at_period_end = excluded.cancel_at_period_end,
             updated_at = excluded.updated_at
-        `).run(prop, sub.userId, sub.planId, sub.status, sub.currentPeriodEnd || null, sub.createdAt || new Date().toISOString(), sub.updatedAt || new Date().toISOString());
+        `).run(
+          prop,
+          sub.userId,
+          sub.planId,
+          sub.status,
+          sub.currentPeriodEnd || null,
+          typeof sub.lastEventCreated === 'number' && Number.isFinite(sub.lastEventCreated) ? Math.floor(sub.lastEventCreated) : null,
+          sub.cancelAtPeriodEnd ? 1 : 0,
+          sub.createdAt || new Date().toISOString(),
+          sub.updatedAt || new Date().toISOString()
+        );
         return true;
       }
     });
@@ -812,6 +830,28 @@ export class SqliteStorageRepository implements IStorageRepository {
       } catch (err) {
         this.db.exec('ROLLBACK;');
         throw new Error(`Failed to apply migration 8: ${err}`);
+      }
+    }
+
+    // Migration 9: Subscription webhook event ordering & cancel_at_period_end columns
+    if (!appliedVersions.has(9)) {
+      this.db.exec('BEGIN IMMEDIATE;');
+      try {
+        const subCols = this.db.prepare('PRAGMA table_info(subscriptions)').all() as Array<{ name: string }>;
+        if (!subCols.some(c => c.name === 'last_event_created')) {
+          this.db.exec('ALTER TABLE subscriptions ADD COLUMN last_event_created INTEGER;');
+        }
+        if (!subCols.some(c => c.name === 'cancel_at_period_end')) {
+          this.db.exec('ALTER TABLE subscriptions ADD COLUMN cancel_at_period_end INTEGER NOT NULL DEFAULT 0;');
+        }
+        this.db.exec(`
+          INSERT INTO schema_migrations (version, name, applied_at)
+          VALUES (9, '009_subscriptions_event_ordering_and_cancel_state', datetime('now'));
+        `);
+        this.db.exec('COMMIT;');
+      } catch (err) {
+        this.db.exec('ROLLBACK;');
+        throw new Error(`Failed to apply migration 9: ${err}`);
       }
     }
   }
@@ -2220,14 +2260,30 @@ export class SqliteStorageRepository implements IStorageRepository {
 
     saveSubscription: async (sub: SubscriptionRecord): Promise<void> => {
       this.db.prepare(`
-        INSERT INTO subscriptions (id, user_id, plan_id, status, current_period_end, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO subscriptions (id, user_id, plan_id, status, current_period_end, last_event_created, cancel_at_period_end, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET 
           plan_id = excluded.plan_id,
           status = excluded.status,
           current_period_end = excluded.current_period_end,
+          last_event_created = CASE
+            WHEN excluded.last_event_created IS NULL THEN subscriptions.last_event_created
+            WHEN subscriptions.last_event_created IS NULL THEN excluded.last_event_created
+            ELSE MAX(subscriptions.last_event_created, excluded.last_event_created)
+          END,
+          cancel_at_period_end = excluded.cancel_at_period_end,
           updated_at = excluded.updated_at
-      `).run(sub.id, sub.userId, sub.planId, sub.status, sub.currentPeriodEnd || null, sub.createdAt, sub.updatedAt);
+      `).run(
+        sub.id,
+        sub.userId,
+        sub.planId,
+        sub.status,
+        sub.currentPeriodEnd || null,
+        typeof sub.lastEventCreated === 'number' && Number.isFinite(sub.lastEventCreated) ? Math.floor(sub.lastEventCreated) : null,
+        sub.cancelAtPeriodEnd ? 1 : 0,
+        sub.createdAt,
+        sub.updatedAt
+      );
     },
 
     getSubscription: async (id: string): Promise<SubscriptionRecord | null> => {
@@ -2239,6 +2295,8 @@ export class SqliteStorageRepository implements IStorageRepository {
         planId: row.plan_id,
         status: row.status,
         currentPeriodEnd: row.current_period_end || undefined,
+        lastEventCreated: row.last_event_created !== null && row.last_event_created !== undefined ? Number(row.last_event_created) : undefined,
+        cancelAtPeriodEnd: row.cancel_at_period_end === 1,
         createdAt: row.created_at,
         updatedAt: row.updated_at
       };
@@ -2252,6 +2310,8 @@ export class SqliteStorageRepository implements IStorageRepository {
         planId: row.plan_id,
         status: row.status,
         currentPeriodEnd: row.current_period_end || undefined,
+        lastEventCreated: row.last_event_created !== null && row.last_event_created !== undefined ? Number(row.last_event_created) : undefined,
+        cancelAtPeriodEnd: row.cancel_at_period_end === 1,
         createdAt: row.created_at,
         updatedAt: row.updated_at
       }));
