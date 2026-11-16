@@ -3,7 +3,12 @@ import path from 'path';
 import fs from 'fs';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { videoProcessor, validateTesseractTsv } from '../src/server/pipeline/videoProcessor';
+import {
+  videoProcessor,
+  validateTesseractTsv,
+  validatePngFrameFile,
+  sanitizeOcrDiagnostic
+} from '../src/server/pipeline/videoProcessor';
 import { MediaMetadata } from '../src/types';
 
 const execFileAsync = promisify(execFile);
@@ -228,12 +233,296 @@ printf "5\\t1\\t1\\t1\\t1\\t1\\t20\\t20\\t120\\t40\\t94.5\\tPARTIAL_OK\\n"
       assert.ok(thaiRes.allExtractedText.some(t => /POLICY/.test(t) || /[\u0E00-\u0E7F]/.test(t)), 'H.2 Recognized mixed Thai/English script');
       console.log(`  ✅ PASS: English + Thai (${path.basename(thaiFontFile)}) OCR verified`);
     } else {
-      console.log('  ℹ️  INFO: No Thai TTF font installed for FFmpeg drawtext on this host; English OCR verified and Thai execution skipped cleanly.');
+      console.log('  ⚠️  SKIPPED: Thai mixed-script OCR check skipped (no Thai TTF font available for FFmpeg drawtext on this host); English OCR verified.');
+    }
+
+    // -------------------------------------------------------------------------
+    // D2. STRICT PNG SIGNATURE, IHDR & CHUNK VALIDATION
+    // -------------------------------------------------------------------------
+    console.log('\n[D2. Strict PNG Signature, IHDR, Dimension & Chunk Validation]');
+    const validPngProbe = path.resolve(testDir, 'valid_probe.png');
+    await execFileAsync('ffmpeg', [
+      '-y', '-f', 'lavfi', '-i', 'color=c=#111827:s=640x360:d=1',
+      '-vframes', '1', validPngProbe
+    ]);
+    const validProbeRes = validatePngFrameFile(validPngProbe);
+    assert.strictEqual(validProbeRes.valid, true, 'D2.1 Real FFmpeg PNG passes strict PNG validation');
+    assert.deepStrictEqual(validProbeRes.dimensions, { width: 640, height: 360 }, 'D2.2 Real FFmpeg PNG reports exact 640x360 dimensions');
+
+    // Non-PNG ASCII payload (previously bypassed header check when isPngHeader was false!)
+    const nonPngFile = path.resolve(testDir, 'fake_non_png.png');
+    fs.writeFileSync(nonPngFile, 'THIS_IS_PLAIN_TEXT_NOT_A_PNG_FILE_1234567890');
+    assert.strictEqual(validatePngFrameFile(nonPngFile).valid, false, 'D2.3 Rejects non-PNG ASCII payload');
+
+    // Fake JPEG bytes
+    const jpegSpoofFile = path.resolve(testDir, 'fake_jpeg.png');
+    fs.writeFileSync(jpegSpoofFile, Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01]));
+    assert.strictEqual(validatePngFrameFile(jpegSpoofFile).valid, false, 'D2.4 Rejects JPEG bytes masquerading as .png');
+
+    // Truncated (< 8 byte) and truncated mid-IHDR (20 byte) PNG files
+    const shortSigFile = path.resolve(testDir, 'short_sig.png');
+    fs.writeFileSync(shortSigFile, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    assert.strictEqual(validatePngFrameFile(shortSigFile).valid, false, 'D2.5 Rejects <8 byte truncated signature');
+
+    const truncatedIhdrFile = path.resolve(testDir, 'trunc_ihdr.png');
+    fs.writeFileSync(truncatedIhdrFile, Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.from([0x00, 0x00, 0x00, 0x0d]),
+      Buffer.from('IHDR', 'ascii'),
+      Buffer.alloc(4)
+    ]));
+    assert.strictEqual(validatePngFrameFile(truncatedIhdrFile).valid, false, 'D2.6 Rejects truncated IHDR');
+
+    // Corrupt IHDR CRC-32 & missing IDAT/IEND (mutate CRC byte in valid PNG)
+    const validBytes = fs.readFileSync(validPngProbe);
+    const badCrcBytes = Buffer.from(validBytes);
+    badCrcBytes[30] ^= 0xff;
+    const badCrcFile = path.resolve(testDir, 'bad_crc.png');
+    fs.writeFileSync(badCrcFile, badCrcBytes);
+    assert.strictEqual(validatePngFrameFile(badCrcFile).valid, false, 'D2.7 Rejects PNG with corrupted IHDR CRC-32');
+
+    // Valid IHDR + CRC only, missing IDAT & IEND
+    const ihdrOnlyFile = path.resolve(testDir, 'ihdr_only.png');
+    fs.writeFileSync(ihdrOnlyFile, validBytes.subarray(0, 33));
+    assert.strictEqual(validatePngFrameFile(ihdrOnlyFile).valid, false, 'D2.8 Rejects IHDR-only PNG missing IDAT and IEND');
+
+    // Truncated mid-IDAT chunk (remove last 16 bytes including IEND)
+    const truncIdatFile = path.resolve(testDir, 'trunc_idat.png');
+    fs.writeFileSync(truncIdatFile, validBytes.subarray(0, validBytes.length - 16));
+    assert.strictEqual(validatePngFrameFile(truncIdatFile).valid, false, 'D2.9 Rejects PNG truncated before IEND / inside chunk');
+
+    // Directory path rejected safely
+    assert.strictEqual(validatePngFrameFile(testDir).valid, false, 'D2.10 Rejects non-regular directory path safely');
+
+    // Pipeline rejection of non-PNG output from FFmpeg (must NEVER reach Tesseract or claim NO_SIGNAL_DETECTED)
+    const tesseractInvokeLog = path.resolve(testDir, 'tess_invoked_on_nonpng.log');
+    const spyTessScript = path.resolve(testDir, 'spy_tess.sh');
+    fs.writeFileSync(spyTessScript, `#!/bin/sh
+echo "INVOKED:$1" >> "${tesseractInvokeLog}"
+printf "level\\tpage_num\\tblock_num\\tpar_num\\tline_num\\tword_num\\tleft\\ttop\\twidth\\theight\\tconf\\ttext\\n"
+printf "5\\t1\\t1\\t1\\t1\\t1\\t10\\t10\\t40\\t20\\t95\\tSHOULD_NOT_RUN\\n"
+`, { mode: 0o755 });
+    const nonPngFfmpegScript = path.resolve(testDir, 'ffmpeg_non_png.sh');
+    fs.writeFileSync(nonPngFfmpegScript, `#!/bin/sh
+OUT=""
+for arg in "$@"; do OUT="$arg"; done
+printf "NOT_A_PNG_HEADER_AT_ALL" > "$OUT"
+exit 0
+`, { mode: 0o755 });
+    process.env.FFMPEG_PATH = nonPngFfmpegScript;
+    process.env.TESSERACT_PATH = spyTessScript;
+    const nonPngPipelineRes = await videoProcessor.performVideoOcr(posVideo, baseMeta('pos_text.mp4', 3.0), { timestamps: [1] });
+    assert.strictEqual(nonPngPipelineRes.status, 'ANALYSIS_UNAVAILABLE', 'D2.11 Non-PNG extracted frame rejected as ANALYSIS_UNAVAILABLE');
+    assert.strictEqual(nonPngPipelineRes.extractionErrors?.[0]?.category, 'EMPTY_OUTPUT', 'D2.12 Non-PNG rejection categorized cleanly');
+    assert.strictEqual(fs.existsSync(tesseractInvokeLog), false, 'D2.13 Tesseract was NEVER invoked on invalid non-PNG output');
+    delete process.env.FFMPEG_PATH;
+    process.env.TESSERACT_PATH = '/usr/bin/tesseract';
+    assertNoTempOcrDirLeak('D2.cleanup');
+    console.log('  ✅ PASS: Strict PNG signature, IHDR, CRC-32, dimension, chunk & pipeline rejection verified');
+
+    // -------------------------------------------------------------------------
+    // J. STRICT OVERALL TIMEOUT BUDGET ENFORCEMENT
+    // -------------------------------------------------------------------------
+    console.log('\n[J. Strict Overall Timeout Budget Enforcement & Cleanup]');
+
+    // J.1 Exhausted overall budget (timeoutMs=0) prevents ANY FFmpeg or Tesseract spawn
+    const j1FfmpegLog = path.resolve(testDir, 'j1_ffmpeg.log');
+    const j1FfmpegScript = path.resolve(testDir, 'j1_ffmpeg.sh');
+    fs.writeFileSync(j1FfmpegScript, `#!/bin/sh
+echo "CALLED" >> "${j1FfmpegLog}"
+exit 0
+`, { mode: 0o755 });
+    process.env.FFMPEG_PATH = j1FfmpegScript;
+    process.env.TESSERACT_PATH = spyTessScript;
+    const j1Res = await videoProcessor.performVideoOcr(posVideo, baseMeta('pos_text.mp4', 3.0), {
+      timestamps: [0, 1, 2],
+      timeoutMs: 0
+    });
+    assert.strictEqual(fs.existsSync(j1FfmpegLog), false, 'J.1 Exhausted timeoutMs=0 spawns zero FFmpeg processes');
+    assert.strictEqual(fs.existsSync(tesseractInvokeLog), false, 'J.2 Exhausted timeoutMs=0 spawns zero Tesseract processes');
+    assert.strictEqual(j1Res.executionStatus, 'FAILED', 'J.3 Exhausted budget returns FAILED executionStatus');
+    assert.strictEqual(j1Res.status, 'INSUFFICIENT_EVIDENCE', 'J.4 Exhausted budget returns INSUFFICIENT_EVIDENCE');
+    assert.ok(j1Res.failureReason?.includes('budget'), 'J.5 failureReason documents exhausted overall budget');
+    assertNoTempOcrDirLeak('J1.cleanup');
+
+    // J.2 Per-frame FFmpeg timeout (10000ms) CANNOT override tight overall deadline (220ms)
+    const j2FfmpegCountLog = path.resolve(testDir, 'j2_ffmpeg_count.log');
+    const j2HangFfmpeg = path.resolve(testDir, 'j2_hang_ffmpeg.sh');
+    fs.writeFileSync(j2HangFfmpeg, `#!/bin/sh
+echo "1" >> "${j2FfmpegCountLog}"
+sleep 2
+exit 0
+`, { mode: 0o755 });
+    process.env.FFMPEG_PATH = j2HangFfmpeg;
+    const j2T0 = Date.now();
+    const j2Res = await videoProcessor.performVideoOcr(posVideo, baseMeta('pos_text.mp4', 3.0), {
+      timestamps: [0, 1, 2],
+      timeoutMs: 220,
+      perFrameTimeoutMs: 10000
+    });
+    const j2Elapsed = Date.now() - j2T0;
+    assert.ok(j2Elapsed < 1500, `J.6 FFmpeg capped by remaining overall budget (elapsed=${j2Elapsed}ms, << 10000ms perFrameTimeoutMs)`);
+    assert.strictEqual(fs.readFileSync(j2FfmpegCountLog, 'utf8').trim().split('\n').length, 1, 'J.7 Stopped extraction loop after overall budget expired (only 1 FFmpeg launch)');
+    assert.strictEqual(j2Res.executionStatus, 'FAILED', 'J.8 Overall timeout during extraction reports FAILED');
+    assert.strictEqual(j2Res.framesSkipped, 2, 'J.9 Remaining 2 timestamps accounted as framesSkipped');
+    assertNoTempOcrDirLeak('J2.cleanup');
+
+    // J.3 Tesseract CANNOT exceed remaining overall budget & partial execution preserves frame 0 result
+    const j3FastFfmpeg = path.resolve(testDir, 'j3_fast_ffmpeg.sh');
+    fs.writeFileSync(j3FastFfmpeg, `#!/bin/sh
+OUT=""
+for arg in "$@"; do OUT="$arg"; done
+cp "${validPngProbe}" "$OUT"
+exit 0
+`, { mode: 0o755 });
+    const j3SlowSecondTess = path.resolve(testDir, 'j3_slow_second_tess.sh');
+    const j3TessCountLog = path.resolve(testDir, 'j3_tess_count.log');
+    fs.writeFileSync(j3SlowSecondTess, `#!/bin/sh
+echo "$1" >> "${j3TessCountLog}"
+if echo "$1" | grep -q "frame_001"; then
+  sleep 2
+  exit 0
+fi
+printf "level\\tpage_num\\tblock_num\\tpar_num\\tline_num\\tword_num\\tleft\\ttop\\twidth\\theight\\tconf\\ttext\\n"
+printf "5\\t1\\t1\\t1\\t1\\t1\\t10\\t10\\t80\\t24\\t93\\tFRAME0_OK\\n"
+`, { mode: 0o755 });
+    process.env.FFMPEG_PATH = j3FastFfmpeg;
+    process.env.TESSERACT_PATH = j3SlowSecondTess;
+    const j3T0 = Date.now();
+    const j3Res = await videoProcessor.performVideoOcr(posVideo, baseMeta('pos_text.mp4', 3.0), {
+      timestamps: [0, 1, 2],
+      timeoutMs: 260,
+      perFrameTimeoutMs: 10000
+    });
+    const j3Elapsed = Date.now() - j3T0;
+    assert.ok(j3Elapsed < 1500, `J.10 Tesseract capped strictly by remaining overall budget (elapsed=${j3Elapsed}ms, << 15000ms)`);
+    assert.strictEqual(j3Res.executionStatus, 'PARTIAL', 'J.11 Frame 0 succeeded before frame 1 exhausted overall budget -> PARTIAL');
+    assert.strictEqual(j3Res.status, 'DETECTED', 'J.12 Partial execution preserves detected text from frame 0');
+    assert.strictEqual(j3Res.framesSucceeded, 1, 'J.13 Exactly 1 frame succeeded');
+    assert.strictEqual(j3Res.framesSkipped, 1, 'J.14 Frame 2 was never launched after overall budget expired');
+    assert.strictEqual(fs.readFileSync(j3TessCountLog, 'utf8').trim().split('\n').length, 2, 'J.15 Exactly 2 Tesseract invocations (frame 0 & frame 1), frame 2 never started');
+    assert.ok(j3Res.failureReason?.includes('Overall OCR execution budget'), 'J.16 Failure reason identifies overall execution budget exhaustion');
+    assertNoTempOcrDirLeak('J3.cleanup');
+
+    // J.4 Individual per-frame timeout (120ms) within generous overall budget (10000ms) continues to frame 1
+    const j4PerFrameTimeoutFfmpeg = path.resolve(testDir, 'j4_per_frame.sh');
+    fs.writeFileSync(j4PerFrameTimeoutFfmpeg, `#!/bin/sh
+TS=""
+PREV=""
+OUT=""
+for arg in "$@"; do
+  if [ "$PREV" = "-ss" ]; then TS="$arg"; fi
+  PREV="$arg"
+  OUT="$arg"
+done
+if [ "$TS" = "0" ]; then
+  sleep 2
+  exit 0
+fi
+cp "${validPngProbe}" "$OUT"
+exit 0
+`, { mode: 0o755 });
+    const j4FastTess = path.resolve(testDir, 'j4_fast_tess.sh');
+    fs.writeFileSync(j4FastTess, `#!/bin/sh
+printf "level\\tpage_num\\tblock_num\\tpar_num\\tline_num\\tword_num\\tleft\\ttop\\twidth\\theight\\tconf\\ttext\\n"
+printf "5\\t1\\t1\\t1\\t1\\t1\\t10\\t10\\t80\\t24\\t91\\tFRAME1_OK\\n"
+`, { mode: 0o755 });
+    process.env.FFMPEG_PATH = j4PerFrameTimeoutFfmpeg;
+    process.env.TESSERACT_PATH = j4FastTess;
+    const j4Res = await videoProcessor.performVideoOcr(posVideo, baseMeta('pos_text.mp4', 3.0), {
+      timestamps: [0, 1],
+      perFrameTimeoutMs: 120,
+      timeoutMs: 10000
+    });
+    assert.strictEqual(j4Res.executionStatus, 'PARTIAL', 'J.17 Per-frame timeout on frame 0 still executes frame 1 -> PARTIAL');
+    assert.strictEqual(j4Res.status, 'DETECTED', 'J.18 Frame 1 still produces DETECTED');
+    assert.strictEqual(j4Res.extractionErrors?.[0]?.category, 'TIMEOUT', 'J.19 Frame 0 categorized as TIMEOUT');
+    assert.ok(j4Res.failureReason?.includes('Individual frame timeout'), 'J.20 Failure reason distinguishes individual frame timeout from overall budget');
+    assertNoTempOcrDirLeak('J4.cleanup');
+
+    delete process.env.FFMPEG_PATH;
+    process.env.TESSERACT_PATH = '/usr/bin/tesseract';
+    console.log('  ✅ PASS: Strict overall timeout enforcement & temp cleanup verified');
+
+    // -------------------------------------------------------------------------
+    // K. DIAGNOSTICS SANITIZATION (DIRECT + PIPELINE)
+    // -------------------------------------------------------------------------
+    console.log('\n[K. Diagnostics Sanitization (Unix, Windows, UNC, Secrets, Env, Bounds)]');
+    const prevInjectedSecret = process.env.VIDEORISK_OCR_TEST_API_SECRET;
+    process.env.VIDEORISK_OCR_TEST_API_SECRET = 'vr_custom_env_secret_987654321';
+    try {
+      const dirtyInput = [
+        'Failed reading /Users/alice/private_vault/video.mp4',
+        'Win C:\\Users\\Bob\\Confidential\\clip.mp4',
+        'Quoted "D:\\My Private Folder\\bin\\ffmpeg.exe"',
+        'UNC \\\\corp-fs01\\restricted\\finance\\raw.mp4 and //10.0.0.8/vault/doc.png',
+        'HTTPS https://admin:Passw0rd!@api.service.local/hook and https://public.example.com/ok',
+        'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature123',
+        'Keys sk_live_secret1234567890 AIzaSyDummyKey123456789012 ghp_1234567890abcdef1234',
+        'Env STRIPE_SECRET_KEY=sk_test_000111222333 PASSWORD="my_secret_pw" and vr_custom_env_secret_987654321',
+        '   extra   whitespace\n\rand   length   padding   ' + 'Z'.repeat(240)
+      ].join(' | ');
+
+      const cleaned = sanitizeOcrDiagnostic(dirtyInput, 220);
+      assert.ok(!cleaned.includes('/Users/alice/private_vault'), 'K.1 Unix path directory redacted');
+      assert.ok(!cleaned.includes('C:\\Users\\Bob'), 'K.2 Windows drive path directory redacted');
+      assert.ok(!cleaned.includes('D:\\My Private Folder'), 'K.3 Quoted Windows path directory redacted');
+      assert.ok(!cleaned.includes('\\\\corp-fs01\\restricted'), 'K.4 Windows UNC path redacted');
+      assert.ok(!cleaned.includes('//10.0.0.8/vault'), 'K.5 Forward-slash UNC path redacted');
+      assert.ok(!cleaned.includes('Passw0rd!'), 'K.6 URL credentials redacted');
+      assert.ok(!cleaned.includes('eyJhbGciOiJIUzI1NiJ9'), 'K.7 Bearer JWT token redacted');
+      assert.ok(!cleaned.includes('sk_live_secret1234567890'), 'K.8 Stripe secret key prefix redacted');
+      assert.ok(!cleaned.includes('AIzaSyDummyKey'), 'K.9 Google API key prefix redacted');
+      assert.ok(!cleaned.includes('ghp_1234567890'), 'K.10 GitHub token prefix redacted');
+      assert.ok(!cleaned.includes('my_secret_pw'), 'K.11 Env/password assignment value redacted');
+      assert.ok(!cleaned.includes('vr_custom_env_secret_987654321'), 'K.12 Active secret process.env value redacted');
+      assert.ok(!cleaned.includes('\n') && !cleaned.includes('  '), 'K.13 Newlines and excessive whitespace collapsed');
+      assert.ok(cleaned.length <= 220, 'K.14 Output bounded within maxLength');
+
+      // Direct path-only check verifying HTTPS URLs are NOT mangled as UNC/Unix paths while paths preserve basenames
+      const pathPreservation = sanitizeOcrDiagnostic('Win C:\\Users\\Bob\\clip.mp4 UNC \\\\srv\\share\\dir\\vid.mp4 Unix /home/bob/raw.mp4 OK https://example.com/status', 300);
+      assert.ok(pathPreservation.includes('[path]/clip.mp4'), 'K.15 Windows basename preserved after redaction');
+      assert.ok(pathPreservation.includes('[unc-path]/vid.mp4'), 'K.16 UNC basename preserved after redaction');
+      assert.ok(pathPreservation.includes('[path]/raw.mp4'), 'K.17 Unix basename preserved after redaction');
+      assert.ok(pathPreservation.includes('https://example.com/status'), 'K.18 Safe HTTPS URL preserved intact');
+
+      // Pipeline diagnostic check: leaky stderr from FFmpeg must be sanitized across extractionErrors, frameDiagnostics, and failureReason
+      const leakyFfmpeg = path.resolve(testDir, 'leaky_ffmpeg.sh');
+      fs.writeFileSync(leakyFfmpeg, `#!/bin/sh
+echo "Error at C:\\\\Users\\\\SecretUser\\\\video.mp4 and \\\\\\\\filesrv\\\\priv\\\\a.mp4 using Bearer tok_secret_abc12345 sk_live_abc123456789 API_KEY=topsecret_val vr_custom_env_secret_987654321" >&2
+exit 1
+`, { mode: 0o755 });
+      process.env.FFMPEG_PATH = leakyFfmpeg;
+      const leakyRes = await videoProcessor.performVideoOcr(posVideo, baseMeta('pos_text.mp4', 3.0), { timestamps: [0] });
+      const serializedDiag = JSON.stringify({
+        failureReason: leakyRes.failureReason,
+        extractionErrors: leakyRes.extractionErrors,
+        frameDiagnostics: leakyRes.frameDiagnostics
+      });
+      assert.strictEqual(leakyRes.extractionErrors?.[0]?.category, 'NON_ZERO_EXIT', 'K.19 Error classification preserved despite sanitization');
+      assert.ok(!serializedDiag.includes('C:\\Users\\SecretUser'), 'K.20 Pipeline diagnostics redact Windows path');
+      assert.ok(!serializedDiag.includes('\\\\filesrv\\priv'), 'K.21 Pipeline diagnostics redact UNC path');
+      assert.ok(!serializedDiag.includes('tok_secret_abc12345'), 'K.22 Pipeline diagnostics redact Bearer token');
+      assert.ok(!serializedDiag.includes('sk_live_abc123456789'), 'K.23 Pipeline diagnostics redact Stripe API key');
+      assert.ok(!serializedDiag.includes('topsecret_val'), 'K.24 Pipeline diagnostics redact API_KEY= value');
+      assert.ok(!serializedDiag.includes('vr_custom_env_secret_987654321'), 'K.25 Pipeline diagnostics redact sensitive process.env secret');
+      assert.ok(serializedDiag.includes('code 1'), 'K.26 Exit code remains visible for troubleshooting');
+
+      // Missing TESSERACT_PATH failureReason must not leak private path
+      process.env.TESSERACT_PATH = '/Users/private_admin/hidden_bin/tesseract';
+      const missingTessPathRes = await videoProcessor.performVideoOcr(posVideo, baseMeta('pos_text.mp4', 3.0), { timestamps: [0] });
+      assert.ok(!missingTessPathRes.failureReason?.includes('/Users/private_admin/hidden_bin'), 'K.27 Missing TESSERACT_PATH failureReason redacts private directory');
+      assert.ok(missingTessPathRes.failureReason?.includes('tesseract'), 'K.28 Missing TESSERACT_PATH preserves binary basename');
+    } finally {
+      if (prevInjectedSecret === undefined) delete process.env.VIDEORISK_OCR_TEST_API_SECRET;
+      else process.env.VIDEORISK_OCR_TEST_API_SECRET = prevInjectedSecret;
+      delete process.env.FFMPEG_PATH;
+      process.env.TESSERACT_PATH = '/usr/bin/tesseract';
     }
     assertNoTempOcrDirLeak('I.final');
 
     console.log('\n======================================================');
-    console.log('🎉 ALL FULL-VIDEO OCR REGRESSION SCENARIOS (A–I) PASSED!');
+    console.log('🎉 ALL FULL-VIDEO OCR REGRESSION SCENARIOS (A–K) PASSED!');
     console.log('======================================================\n');
   } finally {
     if (prevTesseract === undefined) delete process.env.TESSERACT_PATH;

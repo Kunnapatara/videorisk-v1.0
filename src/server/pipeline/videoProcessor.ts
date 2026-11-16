@@ -187,29 +187,281 @@ export interface OcrFrameDiagnostic {
   failureReason?: string;
 }
 
-function readPngDimensions(filePath: string): { isPngHeader: boolean; width: number; height: number } | null {
-  try {
-    const fd = fs.openSync(filePath, 'r');
-    try {
-      const buf = Buffer.alloc(24);
-      const bytesRead = fs.readSync(fd, buf, 0, 24, 0);
-      if (bytesRead < 8) return null;
-      const pngMagic = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-      if (!buf.subarray(0, 8).equals(pngMagic)) {
-        return { isPngHeader: false, width: 0, height: 0 };
-      }
-      if (bytesRead < 24 || buf.subarray(12, 16).toString('ascii') !== 'IHDR') {
-        return { isPngHeader: true, width: 0, height: 0 };
-      }
-      const width = buf.readUInt32BE(16);
-      const height = buf.readUInt32BE(20);
-      return { isPngHeader: true, width, height };
-    } finally {
-      fs.closeSync(fd);
+const MAX_OCR_PNG_DIMENSION = 16384;
+const MAX_OCR_PNG_PIXELS = 67108864; // 64 MP cap
+const MAX_OCR_PNG_CHUNKS = 4096;
+const PNG_MAGIC_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) {
+      c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
     }
-  } catch {
-    return null;
+    table[i] = c >>> 0;
   }
+  return table;
+})();
+
+function computeCrc32(buf: Buffer): number {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    crc = CRC32_TABLE[(crc ^ buf[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function isValidPngColorBitDepth(colorType: number, bitDepth: number): boolean {
+  switch (colorType) {
+    case 0: // Grayscale
+      return bitDepth === 1 || bitDepth === 2 || bitDepth === 4 || bitDepth === 8 || bitDepth === 16;
+    case 2: // RGB
+    case 4: // Grayscale + Alpha
+    case 6: // RGBA
+      return bitDepth === 8 || bitDepth === 16;
+    case 3: // Indexed palette
+      return bitDepth === 1 || bitDepth === 2 || bitDepth === 4 || bitDepth === 8;
+    default:
+      return false;
+  }
+}
+
+export interface PngFrameValidationResult {
+  valid: boolean;
+  dimensions: { width: number; height: number } | null;
+  reason?: string;
+}
+
+/**
+ * Strictly validates an extracted PNG frame file before passing it to OCR:
+ * - File exists, is a regular readable file, and is non-empty
+ * - Exact 8-byte PNG signature
+ * - Canonical 13-byte IHDR first chunk with valid dimensions, color/bit-depth, compression, filter, interlace, and CRC-32
+ * - Valid chunk framing across the file with at least one non-empty IDAT chunk and a canonical IEND trailer
+ */
+export function validatePngFrameFile(filePath: string): PngFrameValidationResult {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(filePath);
+  } catch (err: any) {
+    return { valid: false, dimensions: null, reason: `Extracted frame file is unreadable: ${err?.code || err?.message || 'stat failed'}.` };
+  }
+
+  if (!stat.isFile()) {
+    return { valid: false, dimensions: null, reason: 'Extracted frame path is not a regular file.' };
+  }
+  if (stat.size <= 0) {
+    return { valid: false, dimensions: null, reason: 'FFmpeg produced empty 0-byte frame image.' };
+  }
+
+  let fd: number;
+  try {
+    fd = fs.openSync(filePath, 'r');
+  } catch (err: any) {
+    return { valid: false, dimensions: null, reason: `Extracted frame file cannot be opened for reading (${err?.code || 'error'}).` };
+  }
+
+  try {
+    const headerBuf = Buffer.alloc(33);
+    const bytesRead = fs.readSync(fd, headerBuf, 0, 33, 0);
+    if (bytesRead < 8) {
+      return { valid: false, dimensions: null, reason: `Extracted file is too short (${stat.size} bytes) to contain a PNG signature.` };
+    }
+    if (!headerBuf.subarray(0, 8).equals(PNG_MAGIC_BYTES)) {
+      return { valid: false, dimensions: null, reason: 'Extracted frame lacks a valid PNG file signature.' };
+    }
+    if (bytesRead < 33) {
+      return { valid: false, dimensions: null, reason: `Extracted PNG is truncated before completing the IHDR chunk (${bytesRead} bytes).` };
+    }
+
+    const ihdrLength = headerBuf.readUInt32BE(8);
+    const ihdrTag = headerBuf.subarray(12, 16).toString('ascii');
+    if (ihdrTag !== 'IHDR' || ihdrLength !== 13) {
+      return { valid: false, dimensions: null, reason: `Invalid PNG header chunk: expected 13-byte IHDR, got '${ihdrTag}' (${ihdrLength} bytes).` };
+    }
+
+    const width = headerBuf.readUInt32BE(16);
+    const height = headerBuf.readUInt32BE(20);
+    if (width <= 0 || height <= 0 || width > MAX_OCR_PNG_DIMENSION || height > MAX_OCR_PNG_DIMENSION) {
+      return { valid: false, dimensions: null, reason: `Invalid PNG dimensions (${width}x${height}).` };
+    }
+    if (width * height > MAX_OCR_PNG_PIXELS) {
+      return { valid: false, dimensions: null, reason: `PNG pixel area (${width}x${height}) exceeds supported processing limit.` };
+    }
+
+    const bitDepth = headerBuf[24];
+    const colorType = headerBuf[25];
+    const compression = headerBuf[26];
+    const filter = headerBuf[27];
+    const interlace = headerBuf[28];
+
+    if (!isValidPngColorBitDepth(colorType, bitDepth)) {
+      return { valid: false, dimensions: null, reason: `Invalid PNG IHDR colorType/bitDepth (${colorType}/${bitDepth}).` };
+    }
+    if (compression !== 0 || filter !== 0 || (interlace !== 0 && interlace !== 1)) {
+      return { valid: false, dimensions: null, reason: `Invalid PNG IHDR encoding parameters (${compression}/${filter}/${interlace}).` };
+    }
+
+    const expectedCrc = headerBuf.readUInt32BE(29) >>> 0;
+    const actualCrc = computeCrc32(headerBuf.subarray(12, 29));
+    if (expectedCrc !== actualCrc) {
+      return { valid: false, dimensions: null, reason: 'Corrupt PNG IHDR checksum (CRC-32 mismatch).' };
+    }
+
+    // Validate chunk framing from offset 33 through IEND
+    let offset = 33;
+    let hasIdat = false;
+    let hasIend = false;
+    let chunkCount = 0;
+    const chunkHdr = Buffer.alloc(8);
+
+    while (offset < stat.size && chunkCount < MAX_OCR_PNG_CHUNKS) {
+      chunkCount++;
+      if (offset + 12 > stat.size) {
+        return { valid: false, dimensions: null, reason: 'Truncated PNG chunk structure near end of file.' };
+      }
+      const hdrRead = fs.readSync(fd, chunkHdr, 0, 8, offset);
+      if (hdrRead < 8) {
+        return { valid: false, dimensions: null, reason: 'Unreadable PNG chunk header.' };
+      }
+      const chunkLen = chunkHdr.readUInt32BE(0);
+      const chunkType = chunkHdr.subarray(4, 8).toString('ascii');
+      if (!/^[A-Za-z]{4}$/.test(chunkType)) {
+        return { valid: false, dimensions: null, reason: 'Invalid PNG chunk type identifier.' };
+      }
+      if (chunkLen > 0x7fffffff || offset + 12 + chunkLen > stat.size) {
+        return { valid: false, dimensions: null, reason: `Truncated PNG chunk '${chunkType}' (declared ${chunkLen} bytes exceeds file size).` };
+      }
+      if (chunkType === 'IDAT' && chunkLen > 0) {
+        hasIdat = true;
+      }
+      offset += 12 + chunkLen;
+      if (chunkType === 'IEND') {
+        if (chunkLen !== 0) {
+          return { valid: false, dimensions: null, reason: 'Invalid non-empty PNG IEND chunk.' };
+        }
+        hasIend = true;
+        break;
+      }
+    }
+
+    if (!hasIdat) {
+      return { valid: false, dimensions: null, reason: 'PNG file contains no non-empty IDAT image data chunk.' };
+    }
+    if (!hasIend) {
+      return { valid: false, dimensions: null, reason: 'Truncated PNG file: missing IEND trailer chunk.' };
+    }
+
+    return { valid: true, dimensions: { width, height } };
+  } catch (err: any) {
+    return { valid: false, dimensions: null, reason: `Failed reading PNG frame structure: ${err?.message || 'read error'}.` };
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // Ignore close error
+    }
+  }
+}
+
+/**
+ * Sanitizes external process diagnostics and paths before storing/returning in OcrFrameDiagnostic or failureReason:
+ * - Redacts URL credentials, Bearer/Basic Authorization tokens, known API-key/token prefixes, sensitive key=value pairs, and active secret env values
+ * - Redacts Windows UNC paths, Windows drive-letter paths, Unix absolute paths, and home (~/) paths while preserving basename
+ * - Strips control chars, collapses whitespace, and bounds output length
+ *
+ * Limitations: naked high-entropy strings without a recognizable prefix, key/env label, or matching sensitive process.env value are not detected.
+ */
+export function sanitizeOcrDiagnostic(raw: string, maxLength: number = 200): string {
+  if (!raw || typeof raw !== 'string') return '';
+
+  let s = raw.replace(/[\u0000-\u001F\u007F]+/g, ' ');
+
+  // 1. Redact active sensitive process.env values (min length 8 to avoid false positives on short flags)
+  for (const [envKey, envVal] of Object.entries(process.env)) {
+    if (
+      typeof envVal === 'string' &&
+      envVal.length >= 8 &&
+      /(?:SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY|CREDENTIAL|API_KEY|APIKEY|ACCESS_KEY|AUTH_KEY|WEBHOOK_SECRET|DATABASE_URL)/i.test(envKey)
+    ) {
+      s = s.split(envVal).join('[REDACTED]');
+    }
+  }
+
+  // 2. Redact URL-embedded credentials: https://user:pass@host -> https://[redacted-credentials]@host
+  s = s.replace(/\b(https?:\/\/)([^/\s:@]+:[^/\s@]+)@/gi, '$1[redacted-credentials]@');
+
+  // 3. Redact Authorization headers, Bearer/Basic tokens, and x-api-key headers
+  s = s.replace(/\b(Authorization\s*:\s*)(?:Bearer|Basic|Token)\s+[^\s,;'"`]+/gi, '$1[REDACTED]');
+  s = s.replace(/\b(Authorization|x-api-key|api-key|x-auth-token)\s*:\s*[^\s,;'"`]+/gi, '$1: [REDACTED]');
+  s = s.replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}/gi, '$1 [REDACTED]');
+
+  // 4. Redact recognizable API keys, JWTs, and token formats
+  s = s.replace(/\b(?:sk_live_|sk_test_|rk_live_|rk_test_|pk_live_|pk_test_|whsec_)[A-Za-z0-9_-]{8,}\b/g, '[REDACTED_KEY]');
+  s = s.replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{12,}\b/g, '[REDACTED_KEY]');
+  s = s.replace(/\bAIza[0-9A-Za-z_-]{16,}\b/g, '[REDACTED_KEY]');
+  s = s.replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, '[REDACTED_KEY]');
+  s = s.replace(/\b(?:ghp|gho|ghs|ghu|github_pat)_[A-Za-z0-9_]{16,}\b/g, '[REDACTED_TOKEN]');
+  s = s.replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, '[REDACTED_TOKEN]');
+  s = s.replace(/\bglpat-[A-Za-z0-9_-]{12,}\b/g, '[REDACTED_TOKEN]');
+  s = s.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, '[REDACTED_JWT]');
+
+  // 5. Redact sensitive key=value / KEY: value environment or CLI assignments
+  s = s.replace(
+    /\b([A-Za-z0-9_]*(?:PASSWORD|PASSWD|SECRET|API_KEY|APIKEY|ACCESS_KEY|SECRET_KEY|AUTH_TOKEN|PRIVATE_KEY|CLIENT_SECRET|WEBHOOK_SECRET|TOKEN|CREDENTIAL|DATABASE_URL))\s*([=:])\s*(?:"[^"]*"|'[^']*'|[^\s,;'"`]+)/gi,
+    '$1$2[REDACTED]'
+  );
+
+  // 6. Redact Windows UNC paths ("\\server\share\dir\file" or \\server\share\dir\file or //server/share/dir/file)
+  s = s.replace(/"((?:\\\\|\/\/)[A-Za-z0-9._-]+(?:\\|\/)[^"\r\n:*?<>|]+)"/g, (_m, inner: string) => {
+    const parts = inner.split(/[\\/]/).filter(Boolean);
+    const tail = parts.length > 2 ? parts[parts.length - 1] : '';
+    return tail ? `"[unc-path]/${tail}"` : '"[unc-path]"';
+  });
+  s = s.replace(/(^|[\s'"(=,;])((?:\\\\|\/\/)[A-Za-z0-9._-]+(?:\\|\/)[^\s:'"*?<>|"]+)/g, (_m, prefix: string, uncPath: string) => {
+    const parts = uncPath.split(/[\\/]/).filter(Boolean);
+    const tail = parts.length > 2 ? parts[parts.length - 1] : '';
+    return `${prefix}${tail ? `[unc-path]/${tail}` : '[unc-path]'}`;
+  });
+
+  // 7. Redact quoted and unquoted Windows drive-letter paths (C:\Users\...\file.png or "C:\Program Files\...\app.exe")
+  s = s.replace(/"([A-Za-z]:[\\/][^"\r\n]+)"/g, (_m, inner: string) => {
+    const parts = inner.split(/[\\/]/).filter(Boolean);
+    const tail = parts.length > 1 ? parts[parts.length - 1] : '';
+    return tail ? `"[path]/${tail}"` : '"[path]"';
+  });
+  s = s.replace(/\b[A-Za-z]:(?:\\|\/)(?:[^\s:'"*?<>|\\\/]+(?:\\|\/))*[^\s:'"*?<>|\\\/]*/g, (match) => {
+    const parts = match.split(/[\\/]/).filter(Boolean);
+    const tail = parts.length > 1 ? parts[parts.length - 1] : '';
+    return tail ? `[path]/${tail}` : '[path]';
+  });
+
+  // 8. Redact Unix absolute paths (/dir/sub/file) & ~/ home paths without touching http:// URLs or [path]/
+  s = s.replace(/(^|[\s:'"(=,;])~\/(?:[^\s:'"\\,;)]*)/g, (_m, prefix: string) => {
+    const clean = _m.slice(prefix.length);
+    const parts = clean.split('/').filter(Boolean);
+    const tail = parts.length > 1 ? parts[parts.length - 1] : '';
+    return `${prefix}${tail ? `[path]/${tail}` : '[path]'}`;
+  });
+  s = s.replace(/(^|[\s:'"(=,;])(\/(?!\/)(?:[^\s:'"\\,;)]+\/)+)([^\s:'"\\,;)]*)/g, (_m, prefix: string, _dirs: string, tail: string) => {
+    return `${prefix}[path]/${tail || ''}`;
+  });
+  // Single-segment sensitive Unix system paths like /etc/passwd or /root
+  s = s.replace(/(^|[\s:'"(=,;])\/(?!\/)(?:etc|home|Users|root|var|tmp|opt|app|proc|sys)\b(?:\/[^\s:'"\\,;)]*)?/g, (_m, prefix: string) => {
+    const clean = _m.slice(prefix.length);
+    const parts = clean.split('/').filter(Boolean);
+    const tail = parts.length > 1 ? parts[parts.length - 1] : '';
+    return `${prefix}${tail ? `[path]/${tail}` : '[path]'}`;
+  });
+
+  // 9. Normalize whitespace and enforce max length
+  s = s.replace(/\s+/g, ' ').trim();
+  const limit = Math.max(24, maxLength);
+  if (s.length > limit) {
+    s = `${s.slice(0, limit - 3).trimEnd()}...`;
+  }
+  return s;
 }
 
 export function validateTesseractTsv(stdout: string): {
@@ -1371,7 +1623,7 @@ export class VideoProcessor {
         extractedTimestamps: [],
         succeededTimestamps: [],
         limitations: 'OCR engine path configured but executable is missing on disk.',
-        failureReason: `Configured TESSERACT_PATH not found at ${tesseractPath}`,
+        failureReason: sanitizeOcrDiagnostic(`Configured TESSERACT_PATH not found at ${tesseractPath}`),
         executionDurationMs: Date.now() - startTime,
         detectedFrames: [],
         allExtractedText: []
@@ -1398,10 +1650,16 @@ export class VideoProcessor {
       };
     }
 
-    // Bounded configuration limits
+    // Bounded configuration limits with single strict overall deadline
     const maxFrames = Math.max(1, Math.min(60, options?.maxFrames || 15));
-    const timeoutMs = options?.timeoutMs || 45000;
-    const perFrameTimeoutMs = options?.perFrameTimeoutMs || 10000;
+    const timeoutMs = (typeof options?.timeoutMs === 'number' && Number.isFinite(options.timeoutMs))
+      ? Math.max(0, options.timeoutMs)
+      : 45000;
+    const perFrameTimeoutMs = (typeof options?.perFrameTimeoutMs === 'number' && Number.isFinite(options.perFrameTimeoutMs))
+      ? Math.max(1, options.perFrameTimeoutMs)
+      : 10000;
+    const deadlineMs = startTime + timeoutMs;
+    const getRemainingOverallMs = (): number => deadlineMs - Date.now();
     const langs = options?.languages || 'eng+tha';
     const ffmpegBin = process.env.FFMPEG_PATH || 'ffmpeg';
 
@@ -1418,34 +1676,32 @@ export class VideoProcessor {
     const MAX_DIAGNOSTIC_ERRORS = 10;
     const extractionErrors: import('../../types').ExtractionFailureDiagnostic[] = [];
     const frameDiagnosticsByIndex = new Map<number, OcrFrameDiagnostic>();
-    const sanitizeReason = (raw: string): string =>
-      raw
-        .replace(/\/[^\s:'"]+\//g, '[path]/')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .slice(0, 160);
+    const sanitizeReason = (raw: string): string => sanitizeOcrDiagnostic(raw, 180);
 
     try {
       if (!fs.existsSync(tempOcrDir)) {
         fs.mkdirSync(tempOcrDir, { recursive: true });
       }
 
-      // Extract candidate frames to disk via FFmpeg with categorized failure diagnostics
+      // Extract candidate frames to disk via FFmpeg with categorized failure diagnostics & strict deadline enforcement
       const extractedFrames: Array<{ timestamp: number; index: number; filePath: string; dimensions: { width: number; height: number } | null }> = [];
-      let extractionTimeouts = false;
+      let overallTimedOut = false;
+      let perFrameTimedOut = false;
       let extractionBinaryUnusable = false;
       let framesExtractionFailed = 0;
 
       for (let i = 0; i < candidateTimestamps.length; i++) {
-        // Enforce overall processing timeout before launching next extraction
-        if (Date.now() - startTime >= timeoutMs) {
-          extractionTimeouts = true;
+        // Strictly check overall budget immediately before launching each FFmpeg process
+        const remainingBeforeExtract = getRemainingOverallMs();
+        if (remainingBeforeExtract <= 0) {
+          overallTimedOut = true;
           break;
         }
 
         const ts = candidateTimestamps[i];
         const outName = `frame_${i.toString().padStart(3, '0')}.png`;
         const outPath = path.join(tempOcrDir, outName);
+        const effectiveExtractTimeoutMs = Math.min(perFrameTimeoutMs, remainingBeforeExtract);
 
         try {
           await execFileAsync(ffmpegBin, [
@@ -1456,11 +1712,11 @@ export class VideoProcessor {
             '-vframes', '1',
             '-vf', 'scale=640:-2', // Standardize frame resolution for bounded OCR processing
             outPath
-          ], { timeout: perFrameTimeoutMs });
+          ], { timeout: effectiveExtractTimeoutMs });
 
           if (!fs.existsSync(outPath)) {
             framesExtractionFailed++;
-            const reason = `FFmpeg exited cleanly at ${ts}s without producing output image file.`;
+            const reason = sanitizeReason(`FFmpeg exited cleanly at ${ts}s without producing output image file.`);
             frameDiagnosticsByIndex.set(i, {
               frameIndex: i,
               timestamp: ts,
@@ -1484,14 +1740,10 @@ export class VideoProcessor {
               });
             }
           } else {
-            const stat = fs.statSync(outPath);
-            const pngInfo = stat.size > 0 ? readPngDimensions(outPath) : null;
-            const hasInvalidPngHeader = Boolean(pngInfo && pngInfo.isPngHeader && (pngInfo.width <= 0 || pngInfo.height <= 0));
-            if (stat.size <= 0 || hasInvalidPngHeader) {
+            const pngValidation = validatePngFrameFile(outPath);
+            if (!pngValidation.valid || !pngValidation.dimensions) {
               framesExtractionFailed++;
-              const reason = stat.size <= 0
-                ? `FFmpeg produced empty 0-byte frame image at ${ts}s.`
-                : `FFmpeg produced invalid PNG dimensions (${pngInfo?.width || 0}x${pngInfo?.height || 0}) at ${ts}s.`;
+              const reason = sanitizeReason(`${pngValidation.reason || 'Invalid extracted PNG frame.'} (at ${ts}s)`);
               frameDiagnosticsByIndex.set(i, {
                 frameIndex: i,
                 timestamp: ts,
@@ -1515,9 +1767,7 @@ export class VideoProcessor {
                 });
               }
             } else {
-              const dimensions = (pngInfo && pngInfo.isPngHeader && pngInfo.width > 0 && pngInfo.height > 0)
-                ? { width: pngInfo.width, height: pngInfo.height }
-                : null;
+              const dimensions = pngValidation.dimensions;
               extractedFrames.push({ timestamp: ts, index: i, filePath: outPath, dimensions });
               frameDiagnosticsByIndex.set(i, {
                 frameIndex: i,
@@ -1544,6 +1794,13 @@ export class VideoProcessor {
             errCodeStr === 'ETIMEDOUT' ||
             /timed?\s*out/i.test(String(extErr?.message || ''))
           );
+          const hitOverallBudget = isTimeout && (getRemainingOverallMs() <= 0 || effectiveExtractTimeoutMs < perFrameTimeoutMs);
+          if (hitOverallBudget) {
+            overallTimedOut = true;
+          } else if (isTimeout) {
+            perFrameTimedOut = true;
+          }
+
           const exitCode = typeof extErr?.code === 'number' ? extErr.code : null;
           const category: import('../../types').ExtractionFailureDiagnostic['category'] = isMissingExecutable
             ? 'MISSING_EXECUTABLE'
@@ -1564,11 +1821,13 @@ export class VideoProcessor {
             ? `FFmpeg executable was not found at ${ts}s (${path.basename(ffmpegBin)}).`
             : isNonExecutable
               ? `FFmpeg binary is not executable (${errCodeStr}) at ${ts}s.`
-              : isTimeout
-                ? `Frame extraction timed out at ${ts}s.`
-                : exitCode !== null
-                  ? `FFmpeg exited with code ${exitCode} at ${ts}s: ${stderrLine}`
-                  : `Frame extraction error at ${ts}s: ${stderrLine}`;
+              : hitOverallBudget
+                ? `Overall OCR execution budget (${timeoutMs}ms) expired during frame extraction at ${ts}s.`
+                : isTimeout
+                  ? `Frame extraction timed out (${perFrameTimeoutMs}ms per-frame limit) at ${ts}s.`
+                  : exitCode !== null
+                    ? `FFmpeg exited with code ${exitCode} at ${ts}s: ${stderrLine}`
+                    : `Frame extraction error at ${ts}s: ${stderrLine}`;
           const sanitized = sanitizeReason(rawReason);
 
           frameDiagnosticsByIndex.set(i, {
@@ -1595,8 +1854,10 @@ export class VideoProcessor {
             });
           }
 
-          if (isMissingExecutable || isNonExecutable) {
-            extractionBinaryUnusable = true;
+          if (isMissingExecutable || isNonExecutable || hitOverallBudget) {
+            if (isMissingExecutable || isNonExecutable) {
+              extractionBinaryUnusable = true;
+            }
             break;
           }
         }
@@ -1604,7 +1865,7 @@ export class VideoProcessor {
 
       const framesExtracted = extractedFrames.length;
       const extractedTimestamps = extractedFrames.map(f => f.timestamp);
-      const plannedExtractionAttempts = (extractionTimeouts || extractionBinaryUnusable)
+      const plannedExtractionAttempts = (overallTimedOut || extractionBinaryUnusable)
         ? framesExtracted + framesExtractionFailed
         : totalCandidateFrames;
       const extractionSkipped = Math.max(0, totalCandidateFrames - plannedExtractionAttempts);
@@ -1616,9 +1877,18 @@ export class VideoProcessor {
         const errorSummary = extractionErrors.length > 0
           ? extractionErrors.slice(0, 3).map(e => `[${e.category}] ${e.reason}`).join('; ')
           : '';
+        const zeroExtractedFailure = overallTimedOut
+          ? sanitizeOcrDiagnostic(
+              `Overall OCR execution budget (${timeoutMs}ms) exhausted before OCR execution${errorSummary ? `: ${errorSummary}` : '.'}`,
+              240
+            )
+          : sanitizeOcrDiagnostic(
+              `FFmpeg frame extraction yielded 0 readable candidate frames (${framesExtractionFailed} attempt(s) failed)${errorSummary ? `: ${errorSummary}` : '.'}`,
+              240
+            );
         return {
-          status: 'ANALYSIS_UNAVAILABLE',
-          executionStatus: 'UNAVAILABLE',
+          status: overallTimedOut ? 'INSUFFICIENT_EVIDENCE' : 'ANALYSIS_UNAVAILABLE',
+          executionStatus: overallTimedOut ? 'FAILED' : 'UNAVAILABLE',
           framesInspected: 0,
           totalCandidateFrames,
           coverageRatio: 0,
@@ -1640,8 +1910,10 @@ export class VideoProcessor {
           framesOcrFailed: 0,
           framesSkipped: extractionSkipped,
           isPartial: true,
-          limitations: 'Failed to extract video frames for OCR analysis; continuous temporal interval coverage not verified.',
-          failureReason: `FFmpeg frame extraction yielded 0 readable candidate frames (${framesExtractionFailed} attempt(s) failed)${errorSummary ? `: ${errorSummary}` : '.'}`,
+          limitations: overallTimedOut
+            ? `Overall OCR execution budget (${timeoutMs}ms) expired before any frames completed analysis; continuous temporal interval coverage not verified.`
+            : 'Failed to extract video frames for OCR analysis; continuous temporal interval coverage not verified.',
+          failureReason: zeroExtractedFailure,
           executionDurationMs: Date.now() - startTime,
           detectedFrames: [],
           allExtractedText: []
@@ -1656,13 +1928,15 @@ export class VideoProcessor {
       let framesSucceeded = 0;
       let framesOcrFailed = 0;
       const ocrErrors: string[] = [];
-      let executionTimedOut = extractionTimeouts;
+      let ocrTimedOut = false;
 
       const succeededTimestamps: number[] = [];
 
       for (const ef of extractedFrames) {
-        if (Date.now() - startTime >= timeoutMs) {
-          executionTimedOut = true;
+        // Strictly check remaining overall budget immediately before starting each Tesseract process
+        const remainingBeforeOcr = getRemainingOverallMs();
+        if (remainingBeforeOcr <= 0) {
+          overallTimedOut = true;
           break;
         }
 
@@ -1680,12 +1954,13 @@ export class VideoProcessor {
           confidenceSummary: null
         };
 
+        const effectiveOcrTimeoutMs = Math.min(15000, remainingBeforeOcr);
+
         try {
-          const remainingBudgetMs = Math.max(50, timeoutMs - (Date.now() - startTime));
           const { stdout } = await execFileAsync(
             executable,
             [ef.filePath, 'stdout', '-l', langs, 'tsv'],
-            { timeout: Math.min(15000, remainingBudgetMs) }
+            { timeout: effectiveOcrTimeoutMs }
           );
 
           diag.tesseractExitCode = 0;
@@ -1700,7 +1975,7 @@ export class VideoProcessor {
             diag.failureReason = sanitizeReason(tsvValidation.error || 'Invalid TSV structure');
             frameDiagnosticsByIndex.set(ef.index, diag);
             if (ocrErrors.length < MAX_DIAGNOSTIC_ERRORS) {
-              ocrErrors.push(`Frame @ ${ef.timestamp}s: ${tsvValidation.error || 'Invalid TSV structure'}`);
+              ocrErrors.push(sanitizeReason(`Frame @ ${ef.timestamp}s: ${tsvValidation.error || 'Invalid TSV structure'}`));
             }
             continue;
           }
@@ -1753,9 +2028,13 @@ export class VideoProcessor {
             errCodeStr === 'ETIMEDOUT' ||
             /timed?\s*out/i.test(String(ocrErr?.message || ''))
           );
-          if (isTimeout) {
-            executionTimedOut = true;
+          const hitOverallBudget = isTimeout && (getRemainingOverallMs() <= 0 || effectiveOcrTimeoutMs < 15000);
+          if (hitOverallBudget) {
+            overallTimedOut = true;
+          } else if (isTimeout) {
+            ocrTimedOut = true;
           }
+
           diag.tesseractSuccess = false;
           diag.tesseractExitCode = exitCode;
           diag.tsvValid = null;
@@ -1768,11 +2047,20 @@ export class VideoProcessor {
                 : exitCode !== null
                   ? 'NON_ZERO_EXIT'
                   : 'UNKNOWN_ERROR';
-          const sanitizedErr = sanitizeReason(String(ocrErr?.message || ocrErr));
+          const rawOcrErrMsg = hitOverallBudget
+            ? `Overall OCR execution budget (${timeoutMs}ms) expired during OCR at ${ef.timestamp}s.`
+            : isTimeout
+              ? `OCR execution timed out at ${ef.timestamp}s.`
+              : String(ocrErr?.stderr || ocrErr?.message || ocrErr);
+          const sanitizedErr = sanitizeReason(rawOcrErrMsg);
           diag.failureReason = sanitizedErr;
           frameDiagnosticsByIndex.set(ef.index, diag);
           if (ocrErrors.length < MAX_DIAGNOSTIC_ERRORS) {
-            ocrErrors.push(`Frame @ ${ef.timestamp}s: ${sanitizedErr}`);
+            ocrErrors.push(sanitizeReason(`Frame @ ${ef.timestamp}s: ${sanitizedErr}`));
+          }
+
+          if (hitOverallBudget) {
+            break;
           }
         }
       }
@@ -1797,6 +2085,7 @@ export class VideoProcessor {
 
       // coverageRatio represents sample-point fulfillment ratio (distinct from unverified temporal interval coverage)
       const coverageRatio = samplingCoverageRatio ?? 0;
+      const executionTimedOut = overallTimedOut || perFrameTimedOut || ocrTimedOut;
       const isPartial = framesSucceeded < framesTargeted || executionTimedOut || framesExtractionFailed > 0;
 
       // Semantic status classification:
@@ -1822,7 +2111,7 @@ export class VideoProcessor {
       if (executionStatus === 'FAILED') {
         limitations = `OCR execution failed for all ${framesAttempted} attempted frame(s). No visual text signals could be assessed; temporal timeline coverage not verified.`;
       } else if (isPartial) {
-        limitations = `Inspected ${framesSucceeded} discrete frame timestamps of ${framesTargeted} planned sample points (${samplePct}% sample fulfillment across ${Math.round(dur)}s) due to ${executionTimedOut ? 'timeout' : framesExtractionFailed > 0 ? 'frame extraction/processing error' : 'frame processing error'}; continuous temporal interval coverage between still frames is not verified.`;
+        limitations = `Inspected ${framesSucceeded} discrete frame timestamps of ${framesTargeted} planned sample points (${samplePct}% sample fulfillment across ${Math.round(dur)}s) due to ${overallTimedOut ? 'overall budget timeout' : (perFrameTimedOut || ocrTimedOut) ? 'per-frame timeout' : framesExtractionFailed > 0 ? 'frame extraction/processing error' : 'frame processing error'}; continuous temporal interval coverage between still frames is not verified.`;
       } else {
         limitations = `Inspected ${framesSucceeded} discrete frame timestamps deterministically distributed across ${Math.round(dur)}s (${samplePct}% sample fulfillment) via local Tesseract OCR; continuous temporal interval coverage between still frames is not verified.`;
       }
@@ -1835,10 +2124,14 @@ export class VideoProcessor {
       if (ocrErrors.length > 0) {
         failureParts.push(`OCR encountered errors on ${framesOcrFailed} frame(s): ${ocrErrors.slice(0, 3).join('; ')}`);
       }
-      if (executionTimedOut) {
-        failureParts.push(`OCR pipeline exceeded ${timeoutMs}ms time budget`);
+      if (overallTimedOut) {
+        failureParts.push(`Overall OCR execution budget (${timeoutMs}ms) exhausted`);
+      } else if (perFrameTimedOut || ocrTimedOut) {
+        failureParts.push(`Individual frame timeout (${perFrameTimeoutMs}ms limit) exceeded during OCR pipeline`);
       }
-      const failureReason = failureParts.length > 0 ? failureParts.join(' | ') : undefined;
+      const failureReason = failureParts.length > 0
+        ? sanitizeOcrDiagnostic(failureParts.join(' | '), 280)
+        : undefined;
 
       return {
         status,

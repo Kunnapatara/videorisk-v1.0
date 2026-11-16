@@ -2105,9 +2105,41 @@ fi
     assert.strictEqual(longDeep.length, 30, '12.19 Long-duration deep sampling bounded to 30');
     assert.ok(longDeep[0] === 0 && longDeep[29] < 36000 && new Set(longDeep).size === 30, '12.20 Long-duration samples unique & within [0, duration)');
 
-    // Corrupt image frame submitted to real /usr/bin/tesseract must count as framesOcrFailed > 0 (never NO_SIGNAL_DETECTED)
+    // Corrupt image frame (valid PNG container envelope with corrupt IDAT stream) submitted to real /usr/bin/tesseract must count as framesOcrFailed > 0 (never NO_SIGNAL_DETECTED)
     const corruptFramePath = path.resolve(testDir, 'corrupt_frame.png');
-    fs.writeFileSync(corruptFramePath, 'NOT_A_VALID_PNG_IMAGE_PAYLOAD');
+    {
+      const crc32Buf = (buf: Buffer): number => {
+        let c = 0xffffffff;
+        for (let i = 0; i < buf.length; i++) {
+          c ^= buf[i];
+          for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (c & 1 ? 0xedb88320 : 0);
+        }
+        return (c ^ 0xffffffff) >>> 0;
+      };
+      const mkChunk = (type: string, data: Buffer): Buffer => {
+        const len = Buffer.alloc(4);
+        len.writeUInt32BE(data.length, 0);
+        const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+        const crc = Buffer.alloc(4);
+        crc.writeUInt32BE(crc32Buf(body), 0);
+        return Buffer.concat([len, body, crc]);
+      };
+      const ihdrData = Buffer.alloc(13);
+      ihdrData.writeUInt32BE(64, 0);
+      ihdrData.writeUInt32BE(64, 4);
+      ihdrData[8] = 8; // bitDepth
+      ihdrData[9] = 2; // RGB
+      const pngMagic = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+      fs.writeFileSync(
+        corruptFramePath,
+        Buffer.concat([
+          pngMagic,
+          mkChunk('IHDR', ihdrData),
+          mkChunk('IDAT', Buffer.from('CORRUPT_ZLIB_PIXEL_STREAM_PAYLOAD', 'ascii')),
+          mkChunk('IEND', Buffer.alloc(0))
+        ])
+      );
+    }
     generatedFiles.push(corruptFramePath);
 
     const corruptFrameFfmpeg = path.resolve(testDir, 'corrupt_frame_ffmpeg.sh');
