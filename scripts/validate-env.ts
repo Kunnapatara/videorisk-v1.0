@@ -17,6 +17,7 @@ import Stripe from 'stripe';
 import {
   isLoopbackHostname,
   resolveEnvironmentSecurity,
+  validateMediaTokenSecret,
 } from '../src/server/config/environment';
 
 dotenv.config();
@@ -361,22 +362,20 @@ export function validateBillingConfiguration(
     }
   }
 
-  // 6. Media Access Token Secret Validation
-  const mediaTokenSecret = env.MEDIA_TOKEN_SECRET?.trim() || '';
-  if (!mediaTokenSecret) {
-    if (effectiveProduction) {
-      issues.push({
-        type: 'WARNING',
-        variable: 'MEDIA_TOKEN_SECRET',
-        message: 'MEDIA_TOKEN_SECRET is not set. Production server startup will fail fast unless MEDIA_TOKEN_SECRET is provided.',
-      });
-    } else {
-      issues.push({
-        type: 'INFO',
-        variable: 'MEDIA_TOKEN_SECRET',
-        message: 'MEDIA_TOKEN_SECRET not set. Development server will operate with per-process random fallback secret.',
-      });
-    }
+  // 6. Media Access Token Secret Validation (shared canonical rule with runtime API & readiness)
+  const mediaSecretValidation = validateMediaTokenSecret(env.MEDIA_TOKEN_SECRET, effectiveProduction);
+  if (!mediaSecretValidation.valid) {
+    issues.push({
+      type: 'ERROR',
+      variable: 'MEDIA_TOKEN_SECRET',
+      message: mediaSecretValidation.message,
+    });
+  } else if (mediaSecretValidation.severity === 'INFO') {
+    issues.push({
+      type: 'INFO',
+      variable: 'MEDIA_TOKEN_SECRET',
+      message: mediaSecretValidation.message,
+    });
   }
 
   const errorsCount = issues.filter((i) => i.type === 'ERROR').length;

@@ -15,7 +15,12 @@ import { billingService, ALLOWED_PAID_PLANS } from '../services/billingService';
 import { ensureDemoFixtures, getDemoFixture } from '../fixtures/demoMedia';
 import { channelIntelligenceEngine } from '../intelligence/channelIntelligence';
 import { validateStripeWebhookSecret } from '../../../scripts/validate-env';
-import { isLoopbackHostname, isProductionEnvironment, resolveEnvironmentSecurity } from '../config/environment';
+import {
+  isLoopbackHostname,
+  isProductionEnvironment,
+  resolveEnvironmentSecurity,
+  validateMediaTokenSecret,
+} from '../config/environment';
 import { ScanJob, ScanMode, UserAccount, CrossVideoPattern, ChannelCoverageReport, ChannelCoverageDetail, ChannelPatternsResponse, CrossVideoComparisonStatus } from '../../types';
 
 export const apiRouter = Router();
@@ -278,17 +283,14 @@ export function validateAndGetMediaTokenSecret(env: NodeJS.ProcessEnv = process.
 
   const rawSecret = env.MEDIA_TOKEN_SECRET;
   const isProd = isProductionEnvironment(env);
+  const validation = validateMediaTokenSecret(rawSecret, isProd);
+
+  if (!validation.valid) {
+    throw new Error(`[FATAL SECURITY CONFIGURATION ERROR] ${validation.message} Server startup aborted.`);
+  }
 
   if (typeof rawSecret === 'string' && rawSecret.trim().length > 0) {
     return rawSecret.trim();
-  }
-
-  if (isProd) {
-    throw new Error(
-      '[FATAL SECURITY CONFIGURATION ERROR] MEDIA_TOKEN_SECRET environment variable is missing, empty, or whitespace-only. ' +
-      'Production mode strictly requires an explicit, pre-shared MEDIA_TOKEN_SECRET to ensure multi-instance authorization integrity. ' +
-      'Server startup aborted.'
-    );
   }
 
   // Development / Test fallback: keep a stable secret per process lifecycle
@@ -1255,6 +1257,22 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
       if (fs.existsSync(probeFile)) fs.unlinkSync(probeFile);
     } catch {}
     checks.storage = { status: 'unhealthy', message: 'Upload storage writeability probe failed: directory is not writable.' };
+    isCoreReady = false;
+  }
+
+  // 2b. Media Access Token Secret readiness check (aligned with startup and validate-env)
+  const mediaSecretValidation = validateMediaTokenSecret(process.env.MEDIA_TOKEN_SECRET, isProd);
+  checks.mediaSecurity = {
+    status: mediaSecretValidation.valid ? 'healthy' : 'unhealthy',
+    message: mediaSecretValidation.message,
+    details: {
+      configured: mediaSecretValidation.code !== 'MISSING' && mediaSecretValidation.code !== 'DEV_RANDOM_FALLBACK',
+      valid: mediaSecretValidation.valid,
+      code: mediaSecretValidation.code,
+      isProductionMode: isProd
+    }
+  };
+  if (!mediaSecretValidation.valid) {
     isCoreReady = false;
   }
 

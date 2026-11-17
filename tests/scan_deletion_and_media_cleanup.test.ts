@@ -1042,6 +1042,7 @@ export async function runScanDeletionAndMediaCleanupTests() {
     assert(testWithLiveKey.issues.some(i => i.message.includes('Accidental live key')), 'Warns about live key in test mode');
 
     // 9d. Valid production configuration
+    const validMediaSecret = 'vr_prod_media_token_secret_0123456789abcdef_strong';
     const prodValidRes = validateBillingConfiguration('production', {
       NODE_ENV: 'production',
       STRIPE_SECRET_KEY: 'sk_live_prodkey123456789',
@@ -1050,6 +1051,7 @@ export async function runScanDeletionAndMediaCleanupTests() {
       STRIPE_PRICE_PRO: 'price_pro_123',
       STRIPE_PRICE_AGENCY: 'price_agency_123',
       STRIPE_PRICE_AUDIT_ONCE: 'price_audit_123',
+      MEDIA_TOKEN_SECRET: validMediaSecret,
     });
     assert.strictEqual(prodValidRes.valid, true, 'Valid production billing configuration passes');
     assert.strictEqual(prodValidRes.errorsCount, 0, 'Zero errors in valid configuration');
@@ -1074,7 +1076,65 @@ export async function runScanDeletionAndMediaCleanupTests() {
     const auditPlan = INTENDED_PLANS.find(p => p.id === 'audit_once');
     assert.strictEqual(auditPlan?.priceUsd, 29, 'Audit is $29');
     assert.strictEqual(auditPlan?.credits, 60, 'Audit is 60 credits');
-    console.log('  ✅ PASS: Billing validator accurately detects errors, malformations, and masks credentials.');
+
+    // 9g. Task A2: MEDIA_TOKEN_SECRET production enforcement & non-leakage
+    const baseProdForMedia = {
+      NODE_ENV: 'production',
+      STRIPE_SECRET_KEY: 'sk_live_prodkey123456789',
+      STRIPE_WEBHOOK_SECRET: 'whsec_prodwebhook123456789',
+      STRIPE_PRICE_CREATOR: 'price_creator_123',
+      STRIPE_PRICE_PRO: 'price_pro_123',
+      STRIPE_PRICE_AGENCY: 'price_agency_123',
+      STRIPE_PRICE_AUDIT_ONCE: 'price_audit_123',
+    };
+    const prodMissingMediaSecret = validateBillingConfiguration('production', { ...baseProdForMedia });
+    assert.strictEqual(prodMissingMediaSecret.valid, false, '9g.1 Production without MEDIA_TOKEN_SECRET fails validation');
+    assert.ok(
+      prodMissingMediaSecret.issues.some(i => i.variable === 'MEDIA_TOKEN_SECRET' && i.type === 'ERROR'),
+      '9g.2 Missing MEDIA_TOKEN_SECRET in production emits ERROR (never WARNING)'
+    );
+
+    const shortSentinel = 'short_secret_SENTINEL_XYZ';
+    const prodShortMediaSecret = validateBillingConfiguration('production', {
+      ...baseProdForMedia,
+      MEDIA_TOKEN_SECRET: shortSentinel,
+    });
+    assert.strictEqual(prodShortMediaSecret.valid, false, '9g.3 Production with too-short MEDIA_TOKEN_SECRET fails validation');
+    assert.ok(
+      prodShortMediaSecret.issues.some(i => i.variable === 'MEDIA_TOKEN_SECRET' && i.type === 'ERROR'),
+      '9g.4 Short MEDIA_TOKEN_SECRET in production emits ERROR'
+    );
+    assert.ok(
+      prodShortMediaSecret.issues.every(i => !i.message.includes(shortSentinel)),
+      '9g.5 Validation message never leaks short MEDIA_TOKEN_SECRET value'
+    );
+
+    const placeholderSentinel = 'changeme_placeholder_secret_SENTINEL_0123456789';
+    const prodPlaceholderMediaSecret = validateBillingConfiguration('production', {
+      ...baseProdForMedia,
+      MEDIA_TOKEN_SECRET: placeholderSentinel,
+    });
+    assert.strictEqual(prodPlaceholderMediaSecret.valid, false, '9g.6 Production with placeholder MEDIA_TOKEN_SECRET fails validation');
+    assert.ok(
+      prodPlaceholderMediaSecret.issues.every(i => !i.message.includes(placeholderSentinel)),
+      '9g.7 Validation message never leaks placeholder MEDIA_TOKEN_SECRET value'
+    );
+
+    const devMissingMediaSecret = validateBillingConfiguration('development', {
+      NODE_ENV: 'development',
+    });
+    assert.strictEqual(devMissingMediaSecret.valid, true, '9g.8 Development without MEDIA_TOKEN_SECRET passes');
+    assert.ok(
+      devMissingMediaSecret.issues.some(i => i.variable === 'MEDIA_TOKEN_SECRET' && i.type === 'INFO'),
+      '9g.9 Development without MEDIA_TOKEN_SECRET reports INFO fallback'
+    );
+
+    const ciMissingMediaSecret = validateBillingConfiguration('ci', {
+      NODE_ENV: 'production',
+      CI: 'true',
+    });
+    assert.strictEqual(ciMissingMediaSecret.valid, true, '9g.10 CI mode without MEDIA_TOKEN_SECRET passes');
+    console.log('  ✅ PASS: Billing & MEDIA_TOKEN_SECRET validator accurately detects errors, malformations, and masks credentials.');
 
     // ---------------------------------------------------------
     // Test 10: CLI --live-check Reliability & Deployment Gate Tests
@@ -1090,6 +1150,7 @@ export async function runScanDeletionAndMediaCleanupTests() {
       STRIPE_PRICE_PRO: 'price_pro_123',
       STRIPE_PRICE_AGENCY: 'price_agency_123',
       STRIPE_PRICE_AUDIT_ONCE: 'price_audit_123',
+      MEDIA_TOKEN_SECRET: validMediaSecret,
     };
 
     // 10a. Static passes and live Stripe check succeeds -> exit code 0
@@ -1144,6 +1205,31 @@ export async function runScanDeletionAndMediaCleanupTests() {
     );
     assert.strictEqual(exit10d, 1, 'Non-zero exit code when static configuration is invalid');
 
+    // 10d2. Missing or invalid MEDIA_TOKEN_SECRET in production returns failing exit code
+    const exit10dMissingMedia = await runValidatorCli(
+      ['--mode=production'],
+      {
+        ...validProdEnv,
+        MEDIA_TOKEN_SECRET: '',
+      }
+    );
+    assert.strictEqual(exit10dMissingMedia, 1, 'Non-zero exit code in production CLI when MEDIA_TOKEN_SECRET is missing');
+
+    const exit10dInvalidMedia = await runValidatorCli(
+      ['--mode=production'],
+      {
+        ...validProdEnv,
+        MEDIA_TOKEN_SECRET: 'too_short_invalid',
+      }
+    );
+    assert.strictEqual(exit10dInvalidMedia, 1, 'Non-zero exit code in production CLI when MEDIA_TOKEN_SECRET is invalid');
+
+    const exit10dCi = await runValidatorCli(
+      ['--mode=ci'],
+      { CI: 'true' }
+    );
+    assert.strictEqual(exit10dCi, 0, 'Exit code 0 in CI CLI mode');
+
     // 10e. --live-check requested but authorization is missing (ALLOW_LIVE_STRIPE_CHECK != true) -> non-zero exit code
     const exit10e = await runValidatorCli(
       ['--mode=production', '--live-check'],
@@ -1168,7 +1254,7 @@ export async function runScanDeletionAndMediaCleanupTests() {
     );
     assert.strictEqual(exit10g, 0, 'Normal validation without --live-check returns 0 for valid config');
 
-    console.log('  ✅ PASS: All Stripe --live-check deployment gate and sanitization requirements verified.');
+    console.log('  ✅ PASS: All Stripe --live-check & MEDIA_TOKEN_SECRET deployment gate and sanitization requirements verified.');
 
     console.log('======================================================');
     console.log('TEST SUITE 11 COMPLETE: All Deletion & Billing assertions passed!');

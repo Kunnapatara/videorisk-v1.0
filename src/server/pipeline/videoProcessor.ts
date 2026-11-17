@@ -256,36 +256,179 @@ function getPngChannelsPerPixel(colorType: number): number {
   }
 }
 
+const KNOWN_CRITICAL_PNG_CHUNKS = new Set<string>(['IHDR', 'PLTE', 'IDAT', 'IEND']);
+
+function inspectPngChunkType(rawBytes: Buffer): {
+  validAscii: boolean;
+  validReservedBit: boolean;
+  isCritical: boolean;
+  tag: string | null;
+  reason?: string;
+} {
+  if (rawBytes.length !== 4) {
+    return {
+      validAscii: false,
+      validReservedBit: false,
+      isCritical: false,
+      tag: null,
+      reason: 'Invalid PNG chunk type length.'
+    };
+  }
+
+  for (let i = 0; i < 4; i++) {
+    const b = rawBytes[i];
+    const isUpper = b >= 0x41 && b <= 0x5a;
+    const isLower = b >= 0x61 && b <= 0x7a;
+    if (!isUpper && !isLower) {
+      return {
+        validAscii: false,
+        validReservedBit: false,
+        isCritical: false,
+        tag: null,
+        reason: `Invalid PNG chunk type byte sequence (non-letter byte 0x${b.toString(16).padStart(2, '0')} at index ${i}).`
+      };
+    }
+  }
+
+  const tag = String.fromCharCode(rawBytes[0], rawBytes[1], rawBytes[2], rawBytes[3]);
+  const isCritical = rawBytes[0] >= 0x41 && rawBytes[0] <= 0x5a;
+  const validReservedBit = rawBytes[2] >= 0x41 && rawBytes[2] <= 0x5a;
+
+  if (!validReservedBit) {
+    return {
+      validAscii: true,
+      validReservedBit: false,
+      isCritical,
+      tag,
+      reason: `Invalid PNG chunk '${tag}': reserved bit in 3rd chunk-type byte must be uppercase.`
+    };
+  }
+
+  return {
+    validAscii: true,
+    validReservedBit: true,
+    isCritical,
+    tag
+  };
+}
+
+function paethPredictor(a: number, b: number, c: number): number {
+  const p = a + b - c;
+  const pa = Math.abs(p - a);
+  const pb = Math.abs(p - b);
+  const pc = Math.abs(p - c);
+  if (pa <= pb && pa <= pc) return a;
+  if (pb <= pc) return b;
+  return c;
+}
+
+interface PngPassLayout {
+  passWidth: number;
+  rows: number;
+  rawBytesPerRow: number;
+  stride: number;
+}
+
 function computePngScanlineLayout(
   width: number,
   height: number,
   bitDepth: number,
   colorType: number,
   interlace: number
-): { expectedBytes: number; scanlineStrides: Array<{ rows: number; stride: number }> } | null {
+): { expectedBytes: number; scanlineStrides: PngPassLayout[] } | null {
   const channels = getPngChannelsPerPixel(colorType);
   if (channels === 0) return null;
   const bitsPerPixel = channels * bitDepth;
-  const scanlineStrides: Array<{ rows: number; stride: number }> = [];
+  const scanlineStrides: PngPassLayout[] = [];
   let expectedBytes = 0;
 
   if (interlace === 0) {
-    const stride = 1 + Math.ceil((width * bitsPerPixel) / 8);
+    const rawBytesPerRow = Math.ceil((width * bitsPerPixel) / 8);
+    const stride = 1 + rawBytesPerRow;
     expectedBytes = height * stride;
-    scanlineStrides.push({ rows: height, stride });
+    scanlineStrides.push({ passWidth: width, rows: height, rawBytesPerRow, stride });
   } else {
     for (const [startRow, startCol, rowInc, colInc] of ADAM7_PASSES) {
       const passWidth = width > startCol ? Math.ceil((width - startCol) / colInc) : 0;
       const passHeight = height > startRow ? Math.ceil((height - startRow) / rowInc) : 0;
       if (passWidth > 0 && passHeight > 0) {
-        const stride = 1 + Math.ceil((passWidth * bitsPerPixel) / 8);
+        const rawBytesPerRow = Math.ceil((passWidth * bitsPerPixel) / 8);
+        const stride = 1 + rawBytesPerRow;
         expectedBytes += passHeight * stride;
-        scanlineStrides.push({ rows: passHeight, stride });
+        scanlineStrides.push({ passWidth, rows: passHeight, rawBytesPerRow, stride });
       }
     }
   }
 
   return { expectedBytes, scanlineStrides };
+}
+
+function validateIndexedPngPixels(
+  inflated: Buffer,
+  scanlineStrides: PngPassLayout[],
+  bitDepth: number,
+  paletteEntryCount: number
+): string | null {
+  let cursor = 0;
+  for (const pass of scanlineStrides) {
+    let prevRow: Uint8Array | null = null;
+    const currRow = new Uint8Array(pass.rawBytesPerRow);
+
+    for (let row = 0; row < pass.rows; row++) {
+      const filterByte = inflated[cursor];
+      const dataStart = cursor + 1;
+
+      for (let j = 0; j < pass.rawBytesPerRow; j++) {
+        const filt = inflated[dataStart + j];
+        const a = j >= 1 ? currRow[j - 1] : 0;
+        const b = prevRow !== null ? prevRow[j] : 0;
+        const c = j >= 1 && prevRow !== null ? prevRow[j - 1] : 0;
+
+        let recon = filt;
+        if (filterByte === 1) {
+          recon = (filt + a) & 0xff;
+        } else if (filterByte === 2) {
+          recon = (filt + b) & 0xff;
+        } else if (filterByte === 3) {
+          recon = (filt + ((a + b) >>> 1)) & 0xff;
+        } else if (filterByte === 4) {
+          recon = (filt + paethPredictor(a, b, c)) & 0xff;
+        }
+        currRow[j] = recon;
+      }
+
+      for (let p = 0; p < pass.passWidth; p++) {
+        let paletteIdx = 0;
+        if (bitDepth === 8) {
+          paletteIdx = currRow[p];
+        } else if (bitDepth === 4) {
+          const byte = currRow[p >> 1];
+          paletteIdx = (p & 1) === 0 ? (byte >> 4) & 0x0f : byte & 0x0f;
+        } else if (bitDepth === 2) {
+          const byte = currRow[p >> 2];
+          const shift = 6 - 2 * (p & 3);
+          paletteIdx = (byte >> shift) & 0x03;
+        } else if (bitDepth === 1) {
+          const byte = currRow[p >> 3];
+          const shift = 7 - (p & 7);
+          paletteIdx = (byte >> shift) & 0x01;
+        }
+
+        if (paletteIdx >= paletteEntryCount) {
+          return `Indexed PNG pixel references palette index ${paletteIdx}, outside PLTE range [0..${paletteEntryCount - 1}].`;
+        }
+      }
+
+      if (!prevRow) {
+        prevRow = new Uint8Array(currRow);
+      } else {
+        prevRow.set(currRow);
+      }
+      cursor += pass.stride;
+    }
+  }
+
+  return null;
 }
 
 export interface PngFrameValidationResult {
@@ -300,10 +443,11 @@ export interface PngFrameValidationResult {
  * - File exists, is a regular readable file, is non-empty, and is within size bounds
  * - Exact 8-byte PNG signature
  * - Canonical 13-byte IHDR first chunk (single, non-duplicated) with valid dimensions, color/bit-depth, compression, filter, interlace
+ * - Strict raw-byte ASCII chunk type encoding, reserved bit (3rd byte uppercase) validation, and unknown critical chunk rejection
  * - CRC-32 checksum verification on EVERY chunk (IHDR, PLTE, IDAT, ancillary, IEND)
- * - Critical chunk ordering rules (PLTE required for colorType 3 before IDAT, forbidden on 0/4; IDAT chunks strictly contiguous; >= 1 non-empty IDAT)
- * - Full zlib decompression of concatenated IDAT payload with bounded output length (decompression bomb protection)
- * - Exact decompressed byte-length verification and scanline filter byte validation (0..4)
+ * - Critical & ancillary chunk ordering/multiplicity/length rules (PLTE, tRNS, sRGB, gAMA, cHRM, iCCP, sBIT, pHYs, bKGD, hIST, tIME; contiguous IDAT)
+ * - Full single-pass zlib decompression of concatenated IDAT payload requiring complete stream consumption (zero trailing bytes) and bounded memory
+ * - Exact decompressed byte-length verification, scanline filter byte validation (0..4), and indexed-color palette bounds check
  * - Canonical 0-byte IEND trailer with valid CRC and zero trailing bytes after IEND
  */
 export function validatePngFrameFile(filePath: string): PngFrameValidationResult {
@@ -382,13 +526,13 @@ export function validatePngFrameFile(filePath: string): PngFrameValidationResult
   }
 
   const ihdrLength = buf.readUInt32BE(8);
-  const ihdrTag = buf.subarray(12, 16).toString('ascii');
-  if (ihdrTag !== 'IHDR' || ihdrLength !== 13) {
+  const ihdrTypeCheck = inspectPngChunkType(buf.subarray(12, 16));
+  if (!ihdrTypeCheck.validAscii || !ihdrTypeCheck.validReservedBit || ihdrTypeCheck.tag !== 'IHDR' || ihdrLength !== 13) {
     return {
       valid: false,
       dimensions: null,
       errorClass: 'INVALID_PNG_STRUCTURE',
-      reason: `Invalid PNG header chunk: expected 13-byte IHDR, got '${ihdrTag}' (${ihdrLength} bytes).`
+      reason: ihdrTypeCheck.reason || `Invalid PNG header chunk: expected 13-byte IHDR, got '${ihdrTypeCheck.tag || 'invalid'}' (${ihdrLength} bytes).`
     };
   }
 
@@ -447,6 +591,17 @@ export function validatePngFrameFile(filePath: string): PngFrameValidationResult
 
   let offset = 33;
   let seenPlte = false;
+  let paletteEntryCount = 0;
+  let seenTrns = false;
+  let seenSrgb = false;
+  let seenGama = false;
+  let seenChrm = false;
+  let seenIccp = false;
+  let seenSbit = false;
+  let seenPhys = false;
+  let seenBkgd = false;
+  let seenHist = false;
+  let seenTime = false;
   let seenIdat = false;
   let idatFinished = false;
   let seenIend = false;
@@ -473,15 +628,26 @@ export function validatePngFrameFile(filePath: string): PngFrameValidationResult
     }
 
     const chunkLen = buf.readUInt32BE(offset);
-    const chunkType = buf.subarray(offset + 4, offset + 8).toString('ascii');
-    if (!/^[A-Za-z]{4}$/.test(chunkType)) {
+    const chunkTypeCheck = inspectPngChunkType(buf.subarray(offset + 4, offset + 8));
+    if (!chunkTypeCheck.validAscii || !chunkTypeCheck.validReservedBit || !chunkTypeCheck.tag) {
       return {
         valid: false,
         dimensions: null,
         errorClass: 'INVALID_PNG_STRUCTURE',
-        reason: 'Invalid PNG chunk type identifier.'
+        reason: chunkTypeCheck.reason || 'Invalid PNG chunk type identifier.'
       };
     }
+    const chunkType = chunkTypeCheck.tag;
+
+    if (chunkTypeCheck.isCritical && !KNOWN_CRITICAL_PNG_CHUNKS.has(chunkType)) {
+      return {
+        valid: false,
+        dimensions: null,
+        errorClass: 'INVALID_PNG_STRUCTURE',
+        reason: `Unknown critical PNG chunk '${chunkType}' is unsupported and rejected.`
+      };
+    }
+
     if (chunkLen > 0x7fffffff || offset + 12 + chunkLen > buf.length) {
       return {
         valid: false,
@@ -502,6 +668,8 @@ export function validatePngFrameFile(filePath: string): PngFrameValidationResult
         reason: `Corrupt PNG '${chunkType}' chunk checksum (CRC-32 mismatch).`
       };
     }
+
+    const chunkData = buf.subarray(offset + 8, offset + 8 + chunkLen);
 
     if (chunkType === 'IHDR') {
       return {
@@ -529,12 +697,12 @@ export function validatePngFrameFile(filePath: string): PngFrameValidationResult
           reason: 'Duplicate PNG PLTE chunk detected.'
         };
       }
-      if (seenIdat) {
+      if (seenIdat || seenTrns || seenBkgd || seenHist) {
         return {
           valid: false,
           dimensions: null,
           errorClass: 'INVALID_PNG_STRUCTURE',
-          reason: 'PNG PLTE chunk cannot appear after IDAT chunk.'
+          reason: 'PNG PLTE chunk must appear before IDAT, tRNS, bKGD, and hIST chunks.'
         };
       }
       if (chunkLen === 0 || chunkLen % 3 !== 0 || chunkLen / 3 > 256 || (colorType === 3 && chunkLen / 3 > (1 << bitDepth))) {
@@ -546,6 +714,7 @@ export function validatePngFrameFile(filePath: string): PngFrameValidationResult
         };
       }
       seenPlte = true;
+      paletteEntryCount = chunkLen / 3;
     } else if (chunkType === 'IDAT') {
       if (idatFinished) {
         return {
@@ -565,11 +734,171 @@ export function validatePngFrameFile(filePath: string): PngFrameValidationResult
       }
       seenIdat = true;
       if (chunkLen > 0) {
-        idatChunks.push(buf.subarray(offset + 8, offset + 8 + chunkLen));
+        idatChunks.push(chunkData);
       }
     } else {
       if (seenIdat) {
         idatFinished = true;
+      }
+
+      if (chunkType === 'tRNS') {
+        if (seenTrns || seenIdat) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'INVALID_PNG_STRUCTURE',
+            reason: seenTrns ? 'Duplicate PNG tRNS chunk detected.' : 'PNG tRNS chunk cannot appear after IDAT.'
+          };
+        }
+        if (colorType === 4 || colorType === 6) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'INVALID_PNG_STRUCTURE',
+            reason: `PNG tRNS chunk is forbidden for alpha-enabled colorType ${colorType}.`
+          };
+        }
+        if (colorType === 0 && chunkLen !== 2) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'INVALID_PNG_STRUCTURE',
+            reason: `Invalid PNG tRNS length (${chunkLen}) for grayscale colorType 0 (expected 2).`
+          };
+        }
+        if (colorType === 2 && chunkLen !== 6) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'INVALID_PNG_STRUCTURE',
+            reason: `Invalid PNG tRNS length (${chunkLen}) for RGB colorType 2 (expected 6).`
+          };
+        }
+        if (colorType === 3) {
+          if (!seenPlte) {
+            return {
+              valid: false,
+              dimensions: null,
+              errorClass: 'INVALID_PNG_STRUCTURE',
+              reason: 'PNG tRNS chunk for indexed colorType 3 must appear after PLTE.'
+            };
+          }
+          if (chunkLen === 0 || chunkLen > paletteEntryCount) {
+            return {
+              valid: false,
+              dimensions: null,
+              errorClass: 'INVALID_PNG_STRUCTURE',
+              reason: `Invalid PNG tRNS length (${chunkLen}) for ${paletteEntryCount}-entry PLTE palette.`
+            };
+          }
+        }
+        seenTrns = true;
+      } else if (chunkType === 'sRGB') {
+        if (seenSrgb || seenPlte || seenIdat || chunkLen !== 1 || chunkData[0] > 3) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'INVALID_PNG_STRUCTURE',
+            reason: 'Invalid or misplaced PNG sRGB chunk.'
+          };
+        }
+        seenSrgb = true;
+      } else if (chunkType === 'gAMA') {
+        if (seenGama || seenPlte || seenIdat || chunkLen !== 4) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'INVALID_PNG_STRUCTURE',
+            reason: 'Invalid or misplaced PNG gAMA chunk.'
+          };
+        }
+        seenGama = true;
+      } else if (chunkType === 'cHRM') {
+        if (seenChrm || seenPlte || seenIdat || chunkLen !== 32) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'INVALID_PNG_STRUCTURE',
+            reason: 'Invalid or misplaced PNG cHRM chunk.'
+          };
+        }
+        seenChrm = true;
+      } else if (chunkType === 'iCCP') {
+        if (seenIccp || seenPlte || seenIdat || chunkLen < 3) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'INVALID_PNG_STRUCTURE',
+            reason: 'Invalid or misplaced PNG iCCP chunk.'
+          };
+        }
+        seenIccp = true;
+      } else if (chunkType === 'sBIT') {
+        const expectedSbitLen = colorType === 0 ? 1 : colorType === 4 ? 2 : colorType === 2 || colorType === 3 ? 3 : 4;
+        if (seenSbit || seenPlte || seenIdat || chunkLen !== expectedSbitLen) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'INVALID_PNG_STRUCTURE',
+            reason: 'Invalid or misplaced PNG sBIT chunk.'
+          };
+        }
+        seenSbit = true;
+      } else if (chunkType === 'pHYs') {
+        if (seenPhys || seenIdat || chunkLen !== 9 || chunkData[8] > 1) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'INVALID_PNG_STRUCTURE',
+            reason: 'Invalid or misplaced PNG pHYs chunk.'
+          };
+        }
+        seenPhys = true;
+      } else if (chunkType === 'bKGD') {
+        const expectedBkgdLen = colorType === 3 ? 1 : colorType === 0 || colorType === 4 ? 2 : 6;
+        if (
+          seenBkgd ||
+          seenIdat ||
+          (colorType === 3 && !seenPlte) ||
+          chunkLen !== expectedBkgdLen ||
+          (colorType === 3 && chunkData[0] >= paletteEntryCount)
+        ) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'INVALID_PNG_STRUCTURE',
+            reason: 'Invalid or misplaced PNG bKGD chunk.'
+          };
+        }
+        seenBkgd = true;
+      } else if (chunkType === 'hIST') {
+        if (seenHist || seenIdat || !seenPlte || chunkLen !== paletteEntryCount * 2) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'INVALID_PNG_STRUCTURE',
+            reason: 'Invalid or misplaced PNG hIST chunk.'
+          };
+        }
+        seenHist = true;
+      } else if (chunkType === 'tIME') {
+        if (
+          seenTime ||
+          chunkLen !== 7 ||
+          chunkData[2] < 1 || chunkData[2] > 12 ||
+          chunkData[3] < 1 || chunkData[3] > 31 ||
+          chunkData[4] > 23 ||
+          chunkData[5] > 59 ||
+          chunkData[6] > 60
+        ) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'INVALID_PNG_STRUCTURE',
+            reason: 'Invalid or duplicate PNG tIME chunk.'
+          };
+        }
+        seenTime = true;
       }
     }
 
@@ -633,8 +962,14 @@ export function validatePngFrameFile(filePath: string): PngFrameValidationResult
 
   const compressedPayload = idatChunks.length === 1 ? idatChunks[0] : Buffer.concat(idatChunks);
   let inflated: Buffer;
+  let bytesConsumed = 0;
   try {
-    inflated = zlib.inflateSync(compressedPayload, { maxOutputLength: layout.expectedBytes });
+    const inflateRes = zlib.inflateSync(compressedPayload, {
+      info: true,
+      maxOutputLength: layout.expectedBytes
+    }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+    inflated = inflateRes.buffer;
+    bytesConsumed = inflateRes.engine?.bytesWritten ?? 0;
   } catch (err: any) {
     const isBomb = err?.code === 'ERR_BUFFER_TOO_LARGE';
     return {
@@ -644,6 +979,15 @@ export function validatePngFrameFile(filePath: string): PngFrameValidationResult
       reason: isBomb
         ? `PNG IDAT decompression exceeded expected output size (${layout.expectedBytes} bytes; potential decompression bomb).`
         : `Corrupt PNG IDAT zlib stream: ${err?.message || 'inflateSync failed'}.`
+    };
+  }
+
+  if (bytesConsumed !== compressedPayload.length) {
+    return {
+      valid: false,
+      dimensions: null,
+      errorClass: 'PNG_DECOMPRESSION_FAILURE',
+      reason: `PNG IDAT contains ${compressedPayload.length - bytesConsumed} trailing byte(s) after end of valid zlib stream.`
     };
   }
 
@@ -670,6 +1014,19 @@ export function validatePngFrameFile(filePath: string): PngFrameValidationResult
         };
       }
       cursor += pass.stride;
+    }
+  }
+
+  // Validate indexed-color (colorType 3) pixel indices against PLTE palette bounds after unfiltering
+  if (colorType === 3) {
+    const indexedErr = validateIndexedPngPixels(inflated, layout.scanlineStrides, bitDepth, paletteEntryCount);
+    if (indexedErr) {
+      return {
+        valid: false,
+        dimensions: null,
+        errorClass: 'INVALID_PNG_STRUCTURE',
+        reason: indexedErr
+      };
     }
   }
 

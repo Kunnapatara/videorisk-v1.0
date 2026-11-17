@@ -8,7 +8,12 @@ import { storage, InMemoryStorageRepository } from '../src/server/storage';
 import { SqliteStorageRepository } from '../src/server/storage/sqliteStorage';
 import { billingService } from '../src/server/services/billingService';
 import { apiRouter, validateAndGetMediaTokenSecret } from '../src/server/routes/api';
-import { isProductionEnvironment, resolveEnvironmentSecurity } from '../src/server/config/environment';
+import {
+  isLoopbackHostname,
+  isProductionEnvironment,
+  resolveEnvironmentSecurity,
+  validateMediaTokenSecret,
+} from '../src/server/config/environment';
 import { validateBillingConfiguration } from '../scripts/validate-env';
 
 function buildSignedWebhookRequest(
@@ -2134,6 +2139,7 @@ export async function runStripeOriginAndRefundLifecycleTests() {
         STRIPE_PRICE_AUDIT_ONCE: 'price_o_live',
         APP_BASE_URL: 'https://videorisk.com',
         ALLOWED_ORIGINS: 'https://app.videorisk.com',
+        MEDIA_TOKEN_SECRET: 'vr_prod_media_token_secret_0123456789abcdef_strong',
       };
       const prodLiveSec = resolveEnvironmentSecurity(validProdLiveEnv);
       assert.strictEqual(prodLiveSec.isProduction, true, '5.2a Canonical isProduction=true');
@@ -2346,6 +2352,159 @@ export async function runStripeOriginAndRefundLifecycleTests() {
       );
 
       console.log('  ✅ PASS: All 11 Canonical Production Predicate & Live-Payment Origin Hardening cases verified');
+
+      // ------------------------------------------------------------------------
+      // 6. TASK A1 & A2: COMPLETE LOOPBACK BOUNDARIES & MEDIA_TOKEN_SECRET PARITY
+      // ------------------------------------------------------------------------
+      console.log('\n[6. Task A1 & A2: IPv4/IPv6 Loopback Boundaries & MEDIA_TOKEN_SECRET Parity]');
+
+      // 6.1 IPv4 loopback range 127.0.0.0/8 & boundary cases
+      for (const lbIpv4 of ['127.0.0.0', '127.0.0.1', '127.0.0.2', '127.1.2.3', '127.255.255.254', '127.255.255.255']) {
+        assert.strictEqual(isLoopbackHostname(lbIpv4), true, `6.1 IPv4 loopback ${lbIpv4} detected as loopback`);
+      }
+      for (const nonLbIpv4 of ['126.255.255.255', '128.0.0.0', '127.0.0.1.evil.com', '127.0.0', '127.0.0.256', '127.0.0.01']) {
+        assert.strictEqual(isLoopbackHostname(nonLbIpv4), false, `6.1b Non-loopback/invalid IPv4 ${nonLbIpv4} returns false`);
+      }
+
+      // 6.2 IPv6 loopback representations
+      for (const lbIpv6 of [
+        '::1',
+        '[::1]',
+        '0:0:0:0:0:0:0:1',
+        '0000:0000:0000:0000:0000:0000:0000:0001',
+        '[0:0:0:0:0:0:0:1]',
+        '::0:1',
+      ]) {
+        assert.strictEqual(isLoopbackHostname(lbIpv6), true, `6.2 IPv6 loopback ${lbIpv6} detected as loopback`);
+      }
+
+      // 6.3 IPv4-mapped IPv6 loopback (both dotted and WHATWG canonical hex forms)
+      for (const mappedLb of [
+        '::ffff:127.0.0.1',
+        '[::ffff:127.0.0.1]',
+        '::ffff:127.0.0.2',
+        '::ffff:127.255.255.254',
+        '::ffff:7f00:1',
+        '[::ffff:7f00:1]',
+        '::FFFF:7F00:0001',
+        '0:0:0:0:0:ffff:127.1.2.3',
+        '0000:0000:0000:0000:0000:ffff:7f01:0203',
+        '::127.0.0.1',
+      ]) {
+        assert.strictEqual(isLoopbackHostname(mappedLb), true, `6.3 IPv4-mapped IPv6 loopback ${mappedLb} detected as loopback`);
+      }
+      for (const mappedNonLb of ['::ffff:126.255.255.255', '::ffff:128.0.0.1', '::ffff:10.0.0.1', '::ffff:192.168.1.1', '::ffff:8.8.8.8']) {
+        assert.strictEqual(isLoopbackHostname(mappedNonLb), false, `6.3b IPv4-mapped IPv6 non-loopback ${mappedNonLb} returns false`);
+      }
+
+      // 6.4 Localhost casing, subdomains, trailing dot vs lookalike domains
+      for (const lh of ['localhost', 'LOCALHOST', 'sub.localhost', 'API.LOCALHOST', 'localhost.', 'sub.localhost.']) {
+        assert.strictEqual(isLoopbackHostname(lh), true, `6.4 Localhost variant ${lh} detected`);
+      }
+      for (const lookalike of ['localhost.evil.com', 'notlocalhost', 'my-localhost.org']) {
+        assert.strictEqual(isLoopbackHostname(lookalike), false, `6.4b Lookalike ${lookalike} rejected`);
+      }
+
+      // 6.5 Non-loopback private & public IPv4/IPv6 addresses + invalid hostnames / malformed inputs
+      for (const privateOrPublic of [
+        '10.0.0.1',
+        '172.16.0.1',
+        '192.168.1.1',
+        '169.254.1.1',
+        'fc00::1',
+        'fd00::1',
+        'fe80::1',
+        '8.8.8.8',
+        '1.1.1.1',
+        '2001:4860:4860::8888',
+        '2606:4700:4700::1111',
+      ]) {
+        assert.strictEqual(isLoopbackHostname(privateOrPublic), false, `6.5 Non-loopback IP ${privateOrPublic} returns false`);
+      }
+      for (const malformed of ['', '   ', '[::1', '::1]', ':::', '127.0.0.1:3000', '127.0.0.1/evil', 'user@127.0.0.1', 'http://[::1']) {
+        assert.strictEqual(isLoopbackHostname(malformed), false, `6.5b Invalid hostname '${malformed}' returns false`);
+      }
+
+      // 6.6 End-to-end production rejection of expanded loopback origins (Trusted Origins, Checkout, Portal, validate-env)
+      process.env.NODE_ENV = 'production';
+      process.env.PAYMENT_MODE = 'live';
+      process.env.STRIPE_SECRET_KEY = 'sk_live_mock1234567890abcdef';
+      process.env.STRIPE_WEBHOOK_SECRET = 'whsec_mock1234567890abcdef';
+      process.env.APP_BASE_URL = 'https://videorisk.com';
+      process.env.ALLOWED_ORIGINS = 'https://app.videorisk.com,https://127.0.0.2:3000,https://[::ffff:127.0.0.1]:3000,https://[0:0:0:0:0:0:0:1]:3000';
+      const trustedExpanded = billingService.getTrustedOrigins();
+      assert.deepStrictEqual(
+        trustedExpanded.sort(),
+        ['https://app.videorisk.com', 'https://videorisk.com'],
+        '6.6a getTrustedOrigins strips 127.0.0.2, ::ffff:127.0.0.1, and 0:0:0:0:0:0:0:1 in production'
+      );
+
+      for (const expandedLoopbackOrigin of [
+        'https://127.0.0.2:3000',
+        'https://127.1.2.3',
+        'https://[::1]:3000',
+        'https://[0:0:0:0:0:0:0:1]:3000',
+        'https://[::ffff:127.0.0.1]:3000',
+      ]) {
+        const hdrRej = await fetch(`${baseUrl}/billing/checkout`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${taskAToken}`, Origin: expandedLoopbackOrigin },
+          body: JSON.stringify({ planId: 'pro' }),
+        });
+        assert.strictEqual(hdrRej.status, 400, `6.6b Checkout rejects expanded loopback Origin ${expandedLoopbackOrigin}`);
+
+        assert.throws(
+          () => billingService.validatePortalReturnUrl(`${expandedLoopbackOrigin}/pricing`),
+          (err: any) => err.statusCode === 400,
+          `6.6c Portal returnUrl rejects expanded loopback ${expandedLoopbackOrigin}`
+        );
+
+        const envLoopbackCheck = validateBillingConfiguration('production', {
+          ...validProdLiveEnv,
+          APP_BASE_URL: expandedLoopbackOrigin,
+        });
+        assert.strictEqual(envLoopbackCheck.valid, false, `6.6d validate-env rejects ${expandedLoopbackOrigin} in production`);
+      }
+
+      // 6.7 Task A2 runtime + readiness + validate-env consistency for MEDIA_TOKEN_SECRET
+      delete process.env.MEDIA_TOKEN_SECRET;
+      assert.strictEqual(validateMediaTokenSecret(undefined, true).valid, false, '6.7a Canonical validator rejects missing secret in prod');
+      assert.throws(() => validateAndGetMediaTokenSecret(process.env), /MEDIA_TOKEN_SECRET/, '6.7b Runtime rejects missing secret in prod');
+      const readinessMissingMedia = await fetch(`${baseUrl}/health/readiness`);
+      assert.strictEqual(readinessMissingMedia.status, 503, '6.7c Readiness returns 503 when MEDIA_TOKEN_SECRET missing in prod');
+      const readinessMissingJson = await readinessMissingMedia.json();
+      assert.strictEqual(readinessMissingJson.checks?.mediaSecurity?.status, 'unhealthy', '6.7d Readiness marks mediaSecurity unhealthy');
+
+      const invalidMediaSentinel = 'short_BAD_SENTINEL_123';
+      process.env.MEDIA_TOKEN_SECRET = invalidMediaSentinel;
+      assert.strictEqual(validateMediaTokenSecret(invalidMediaSentinel, true).valid, false, '6.7e Canonical validator rejects short secret in prod');
+      let caughtRuntimeMsg = '';
+      try {
+        validateAndGetMediaTokenSecret(process.env);
+      } catch (e: any) {
+        caughtRuntimeMsg = String(e?.message || '');
+      }
+      assert.ok(caughtRuntimeMsg.includes('MEDIA_TOKEN_SECRET'), '6.7f Runtime rejects invalid/short secret in prod');
+      assert.ok(!caughtRuntimeMsg.includes(invalidMediaSentinel), '6.7g Runtime error never leaks secret value');
+      const readinessInvalidJson = await (await fetch(`${baseUrl}/health/readiness`)).json();
+      assert.strictEqual(readinessInvalidJson.checks?.mediaSecurity?.status, 'unhealthy', '6.7h Readiness marks short secret unhealthy');
+
+      process.env.MEDIA_TOKEN_SECRET = 'vr_prod_media_token_secret_0123456789abcdef_strong';
+      assert.strictEqual(
+        validateAndGetMediaTokenSecret(process.env),
+        'vr_prod_media_token_secret_0123456789abcdef_strong',
+        '6.7i Runtime accepts valid strong MEDIA_TOKEN_SECRET in prod'
+      );
+      const readinessValidJson = await (await fetch(`${baseUrl}/health/readiness`)).json();
+      assert.strictEqual(readinessValidJson.checks?.mediaSecurity?.status, 'healthy', '6.7j Readiness marks mediaSecurity healthy with valid secret');
+
+      process.env.NODE_ENV = 'development';
+      process.env.PAYMENT_MODE = 'test';
+      process.env.STRIPE_SECRET_KEY = 'sk_test_12345678901234567890';
+      delete process.env.MEDIA_TOKEN_SECRET;
+      assert.ok(validateAndGetMediaTokenSecret(process.env).length >= 32, '6.7k Development fallback secret works when unset');
+
+      console.log('  ✅ PASS: All Task A1 loopback boundaries & Task A2 MEDIA_TOKEN_SECRET runtime/readiness/validator parity cases verified');
     } finally {
       for (const [k, v] of Object.entries(savedStripeEnv)) {
         if (v === undefined) delete process.env[k];

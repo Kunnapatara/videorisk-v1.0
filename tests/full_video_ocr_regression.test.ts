@@ -530,7 +530,345 @@ exit 0
     delete process.env.FFMPEG_PATH;
     process.env.TESSERACT_PATH = '/usr/bin/tesseract';
     assertNoTempOcrDirLeak('D2.full_integrity.cleanup');
-    console.log('  ✅ PASS: Full PNG integrity (signature, IHDR, per-chunk CRC-32, ordering, zlib inflate, bomb/filter, Adam7, zero trailing bytes) verified');
+
+    // C1: Unknown critical chunks vs known critical & unknown ancillary chunks
+    const mkChunkRawType = (rawTypeBytes: number[], data: Buffer): Buffer => {
+      const len = Buffer.alloc(4);
+      len.writeUInt32BE(data.length, 0);
+      const body = Buffer.concat([Buffer.from(rawTypeBytes), data]);
+      const crc = Buffer.alloc(4);
+      crc.writeUInt32BE(pngCrc32(body), 0);
+      return Buffer.concat([len, body, crc]);
+    };
+
+    const valid1x1RgbIdat = zlib.deflateSync(Buffer.from([0, 10, 20, 30]));
+    const unknownCritFile = path.resolve(testDir, 'c1_unknown_critical.png');
+    fs.writeFileSync(
+      unknownCritFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(1, 1, 8, 2)),
+        mkPngChunk('FAKE', Buffer.from([1, 2, 3, 4])),
+        mkPngChunk('IDAT', valid1x1RgbIdat),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    const unknownCritRes = validatePngFrameFile(unknownCritFile);
+    assert.strictEqual(unknownCritRes.valid, false, 'D2.23a Rejects unknown critical chunk FAKE');
+    assert.strictEqual(unknownCritRes.errorClass, 'INVALID_PNG_STRUCTURE', 'D2.23b Unknown critical chunk classified as INVALID_PNG_STRUCTURE');
+
+    const unknownAncillaryFile = path.resolve(testDir, 'c1_unknown_ancillary.png');
+    fs.writeFileSync(
+      unknownAncillaryFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(1, 1, 8, 2)),
+        mkPngChunk('tESt', Buffer.from('ancillary-ok')),
+        mkPngChunk('IDAT', valid1x1RgbIdat),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    assert.strictEqual(validatePngFrameFile(unknownAncillaryFile).valid, true, 'D2.25 Allows valid unknown ancillary chunk tESt before IDAT');
+
+    // PLTE after IDAT and PLTE on grayscale colorType 0
+    const plteAfterIdatFile = path.resolve(testDir, 'c1_plte_after_idat.png');
+    fs.writeFileSync(
+      plteAfterIdatFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(1, 1, 8, 2)),
+        mkPngChunk('IDAT', valid1x1RgbIdat),
+        mkPngChunk('PLTE', Buffer.from([255, 0, 0])),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    assert.strictEqual(validatePngFrameFile(plteAfterIdatFile).valid, false, 'D2.26a Rejects PLTE after IDAT');
+
+    const plteOnGrayFile = path.resolve(testDir, 'c1_plte_grayscale.png');
+    fs.writeFileSync(
+      plteOnGrayFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(1, 1, 8, 0)),
+        mkPngChunk('PLTE', Buffer.from([255, 0, 0])),
+        mkPngChunk('IDAT', zlib.deflateSync(Buffer.from([0, 42]))),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    assert.strictEqual(validatePngFrameFile(plteOnGrayFile).valid, false, 'D2.26b Rejects PLTE on grayscale colorType 0');
+
+    // C2: Reserved chunk-type bit & chunk-type encoding validation
+    const validTextChunkFile = path.resolve(testDir, 'c2_valid_reserved_bit.png');
+    fs.writeFileSync(
+      validTextChunkFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(1, 1, 8, 2)),
+        mkPngChunk('tEXt', Buffer.from('Software\0VideoRisk')),
+        mkPngChunk('IDAT', valid1x1RgbIdat),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    assert.strictEqual(validatePngFrameFile(validTextChunkFile).valid, true, 'D2.27 Accepts valid uppercase 3rd char chunk type (tEXt)');
+
+    for (const badReserved of ['tExt', 'IDaT', 'plte', 'ABcD']) {
+      const badReservedFile = path.resolve(testDir, `c2_bad_reserved_${badReserved}.png`);
+      const payload = badReserved === 'IDaT' ? valid1x1RgbIdat : Buffer.from('test');
+      fs.writeFileSync(
+        badReservedFile,
+        Buffer.concat([
+          PNG_SIG,
+          mkPngChunk('IHDR', mkIhdr(1, 1, 8, 2)),
+          mkPngChunk(badReserved, payload),
+          ...(badReserved === 'IDaT' ? [] : [mkPngChunk('IDAT', valid1x1RgbIdat)]),
+          mkPngChunk('IEND', Buffer.alloc(0))
+        ])
+      );
+      const r = validatePngFrameFile(badReservedFile);
+      assert.strictEqual(r.valid, false, `D2.28a Rejects lowercase reserved bit in '${badReserved}'`);
+      assert.strictEqual(r.errorClass, 'INVALID_PNG_STRUCTURE', `D2.28b '${badReserved}' classified as INVALID_PNG_STRUCTURE`);
+    }
+
+    const safeToCopyAncillaryFile = path.resolve(testDir, 'c2_valid_safe_to_copy_ancillary.png');
+    fs.writeFileSync(
+      safeToCopyAncillaryFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(1, 1, 8, 2)),
+        mkPngChunk('plTe', Buffer.from('safe-to-copy')),
+        mkPngChunk('IDAT', valid1x1RgbIdat),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    assert.strictEqual(validatePngFrameFile(safeToCopyAncillaryFile).valid, true, "D2.28c Accepts unknown ancillary 'plTe' (uppercase 3rd byte, lowercase safe-to-copy 4th byte)");
+
+    // Non-ASCII high-bit byte chunk type (must NOT bypass via .toString('ascii') masking!)
+    const nonAsciiChunkFile = path.resolve(testDir, 'c2_non_ascii_highbit.png');
+    fs.writeFileSync(
+      nonAsciiChunkFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(1, 1, 8, 2)),
+        mkChunkRawType([0x74, 0x45 | 0x80, 0x58, 0x74], Buffer.from('highbit')),
+        mkPngChunk('IDAT', valid1x1RgbIdat),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    assert.strictEqual(validatePngFrameFile(nonAsciiChunkFile).valid, false, 'D2.29 Rejects non-ASCII high-bit byte in chunk type');
+
+    // Numeric / punctuation chars in chunk type
+    for (const [label, rawBytes] of [
+      ['digit', [0x31, 0x44, 0x41, 0x54]],
+      ['hyphen', [0x74, 0x2d, 0x58, 0x74]],
+      ['underscore', [0x74, 0x5f, 0x58, 0x74]],
+      ['space', [0x74, 0x20, 0x58, 0x74]]
+    ] as Array<[string, number[]]>) {
+      const malformedTagFile = path.resolve(testDir, `c2_malformed_${label}.png`);
+      fs.writeFileSync(
+        malformedTagFile,
+        Buffer.concat([
+          PNG_SIG,
+          mkPngChunk('IHDR', mkIhdr(1, 1, 8, 2)),
+          mkChunkRawType(rawBytes, Buffer.from('bad')),
+          mkPngChunk('IDAT', valid1x1RgbIdat),
+          mkPngChunk('IEND', Buffer.alloc(0))
+        ])
+      );
+      assert.strictEqual(validatePngFrameFile(malformedTagFile).valid, false, `D2.30 Rejects ${label} in chunk type`);
+    }
+
+    // C3: Strict complete zlib stream consumption (reject trailing bytes inside concatenated IDAT)
+    const trail1ByteFile = path.resolve(testDir, 'c3_trailing_1byte.png');
+    fs.writeFileSync(
+      trail1ByteFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(1, 1, 8, 2)),
+        mkPngChunk('IDAT', Buffer.concat([valid1x1RgbIdat, Buffer.from([0x00])])),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    const trail1Res = validatePngFrameFile(trail1ByteFile);
+    assert.strictEqual(trail1Res.valid, false, 'D2.32a Rejects 1 trailing byte after valid zlib stream');
+    assert.strictEqual(trail1Res.errorClass, 'PNG_DECOMPRESSION_FAILURE', 'D2.32b 1 trailing byte classified as PNG_DECOMPRESSION_FAILURE');
+
+    const trailMultiFile = path.resolve(testDir, 'c3_trailing_multi_and_double_stream.png');
+    fs.writeFileSync(
+      trailMultiFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(1, 1, 8, 2)),
+        mkPngChunk('IDAT', Buffer.concat([valid1x1RgbIdat, valid1x1RgbIdat])),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    const trailMultiRes = validatePngFrameFile(trailMultiFile);
+    assert.strictEqual(trailMultiRes.valid, false, 'D2.33a Rejects trailing bytes / concatenated second zlib stream in IDAT');
+    assert.strictEqual(trailMultiRes.errorClass, 'PNG_DECOMPRESSION_FAILURE', 'D2.33b Trailing second stream classified as PNG_DECOMPRESSION_FAILURE');
+
+    const truncZlibFile = path.resolve(testDir, 'c3_truncated_zlib.png');
+    fs.writeFileSync(
+      truncZlibFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(1, 1, 8, 2)),
+        mkPngChunk('IDAT', valid1x1RgbIdat.subarray(0, valid1x1RgbIdat.length - 2)),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    const truncZlibRes = validatePngFrameFile(truncZlibFile);
+    assert.strictEqual(truncZlibRes.valid, false, 'D2.34a Rejects truncated zlib stream inside IDAT');
+    assert.strictEqual(truncZlibRes.errorClass, 'PNG_DECOMPRESSION_FAILURE', 'D2.34b Truncated zlib classified as PNG_DECOMPRESSION_FAILURE');
+
+    const multiIdatValidFile = path.resolve(testDir, 'c3_multi_idat_valid.png');
+    const splitZlibAt = Math.floor(valid1x1RgbIdat.length / 2);
+    fs.writeFileSync(
+      multiIdatValidFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(1, 1, 8, 2)),
+        mkPngChunk('IDAT', valid1x1RgbIdat.subarray(0, splitZlibAt)),
+        mkPngChunk('IDAT', valid1x1RgbIdat.subarray(splitZlibAt)),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    assert.strictEqual(validatePngFrameFile(multiIdatValidFile).valid, true, 'D2.35 Accepts multiple contiguous IDAT chunks forming 1 valid zlib stream');
+
+    const multiIdatTrailingFile = path.resolve(testDir, 'c3_multi_idat_trailing.png');
+    fs.writeFileSync(
+      multiIdatTrailingFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(1, 1, 8, 2)),
+        mkPngChunk('IDAT', valid1x1RgbIdat.subarray(0, splitZlibAt)),
+        mkPngChunk('IDAT', Buffer.concat([valid1x1RgbIdat.subarray(splitZlibAt), Buffer.from([0xff])])),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    assert.strictEqual(validatePngFrameFile(multiIdatTrailingFile).valid, false, 'D2.36 Rejects trailing byte in final chunk of multi-IDAT zlib stream');
+
+    // C4: PLTE, tRNS, ancillary chunk semantics, and indexed-color pixel bounds after unfiltering
+    const validIndexedTrnsFile = path.resolve(testDir, 'c4_valid_indexed_trns.png');
+    fs.writeFileSync(
+      validIndexedTrnsFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(2, 1, 8, 3)),
+        mkPngChunk('PLTE', Buffer.from([0, 0, 0, 255, 255, 255])),
+        mkPngChunk('tRNS', Buffer.from([255, 128])),
+        // Sub filter: pixel0 = 0 (filt 0), pixel1 = 1 (filt 1 -> 0 + 1 = 1 < 2 entries)
+        mkPngChunk('IDAT', zlib.deflateSync(Buffer.from([1, 0, 1]))),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    assert.strictEqual(validatePngFrameFile(validIndexedTrnsFile).valid, true, 'D2.37a Accepts valid indexed PNG with PLTE, tRNS, and unfiltered indices in bounds');
+
+    // tRNS forbidden on RGBA (colorType=6) and wrong lengths on 0/2/3
+    const badTrnsRgbaFile = path.resolve(testDir, 'c4_bad_trns_rgba.png');
+    fs.writeFileSync(
+      badTrnsRgbaFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(1, 1, 8, 6)),
+        mkPngChunk('tRNS', Buffer.from([0, 0])),
+        mkPngChunk('IDAT', zlib.deflateSync(Buffer.from([0, 10, 20, 30, 255]))),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    assert.strictEqual(validatePngFrameFile(badTrnsRgbaFile).valid, false, 'D2.38a Rejects tRNS on RGBA colorType 6');
+
+    const badTrnsOverflowFile = path.resolve(testDir, 'c4_bad_trns_overflow.png');
+    fs.writeFileSync(
+      badTrnsOverflowFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(1, 1, 8, 3)),
+        mkPngChunk('PLTE', Buffer.from([0, 0, 0, 255, 255, 255])),
+        mkPngChunk('tRNS', Buffer.from([255, 255, 255])), // 3 entries > 2 PLTE entries
+        mkPngChunk('IDAT', zlib.deflateSync(Buffer.from([0, 0]))),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    assert.strictEqual(validatePngFrameFile(badTrnsOverflowFile).valid, false, 'D2.38b Rejects tRNS exceeding PLTE entry count');
+
+    const badTrnsGrayLenFile = path.resolve(testDir, 'c4_bad_trns_gray_len.png');
+    fs.writeFileSync(
+      badTrnsGrayLenFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(1, 1, 8, 0)),
+        mkPngChunk('tRNS', Buffer.from([0, 1, 2])), // expected 2
+        mkPngChunk('IDAT', zlib.deflateSync(Buffer.from([0, 42]))),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    assert.strictEqual(validatePngFrameFile(badTrnsGrayLenFile).valid, false, 'D2.38c Rejects malformed tRNS length for grayscale');
+
+    // Indexed PNG out-of-range pixel AFTER Sub unfiltering ([filter=1, 1, 1] -> pixel1 = 1+1 = 2 >= 2 PLTE entries!)
+    const badIdxSubUnfilterFile = path.resolve(testDir, 'c4_indexed_oob_after_sub.png');
+    fs.writeFileSync(
+      badIdxSubUnfilterFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(2, 1, 8, 3)),
+        mkPngChunk('PLTE', Buffer.from([0, 0, 0, 255, 255, 255])),
+        mkPngChunk('IDAT', zlib.deflateSync(Buffer.from([1, 1, 1]))),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    const badIdxRes = validatePngFrameFile(badIdxSubUnfilterFile);
+    assert.strictEqual(badIdxRes.valid, false, 'D2.39a Rejects indexed PNG whose unfiltered pixel index exceeds PLTE size');
+    assert.strictEqual(badIdxRes.errorClass, 'INVALID_PNG_STRUCTURE', 'D2.39b Out-of-range palette index classified as INVALID_PNG_STRUCTURE');
+
+    // Sub-byte 4-bit indexed PNG out-of-range check
+    const badIdx4BitFile = path.resolve(testDir, 'c4_indexed_4bit_oob.png');
+    fs.writeFileSync(
+      badIdx4BitFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(2, 1, 4, 3)),
+        mkPngChunk('PLTE', Buffer.from([0, 0, 0, 255, 255, 255])), // max valid index 1
+        mkPngChunk('IDAT', zlib.deflateSync(Buffer.from([0, 0x05]))), // pixel0=0, pixel1=5 >= 2
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    assert.strictEqual(validatePngFrameFile(badIdx4BitFile).valid, false, 'D2.39c Rejects out-of-range 4-bit indexed pixel nibble');
+
+    // Bad ancillary semantics (sRGB intent > 3, bKGD index out of palette range)
+    const badSrgbIntentFile = path.resolve(testDir, 'c4_bad_srgb_intent.png');
+    fs.writeFileSync(
+      badSrgbIntentFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(1, 1, 8, 2)),
+        mkPngChunk('sRGB', Buffer.from([9])),
+        mkPngChunk('IDAT', valid1x1RgbIdat),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    assert.strictEqual(validatePngFrameFile(badSrgbIntentFile).valid, false, 'D2.40 Rejects invalid sRGB rendering intent');
+
+    // Pipeline isolation check: trailing zlib byte & unknown critical chunk never reach Tesseract
+    if (fs.existsSync(tesseractInvokeLog)) fs.unlinkSync(tesseractInvokeLog);
+    const trailZlibFfmpeg = path.resolve(testDir, 'ffmpeg_trail_zlib.sh');
+    fs.writeFileSync(trailZlibFfmpeg, `#!/bin/sh
+OUT=""
+for arg in "$@"; do OUT="$arg"; done
+cp "${trail1ByteFile}" "$OUT"
+exit 0
+`, { mode: 0o755 });
+    process.env.FFMPEG_PATH = trailZlibFfmpeg;
+    process.env.TESSERACT_PATH = spyTessScript;
+    const trailPipelineRes = await videoProcessor.performVideoOcr(posVideo, baseMeta('pos_text.mp4', 3.0), { timestamps: [1] });
+    assert.strictEqual(trailPipelineRes.status, 'ANALYSIS_UNAVAILABLE', 'D2.42a Trailing zlib PNG rejected as ANALYSIS_UNAVAILABLE');
+    assert.strictEqual(trailPipelineRes.failureClassification, 'OCR_INPUT_FAILURE', 'D2.42b Pipeline classifies trailing zlib as OCR_INPUT_FAILURE');
+    assert.strictEqual(trailPipelineRes.extractionErrors?.[0]?.classification, 'PNG_DECOMPRESSION_FAILURE', 'D2.42c Frame error classified as PNG_DECOMPRESSION_FAILURE');
+    assert.strictEqual(fs.existsSync(tesseractInvokeLog), false, 'D2.42d Tesseract never invoked on trailing-zlib PNG');
+
+    delete process.env.FFMPEG_PATH;
+    process.env.TESSERACT_PATH = '/usr/bin/tesseract';
+    assertNoTempOcrDirLeak('D2.c1_c4.cleanup');
+    console.log('  ✅ PASS: Full PNG integrity (C1-C4: signature, IHDR, critical/ancillary, reserved bit, complete zlib consumption, PLTE/tRNS/indexed bounds, zero trailing bytes) verified');
 
     // -------------------------------------------------------------------------
     // J. STRICT OVERALL TIMEOUT BUDGET ENFORCEMENT
