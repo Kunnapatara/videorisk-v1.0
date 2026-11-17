@@ -7,7 +7,8 @@ import Stripe from 'stripe';
 import { storage, InMemoryStorageRepository } from '../src/server/storage';
 import { SqliteStorageRepository } from '../src/server/storage/sqliteStorage';
 import { billingService } from '../src/server/services/billingService';
-import { apiRouter } from '../src/server/routes/api';
+import { apiRouter, validateAndGetMediaTokenSecret } from '../src/server/routes/api';
+import { isProductionEnvironment, resolveEnvironmentSecurity } from '../src/server/config/environment';
 import { validateBillingConfiguration } from '../scripts/validate-env';
 
 function buildSignedWebhookRequest(
@@ -2058,6 +2059,300 @@ export async function runStripeOriginAndRefundLifecycleTests() {
     }
 
     console.log('  ✅ PASS: WS4 subscription event ordering, multi-sub isolation, cancel_at_period_end, & renewal dedup verified');
+
+    // ------------------------------------------------------------------------
+    // 5. TASK A: CANONICAL PRODUCTION PREDICATE, CONFLICT DETECTION & LIVE ORIGIN HARDENING
+    // ------------------------------------------------------------------------
+    console.log('\n[5. Task A: Canonical Production Predicate, Conflict Detection & Live-Payment Origin Hardening]');
+
+    const savedStripeEnv = {
+      STRIPE_PRICE_CREATOR: process.env.STRIPE_PRICE_CREATOR,
+      STRIPE_PRICE_PRO: process.env.STRIPE_PRICE_PRO,
+      STRIPE_PRICE_AGENCY: process.env.STRIPE_PRICE_AGENCY,
+      STRIPE_PRICE_AUDIT_ONCE: process.env.STRIPE_PRICE_AUDIT_ONCE,
+      MEDIA_TOKEN_SECRET: process.env.MEDIA_TOKEN_SECRET,
+      PAYMENT_PROVIDER: process.env.PAYMENT_PROVIDER,
+    };
+
+    try {
+      const taskAUser = await storage.users.createUser(
+        `task_a_canonical_${Date.now()}@videorisk.test`,
+        'hash_a',
+        'salt_a',
+        10,
+        'free'
+      );
+      const taskAToken = await storage.users.createSession(taskAUser.id);
+
+      // 5.1 NODE_ENV=production + PAYMENT_MODE=test -> conflict rejected
+      const conflictProdTest = resolveEnvironmentSecurity({
+        NODE_ENV: 'production',
+        PAYMENT_MODE: 'test',
+        STRIPE_SECRET_KEY: 'sk_test_12345678901234567890',
+      });
+      assert.strictEqual(conflictProdTest.isProduction, true, '5.1a NODE_ENV=production keeps canonical isProduction=true');
+      assert.strictEqual(conflictProdTest.hasConflict, true, '5.1b NODE_ENV=production + PAYMENT_MODE=test flags conflict');
+      assert.ok(conflictProdTest.conflicts.some(c => c.code === 'PROD_TEST_MODE_CONFLICT'), '5.1c Reports PROD_TEST_MODE_CONFLICT');
+
+      const valProdTest = validateBillingConfiguration('production', {
+        NODE_ENV: 'production',
+        PAYMENT_MODE: 'test',
+        STRIPE_SECRET_KEY: 'sk_live_mock1234567890abcdef',
+        STRIPE_WEBHOOK_SECRET: 'whsec_mock1234567890abcdef',
+        STRIPE_PRICE_CREATOR: 'price_c',
+        STRIPE_PRICE_PRO: 'price_p',
+        STRIPE_PRICE_AGENCY: 'price_a',
+        STRIPE_PRICE_AUDIT_ONCE: 'price_o',
+        APP_BASE_URL: 'https://videorisk.com',
+      });
+      assert.strictEqual(valProdTest.valid, false, '5.1d validateBillingConfiguration rejects NODE_ENV=production + PAYMENT_MODE=test');
+
+      process.env.NODE_ENV = 'production';
+      process.env.PAYMENT_MODE = 'test';
+      process.env.STRIPE_SECRET_KEY = 'sk_live_mock1234567890abcdef';
+      process.env.STRIPE_WEBHOOK_SECRET = 'whsec_mock1234567890abcdef';
+      process.env.APP_BASE_URL = 'https://videorisk.com';
+      const readinessProdTest = await (await fetch(`${baseUrl}/health/readiness`)).json();
+      assert.strictEqual(readinessProdTest.checks.billing.status, 'degraded', '5.1e Readiness degraded on NODE_ENV=production + PAYMENT_MODE=test');
+      assert.strictEqual(readinessProdTest.checks.billing.details.checkoutAvailable, false, '5.1f Checkout disabled on conflict');
+      const checkoutProdTestRes = await fetch(`${baseUrl}/billing/checkout`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${taskAToken}` },
+        body: JSON.stringify({ planId: 'pro' }),
+      });
+      assert.strictEqual(checkoutProdTestRes.status, 500, '5.1g Checkout fails closed with 500 on conflict');
+
+      // 5.2 NODE_ENV=production + PAYMENT_MODE=live with valid HTTPS config -> valid & trusted HTTPS origin works
+      const validProdLiveEnv = {
+        NODE_ENV: 'production',
+        PAYMENT_MODE: 'live',
+        STRIPE_SECRET_KEY: 'sk_live_mock1234567890abcdef',
+        STRIPE_WEBHOOK_SECRET: 'whsec_mock1234567890abcdef',
+        STRIPE_PRICE_CREATOR: 'price_c_live',
+        STRIPE_PRICE_PRO: 'price_p_live',
+        STRIPE_PRICE_AGENCY: 'price_a_live',
+        STRIPE_PRICE_AUDIT_ONCE: 'price_o_live',
+        APP_BASE_URL: 'https://videorisk.com',
+        ALLOWED_ORIGINS: 'https://app.videorisk.com',
+      };
+      const prodLiveSec = resolveEnvironmentSecurity(validProdLiveEnv);
+      assert.strictEqual(prodLiveSec.isProduction, true, '5.2a Canonical isProduction=true');
+      assert.strictEqual(prodLiveSec.hasConflict, false, '5.2b Valid production live env has zero conflicts');
+      assert.strictEqual(validateBillingConfiguration('production', validProdLiveEnv).valid, true, '5.2c validateBillingConfiguration passes');
+
+      process.env.NODE_ENV = 'production';
+      process.env.PAYMENT_MODE = 'live';
+      process.env.STRIPE_SECRET_KEY = 'sk_live_mock1234567890abcdef';
+      process.env.STRIPE_WEBHOOK_SECRET = 'whsec_mock1234567890abcdef';
+      process.env.STRIPE_PRICE_CREATOR = 'price_c_live';
+      process.env.STRIPE_PRICE_PRO = 'price_p_live';
+      process.env.STRIPE_PRICE_AGENCY = 'price_a_live';
+      process.env.STRIPE_PRICE_AUDIT_ONCE = 'price_o_live';
+      process.env.APP_BASE_URL = 'https://videorisk.com';
+      process.env.ALLOWED_ORIGINS = 'https://app.videorisk.com,http://insecure.videorisk.com,https://localhost:3000';
+
+      const trustedLiveOrigins = billingService.getTrustedOrigins();
+      assert.deepStrictEqual(
+        trustedLiveOrigins.sort(),
+        ['https://app.videorisk.com', 'https://videorisk.com'],
+        '5.2d getTrustedOrigins excludes insecure HTTP and localhost even when listed in ALLOWED_ORIGINS'
+      );
+
+      capturedCheckoutParams.length = 0;
+      const validLiveCheckoutRes = await fetch(`${baseUrl}/billing/checkout`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${taskAToken}`,
+          Origin: 'https://app.videorisk.com',
+        },
+        body: JSON.stringify({ planId: 'pro' }),
+      });
+      assert.strictEqual(validLiveCheckoutRes.status, 200, '5.2e Trusted HTTPS Origin succeeds in live production mode');
+      assert.strictEqual(
+        capturedCheckoutParams[0].success_url,
+        'https://app.videorisk.com/?checkout_status=success&session_id={CHECKOUT_SESSION_ID}',
+        '5.2f success_url strictly HTTPS trusted origin'
+      );
+
+      // 5.3 NODE_ENV=development + PAYMENT_MODE=live -> canonical isProduction=true, localhost/http/missing/sim forbidden!
+      process.env.NODE_ENV = 'development';
+      process.env.PAYMENT_MODE = 'live';
+      assert.strictEqual(isProductionEnvironment(process.env), true, '5.3a PAYMENT_MODE=live elevates canonical predicate even with NODE_ENV=development');
+      assert.strictEqual(billingService.isProductionMode(), true, '5.3b BillingService uses canonical production predicate');
+
+      const devLiveTrusted = billingService.getTrustedOrigins();
+      assert.ok(!devLiveTrusted.some(o => o.includes('localhost') || o.includes('127.0.0.1') || o.startsWith('http://')), '5.3c No localhost/HTTP origins allowed in PAYMENT_MODE=live');
+
+      for (const forbiddenOrigin of ['http://localhost:3000', 'https://localhost:3000', 'http://127.0.0.1:3000', 'http://videorisk.com', 'https://attacker.com', 'https://videorisk.com.evil.com']) {
+        const resHeader = await fetch(`${baseUrl}/billing/checkout`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${taskAToken}`, Origin: forbiddenOrigin },
+          body: JSON.stringify({ planId: 'pro' }),
+        });
+        assert.strictEqual(resHeader.status, 400, `5.3d/6/7/8 Rejects Origin header ${forbiddenOrigin} in live mode`);
+
+        const resBody = await fetch(`${baseUrl}/billing/checkout`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${taskAToken}` },
+          body: JSON.stringify({ planId: 'pro', originUrl: forbiddenOrigin }),
+        });
+        assert.strictEqual(resBody.status, 400, `5.3e/6/7/8 Rejects body.originUrl ${forbiddenOrigin} in live mode`);
+
+        assert.throws(
+          () => billingService.validatePortalReturnUrl(`${forbiddenOrigin}/pricing`),
+          (err: any) => err.statusCode === 400,
+          `5.3f/6/7/8 Portal returnUrl rejects ${forbiddenOrigin} in live mode`
+        );
+      }
+
+      // Simulation session-status disabled in NODE_ENV=development + PAYMENT_MODE=live
+      const simInLiveRes = await fetch(`${baseUrl}/billing/session-status?sessionId=sim_1&plan=pro&mode=simulation`, {
+        headers: { Authorization: `Bearer ${taskAToken}` },
+      });
+      assert.strictEqual(simInLiveRes.status, 403, '5.3g Simulation checkout completion blocked (403) when PAYMENT_MODE=live');
+
+      // Missing MEDIA_TOKEN_SECRET throws fatal error when PAYMENT_MODE=live even in NODE_ENV=development
+      delete process.env.MEDIA_TOKEN_SECRET;
+      assert.throws(
+        () => validateAndGetMediaTokenSecret(process.env),
+        /MEDIA_TOKEN_SECRET/,
+        '5.3h MEDIA_TOKEN_SECRET enforced when PAYMENT_MODE=live'
+      );
+
+      // Missing APP_BASE_URL fails closed 500 when PAYMENT_MODE=live
+      delete process.env.APP_BASE_URL;
+      const devLiveMissingBaseRes = await fetch(`${baseUrl}/billing/checkout`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${taskAToken}` },
+        body: JSON.stringify({ planId: 'pro' }),
+      });
+      assert.strictEqual(devLiveMissingBaseRes.status, 500, '5.3i Missing APP_BASE_URL fails closed 500 in PAYMENT_MODE=live');
+
+      const valDevLive = validateBillingConfiguration('development', {
+        NODE_ENV: 'development',
+        PAYMENT_MODE: 'live',
+        STRIPE_SECRET_KEY: 'sk_live_mock1234567890abcdef',
+        STRIPE_WEBHOOK_SECRET: 'whsec_mock1234567890abcdef',
+        STRIPE_PRICE_CREATOR: 'price_c_live',
+        STRIPE_PRICE_PRO: 'price_p_live',
+        STRIPE_PRICE_AGENCY: 'price_a_live',
+        STRIPE_PRICE_AUDIT_ONCE: 'price_o_live',
+        APP_BASE_URL: 'https://localhost:3000',
+      });
+      assert.strictEqual(valDevLive.valid, false, '5.3j validateBillingConfiguration rejects development+live conflict and localhost APP_BASE_URL');
+
+      // 5.4 NODE_ENV=development + PAYMENT_MODE=test -> valid dev behavior, localhost allowed
+      process.env.NODE_ENV = 'development';
+      process.env.PAYMENT_MODE = 'test';
+      process.env.STRIPE_SECRET_KEY = 'sk_test_mock_key_1234567890abcdef';
+      process.env.STRIPE_WEBHOOK_SECRET = webhookSecret;
+      process.env.APP_BASE_URL = 'http://localhost:3000';
+      assert.strictEqual(isProductionEnvironment(process.env), false, '5.4a Dev+test keeps isProduction=false');
+      assert.strictEqual(resolveEnvironmentSecurity(process.env).hasConflict, false, '5.4b Dev+test has no conflicts');
+      assert.ok(billingService.getTrustedOrigins().includes('http://localhost:3000'), '5.4c Dev+test permits http://localhost:3000');
+      assert.strictEqual(
+        validateBillingConfiguration('test', {
+          NODE_ENV: 'test',
+          PAYMENT_MODE: 'test',
+          STRIPE_SECRET_KEY: 'sk_test_12345678901234567890',
+          STRIPE_WEBHOOK_SECRET: 'whsec_mock1234567890abcdef',
+          APP_BASE_URL: 'http://localhost:3000',
+        }).valid,
+        true,
+        '5.4d validateBillingConfiguration allows test/dev localhost'
+      );
+
+      // 5.5 Conflicting keys & VIDEORISK_TEST_RUN cannot bypass production rules
+      assert.strictEqual(
+        resolveEnvironmentSecurity({ NODE_ENV: 'development', PAYMENT_MODE: 'test', STRIPE_SECRET_KEY: 'sk_live_12345678901234567890' }).isProduction,
+        true,
+        '5.5a Live key activates production security rules immediately'
+      );
+      assert.ok(
+        resolveEnvironmentSecurity({ NODE_ENV: 'development', PAYMENT_MODE: 'test', STRIPE_SECRET_KEY: 'sk_live_12345678901234567890' }).conflicts.some(c => c.code === 'LIVE_KEY_IN_DEV_OR_TEST'),
+        '5.5b Flags LIVE_KEY_IN_DEV_OR_TEST'
+      );
+      assert.ok(
+        resolveEnvironmentSecurity({ PAYMENT_MODE: 'staging' as any }).conflicts.some(c => c.code === 'INVALID_PAYMENT_MODE'),
+        '5.5c Flags unrecognized PAYMENT_MODE'
+      );
+      process.env.NODE_ENV = 'production';
+      process.env.PAYMENT_MODE = 'live';
+      process.env.VIDEORISK_TEST_RUN = 'true';
+      process.env.STRIPE_SECRET_KEY = 'sk_live_mock1234567890abcdef';
+      delete process.env.APP_BASE_URL;
+      const bypassAttemptRes = await fetch(`${baseUrl}/billing/checkout`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${taskAToken}`, Origin: 'http://localhost:3000' },
+        body: JSON.stringify({ planId: 'pro' }),
+      });
+      assert.strictEqual(bypassAttemptRes.status, 500, '5.5d VIDEORISK_TEST_RUN=true does NOT bypass missing APP_BASE_URL in production');
+
+      // 5.10 Checkout origin mismatch between Origin header & body.originUrl + Host header spoofing
+      process.env.APP_BASE_URL = 'https://videorisk.com';
+      process.env.ALLOWED_ORIGINS = 'https://app.videorisk.com';
+      const mismatchRes = await fetch(`${baseUrl}/billing/checkout`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${taskAToken}`,
+          Origin: 'https://videorisk.com',
+        },
+        body: JSON.stringify({ planId: 'pro', originUrl: 'https://app.videorisk.com' }),
+      });
+      assert.strictEqual(mismatchRes.status, 400, '5.10a Mismatched Origin header vs body.originUrl rejected with 400');
+
+      capturedCheckoutParams.length = 0;
+      const spoofedProdRes = await fetch(`${baseUrl}/billing/checkout`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${taskAToken}`,
+          Host: 'phish.attacker.com',
+          'X-Forwarded-Host': 'phish.attacker.com',
+        },
+        body: JSON.stringify({ planId: 'pro' }),
+      });
+      assert.strictEqual(spoofedProdRes.status, 200, '5.10b Server canonical origin used when client omits Origin');
+      assert.strictEqual(
+        capturedCheckoutParams[0].success_url,
+        'https://videorisk.com/?checkout_status=success&session_id={CHECKOUT_SESSION_ID}',
+        '5.10c Host & X-Forwarded-Host headers never influence Stripe redirect URLs'
+      );
+
+      // 5.11 APP_BASE_URL=https://localhost:3000 rejected in production (fails closed 500 + validate-env ERROR)
+      process.env.APP_BASE_URL = 'https://localhost:3000';
+      const localhostBaseRes = await fetch(`${baseUrl}/billing/checkout`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${taskAToken}` },
+        body: JSON.stringify({ planId: 'pro' }),
+      });
+      assert.strictEqual(localhostBaseRes.status, 500, '5.11a Localhost APP_BASE_URL fails closed with 500 in production');
+      assert.strictEqual(
+        validateBillingConfiguration('production', {
+          NODE_ENV: 'production',
+          PAYMENT_MODE: 'live',
+          STRIPE_SECRET_KEY: 'sk_live_mock1234567890abcdef',
+          STRIPE_WEBHOOK_SECRET: 'whsec_mock1234567890abcdef',
+          STRIPE_PRICE_CREATOR: 'price_c_live',
+          STRIPE_PRICE_PRO: 'price_p_live',
+          STRIPE_PRICE_AGENCY: 'price_a_live',
+          STRIPE_PRICE_AUDIT_ONCE: 'price_o_live',
+          APP_BASE_URL: 'https://localhost:3000',
+        }).valid,
+        false,
+        '5.11b validate-env rejects https://localhost:3000 in production'
+      );
+
+      console.log('  ✅ PASS: All 11 Canonical Production Predicate & Live-Payment Origin Hardening cases verified');
+    } finally {
+      for (const [k, v] of Object.entries(savedStripeEnv)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      restoreEnv();
+    }
 
     console.log('\n======================================================');
     console.log('🎉 ALL CHECKOUT ORIGIN & STRIPE REFUND TESTS PASSED!');

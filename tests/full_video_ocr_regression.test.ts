@@ -1,13 +1,15 @@
 import assert from 'assert';
 import path from 'path';
 import fs from 'fs';
+import zlib from 'zlib';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import {
   videoProcessor,
   validateTesseractTsv,
   validatePngFrameFile,
-  sanitizeOcrDiagnostic
+  sanitizeOcrDiagnostic,
+  defaultMonotonicNowMs
 } from '../src/server/pipeline/videoProcessor';
 import { MediaMetadata } from '../src/types';
 
@@ -206,35 +208,65 @@ printf "5\\t1\\t1\\t1\\t1\\t1\\t20\\t20\\t120\\t40\\t94.5\\tPARTIAL_OK\\n"
     console.log('  ✅ PASS: Repeated text deduplication & reappearance verified');
 
     // -------------------------------------------------------------------------
-    // H. LANGUAGE HANDLING (English, Thai & Mixed English/Thai when font permits)
+    // H. LANGUAGE HANDLING (English, Pure Thai & Mixed Thai/English — MUST EXECUTE IN CI)
     // -------------------------------------------------------------------------
-    console.log('\n[H. Language Handling (English & Conditional Thai/Mixed)]');
-    let thaiFontFile = '';
-    try {
-      const { stdout: fcOut } = await execFileAsync('fc-list', [':lang=th', 'file']);
-      const candidates = fcOut.split(/\r?\n/).map(l => l.split(':')[0].trim()).filter(f => f.endsWith('.ttf') && fs.existsSync(f));
-      if (candidates.length > 0) thaiFontFile = candidates[0];
-    } catch { /* no thai font installed */ }
+    console.log('\n[H. Language Handling (English, Thai & Mixed Thai/English)]');
+    const resolveRequiredThaiTtfFont = (fcListStdout: string): string => {
+      const candidates = fcListStdout
+        .split(/\r?\n/)
+        .map(l => l.split(':')[0].trim())
+        .filter(f => f.endsWith('.ttf') && fs.existsSync(f));
+      if (candidates.length === 0) {
+        throw new Error('Thai TTF font missing: install fonts-thai-tlwg (or Noto Thai) for FFmpeg drawtext Thai OCR verification.');
+      }
+      const preferred = candidates.find(f => /(?:Garuda|Loma|Waree|NotoSansThai-Regular)\.ttf$/i.test(f));
+      return preferred || candidates[0];
+    };
 
-    if (thaiFontFile) {
-      const thaiVideo = path.resolve(testDir, 'thai_mixed_text.mp4');
-      await execFileAsync('ffmpeg', [
-        '-y',
-        '-f', 'lavfi',
-        '-i', `color=c=#111827:s=640x360:rate=10:duration=2,drawtext=fontfile=${thaiFontFile}:text='ทดสอบ POLICY':fontsize=42:fontcolor=white:box=1:boxcolor=black@0.95:boxborderw=10:x=(w-text_w)/2:y=(h-text_h)/2`,
-        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
-        thaiVideo
-      ]);
-      const thaiRes = await videoProcessor.performVideoOcr(thaiVideo, baseMeta('thai_mixed_text.mp4', 2.0), {
-        timestamps: [1],
-        languages: 'eng+tha'
-      });
-      assert.strictEqual(thaiRes.status, 'DETECTED', 'H.1 Mixed Thai+English overlay detected with eng+tha');
-      assert.ok(thaiRes.allExtractedText.some(t => /POLICY/.test(t) || /[\u0E00-\u0E7F]/.test(t)), 'H.2 Recognized mixed Thai/English script');
-      console.log(`  ✅ PASS: English + Thai (${path.basename(thaiFontFile)}) OCR verified`);
-    } else {
-      console.log('  ⚠️  SKIPPED: Thai mixed-script OCR check skipped (no Thai TTF font available for FFmpeg drawtext on this host); English OCR verified.');
-    }
+    assert.throws(
+      () => resolveRequiredThaiTtfFont(''),
+      /Thai TTF font missing/,
+      'H.0 Negative guard: missing Thai font throws explicit failure instead of skipping'
+    );
+
+    const { stdout: fcOut } = await execFileAsync('fc-list', [':lang=th', 'file']);
+    const thaiFontFile = resolveRequiredThaiTtfFont(fcOut);
+    assert.ok(thaiFontFile && fs.existsSync(thaiFontFile), 'H.0b Thai TTF font present and readable on host');
+
+    // Pure Thai text overlay OCR
+    const pureThaiVideo = path.resolve(testDir, 'pure_thai_text.mp4');
+    await execFileAsync('ffmpeg', [
+      '-y',
+      '-f', 'lavfi',
+      '-i', `color=c=#111827:s=640x360:rate=10:duration=2,drawtext=fontfile=${thaiFontFile}:text='ทดสอบ':fontsize=54:fontcolor=white:box=1:boxcolor=black@0.95:boxborderw=12:x=(w-text_w)/2:y=(h-text_h)/2`,
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+      pureThaiVideo
+    ]);
+    const pureThaiRes = await videoProcessor.performVideoOcr(pureThaiVideo, baseMeta('pure_thai_text.mp4', 2.0), {
+      timestamps: [1],
+      languages: 'tha'
+    });
+    assert.strictEqual(pureThaiRes.status, 'DETECTED', 'H.1 Pure Thai overlay detected with tha');
+    assert.ok(pureThaiRes.allExtractedText.some(t => /[\u0E00-\u0E7F]/.test(t)), `H.2 Recognized Thai Unicode script (got: ${JSON.stringify(pureThaiRes.allExtractedText)})`);
+
+    // Mixed Thai + English text overlay OCR
+    const thaiMixedVideo = path.resolve(testDir, 'thai_mixed_text.mp4');
+    await execFileAsync('ffmpeg', [
+      '-y',
+      '-f', 'lavfi',
+      '-i', `color=c=#111827:s=640x360:rate=10:duration=2,drawtext=fontfile=${thaiFontFile}:text='ทดสอบ POLICY':fontsize=48:fontcolor=white:box=1:boxcolor=black@0.95:boxborderw=12:x=(w-text_w)/2:y=(h-text_h)/2`,
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+      thaiMixedVideo
+    ]);
+    const thaiMixedRes = await videoProcessor.performVideoOcr(thaiMixedVideo, baseMeta('thai_mixed_text.mp4', 2.0), {
+      timestamps: [1],
+      languages: 'eng+tha'
+    });
+    assert.strictEqual(thaiMixedRes.status, 'DETECTED', 'H.3 Mixed Thai+English overlay detected with eng+tha');
+    const mixedJoined = thaiMixedRes.allExtractedText.join(' ');
+    assert.ok(/POLICY/.test(mixedJoined), `H.4 Mixed script OCR extracted English token POLICY (got: ${mixedJoined})`);
+    assert.ok(/[\u0E00-\u0E7F]/.test(mixedJoined), `H.5 Mixed script OCR extracted Thai Unicode glyphs (got: ${mixedJoined})`);
+    console.log(`  ✅ PASS: English, Pure Thai & Mixed Thai/English (${path.basename(thaiFontFile)}) OCR verified`);
 
     // -------------------------------------------------------------------------
     // D2. STRICT PNG SIGNATURE, IHDR & CHUNK VALIDATION
@@ -318,7 +350,187 @@ exit 0
     delete process.env.FFMPEG_PATH;
     process.env.TESSERACT_PATH = '/usr/bin/tesseract';
     assertNoTempOcrDirLeak('D2.cleanup');
-    console.log('  ✅ PASS: Strict PNG signature, IHDR, CRC-32, dimension, chunk & pipeline rejection verified');
+
+    // Full PNG Integrity Contract helpers & additional edge vectors (D2.14–D2.23)
+    const pngCrc32 = (b: Buffer): number => {
+      let c = 0xffffffff;
+      for (let i = 0; i < b.length; i++) {
+        c ^= b[i];
+        for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (c & 1 ? 0xedb88320 : 0);
+      }
+      return (c ^ 0xffffffff) >>> 0;
+    };
+    const mkPngChunk = (type: string, data: Buffer): Buffer => {
+      const len = Buffer.alloc(4);
+      len.writeUInt32BE(data.length, 0);
+      const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+      const crc = Buffer.alloc(4);
+      crc.writeUInt32BE(pngCrc32(body), 0);
+      return Buffer.concat([len, body, crc]);
+    };
+    const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const mkIhdr = (w: number, h: number, bitDepth = 8, colorType = 2, interlace = 0): Buffer => {
+      const d = Buffer.alloc(13);
+      d.writeUInt32BE(w, 0);
+      d.writeUInt32BE(h, 4);
+      d[8] = bitDepth;
+      d[9] = colorType;
+      d[10] = 0;
+      d[11] = 0;
+      d[12] = interlace;
+      return d;
+    };
+
+    // D2.14 Corrupt IDAT CRC-32 in valid PNG -> PNG_CRC_FAILURE
+    const badIdatCrcBytes = Buffer.from(validBytes);
+    // Find IDAT chunk offset (after signature + IHDR = 33, advance through chunks until IDAT)
+    {
+      let pOff = 33;
+      while (pOff + 12 <= badIdatCrcBytes.length) {
+        const cLen = badIdatCrcBytes.readUInt32BE(pOff);
+        const cType = badIdatCrcBytes.subarray(pOff + 4, pOff + 8).toString('ascii');
+        if (cType === 'IDAT') {
+          badIdatCrcBytes[pOff + 8 + cLen] ^= 0xff; // Flip IDAT CRC byte
+          break;
+        }
+        pOff += 12 + cLen;
+      }
+    }
+    const badIdatCrcFile = path.resolve(testDir, 'bad_idat_crc.png');
+    fs.writeFileSync(badIdatCrcFile, badIdatCrcBytes);
+    const badIdatCrcRes = validatePngFrameFile(badIdatCrcFile);
+    assert.strictEqual(badIdatCrcRes.valid, false, 'D2.14a Rejects IDAT CRC-32 mismatch');
+    assert.strictEqual(badIdatCrcRes.errorClass, 'PNG_CRC_FAILURE', 'D2.14b Classifies IDAT CRC mismatch as PNG_CRC_FAILURE');
+
+    // D2.15 Trailing bytes after IEND -> INVALID_PNG_STRUCTURE
+    const trailingBytesFile = path.resolve(testDir, 'trailing_after_iend.png');
+    fs.writeFileSync(trailingBytesFile, Buffer.concat([validBytes, Buffer.from('JUNK_TRAILER')]));
+    const trailingRes = validatePngFrameFile(trailingBytesFile);
+    assert.strictEqual(trailingRes.valid, false, 'D2.15a Rejects trailing bytes after IEND');
+    assert.strictEqual(trailingRes.errorClass, 'INVALID_PNG_STRUCTURE', 'D2.15b Classifies trailing bytes as INVALID_PNG_STRUCTURE');
+
+    // D2.16 Non-contiguous IDAT chunks -> INVALID_PNG_STRUCTURE
+    const smallRaw = Buffer.from([0, 10, 20, 30, 0, 40, 50, 60]); // 2x1 RGB: 2 scanlines? Wait: 1x2 RGB = 2*(1+3)=8 bytes
+    const nonContigIdatFile = path.resolve(testDir, 'non_contig_idat.png');
+    const compFull = zlib.deflateSync(smallRaw);
+    const splitAt = Math.max(1, Math.floor(compFull.length / 2));
+    fs.writeFileSync(
+      nonContigIdatFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(1, 2, 8, 2)),
+        mkPngChunk('IDAT', compFull.subarray(0, splitAt)),
+        mkPngChunk('tEXt', Buffer.from('Comment\0split')),
+        mkPngChunk('IDAT', compFull.subarray(splitAt)),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    const nonContigRes = validatePngFrameFile(nonContigIdatFile);
+    assert.strictEqual(nonContigRes.valid, false, 'D2.16a Rejects non-contiguous IDAT chunks');
+    assert.strictEqual(nonContigRes.errorClass, 'INVALID_PNG_STRUCTURE', 'D2.16b Classifies non-contiguous IDAT as INVALID_PNG_STRUCTURE');
+
+    // D2.17 Corrupt zlib IDAT payload (with valid CRC!) -> PNG_DECOMPRESSION_FAILURE
+    const corruptZlibFile = path.resolve(testDir, 'corrupt_zlib_valid_crc.png');
+    fs.writeFileSync(
+      corruptZlibFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(1, 2, 8, 2)),
+        mkPngChunk('IDAT', Buffer.from('NOT_VALID_ZLIB_STREAM')),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    const corruptZlibRes = validatePngFrameFile(corruptZlibFile);
+    assert.strictEqual(corruptZlibRes.valid, false, 'D2.17a Rejects corrupt zlib stream even with valid chunk CRC');
+    assert.strictEqual(corruptZlibRes.errorClass, 'PNG_DECOMPRESSION_FAILURE', 'D2.17b Classifies corrupt zlib as PNG_DECOMPRESSION_FAILURE');
+
+    // D2.18 Decompression bomb (1x1 RGB expects 4 bytes; zlib expands to 64 KB) -> PNG_DECOMPRESSION_FAILURE
+    const bombFile = path.resolve(testDir, 'zlib_bomb.png');
+    fs.writeFileSync(
+      bombFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(1, 1, 8, 2)),
+        mkPngChunk('IDAT', zlib.deflateSync(Buffer.alloc(65536))),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    const bombRes = validatePngFrameFile(bombFile);
+    assert.strictEqual(bombRes.valid, false, 'D2.18a Rejects zlib decompression bomb exceeding IHDR expected length');
+    assert.strictEqual(bombRes.errorClass, 'PNG_DECOMPRESSION_FAILURE', 'D2.18b Classifies decompression bomb as PNG_DECOMPRESSION_FAILURE');
+
+    // D2.19 Invalid scanline filter byte (>4) inside valid compressed IDAT -> PNG_DECOMPRESSION_FAILURE
+    const badFilterFile = path.resolve(testDir, 'bad_filter_byte.png');
+    fs.writeFileSync(
+      badFilterFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(1, 1, 8, 2)),
+        mkPngChunk('IDAT', zlib.deflateSync(Buffer.from([9, 100, 110, 120]))),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    const badFilterRes = validatePngFrameFile(badFilterFile);
+    assert.strictEqual(badFilterRes.valid, false, 'D2.19a Rejects invalid scanline filter byte > 4');
+    assert.strictEqual(badFilterRes.errorClass, 'PNG_DECOMPRESSION_FAILURE', 'D2.19b Classifies invalid scanline filter byte as PNG_DECOMPRESSION_FAILURE');
+
+    // D2.20 Indexed PNG (colorType=3) without required PLTE chunk -> INVALID_PNG_STRUCTURE
+    const missingPlteFile = path.resolve(testDir, 'missing_plte.png');
+    fs.writeFileSync(
+      missingPlteFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(1, 1, 8, 3)),
+        mkPngChunk('IDAT', zlib.deflateSync(Buffer.from([0, 0]))),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    const missingPlteRes = validatePngFrameFile(missingPlteFile);
+    assert.strictEqual(missingPlteRes.valid, false, 'D2.20a Rejects indexed PNG without PLTE');
+    assert.strictEqual(missingPlteRes.errorClass, 'INVALID_PNG_STRUCTURE', 'D2.20b Classifies missing PLTE as INVALID_PNG_STRUCTURE');
+
+    // D2.21 Valid Adam7 interlaced PNG generated cleanly by FFmpeg passes Full PNG validation
+    const adam7Probe = path.resolve(testDir, 'adam7_valid.png');
+    await execFileAsync('ffmpeg', [
+      '-y', '-f', 'lavfi', '-i', 'color=c=white:s=33x17:d=1',
+      '-vframes', '1', '-pred', 'none', '-vf', 'format=rgb24', '-interlace', '1', adam7Probe
+    ]).catch(async () => {
+      // Fallback: synthesize exact spec-valid 3x3 Adam7 RGB PNG
+      // Passes for 3x3: P1(0,0,8,8):1x1(4B), P2:0, P3:0, P4(0,2,4,4):1x1(4B)? No: w=3,h=3 -> P1(0,0)=1x1(4B); P4(0,2):startCol=2<3->1x1(4B); P5(2,0):startRow=2,cols 0,2 -> passW=1,passH=1(4B); wait P5 colInc=2 so cols 0,2 => passW=2 (1+6=7B); P6(0,1,2,2): passW=1, passH=2 => 2*(1+3)=8B; P7(1,0,2,1): startRow=1,cols 0..2 => passW=3,passH=1 => 1+9=10B. Total = 4+4+7+8+10 = 33B
+      fs.writeFileSync(
+        adam7Probe,
+        Buffer.concat([
+          PNG_SIG,
+          mkPngChunk('IHDR', mkIhdr(3, 3, 8, 2, 1)),
+          mkPngChunk('IDAT', zlib.deflateSync(Buffer.alloc(33))),
+          mkPngChunk('IEND', Buffer.alloc(0))
+        ])
+      );
+    });
+    const adam7Res = validatePngFrameFile(adam7Probe);
+    assert.strictEqual(adam7Res.valid, true, `D2.21 Valid Adam7 interlaced PNG accepted (${adam7Res.reason || 'ok'})`);
+
+    // D2.22 Pipeline rejection on corrupt-CRC IDAT sets PNG_CRC_FAILURE and NEVER invokes Tesseract
+    if (fs.existsSync(tesseractInvokeLog)) fs.unlinkSync(tesseractInvokeLog);
+    const badCrcFfmpeg = path.resolve(testDir, 'ffmpeg_bad_idat_crc.sh');
+    fs.writeFileSync(badCrcFfmpeg, `#!/bin/sh
+OUT=""
+for arg in "$@"; do OUT="$arg"; done
+cp "${badIdatCrcFile}" "$OUT"
+exit 0
+`, { mode: 0o755 });
+    process.env.FFMPEG_PATH = badCrcFfmpeg;
+    process.env.TESSERACT_PATH = spyTessScript;
+    const crcFailPipelineRes = await videoProcessor.performVideoOcr(posVideo, baseMeta('pos_text.mp4', 3.0), { timestamps: [1] });
+    assert.strictEqual(crcFailPipelineRes.status, 'ANALYSIS_UNAVAILABLE', 'D2.22a Bad IDAT CRC rejected as ANALYSIS_UNAVAILABLE');
+    assert.strictEqual(crcFailPipelineRes.failureClassification, 'OCR_INPUT_FAILURE', 'D2.22b Pipeline failureClassification is OCR_INPUT_FAILURE');
+    assert.strictEqual(crcFailPipelineRes.extractionErrors?.[0]?.classification, 'PNG_CRC_FAILURE', 'D2.22c Frame error classification is PNG_CRC_FAILURE');
+    assert.strictEqual(fs.existsSync(tesseractInvokeLog), false, 'D2.22d Tesseract never invoked on corrupt PNG CRC');
+
+    delete process.env.FFMPEG_PATH;
+    process.env.TESSERACT_PATH = '/usr/bin/tesseract';
+    assertNoTempOcrDirLeak('D2.full_integrity.cleanup');
+    console.log('  ✅ PASS: Full PNG integrity (signature, IHDR, per-chunk CRC-32, ordering, zlib inflate, bomb/filter, Adam7, zero trailing bytes) verified');
 
     // -------------------------------------------------------------------------
     // J. STRICT OVERALL TIMEOUT BUDGET ENFORCEMENT
@@ -443,6 +655,119 @@ printf "5\\t1\\t1\\t1\\t1\\t1\\t10\\t10\\t80\\t24\\t91\\tFRAME1_OK\\n"
     delete process.env.FFMPEG_PATH;
     process.env.TESSERACT_PATH = '/usr/bin/tesseract';
     console.log('  ✅ PASS: Strict overall timeout enforcement & temp cleanup verified');
+
+    // -------------------------------------------------------------------------
+    // J2. TASK B: MONOTONIC CLOCK TIMEOUT & WALL-CLOCK JUMP RESILIENCE
+    // -------------------------------------------------------------------------
+    console.log('\n[J2. Monotonic Clock Timeout & Wall-Clock Jump Resilience]');
+
+    // J2.1 Verify defaultMonotonicNowMs uses monotonic clock
+    assert.ok(typeof defaultMonotonicNowMs() === 'number' && defaultMonotonicNowMs() > 0, 'J2.1 defaultMonotonicNowMs returns positive monotonic reading');
+
+    // J2.2 Date.now() jumping backward (-1 hour) and forward (+1 hour) mid-execution does NOT distort timeout/budget!
+    const origDateNow = Date.now;
+    let dateJumpCallCount = 0;
+    const spyFastFfmpeg = path.resolve(testDir, 'j2_spy_fast_ffmpeg.sh');
+    fs.writeFileSync(spyFastFfmpeg, `#!/bin/sh
+OUT=""
+for arg in "$@"; do OUT="$arg"; done
+cp "${validPngProbe}" "$OUT"
+exit 0
+`, { mode: 0o755 });
+    const j2FastTess = path.resolve(testDir, 'j2_fast_tess.sh');
+    fs.writeFileSync(j2FastTess, `#!/bin/sh
+printf "level\\tpage_num\\tblock_num\\tpar_num\\tline_num\\tword_num\\tleft\\ttop\\twidth\\theight\\tconf\\ttext\\n"
+printf "5\\t1\\t1\\t1\\t1\\t1\\t10\\t10\\t80\\t24\\t94\\tMONOTONIC_OK\\n"
+`, { mode: 0o755 });
+
+    try {
+      process.env.FFMPEG_PATH = spyFastFfmpeg;
+      process.env.TESSERACT_PATH = j2FastTess;
+
+      // Forward +1 hour jump during execution MUST NOT trigger false timeout
+      dateJumpCallCount = 0;
+      (Date as any).now = () => {
+        dateJumpCallCount++;
+        return origDateNow() + (dateJumpCallCount > 2 ? 3600_000 : 0);
+      };
+      const forwardJumpRes = await videoProcessor.performVideoOcr(posVideo, baseMeta('pos_text.mp4', 3.0), {
+        timestamps: [0, 1],
+        timeoutMs: 10000,
+        perFrameTimeoutMs: 5000
+      });
+      assert.strictEqual(forwardJumpRes.status, 'DETECTED', 'J2.2a Forward Date.now() jump (+1h) does NOT trigger false timeout');
+      assert.strictEqual(forwardJumpRes.framesSucceeded, 2, 'J2.2b All 2 frames succeed cleanly despite +1h wall-clock jump');
+
+      // Backward -1 hour jump during hanging FFmpeg MUST still enforce real 200ms monotonic timeout
+      (Date as any).now = () => origDateNow() - 3600_000;
+      process.env.FFMPEG_PATH = j2HangFfmpeg;
+      const monoBeforeHang = defaultMonotonicNowMs();
+      const backwardJumpTimeoutRes = await videoProcessor.performVideoOcr(posVideo, baseMeta('pos_text.mp4', 3.0), {
+        timestamps: [0, 1],
+        timeoutMs: 200,
+        perFrameTimeoutMs: 10000
+      });
+      const monoHangElapsed = defaultMonotonicNowMs() - monoBeforeHang;
+      assert.ok(monoHangElapsed < 1500, `J2.3a Backward Date.now() jump (-1h) did NOT bypass 200ms monotonic timeout (elapsed=${Math.round(monoHangElapsed)}ms)`);
+      assert.strictEqual(backwardJumpTimeoutRes.executionStatus, 'FAILED', 'J2.3b Timeout triggered cleanly on monotonic clock');
+      assert.strictEqual(backwardJumpTimeoutRes.failureClassification, 'OCR_TIMEOUT', 'J2.3c Timeout classified as OCR_TIMEOUT');
+    } finally {
+      (Date as any).now = origDateNow;
+      delete process.env.FFMPEG_PATH;
+      process.env.TESSERACT_PATH = '/usr/bin/tesseract';
+    }
+    assertNoTempOcrDirLeak('J2.walljump.cleanup');
+
+    // J2.4 Injected mock monotonic clock advancing past budget mid-pipeline stops loop before next frame
+    const mockAdvFfmpegLog = path.resolve(testDir, 'j2_mock_ffmpeg.log');
+    const mockAdvFfmpeg = path.resolve(testDir, 'j2_mock_ffmpeg.sh');
+    fs.writeFileSync(mockAdvFfmpeg, `#!/bin/sh
+OUT=""
+for arg in "$@"; do OUT="$arg"; done
+echo "CALL" >> "${mockAdvFfmpegLog}"
+cp "${validPngProbe}" "$OUT"
+exit 0
+`, { mode: 0o755 });
+    const mockAdvTess = path.resolve(testDir, 'j2_mock_tess.sh');
+    const mockAdvTessLog = path.resolve(testDir, 'j2_mock_tess.log');
+    fs.writeFileSync(mockAdvTess, `#!/bin/sh
+echo "TESS" >> "${mockAdvTessLog}"
+printf "level\\tpage_num\\tblock_num\\tpar_num\\tline_num\\tword_num\\tleft\\ttop\\twidth\\theight\\tconf\\ttext\\n"
+printf "5\\t1\\t1\\t1\\t1\\t1\\t10\\t10\\t80\\t24\\t94\\tSTEP_OK\\n"
+`, { mode: 0o755 });
+
+    // Advance mock clock deterministically between frame extraction checks & OCR loop
+    let clockReads = 0;
+    const steppingClock = () => {
+      clockReads++;
+      // Read 1: startMonoMs = 1000; Read 2..3 (extract 0,1,2 within budget): 1050,1100,1150;
+      // Read 4: remainingBeforeOcr for frame 0 -> 1200 (800ms left); Read 5: remainingBeforeOcr for frame 1 -> 2500 (> deadline 2000!)
+      if (clockReads === 1) return 1000;
+      if (clockReads <= 4) return 1000 + (clockReads - 1) * 50;
+      if (clockReads === 5) return 1200;
+      return 2500;
+    };
+
+    try {
+      process.env.FFMPEG_PATH = mockAdvFfmpeg;
+      process.env.TESSERACT_PATH = mockAdvTess;
+      const mockClockRes = await videoProcessor.performVideoOcr(posVideo, baseMeta('pos_text.mp4', 3.0), {
+        timestamps: [0, 1, 2],
+        timeoutMs: 1000,
+        monotonicNowMs: steppingClock
+      });
+      assert.strictEqual(mockClockRes.framesExtracted, 3, 'J2.4a All 3 frames extracted while mock clock < deadline');
+      assert.strictEqual(mockClockRes.framesAttempted, 1, 'J2.4b Stopped after frame 0 when mock monotonic clock crossed deadline');
+      assert.strictEqual(mockClockRes.framesSkipped, 2, 'J2.4c Remaining 2 frames accounted in framesSkipped');
+      assert.strictEqual(mockClockRes.executionStatus, 'PARTIAL', 'J2.4d Partial status reflects mid-OCR budget exhaustion');
+      assert.strictEqual(mockClockRes.failureClassification, 'OCR_TIMEOUT', 'J2.4e Classification is OCR_TIMEOUT');
+      assert.strictEqual(fs.readFileSync(mockAdvTessLog, 'utf8').trim().split('\n').length, 1, 'J2.4f Only 1 Tesseract process launched');
+    } finally {
+      delete process.env.FFMPEG_PATH;
+      process.env.TESSERACT_PATH = '/usr/bin/tesseract';
+    }
+    assertNoTempOcrDirLeak('J2.mockclock.cleanup');
+    console.log('  ✅ PASS: Monotonic clock timeout & wall-clock jump resilience verified');
 
     // -------------------------------------------------------------------------
     // K. DIAGNOSTICS SANITIZATION (DIRECT + PIPELINE)

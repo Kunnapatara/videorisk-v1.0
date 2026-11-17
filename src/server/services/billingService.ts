@@ -1,6 +1,11 @@
 import Stripe from 'stripe';
 import { storage, IStorageRepository } from '../storage';
 import {
+  isLoopbackHostname,
+  isProductionEnvironment,
+  resolveEnvironmentSecurity,
+} from '../config/environment';
+import {
   UserAccount,
   SubscriptionRecord,
   WebhookEventRecord,
@@ -54,7 +59,11 @@ export class BillingService {
   private stripe: Stripe | null = null;
   private isConfigured: boolean = false;
   private get isProduction(): boolean {
-    return process.env.NODE_ENV === 'production';
+    return isProductionEnvironment(process.env);
+  }
+
+  public isProductionMode(): boolean {
+    return this.isProduction;
   }
 
   private hasExplicitTestClient: boolean = false;
@@ -150,12 +159,18 @@ export class BillingService {
   public getTrustedOrigins(): string[] {
     const origins = new Set<string>();
     const configured = this.getConfiguredAppBaseUrl();
-    const isDevOrTest = !this.isProduction || process.env.VIDEORISK_TEST_RUN === 'true';
+    const isProd = this.isProduction;
+    const isDevOrTest = !isProd;
 
     if (configured) {
       try {
         const parsed = new URL(configured);
-        if (!parsed.username && !parsed.password && (parsed.protocol === 'https:' || (isDevOrTest && parsed.protocol === 'http:'))) {
+        const isLoopback = isLoopbackHostname(parsed.hostname);
+        if (
+          !parsed.username &&
+          !parsed.password &&
+          ((parsed.protocol === 'https:' && (!isProd || !isLoopback)) || (isDevOrTest && parsed.protocol === 'http:'))
+        ) {
           origins.add(parsed.origin);
         }
       } catch {
@@ -174,8 +189,9 @@ export class BillingService {
         if (trimmed && !trimmed.includes('@') && !trimmed.startsWith('//')) {
           try {
             const parsed = new URL(trimmed);
+            const isLoopback = isLoopbackHostname(parsed.hostname);
             if (!parsed.username && !parsed.password) {
-              if (parsed.protocol === 'https:' || (isDevOrTest && parsed.protocol === 'http:' && (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1'))) {
+              if ((parsed.protocol === 'https:' && (!isProd || !isLoopback)) || (isDevOrTest && parsed.protocol === 'http:' && isLoopback)) {
                 origins.add(parsed.origin);
               }
             }
@@ -186,7 +202,7 @@ export class BillingService {
       });
     }
 
-    // In development or test environments, permit explicit localhost origins
+    // In development or test environments only, permit explicit localhost origins
     if (isDevOrTest) {
       origins.add('http://localhost:3000');
       origins.add('http://127.0.0.1:3000');
@@ -202,27 +218,35 @@ export class BillingService {
   /**
    * Validates and resolves a trusted origin for Stripe Checkout success_url / cancel_url.
    * Security rules:
-   * - Fails closed in production if APP_BASE_URL (or APP_URL / PUBLIC_APP_URL) is missing or invalid.
+   * - Fails closed in production or live payment mode if APP_BASE_URL is missing, insecure, loopback, or invalid.
    * - Never falls back to request Host or X-Forwarded-Host headers.
    * - If client supplies an Origin header or body originUrl, validates it strictly against server allowlist
-   *   and rejects untrusted, lookalike, userinfo (@), protocol-relative, malformed, or insecure schemes (400).
+   *   and rejects untrusted, mismatched, lookalike, userinfo (@), protocol-relative, malformed, loopback, or insecure schemes (400).
    */
   public resolveTrustedCheckoutOrigin(options?: {
     requestedOrigin?: string | string[] | null;
     bodyOrigin?: string | null;
   }): string {
-    const isDevOrTest = !this.isProduction || process.env.VIDEORISK_TEST_RUN === 'true';
+    const envSec = resolveEnvironmentSecurity(process.env);
+    if (envSec.conflicts.some(c => c.code === 'INVALID_PAYMENT_MODE')) {
+      const err: any = new Error(envSec.conflicts[0].message);
+      err.statusCode = 500;
+      throw err;
+    }
+
+    const isProd = envSec.isProduction;
+    const isDevOrTest = !isProd;
     const configuredBase = this.getConfiguredAppBaseUrl();
 
-    if (this.isProduction && process.env.VIDEORISK_TEST_RUN !== 'true') {
+    if (isProd) {
       if (!configuredBase) {
-        const err: any = new Error('Server checkout origin misconfiguration: APP_BASE_URL must be configured in production.');
+        const err: any = new Error('Server checkout origin misconfiguration: APP_BASE_URL must be configured in production/live mode.');
         err.statusCode = 500;
         throw err;
       }
       let parsedBase: URL;
       try {
-        if (configuredBase.startsWith('//') || configuredBase.includes('@') || /\s/.test(configuredBase)) {
+        if (configuredBase.startsWith('//') || configuredBase.includes('@') || /\s/.test(configuredBase) || configuredBase.includes('\\')) {
           throw new Error('Invalid characters');
         }
         parsedBase = new URL(configuredBase);
@@ -231,8 +255,8 @@ export class BillingService {
         err.statusCode = 500;
         throw err;
       }
-      if (parsedBase.protocol !== 'https:' || parsedBase.username || parsedBase.password) {
-        const err: any = new Error('Server checkout origin misconfiguration: APP_BASE_URL must be a valid HTTPS origin without credentials.');
+      if (parsedBase.protocol !== 'https:' || parsedBase.username || parsedBase.password || isLoopbackHostname(parsedBase.hostname)) {
+        const err: any = new Error('Server checkout origin misconfiguration: APP_BASE_URL must be a valid non-localhost HTTPS origin without credentials.');
         err.statusCode = 500;
         throw err;
       }
@@ -290,8 +314,14 @@ export class BillingService {
         throw err;
       }
 
+      const isLocalHost = isLoopbackHostname(parsed.hostname);
+      if (isProd && isLocalHost) {
+        const err: any = new Error('Localhost or loopback checkout origins are strictly forbidden in production/live payment mode.');
+        err.statusCode = 400;
+        throw err;
+      }
+
       if (parsed.protocol === 'http:') {
-        const isLocalHost = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
         if (!isDevOrTest || !isLocalHost) {
           const err: any = new Error('Insecure HTTP checkout origins are not permitted outside of development localhost.');
           err.statusCode = 400;
@@ -308,7 +338,7 @@ export class BillingService {
         try {
           const t = new URL(trusted);
           if (parsed.origin === t.origin) return true;
-          if (isDevOrTest && (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') && (t.hostname === 'localhost' || t.hostname === '127.0.0.1')) {
+          if (isDevOrTest && isLocalHost && isLoopbackHostname(t.hostname)) {
             return true;
           }
         } catch {
@@ -334,6 +364,12 @@ export class BillingService {
       ? validateCandidateOrigin(options.bodyOrigin)
       : null;
 
+    if (validatedHeaderOrigin && validatedBodyOrigin && validatedHeaderOrigin !== validatedBodyOrigin) {
+      const err: any = new Error('Checkout origin mismatch between Origin header and body originUrl.');
+      err.statusCode = 400;
+      throw err;
+    }
+
     const resolvedOrigin = validatedBodyOrigin || validatedHeaderOrigin;
     if (resolvedOrigin) {
       return resolvedOrigin;
@@ -346,15 +382,29 @@ export class BillingService {
 
   /**
    * Validates Customer Portal return URL strictly against trusted application origins.
-   * Rejects external origins, lookalikes, userinfo spoofing, protocol-relative URLs, malformed URLs, and dangerous schemes.
+   * Rejects external origins, loopback in production, lookalikes, userinfo spoofing, protocol-relative URLs, malformed URLs, and dangerous schemes.
    */
   public validatePortalReturnUrl(inputUrl?: string | null): string {
-    const isDevOrTest = !this.isProduction || process.env.VIDEORISK_TEST_RUN === 'true';
+    const isProd = this.isProduction;
+    const isDevOrTest = !isProd;
+    const configuredBase = this.getConfiguredAppBaseUrl();
 
-    if (!isDevOrTest && !this.getConfiguredAppBaseUrl()) {
-      const err: any = new Error('Server portal return URL misconfiguration: APP_BASE_URL must be configured in production.');
-      err.statusCode = 500;
-      throw err;
+    if (isProd) {
+      if (!configuredBase) {
+        const err: any = new Error('Server portal return URL misconfiguration: APP_BASE_URL must be configured in production.');
+        err.statusCode = 500;
+        throw err;
+      }
+      try {
+        const parsedBase = new URL(configuredBase);
+        if (parsedBase.protocol !== 'https:' || parsedBase.username || parsedBase.password || isLoopbackHostname(parsedBase.hostname)) {
+          throw new Error('Insecure base URL');
+        }
+      } catch {
+        const err: any = new Error('Server portal return URL misconfiguration: APP_BASE_URL must be a valid non-localhost HTTPS origin.');
+        err.statusCode = 500;
+        throw err;
+      }
     }
 
     // Missing return URL falls back to canonical application URL
@@ -401,8 +451,14 @@ export class BillingService {
       throw err;
     }
 
+    const isLocalHost = isLoopbackHostname(parsed.hostname);
+    if (isProd && isLocalHost) {
+      const err: any = new Error('Localhost return URLs are strictly forbidden in production/live payment mode.');
+      err.statusCode = 400;
+      throw err;
+    }
+
     if (parsed.protocol === 'http:') {
-      const isLocalHost = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
       if (!isDevOrTest || !isLocalHost) {
         const err: any = new Error('Insecure HTTP return URLs are not permitted outside of development localhost.');
         err.statusCode = 400;
@@ -420,7 +476,7 @@ export class BillingService {
       try {
         const t = new URL(trusted);
         if (parsed.origin === t.origin) return true;
-        if (isDevOrTest && (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') && (t.hostname === 'localhost' || t.hostname === '127.0.0.1')) {
+        if (isDevOrTest && isLocalHost && isLoopbackHostname(t.hostname)) {
           return true;
         }
       } catch {
@@ -544,6 +600,13 @@ export class BillingService {
       requestedOrigin: options.originUrl
     });
 
+    const envSec = resolveEnvironmentSecurity(process.env);
+    if (envSec.hasConflict) {
+      const err: any = new Error(envSec.conflicts[0].message);
+      err.statusCode = 500;
+      throw err;
+    }
+
     if (!ALLOWED_PAID_PLANS.includes(planId as any)) {
       throw new Error(`Invalid plan ID: ${planId}. Allowed paid plans are: ${ALLOWED_PAID_PLANS.join(', ')}`);
     }
@@ -553,21 +616,34 @@ export class BillingService {
       throw new Error(`User not found: ${userId}`);
     }
 
-    const paymentMode = process.env.PAYMENT_MODE;
-    const requireLive = this.isProduction || paymentMode === 'production' || paymentMode === 'live';
+    const requireLive = envSec.isProduction;
 
     // Production guard: fail fast if production credentials are missing or if test key is used in production
     if (requireLive) {
       if (!this.stripe) {
-        throw new Error('Payment gateway is not configured for production. Please verify STRIPE_SECRET_KEY.');
+        const err: any = new Error('Payment gateway is not configured for production. Please verify STRIPE_SECRET_KEY.');
+        err.statusCode = 500;
+        throw err;
       }
       if (this.getStripeMode() !== 'live') {
-        throw new Error('Production mode requires a Stripe LIVE key (sk_live_... or rk_live_...). Found test mode credentials.');
+        const err: any = new Error('Production mode requires a Stripe LIVE key (sk_live_... or rk_live_...). Found test mode credentials.');
+        err.statusCode = 500;
+        throw err;
       }
       const priceId = this.getPriceIdForPlan(planId);
       if (!priceId) {
-        throw new Error(`Configured Stripe Price ID missing for plan '${planId}' in production.`);
+        const err: any = new Error(`Configured Stripe Price ID missing for plan '${planId}' in production.`);
+        err.statusCode = 500;
+        throw err;
       }
+    }
+
+    const successUrl = `${trustedOrigin}/?checkout_status=success&session_id={CHECKOUT_SESSION_ID}`;
+    const cancelUrl = `${trustedOrigin}/?checkout_status=canceled`;
+    if (new URL(successUrl).origin !== trustedOrigin || new URL(cancelUrl).origin !== trustedOrigin) {
+      const err: any = new Error('Redirect URL origin integrity verification failed.');
+      err.statusCode = 400;
+      throw err;
     }
 
     // Real Stripe Session Creation if Stripe SDK is configured
@@ -602,8 +678,8 @@ export class BillingService {
           userId: user.id,
           planId: planId,
         },
-        success_url: `${trustedOrigin}/?checkout_status=success&session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url: `${trustedOrigin}/?checkout_status=canceled`,
+        success_url: successUrl,
+        cancel_url: cancelUrl,
         ...(user.stripeCustomerId ? { customer: user.stripeCustomerId } : { customer_email: user.email }),
         ...(isOneTime ? {} : {
           subscription_data: {
@@ -646,7 +722,7 @@ export class BillingService {
    */
   public async handleWebhook(rawBody: Buffer, signature: string): Promise<{ received: boolean; eventType: string; eventId: string; alreadyProcessed?: boolean }> {
     const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-    const isProd = this.isProduction || process.env.PAYMENT_MODE === 'production' || process.env.PAYMENT_MODE === 'live';
+    const isProd = this.isProduction;
 
     if (isProd) {
       if (!this.stripe || !webhookSecret) {
@@ -2968,10 +3044,10 @@ export class BillingService {
    * Completes a simulated checkout session (strictly for non-production environments)
    */
   public async completeSimulatedCheckout(sessionId: string, planId: string, userId: string): Promise<UserAccount> {
-    const paymentMode = process.env.PAYMENT_MODE;
-    const requireLive = this.isProduction || paymentMode === 'production' || paymentMode === 'live';
-    if (requireLive) {
-      throw new Error('Simulation checkout completion is strictly forbidden in production mode.');
+    if (this.isProduction) {
+      const err: any = new Error('Simulation checkout completion is strictly forbidden in production mode.');
+      err.statusCode = 403;
+      throw err;
     }
 
     if (!sessionId.startsWith('sim_')) {

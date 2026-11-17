@@ -14,6 +14,10 @@
 
 import dotenv from 'dotenv';
 import Stripe from 'stripe';
+import {
+  isLoopbackHostname,
+  resolveEnvironmentSecurity,
+} from '../src/server/config/environment';
 
 dotenv.config();
 
@@ -52,7 +56,7 @@ export function maskSecret(secret?: string | null): string {
 
 /**
  * Authoritative Stripe webhook secret format validator.
- * Enforces that non-empty signing secrets strictly match 'whsec_[a-zA-Z0-9]{24,}'.
+ * Enforces that non-empty signing secrets strictly match 'whsec_[a-zA-Z0-9]{16,}'.
  */
 export function validateStripeWebhookSecret(secret?: string | null): {
   isValid: boolean;
@@ -81,14 +85,53 @@ export function validateBillingConfiguration(
 ): ValidationSummary {
   const issues: ValidationIssue[] = [];
 
+  const envSec = resolveEnvironmentSecurity(env);
   const secretKey = env.STRIPE_SECRET_KEY?.trim() || '';
   const webhookSecret = env.STRIPE_WEBHOOK_SECRET?.trim() || '';
   const paymentProvider = env.PAYMENT_PROVIDER?.trim() || '';
-  const paymentMode = env.PAYMENT_MODE?.trim() || '';
+  const paymentMode = envSec.paymentMode;
+
+  // Escalate to strict production rules whenever production mode is targeted OR live payment signals are active
+  const effectiveProduction =
+    mode === 'production' ||
+    envSec.isLivePaymentMode ||
+    envSec.hasLiveStripeKey ||
+    (mode !== 'ci' && envSec.isNodeEnvProduction);
+
+  // Flag explicit cross-variable conflicts (NODE_ENV vs PAYMENT_MODE vs target mode)
+  for (const conflict of envSec.conflicts) {
+    // Key conflicts are emitted in section 1 with maskSecret details below
+    if (conflict.code === 'TEST_KEY_IN_LIVE_OR_PROD' || conflict.code === 'LIVE_KEY_IN_DEV_OR_TEST') {
+      continue;
+    }
+    issues.push({
+      type: 'ERROR',
+      variable: conflict.variable,
+      message: conflict.message,
+    });
+  }
+
+  if ((mode === 'test' || mode === 'development') && envSec.isLivePaymentMode) {
+    if (!envSec.conflicts.some((c) => c.code === 'DEV_LIVE_PAYMENT_CONFLICT')) {
+      issues.push({
+        type: 'ERROR',
+        variable: 'PAYMENT_MODE',
+        message: `Contradictory environment configuration: PAYMENT_MODE='${paymentMode}' cannot run under '${mode}' mode.`,
+      });
+    }
+  }
+
+  if (mode === 'production' && (envSec.nodeEnv === 'development' || envSec.nodeEnv === 'test')) {
+    issues.push({
+      type: 'ERROR',
+      variable: 'NODE_ENV',
+      message: `Contradictory environment configuration: NODE_ENV='${envSec.nodeEnv}' cannot be combined with production evaluation mode.`,
+    });
+  }
 
   // 1. Stripe Secret Key Validation
   if (!secretKey) {
-    if (mode === 'production') {
+    if (effectiveProduction) {
       issues.push({
         type: 'ERROR',
         variable: 'STRIPE_SECRET_KEY',
@@ -117,7 +160,43 @@ export function validateBillingConfiguration(
     const isLiveKey = secretKey.startsWith('sk_live_') || secretKey.startsWith('rk_live_');
     const isTestKey = secretKey.startsWith('sk_test_') || secretKey.startsWith('rk_test_');
 
-    if (mode === 'production') {
+    const isNonProdContext =
+      mode === 'test' ||
+      mode === 'development' ||
+      envSec.nodeEnv === 'development' ||
+      envSec.nodeEnv === 'test' ||
+      paymentMode === 'test' ||
+      paymentMode === 'simulation';
+
+    if (isNonProdContext) {
+      if (isLiveKey) {
+        issues.push({
+          type: 'ERROR',
+          variable: 'STRIPE_SECRET_KEY',
+          message: `Accidental live key (${maskSecret(secretKey)}) in ${mode} mode! Non-production mode must use sk_test_... or rk_test_... to prevent real credit card charges.`,
+        });
+      } else if (effectiveProduction) {
+        if (isTestKey) {
+          issues.push({
+            type: 'ERROR',
+            variable: 'STRIPE_SECRET_KEY',
+            message: `Contradictory environment configuration: Test key (${maskSecret(secretKey)}) found in production mode. Production strictly requires a live key (sk_live_... or rk_live_...).`,
+          });
+        } else {
+          issues.push({
+            type: 'ERROR',
+            variable: 'STRIPE_SECRET_KEY',
+            message: `Malformed Stripe secret key: must begin with 'sk_live_' or 'rk_live_'. Found: ${maskSecret(secretKey)}.`,
+          });
+        }
+      } else if (!isTestKey) {
+        issues.push({
+          type: 'ERROR',
+          variable: 'STRIPE_SECRET_KEY',
+          message: `Malformed test key: must begin with 'sk_test_' or 'rk_test_'. Found: ${maskSecret(secretKey)}.`,
+        });
+      }
+    } else if (effectiveProduction) {
       if (!isLiveKey) {
         if (isTestKey) {
           issues.push({
@@ -133,28 +212,12 @@ export function validateBillingConfiguration(
           });
         }
       }
-    } else if (mode === 'test') {
-      if (!isTestKey) {
-        if (isLiveKey) {
-          issues.push({
-            type: 'ERROR',
-            variable: 'STRIPE_SECRET_KEY',
-            message: `Accidental live key (${maskSecret(secretKey)}) in test mode! Test mode must use sk_test_... or rk_test_... to prevent real credit card charges.`,
-          });
-        } else {
-          issues.push({
-            type: 'ERROR',
-            variable: 'STRIPE_SECRET_KEY',
-            message: `Malformed test key: must begin with 'sk_test_' or 'rk_test_'. Found: ${maskSecret(secretKey)}.`,
-          });
-        }
-      }
     }
   }
 
   // 2. Stripe Webhook Secret Validation
   if (!webhookSecret) {
-    if (mode === 'production') {
+    if (effectiveProduction) {
       issues.push({
         type: 'ERROR',
         variable: 'STRIPE_WEBHOOK_SECRET',
@@ -184,7 +247,7 @@ export function validateBillingConfiguration(
     const priceId = env[plan.envVar!]?.trim() || '';
 
     if (!priceId) {
-      if (mode === 'production') {
+      if (effectiveProduction) {
         issues.push({
           type: 'ERROR',
           variable: plan.envVar!,
@@ -217,11 +280,11 @@ export function validateBillingConfiguration(
     });
   }
 
-  if (mode === 'production' && paymentMode === 'simulation') {
+  if (effectiveProduction && paymentMode === 'simulation') {
     issues.push({
       type: 'ERROR',
       variable: 'PAYMENT_MODE',
-      message: "PAYMENT_MODE='simulation' is strictly forbidden in production mode. Set to 'live' or leave unset.",
+      message: "PAYMENT_MODE='simulation' is strictly forbidden in production/live mode. Set to 'live' or leave unset.",
     });
   }
 
@@ -239,11 +302,17 @@ export function validateBillingConfiguration(
     }
     try {
       const parsed = new URL(rawOrigin);
-      if (mode === 'production' && parsed.protocol !== 'https:') {
+      if (effectiveProduction && parsed.protocol !== 'https:') {
         issues.push({
           type: 'ERROR',
           variable: varName,
           message: `Insecure scheme '${parsed.protocol}' in ${varName}. Production strictly requires https:// origins.`,
+        });
+      } else if (effectiveProduction && isLoopbackHostname(parsed.hostname)) {
+        issues.push({
+          type: 'ERROR',
+          variable: varName,
+          message: `Loopback/localhost origin '${parsed.origin}' in ${varName} is forbidden in production/live payment mode.`,
         });
       } else if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
         issues.push({
@@ -262,9 +331,9 @@ export function validateBillingConfiguration(
   };
 
   if (!appBaseUrl) {
-    if (mode === 'production') {
+    if (effectiveProduction) {
       issues.push({
-        type: 'WARNING',
+        type: envSec.isLivePaymentMode && !envSec.isNodeEnvProduction ? 'ERROR' : 'WARNING',
         variable: 'APP_BASE_URL',
         message: 'APP_BASE_URL is not set. Production checkout & portal redirect origin resolution will fail closed until APP_BASE_URL is configured.',
       });
@@ -295,7 +364,7 @@ export function validateBillingConfiguration(
   // 6. Media Access Token Secret Validation
   const mediaTokenSecret = env.MEDIA_TOKEN_SECRET?.trim() || '';
   if (!mediaTokenSecret) {
-    if (mode === 'production') {
+    if (effectiveProduction) {
       issues.push({
         type: 'WARNING',
         variable: 'MEDIA_TOKEN_SECRET',

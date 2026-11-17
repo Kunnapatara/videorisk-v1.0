@@ -17,10 +17,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: 'npm'
@@ -31,10 +31,10 @@ jobs:
       - name: Run linter and typecheck
         run: npm run lint
 
-      - name: Install system dependencies (FFmpeg, Tesseract OCR + eng/tha, Fontconfig + DejaVu fonts)
+      - name: Install system dependencies (FFmpeg, Tesseract OCR + eng/tha, Fontconfig + DejaVu/Thai fonts)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg tesseract-ocr tesseract-ocr-eng tesseract-ocr-tha fontconfig fonts-dejavu-core
+          sudo apt-get install -y --no-install-recommends ffmpeg tesseract-ocr tesseract-ocr-eng tesseract-ocr-tha fontconfig fonts-dejavu-core fonts-thai-tlwg
           sudo fc-cache -f
 
       - name: Verify native media binaries, fonts, and OCR languages
@@ -45,8 +45,11 @@ jobs:
           tesseract --list-langs | grep -qx 'eng'
           tesseract --list-langs | grep -qx 'tha'
           fc-match Sans
+          THAI_FONT=$(fc-list :lang=th file | head -n1 | cut -d: -f1 | xargs)
+          test -n "$THAI_FONT" && test -f "$THAI_FONT"
           ffmpeg -y -f lavfi -i "color=c=black:s=640x360:d=1,drawtext=text='CI FONT CHECK':fontsize=32:fontcolor=white" -vframes 1 /tmp/ci_drawtext_probe.png
-          rm -f /tmp/ci_drawtext_probe.png
+          ffmpeg -y -f lavfi -i "color=c=black:s=640x360:d=1,drawtext=fontfile=${THAI_FONT}:text='ทดสอบ POLICY':fontsize=36:fontcolor=white" -vframes 1 /tmp/ci_thai_drawtext_probe.png
+          rm -f /tmp/ci_drawtext_probe.png /tmp/ci_thai_drawtext_probe.png
 
       - name: Validate environment and plan configuration
         run: npx tsx scripts/validate-env.ts --mode=ci

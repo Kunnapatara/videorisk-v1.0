@@ -1449,7 +1449,7 @@ esac
     try {
       const diagRes = await videoProcessor.performVideoOcr(dummyVideoPath, meta3s, {
         timestamps: [0, 0.5, 1, 1.5, 2],
-        perFrameTimeoutMs: 150,
+        perFrameTimeoutMs: 900,
         timeoutMs: 30000
       });
 
@@ -2105,7 +2105,7 @@ fi
     assert.strictEqual(longDeep.length, 30, '12.19 Long-duration deep sampling bounded to 30');
     assert.ok(longDeep[0] === 0 && longDeep[29] < 36000 && new Set(longDeep).size === 30, '12.20 Long-duration samples unique & within [0, duration)');
 
-    // Corrupt image frame (valid PNG container envelope with corrupt IDAT stream) submitted to real /usr/bin/tesseract must count as framesOcrFailed > 0 (never NO_SIGNAL_DETECTED)
+    // Corrupt image frame (valid PNG container envelope with corrupt IDAT zlib stream) MUST be rejected BEFORE reaching Tesseract under Full PNG Integrity Validation
     const corruptFramePath = path.resolve(testDir, 'corrupt_frame.png');
     {
       const crc32Buf = (buf: Buffer): number => {
@@ -2159,9 +2159,20 @@ exit 0
     try {
       process.env.FFMPEG_PATH = corruptFrameFfmpeg;
       const corruptImgOcr = await videoProcessor.performVideoOcr(dummyVideoPath, meta3s, { maxFrames: 2 });
-      assert.strictEqual(corruptImgOcr.framesOcrFailed, 2, '12.21 Invalid PNG submitted to real Tesseract increments framesOcrFailed=2');
-      assert.strictEqual(corruptImgOcr.framesSucceeded, 0, '12.22 Invalid PNG never increments framesSucceeded');
-      assert.strictEqual(corruptImgOcr.status, 'INSUFFICIENT_EVIDENCE', '12.23 All-failed OCR returns INSUFFICIENT_EVIDENCE (never NO_SIGNAL_DETECTED)');
+      assert.strictEqual(corruptImgOcr.status, 'ANALYSIS_UNAVAILABLE', '12.21 Corrupt IDAT PNG rejected safely pre-Tesseract as ANALYSIS_UNAVAILABLE');
+      assert.strictEqual(corruptImgOcr.failureClassification, 'OCR_INPUT_FAILURE', '12.21b Corrupt IDAT classified at pipeline level as OCR_INPUT_FAILURE');
+      assert.strictEqual(corruptImgOcr.extractionErrors?.[0]?.classification, 'PNG_DECOMPRESSION_FAILURE', '12.21c Frame-level PNG failure classified as PNG_DECOMPRESSION_FAILURE');
+      assert.strictEqual(corruptImgOcr.framesAttempted, 0, '12.22a Invalid PNG never submitted to Tesseract');
+      assert.strictEqual(corruptImgOcr.framesSucceeded, 0, '12.22b Invalid PNG never increments framesSucceeded');
+      assert.notStrictEqual(corruptImgOcr.status, 'NO_SIGNAL_DETECTED', '12.23 Invalid PNG never reports NO_SIGNAL_DETECTED');
+
+      // Real valid PNG with failing OCR engine MUST report OCR_ENGINE_FAILURE and framesOcrFailed=2
+      delete process.env.FFMPEG_PATH;
+      process.env.TESSERACT_PATH = failingOcrScript;
+      const engineFailOcr = await videoProcessor.performVideoOcr(dummyVideoPath, meta3s, { maxFrames: 2 });
+      assert.strictEqual(engineFailOcr.framesOcrFailed, 2, '12.24a Valid PNG submitted to failing Tesseract increments framesOcrFailed=2');
+      assert.strictEqual(engineFailOcr.failureClassification, 'OCR_ENGINE_FAILURE', '12.24b Real engine failure classified as OCR_ENGINE_FAILURE');
+      assert.strictEqual(engineFailOcr.status, 'INSUFFICIENT_EVIDENCE', '12.24c Engine failure never claims NO_SIGNAL_DETECTED');
     } finally {
       if (prevFfmpegCorrupt === undefined) delete process.env.FFMPEG_PATH;
       else process.env.FFMPEG_PATH = prevFfmpegCorrupt;

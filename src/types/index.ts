@@ -235,6 +235,17 @@ export interface VideoFrameOcrItem {
   boundingBoxes: OcrBoundingBox[];
 }
 
+export type PngValidationErrorClass =
+  | 'INVALID_PNG_STRUCTURE'
+  | 'PNG_CRC_FAILURE'
+  | 'PNG_DECOMPRESSION_FAILURE';
+
+export type OcrErrorClassification =
+  | PngValidationErrorClass
+  | 'OCR_INPUT_FAILURE'
+  | 'OCR_ENGINE_FAILURE'
+  | 'OCR_TIMEOUT';
+
 export interface ExtractionFailureDiagnostic {
   frameIndex: number;
   timestamp: number;
@@ -246,6 +257,7 @@ export interface ExtractionFailureDiagnostic {
     | 'MISSING_OUTPUT'
     | 'EMPTY_OUTPUT'
     | 'UNKNOWN_ERROR';
+  classification?: OcrErrorClassification;
   reason: string;
 }
 
@@ -256,6 +268,7 @@ export interface VideoOcrResult {
   coverageRatio: number;
   limitations: string;
   failureReason?: string;
+  failureClassification?: OcrErrorClassification;
   executionDurationMs: number;
   detectedFrames: VideoFrameOcrItem[];
   allExtractedText: string[];

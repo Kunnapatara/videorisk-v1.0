@@ -15,6 +15,7 @@ import { billingService, ALLOWED_PAID_PLANS } from '../services/billingService';
 import { ensureDemoFixtures, getDemoFixture } from '../fixtures/demoMedia';
 import { channelIntelligenceEngine } from '../intelligence/channelIntelligence';
 import { validateStripeWebhookSecret } from '../../../scripts/validate-env';
+import { isLoopbackHostname, isProductionEnvironment, resolveEnvironmentSecurity } from '../config/environment';
 import { ScanJob, ScanMode, UserAccount, CrossVideoPattern, ChannelCoverageReport, ChannelCoverageDetail, ChannelPatternsResponse, CrossVideoComparisonStatus } from '../../types';
 
 export const apiRouter = Router();
@@ -137,7 +138,7 @@ function validateSafeStoragePath(candidatePath: string, options: { mustExist?: b
 
     // Allowed storage roots: production permits uploadDir; non-production permits uploadDir and os.tmpdir()
     const allowedRoots = [uploadDir];
-    if (process.env.NODE_ENV !== 'production') {
+    if (!isProductionEnvironment(process.env)) {
       allowedRoots.push(path.resolve(os.tmpdir()));
     }
 
@@ -193,7 +194,7 @@ function isSafeUploadPath(candidatePath: string): boolean {
  * In production or when ENABLE_TEST_ACCOUNT_SWITCH is not true, returns false.
  */
 function isTestSwitchingAllowed(): boolean {
-  return process.env.NODE_ENV !== 'production' && process.env.ENABLE_TEST_ACCOUNT_SWITCH === 'true';
+  return !isProductionEnvironment(process.env) && process.env.ENABLE_TEST_ACCOUNT_SWITCH === 'true';
 }
 
 /**
@@ -276,7 +277,7 @@ export function validateAndGetMediaTokenSecret(env: NodeJS.ProcessEnv = process.
   }
 
   const rawSecret = env.MEDIA_TOKEN_SECRET;
-  const isProd = env.NODE_ENV === 'production';
+  const isProd = isProductionEnvironment(env);
 
   if (typeof rawSecret === 'string' && rawSecret.trim().length > 0) {
     return rawSecret.trim();
@@ -1193,7 +1194,8 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
   let isCoreReady = true;
 
   // 1. Storage repository & persistence mode check
-  const isProd = process.env.NODE_ENV === 'production' || process.env.PAYMENT_MODE === 'production' || process.env.PAYMENT_MODE === 'live';
+  const envSec = resolveEnvironmentSecurity(process.env);
+  const isProd = envSec.isProduction;
 
   try {
     if ((storage as any).db && typeof (storage as any).db.prepare === 'function') {
@@ -1269,11 +1271,33 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
   const isWebhookFormatValid = hasWebhookSecret && webhookValidation.isValid;
   const isKeyFormatValid = isKeyLive || isKeyTest;
 
+  const configuredBaseUrl = billingService.getConfiguredAppBaseUrl();
+  let isOriginHttpsValid = true;
+  if (isProd) {
+    if (!configuredBaseUrl) {
+      isOriginHttpsValid = false;
+    } else {
+      try {
+        const parsedBase = new URL(configuredBaseUrl);
+        isOriginHttpsValid =
+          parsedBase.protocol === 'https:' &&
+          !parsedBase.username &&
+          !parsedBase.password &&
+          !isLoopbackHostname(parsedBase.hostname);
+      } catch {
+        isOriginHttpsValid = false;
+      }
+    }
+  }
+
   let billingStatus: 'healthy' | 'degraded' | 'unhealthy' = 'healthy';
   let billingMessage = 'Billing operational.';
   const billingMode = isKeyLive ? 'live' : (isKeyTest ? 'test' : (hasSecretKey ? 'custom' : 'disabled'));
 
-  if (!hasSecretKey && !hasWebhookSecret) {
+  if (envSec.hasConflict) {
+    billingStatus = 'degraded';
+    billingMessage = envSec.conflicts[0].message;
+  } else if (!hasSecretKey && !hasWebhookSecret) {
     billingStatus = isProd ? 'degraded' : 'healthy';
     billingMessage = isProd
       ? 'Stripe billing credentials unconfigured in production environment.'
@@ -1290,6 +1314,9 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
   } else if (isProd && !isKeyLive) {
     billingStatus = 'degraded';
     billingMessage = 'Production requires Stripe live credentials (sk_live_...), but test key was detected.';
+  } else if (isProd && !isOriginHttpsValid) {
+    billingStatus = 'degraded';
+    billingMessage = 'Production requires a valid non-localhost HTTPS APP_BASE_URL for Stripe checkout and portal redirects.';
   } else {
     billingStatus = 'healthy';
     billingMessage = `Stripe billing ready in ${billingMode} mode.`;
@@ -1300,8 +1327,10 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
     message: billingMessage,
     details: {
       mode: billingMode,
-      checkoutAvailable: hasSecretKey && isKeyFormatValid,
-      webhooksAvailable: hasWebhookSecret && isWebhookFormatValid
+      isProductionMode: isProd,
+      originConfiguredValid: isOriginHttpsValid,
+      checkoutAvailable: hasSecretKey && isKeyFormatValid && !envSec.hasConflict && (!isProd || isOriginHttpsValid),
+      webhooksAvailable: hasWebhookSecret && isWebhookFormatValid && !envSec.hasConflict
     }
   };
 
@@ -1790,7 +1819,7 @@ apiRouter.post('/auth/forgot-password', async (req: Request, res: Response) => {
       await storage.passwordReset.createResetToken(user.id, tokenHash, expiresAt);
 
       // Safe development-only exposure for testing/local verification
-      if (process.env.NODE_ENV !== 'production' || process.env.ENABLE_DEV_RESET_TOKEN === 'true') {
+      if (!isProductionEnvironment(process.env) || process.env.ENABLE_DEV_RESET_TOKEN === 'true') {
         devToken = rawToken;
       }
 
@@ -2054,8 +2083,7 @@ apiRouter.post('/billing/webhook', async (req: Request, res: Response) => {
     const signature = req.headers['stripe-signature'] as string | undefined;
     const rawBody = (req as any).rawBody as Buffer | undefined;
 
-    const paymentMode = process.env.PAYMENT_MODE;
-    const isProd = process.env.NODE_ENV === 'production' || paymentMode === 'production' || paymentMode === 'live';
+    const isProd = isProductionEnvironment(process.env);
 
     if (isProd) {
       if (!signature) {
@@ -2089,8 +2117,8 @@ apiRouter.get('/billing/session-status', async (req: Request, res: Response) => 
       return res.status(400).json({ error: 'sessionId query parameter is required.' });
     }
 
-    const paymentMode = process.env.PAYMENT_MODE;
-    const requireLive = process.env.NODE_ENV === 'production' || paymentMode === 'production' || paymentMode === 'live';
+    const envSec = resolveEnvironmentSecurity(process.env);
+    const requireLive = envSec.isProduction;
 
     if (mode === 'simulation') {
       if (requireLive) {

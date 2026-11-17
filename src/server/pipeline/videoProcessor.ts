@@ -1,16 +1,22 @@
 import { execFile } from 'child_process';
+import { performance } from 'perf_hooks';
 import { promisify } from 'util';
 import path from 'path';
 import fs from 'fs';
+import zlib from 'zlib';
 import { 
   MediaMetadata, 
   ScanMode, 
   DomainAssessmentStatus, 
   DetectorExecutionStatus,
-  DetectorReport 
+  DetectorReport,
+  OcrErrorClassification,
+  PngValidationErrorClass
 } from '../../types';
 
 const execFileAsync = promisify(execFile);
+
+export const defaultMonotonicNowMs = (): number => performance.now();
 
 export type VideoProcessingFailureCategory =
   | 'MISSING_EXECUTABLE'
@@ -184,13 +190,25 @@ export interface OcrFrameDiagnostic {
   validWordCount: number;
   confidenceSummary: { min: number; max: number; mean: number } | null;
   failureCategory?: string;
+  failureClassification?: OcrErrorClassification;
   failureReason?: string;
 }
 
 const MAX_OCR_PNG_DIMENSION = 16384;
 const MAX_OCR_PNG_PIXELS = 67108864; // 64 MP cap
 const MAX_OCR_PNG_CHUNKS = 4096;
+const MAX_OCR_PNG_FILE_BYTES = 32 * 1024 * 1024; // 32 MB compressed file cap
+const MAX_OCR_PNG_INFLATED_BYTES = 64 * 1024 * 1024; // 64 MB decompressed scanline cap
 const PNG_MAGIC_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const ADAM7_PASSES: ReadonlyArray<readonly [number, number, number, number]> = [
+  [0, 0, 8, 8],
+  [0, 4, 8, 8],
+  [4, 0, 8, 4],
+  [0, 2, 4, 4],
+  [2, 0, 4, 2],
+  [0, 1, 2, 2],
+  [1, 0, 2, 1],
+];
 
 const CRC32_TABLE = (() => {
   const table = new Uint32Array(256);
@@ -227,142 +245,435 @@ function isValidPngColorBitDepth(colorType: number, bitDepth: number): boolean {
   }
 }
 
+function getPngChannelsPerPixel(colorType: number): number {
+  switch (colorType) {
+    case 0: return 1;
+    case 2: return 3;
+    case 3: return 1;
+    case 4: return 2;
+    case 6: return 4;
+    default: return 0;
+  }
+}
+
+function computePngScanlineLayout(
+  width: number,
+  height: number,
+  bitDepth: number,
+  colorType: number,
+  interlace: number
+): { expectedBytes: number; scanlineStrides: Array<{ rows: number; stride: number }> } | null {
+  const channels = getPngChannelsPerPixel(colorType);
+  if (channels === 0) return null;
+  const bitsPerPixel = channels * bitDepth;
+  const scanlineStrides: Array<{ rows: number; stride: number }> = [];
+  let expectedBytes = 0;
+
+  if (interlace === 0) {
+    const stride = 1 + Math.ceil((width * bitsPerPixel) / 8);
+    expectedBytes = height * stride;
+    scanlineStrides.push({ rows: height, stride });
+  } else {
+    for (const [startRow, startCol, rowInc, colInc] of ADAM7_PASSES) {
+      const passWidth = width > startCol ? Math.ceil((width - startCol) / colInc) : 0;
+      const passHeight = height > startRow ? Math.ceil((height - startRow) / rowInc) : 0;
+      if (passWidth > 0 && passHeight > 0) {
+        const stride = 1 + Math.ceil((passWidth * bitsPerPixel) / 8);
+        expectedBytes += passHeight * stride;
+        scanlineStrides.push({ rows: passHeight, stride });
+      }
+    }
+  }
+
+  return { expectedBytes, scanlineStrides };
+}
+
 export interface PngFrameValidationResult {
   valid: boolean;
   dimensions: { width: number; height: number } | null;
+  errorClass?: PngValidationErrorClass;
   reason?: string;
 }
 
 /**
- * Strictly validates an extracted PNG frame file before passing it to OCR:
- * - File exists, is a regular readable file, and is non-empty
+ * Full PNG Integrity Validation Contract before passing any frame to OCR:
+ * - File exists, is a regular readable file, is non-empty, and is within size bounds
  * - Exact 8-byte PNG signature
- * - Canonical 13-byte IHDR first chunk with valid dimensions, color/bit-depth, compression, filter, interlace, and CRC-32
- * - Valid chunk framing across the file with at least one non-empty IDAT chunk and a canonical IEND trailer
+ * - Canonical 13-byte IHDR first chunk (single, non-duplicated) with valid dimensions, color/bit-depth, compression, filter, interlace
+ * - CRC-32 checksum verification on EVERY chunk (IHDR, PLTE, IDAT, ancillary, IEND)
+ * - Critical chunk ordering rules (PLTE required for colorType 3 before IDAT, forbidden on 0/4; IDAT chunks strictly contiguous; >= 1 non-empty IDAT)
+ * - Full zlib decompression of concatenated IDAT payload with bounded output length (decompression bomb protection)
+ * - Exact decompressed byte-length verification and scanline filter byte validation (0..4)
+ * - Canonical 0-byte IEND trailer with valid CRC and zero trailing bytes after IEND
  */
 export function validatePngFrameFile(filePath: string): PngFrameValidationResult {
   let stat: fs.Stats;
   try {
     stat = fs.statSync(filePath);
   } catch (err: any) {
-    return { valid: false, dimensions: null, reason: `Extracted frame file is unreadable: ${err?.code || err?.message || 'stat failed'}.` };
+    return {
+      valid: false,
+      dimensions: null,
+      errorClass: 'INVALID_PNG_STRUCTURE',
+      reason: `Extracted frame file is unreadable: ${err?.code || err?.message || 'stat failed'}.`
+    };
   }
 
   if (!stat.isFile()) {
-    return { valid: false, dimensions: null, reason: 'Extracted frame path is not a regular file.' };
+    return {
+      valid: false,
+      dimensions: null,
+      errorClass: 'INVALID_PNG_STRUCTURE',
+      reason: 'Extracted frame path is not a regular file.'
+    };
   }
   if (stat.size <= 0) {
-    return { valid: false, dimensions: null, reason: 'FFmpeg produced empty 0-byte frame image.' };
+    return {
+      valid: false,
+      dimensions: null,
+      errorClass: 'INVALID_PNG_STRUCTURE',
+      reason: 'FFmpeg produced empty 0-byte frame image.'
+    };
+  }
+  if (stat.size > MAX_OCR_PNG_FILE_BYTES) {
+    return {
+      valid: false,
+      dimensions: null,
+      errorClass: 'INVALID_PNG_STRUCTURE',
+      reason: `PNG frame size (${stat.size} bytes) exceeds maximum allowed limit (${MAX_OCR_PNG_FILE_BYTES} bytes).`
+    };
   }
 
-  let fd: number;
+  let buf: Buffer;
   try {
-    fd = fs.openSync(filePath, 'r');
+    buf = fs.readFileSync(filePath);
   } catch (err: any) {
-    return { valid: false, dimensions: null, reason: `Extracted frame file cannot be opened for reading (${err?.code || 'error'}).` };
+    return {
+      valid: false,
+      dimensions: null,
+      errorClass: 'INVALID_PNG_STRUCTURE',
+      reason: `Extracted frame file cannot be opened for reading (${err?.code || 'error'}).`
+    };
   }
 
+  if (buf.length < 8) {
+    return {
+      valid: false,
+      dimensions: null,
+      errorClass: 'INVALID_PNG_STRUCTURE',
+      reason: `Extracted file is too short (${buf.length} bytes) to contain a PNG signature.`
+    };
+  }
+  if (!buf.subarray(0, 8).equals(PNG_MAGIC_BYTES)) {
+    return {
+      valid: false,
+      dimensions: null,
+      errorClass: 'INVALID_PNG_STRUCTURE',
+      reason: 'Extracted frame lacks a valid PNG file signature.'
+    };
+  }
+  if (buf.length < 33) {
+    return {
+      valid: false,
+      dimensions: null,
+      errorClass: 'INVALID_PNG_STRUCTURE',
+      reason: `Extracted PNG is truncated before completing the IHDR chunk (${buf.length} bytes).`
+    };
+  }
+
+  const ihdrLength = buf.readUInt32BE(8);
+  const ihdrTag = buf.subarray(12, 16).toString('ascii');
+  if (ihdrTag !== 'IHDR' || ihdrLength !== 13) {
+    return {
+      valid: false,
+      dimensions: null,
+      errorClass: 'INVALID_PNG_STRUCTURE',
+      reason: `Invalid PNG header chunk: expected 13-byte IHDR, got '${ihdrTag}' (${ihdrLength} bytes).`
+    };
+  }
+
+  const expectedIhdrCrc = buf.readUInt32BE(29) >>> 0;
+  const actualIhdrCrc = computeCrc32(buf.subarray(12, 29));
+  if (expectedIhdrCrc !== actualIhdrCrc) {
+    return {
+      valid: false,
+      dimensions: null,
+      errorClass: 'PNG_CRC_FAILURE',
+      reason: 'Corrupt PNG IHDR checksum (CRC-32 mismatch).'
+    };
+  }
+
+  const width = buf.readUInt32BE(16);
+  const height = buf.readUInt32BE(20);
+  if (width <= 0 || height <= 0 || width > MAX_OCR_PNG_DIMENSION || height > MAX_OCR_PNG_DIMENSION) {
+    return {
+      valid: false,
+      dimensions: null,
+      errorClass: 'INVALID_PNG_STRUCTURE',
+      reason: `Invalid PNG dimensions (${width}x${height}).`
+    };
+  }
+  if (width * height > MAX_OCR_PNG_PIXELS) {
+    return {
+      valid: false,
+      dimensions: null,
+      errorClass: 'INVALID_PNG_STRUCTURE',
+      reason: `PNG pixel area (${width}x${height}) exceeds supported processing limit.`
+    };
+  }
+
+  const bitDepth = buf[24];
+  const colorType = buf[25];
+  const compression = buf[26];
+  const filter = buf[27];
+  const interlace = buf[28];
+
+  if (!isValidPngColorBitDepth(colorType, bitDepth)) {
+    return {
+      valid: false,
+      dimensions: null,
+      errorClass: 'INVALID_PNG_STRUCTURE',
+      reason: `Invalid PNG IHDR colorType/bitDepth (${colorType}/${bitDepth}).`
+    };
+  }
+  if (compression !== 0 || filter !== 0 || (interlace !== 0 && interlace !== 1)) {
+    return {
+      valid: false,
+      dimensions: null,
+      errorClass: 'INVALID_PNG_STRUCTURE',
+      reason: `Invalid PNG IHDR encoding parameters (${compression}/${filter}/${interlace}).`
+    };
+  }
+
+  let offset = 33;
+  let seenPlte = false;
+  let seenIdat = false;
+  let idatFinished = false;
+  let seenIend = false;
+  let chunkCount = 0;
+  const idatChunks: Buffer[] = [];
+
+  while (offset < buf.length) {
+    chunkCount++;
+    if (chunkCount > MAX_OCR_PNG_CHUNKS) {
+      return {
+        valid: false,
+        dimensions: null,
+        errorClass: 'INVALID_PNG_STRUCTURE',
+        reason: `PNG chunk count exceeds supported ceiling (${MAX_OCR_PNG_CHUNKS}).`
+      };
+    }
+    if (offset + 12 > buf.length) {
+      return {
+        valid: false,
+        dimensions: null,
+        errorClass: 'INVALID_PNG_STRUCTURE',
+        reason: 'Truncated PNG chunk structure near end of file.'
+      };
+    }
+
+    const chunkLen = buf.readUInt32BE(offset);
+    const chunkType = buf.subarray(offset + 4, offset + 8).toString('ascii');
+    if (!/^[A-Za-z]{4}$/.test(chunkType)) {
+      return {
+        valid: false,
+        dimensions: null,
+        errorClass: 'INVALID_PNG_STRUCTURE',
+        reason: 'Invalid PNG chunk type identifier.'
+      };
+    }
+    if (chunkLen > 0x7fffffff || offset + 12 + chunkLen > buf.length) {
+      return {
+        valid: false,
+        dimensions: null,
+        errorClass: 'INVALID_PNG_STRUCTURE',
+        reason: `Truncated PNG chunk '${chunkType}' (declared ${chunkLen} bytes exceeds file size).`
+      };
+    }
+
+    // Verify CRC-32 of EVERY chunk
+    const storedChunkCrc = buf.readUInt32BE(offset + 8 + chunkLen) >>> 0;
+    const computedChunkCrc = computeCrc32(buf.subarray(offset + 4, offset + 8 + chunkLen));
+    if (storedChunkCrc !== computedChunkCrc) {
+      return {
+        valid: false,
+        dimensions: null,
+        errorClass: 'PNG_CRC_FAILURE',
+        reason: `Corrupt PNG '${chunkType}' chunk checksum (CRC-32 mismatch).`
+      };
+    }
+
+    if (chunkType === 'IHDR') {
+      return {
+        valid: false,
+        dimensions: null,
+        errorClass: 'INVALID_PNG_STRUCTURE',
+        reason: 'Duplicate PNG IHDR chunk detected.'
+      };
+    }
+
+    if (chunkType === 'PLTE') {
+      if (colorType === 0 || colorType === 4) {
+        return {
+          valid: false,
+          dimensions: null,
+          errorClass: 'INVALID_PNG_STRUCTURE',
+          reason: `Unexpected PLTE chunk for grayscale PNG colorType ${colorType}.`
+        };
+      }
+      if (seenPlte) {
+        return {
+          valid: false,
+          dimensions: null,
+          errorClass: 'INVALID_PNG_STRUCTURE',
+          reason: 'Duplicate PNG PLTE chunk detected.'
+        };
+      }
+      if (seenIdat) {
+        return {
+          valid: false,
+          dimensions: null,
+          errorClass: 'INVALID_PNG_STRUCTURE',
+          reason: 'PNG PLTE chunk cannot appear after IDAT chunk.'
+        };
+      }
+      if (chunkLen === 0 || chunkLen % 3 !== 0 || chunkLen / 3 > 256 || (colorType === 3 && chunkLen / 3 > (1 << bitDepth))) {
+        return {
+          valid: false,
+          dimensions: null,
+          errorClass: 'INVALID_PNG_STRUCTURE',
+          reason: `Invalid PNG PLTE palette length (${chunkLen} bytes for bitDepth ${bitDepth}).`
+        };
+      }
+      seenPlte = true;
+    } else if (chunkType === 'IDAT') {
+      if (idatFinished) {
+        return {
+          valid: false,
+          dimensions: null,
+          errorClass: 'INVALID_PNG_STRUCTURE',
+          reason: 'Non-contiguous PNG IDAT chunks violate critical chunk ordering.'
+        };
+      }
+      if (colorType === 3 && !seenPlte) {
+        return {
+          valid: false,
+          dimensions: null,
+          errorClass: 'INVALID_PNG_STRUCTURE',
+          reason: 'Indexed PNG (colorType 3) missing required PLTE chunk before IDAT.'
+        };
+      }
+      seenIdat = true;
+      if (chunkLen > 0) {
+        idatChunks.push(buf.subarray(offset + 8, offset + 8 + chunkLen));
+      }
+    } else {
+      if (seenIdat) {
+        idatFinished = true;
+      }
+    }
+
+    offset += 12 + chunkLen;
+    if (chunkType === 'IEND') {
+      if (chunkLen !== 0) {
+        return {
+          valid: false,
+          dimensions: null,
+          errorClass: 'INVALID_PNG_STRUCTURE',
+          reason: 'Invalid non-empty PNG IEND chunk.'
+        };
+      }
+      if (offset !== buf.length) {
+        return {
+          valid: false,
+          dimensions: null,
+          errorClass: 'INVALID_PNG_STRUCTURE',
+          reason: `Unexpected trailing data (${buf.length - offset} bytes) after PNG IEND trailer.`
+        };
+      }
+      seenIend = true;
+      break;
+    }
+  }
+
+  if (colorType === 3 && !seenPlte) {
+    return {
+      valid: false,
+      dimensions: null,
+      errorClass: 'INVALID_PNG_STRUCTURE',
+      reason: 'Indexed PNG (colorType 3) missing required PLTE chunk.'
+    };
+  }
+  if (idatChunks.length === 0) {
+    return {
+      valid: false,
+      dimensions: null,
+      errorClass: 'INVALID_PNG_STRUCTURE',
+      reason: 'PNG file contains no non-empty IDAT image data chunk.'
+    };
+  }
+  if (!seenIend) {
+    return {
+      valid: false,
+      dimensions: null,
+      errorClass: 'INVALID_PNG_STRUCTURE',
+      reason: 'Truncated PNG file: missing IEND trailer chunk.'
+    };
+  }
+
+  const layout = computePngScanlineLayout(width, height, bitDepth, colorType, interlace);
+  if (!layout || layout.expectedBytes <= 0 || layout.expectedBytes > MAX_OCR_PNG_INFLATED_BYTES) {
+    return {
+      valid: false,
+      dimensions: null,
+      errorClass: 'PNG_DECOMPRESSION_FAILURE',
+      reason: 'PNG image uncompressed scanline budget exceeds supported memory limit.'
+    };
+  }
+
+  const compressedPayload = idatChunks.length === 1 ? idatChunks[0] : Buffer.concat(idatChunks);
+  let inflated: Buffer;
   try {
-    const headerBuf = Buffer.alloc(33);
-    const bytesRead = fs.readSync(fd, headerBuf, 0, 33, 0);
-    if (bytesRead < 8) {
-      return { valid: false, dimensions: null, reason: `Extracted file is too short (${stat.size} bytes) to contain a PNG signature.` };
-    }
-    if (!headerBuf.subarray(0, 8).equals(PNG_MAGIC_BYTES)) {
-      return { valid: false, dimensions: null, reason: 'Extracted frame lacks a valid PNG file signature.' };
-    }
-    if (bytesRead < 33) {
-      return { valid: false, dimensions: null, reason: `Extracted PNG is truncated before completing the IHDR chunk (${bytesRead} bytes).` };
-    }
-
-    const ihdrLength = headerBuf.readUInt32BE(8);
-    const ihdrTag = headerBuf.subarray(12, 16).toString('ascii');
-    if (ihdrTag !== 'IHDR' || ihdrLength !== 13) {
-      return { valid: false, dimensions: null, reason: `Invalid PNG header chunk: expected 13-byte IHDR, got '${ihdrTag}' (${ihdrLength} bytes).` };
-    }
-
-    const width = headerBuf.readUInt32BE(16);
-    const height = headerBuf.readUInt32BE(20);
-    if (width <= 0 || height <= 0 || width > MAX_OCR_PNG_DIMENSION || height > MAX_OCR_PNG_DIMENSION) {
-      return { valid: false, dimensions: null, reason: `Invalid PNG dimensions (${width}x${height}).` };
-    }
-    if (width * height > MAX_OCR_PNG_PIXELS) {
-      return { valid: false, dimensions: null, reason: `PNG pixel area (${width}x${height}) exceeds supported processing limit.` };
-    }
-
-    const bitDepth = headerBuf[24];
-    const colorType = headerBuf[25];
-    const compression = headerBuf[26];
-    const filter = headerBuf[27];
-    const interlace = headerBuf[28];
-
-    if (!isValidPngColorBitDepth(colorType, bitDepth)) {
-      return { valid: false, dimensions: null, reason: `Invalid PNG IHDR colorType/bitDepth (${colorType}/${bitDepth}).` };
-    }
-    if (compression !== 0 || filter !== 0 || (interlace !== 0 && interlace !== 1)) {
-      return { valid: false, dimensions: null, reason: `Invalid PNG IHDR encoding parameters (${compression}/${filter}/${interlace}).` };
-    }
-
-    const expectedCrc = headerBuf.readUInt32BE(29) >>> 0;
-    const actualCrc = computeCrc32(headerBuf.subarray(12, 29));
-    if (expectedCrc !== actualCrc) {
-      return { valid: false, dimensions: null, reason: 'Corrupt PNG IHDR checksum (CRC-32 mismatch).' };
-    }
-
-    // Validate chunk framing from offset 33 through IEND
-    let offset = 33;
-    let hasIdat = false;
-    let hasIend = false;
-    let chunkCount = 0;
-    const chunkHdr = Buffer.alloc(8);
-
-    while (offset < stat.size && chunkCount < MAX_OCR_PNG_CHUNKS) {
-      chunkCount++;
-      if (offset + 12 > stat.size) {
-        return { valid: false, dimensions: null, reason: 'Truncated PNG chunk structure near end of file.' };
-      }
-      const hdrRead = fs.readSync(fd, chunkHdr, 0, 8, offset);
-      if (hdrRead < 8) {
-        return { valid: false, dimensions: null, reason: 'Unreadable PNG chunk header.' };
-      }
-      const chunkLen = chunkHdr.readUInt32BE(0);
-      const chunkType = chunkHdr.subarray(4, 8).toString('ascii');
-      if (!/^[A-Za-z]{4}$/.test(chunkType)) {
-        return { valid: false, dimensions: null, reason: 'Invalid PNG chunk type identifier.' };
-      }
-      if (chunkLen > 0x7fffffff || offset + 12 + chunkLen > stat.size) {
-        return { valid: false, dimensions: null, reason: `Truncated PNG chunk '${chunkType}' (declared ${chunkLen} bytes exceeds file size).` };
-      }
-      if (chunkType === 'IDAT' && chunkLen > 0) {
-        hasIdat = true;
-      }
-      offset += 12 + chunkLen;
-      if (chunkType === 'IEND') {
-        if (chunkLen !== 0) {
-          return { valid: false, dimensions: null, reason: 'Invalid non-empty PNG IEND chunk.' };
-        }
-        hasIend = true;
-        break;
-      }
-    }
-
-    if (!hasIdat) {
-      return { valid: false, dimensions: null, reason: 'PNG file contains no non-empty IDAT image data chunk.' };
-    }
-    if (!hasIend) {
-      return { valid: false, dimensions: null, reason: 'Truncated PNG file: missing IEND trailer chunk.' };
-    }
-
-    return { valid: true, dimensions: { width, height } };
+    inflated = zlib.inflateSync(compressedPayload, { maxOutputLength: layout.expectedBytes });
   } catch (err: any) {
-    return { valid: false, dimensions: null, reason: `Failed reading PNG frame structure: ${err?.message || 'read error'}.` };
-  } finally {
-    try {
-      fs.closeSync(fd);
-    } catch {
-      // Ignore close error
+    const isBomb = err?.code === 'ERR_BUFFER_TOO_LARGE';
+    return {
+      valid: false,
+      dimensions: null,
+      errorClass: 'PNG_DECOMPRESSION_FAILURE',
+      reason: isBomb
+        ? `PNG IDAT decompression exceeded expected output size (${layout.expectedBytes} bytes; potential decompression bomb).`
+        : `Corrupt PNG IDAT zlib stream: ${err?.message || 'inflateSync failed'}.`
+    };
+  }
+
+  if (inflated.length !== layout.expectedBytes) {
+    return {
+      valid: false,
+      dimensions: null,
+      errorClass: 'PNG_DECOMPRESSION_FAILURE',
+      reason: `Decompressed PNG IDAT byte count mismatch (expected ${layout.expectedBytes}, got ${inflated.length}).`
+    };
+  }
+
+  // Verify PNG scanline filter type bytes (must be 0..4 on every scanline)
+  let cursor = 0;
+  for (const pass of layout.scanlineStrides) {
+    for (let row = 0; row < pass.rows; row++) {
+      const filterByte = inflated[cursor];
+      if (filterByte > 4) {
+        return {
+          valid: false,
+          dimensions: null,
+          errorClass: 'PNG_DECOMPRESSION_FAILURE',
+          reason: `Corrupt PNG scanline filter type byte (${filterByte}) after decompression.`
+        };
+      }
+      cursor += pass.stride;
     }
   }
+
+  return { valid: true, dimensions: { width, height } };
 }
 
 /**
@@ -640,8 +951,6 @@ export class VideoProcessor {
     metadata: MediaMetadata, 
     scanMode: ScanMode
   ): Promise<VideoAnalysisResult> {
-    const startTime = Date.now();
-
     if (!fs.existsSync(videoPath)) {
       throw new VideoProcessingError(`Video file not found at ${videoPath}`, 'INVALID_INPUT');
     }
@@ -799,7 +1108,7 @@ export class VideoProcessor {
       const totalRawFrames = Math.floor(rawFramesBuffer.length / bytesPerFrame);
 
       // 3. Measure scene cut transitions via FFmpeg select gt(scene,0.3)
-      const sceneDetectStart = Date.now();
+      const sceneDetectStart = performance.now();
       const sceneArgs = [
         '-y',
         '-i', videoPath,
@@ -815,7 +1124,7 @@ export class VideoProcessor {
       } catch (err: any) {
         throw classifyFfmpegError(err, 'scene cut detection');
       }
-      const sceneDetectMs = Date.now() - sceneDetectStart;
+      const sceneDetectMs = Math.max(0, Math.round(performance.now() - sceneDetectStart));
 
       // Parse detected scene cut timestamps
       const cutTimestamps: number[] = [];
@@ -854,7 +1163,7 @@ export class VideoProcessor {
 
       // 4. Repeated Footage Detection via Perceptual Frame Comparison
       // Compare non-adjacent frames to find within-video repeated visual material
-      const repetitionStart = Date.now();
+      const repetitionStart = performance.now();
       const repeatedFootageSegments: VideoAnalysisResult['repeatedFootageSegments'] = [];
       const templateRepetitions: VideoAnalysisResult['templateRepetitions'] = [];
       const sampledIntervals: Array<{ start: number; end: number }> = [];
@@ -1224,7 +1533,7 @@ export class VideoProcessor {
         ? 'INSUFFICIENT_EVIDENCE'
         : (templateRepetitions.length > 0 ? 'DETECTED' : 'NO_SIGNAL_DETECTED');
 
-      const repetitionDurationMs = Date.now() - repetitionStart;
+      const repetitionDurationMs = Math.max(0, Math.round(performance.now() - repetitionStart));
       const bitsToHex = (bits: boolean[]): string => {
         let hex = '';
         for (let b = 0; b < bits.length; b += 4) {
@@ -1340,7 +1649,7 @@ export class VideoProcessor {
     } = {}
   ): Promise<AdaptiveAnalysisResult> {
     const baseline = await this.analyzeVideo(videoPath, metadata, scanMode);
-    const overheadStart = Date.now();
+    const overheadStart = performance.now();
     const cuts = baseline.cutTimestamps || [];
 
     if (cuts.length === 0 || !metadata.videoCodec || metadata.width === 0) {
@@ -1353,7 +1662,7 @@ export class VideoProcessor {
         actualAnalyzedFramesCount: 0,
         additionalFramesExtracted: 0,
         sceneCutCoverageRatio: 1.0,
-        candidateOverheadMs: Date.now() - overheadStart,
+        candidateOverheadMs: Math.max(0, Math.round(performance.now() - overheadStart)),
         adaptiveExtractionStatus: 'SKIPPED_NO_CANDIDATES'
       };
     }
@@ -1423,7 +1732,7 @@ export class VideoProcessor {
         actualAnalyzedFramesCount: 0,
         additionalFramesExtracted: 0,
         sceneCutCoverageRatio: cuts.length > 0 ? parseFloat((coveredCuts / cuts.length).toFixed(3)) : 1.0,
-        candidateOverheadMs: Date.now() - overheadStart,
+        candidateOverheadMs: Math.max(0, Math.round(performance.now() - overheadStart)),
         adaptiveExtractionStatus: 'SKIPPED_NO_CANDIDATES'
       };
     }
@@ -1525,7 +1834,7 @@ export class VideoProcessor {
       }
     }
     const sceneCutCoverageRatio = cuts.length > 0 ? parseFloat((coveredCuts / cuts.length).toFixed(3)) : 1.0;
-    const candidateOverheadMs = Date.now() - overheadStart;
+    const candidateOverheadMs = Math.max(0, Math.round(performance.now() - overheadStart));
 
     return {
       ...baseline,
@@ -1558,9 +1867,12 @@ export class VideoProcessor {
       languages?: string;
       timestamps?: number[];
       perFrameTimeoutMs?: number;
+      monotonicNowMs?: () => number;
     }
   ): Promise<import('../../types').VideoOcrResult & { frameDiagnostics?: OcrFrameDiagnostic[] }> {
-    const startTime = Date.now();
+    const getNowMs = typeof options?.monotonicNowMs === 'function' ? options.monotonicNowMs : defaultMonotonicNowMs;
+    const startMonoMs = getNowMs();
+    const getElapsedMs = (): number => Math.max(0, Math.round(getNowMs() - startMonoMs));
     const dur = Math.max(0.1, metadata.durationSeconds || 0.1);
 
     if (!fs.existsSync(videoPath)) {
@@ -1578,6 +1890,7 @@ export class VideoProcessor {
         succeededTimestamps: [],
         limitations: 'Video file does not exist on disk.',
         failureReason: `Video media file not found at ${path.basename(videoPath)}`,
+        failureClassification: 'OCR_INPUT_FAILURE',
         executionDurationMs: 0,
         detectedFrames: [],
         allExtractedText: []
@@ -1624,7 +1937,8 @@ export class VideoProcessor {
         succeededTimestamps: [],
         limitations: 'OCR engine path configured but executable is missing on disk.',
         failureReason: sanitizeOcrDiagnostic(`Configured TESSERACT_PATH not found at ${tesseractPath}`),
-        executionDurationMs: Date.now() - startTime,
+        failureClassification: 'OCR_ENGINE_FAILURE',
+        executionDurationMs: getElapsedMs(),
         detectedFrames: [],
         allExtractedText: []
       };
@@ -1650,7 +1964,7 @@ export class VideoProcessor {
       };
     }
 
-    // Bounded configuration limits with single strict overall deadline
+    // Bounded configuration limits with single strict monotonic overall deadline
     const maxFrames = Math.max(1, Math.min(60, options?.maxFrames || 15));
     const timeoutMs = (typeof options?.timeoutMs === 'number' && Number.isFinite(options.timeoutMs))
       ? Math.max(0, options.timeoutMs)
@@ -1658,8 +1972,8 @@ export class VideoProcessor {
     const perFrameTimeoutMs = (typeof options?.perFrameTimeoutMs === 'number' && Number.isFinite(options.perFrameTimeoutMs))
       ? Math.max(1, options.perFrameTimeoutMs)
       : 10000;
-    const deadlineMs = startTime + timeoutMs;
-    const getRemainingOverallMs = (): number => deadlineMs - Date.now();
+    const deadlineMonoMs = startMonoMs + timeoutMs;
+    const getRemainingOverallMs = (): number => Math.floor(deadlineMonoMs - getNowMs());
     const langs = options?.languages || 'eng+tha';
     const ffmpegBin = process.env.FFMPEG_PATH || 'ffmpeg';
 
@@ -1683,7 +1997,7 @@ export class VideoProcessor {
         fs.mkdirSync(tempOcrDir, { recursive: true });
       }
 
-      // Extract candidate frames to disk via FFmpeg with categorized failure diagnostics & strict deadline enforcement
+      // Extract candidate frames to disk via FFmpeg with categorized failure diagnostics & strict monotonic deadline enforcement
       const extractedFrames: Array<{ timestamp: number; index: number; filePath: string; dimensions: { width: number; height: number } | null }> = [];
       let overallTimedOut = false;
       let perFrameTimedOut = false;
@@ -1691,7 +2005,7 @@ export class VideoProcessor {
       let framesExtractionFailed = 0;
 
       for (let i = 0; i < candidateTimestamps.length; i++) {
-        // Strictly check overall budget immediately before launching each FFmpeg process
+        // Strictly check remaining monotonic budget immediately before launching each FFmpeg process
         const remainingBeforeExtract = getRemainingOverallMs();
         if (remainingBeforeExtract <= 0) {
           overallTimedOut = true;
@@ -1701,7 +2015,7 @@ export class VideoProcessor {
         const ts = candidateTimestamps[i];
         const outName = `frame_${i.toString().padStart(3, '0')}.png`;
         const outPath = path.join(tempOcrDir, outName);
-        const effectiveExtractTimeoutMs = Math.min(perFrameTimeoutMs, remainingBeforeExtract);
+        const effectiveExtractTimeoutMs = Math.max(1, Math.min(perFrameTimeoutMs, remainingBeforeExtract));
 
         try {
           await execFileAsync(ffmpegBin, [
@@ -1729,6 +2043,7 @@ export class VideoProcessor {
               validWordCount: 0,
               confidenceSummary: null,
               failureCategory: 'MISSING_OUTPUT',
+              failureClassification: 'OCR_INPUT_FAILURE',
               failureReason: reason
             });
             if (extractionErrors.length < MAX_DIAGNOSTIC_ERRORS) {
@@ -1736,6 +2051,7 @@ export class VideoProcessor {
                 frameIndex: i,
                 timestamp: ts,
                 category: 'MISSING_OUTPUT',
+                classification: 'OCR_INPUT_FAILURE',
                 reason
               });
             }
@@ -1743,7 +2059,8 @@ export class VideoProcessor {
             const pngValidation = validatePngFrameFile(outPath);
             if (!pngValidation.valid || !pngValidation.dimensions) {
               framesExtractionFailed++;
-              const reason = sanitizeReason(`${pngValidation.reason || 'Invalid extracted PNG frame.'} (at ${ts}s)`);
+              const pngErrClass: PngValidationErrorClass = pngValidation.errorClass || 'INVALID_PNG_STRUCTURE';
+              const reason = sanitizeReason(`[${pngErrClass}] ${pngValidation.reason || 'Invalid extracted PNG frame.'} (at ${ts}s)`);
               frameDiagnosticsByIndex.set(i, {
                 frameIndex: i,
                 timestamp: ts,
@@ -1756,6 +2073,7 @@ export class VideoProcessor {
                 validWordCount: 0,
                 confidenceSummary: null,
                 failureCategory: 'EMPTY_OUTPUT',
+                failureClassification: pngErrClass,
                 failureReason: reason
               });
               if (extractionErrors.length < MAX_DIAGNOSTIC_ERRORS) {
@@ -1763,6 +2081,7 @@ export class VideoProcessor {
                   frameIndex: i,
                   timestamp: ts,
                   category: 'EMPTY_OUTPUT',
+                  classification: pngErrClass,
                   reason
                 });
               }
@@ -1811,6 +2130,7 @@ export class VideoProcessor {
                 : exitCode !== null
                   ? 'NON_ZERO_EXIT'
                   : 'UNKNOWN_ERROR';
+          const classification: OcrErrorClassification = isTimeout ? 'OCR_TIMEOUT' : 'OCR_INPUT_FAILURE';
 
           const stderrLine = String(extErr?.stderr || extErr?.message || 'FFmpeg extraction failed')
             .split(/\r?\n/)
@@ -1842,6 +2162,7 @@ export class VideoProcessor {
             validWordCount: 0,
             confidenceSummary: null,
             failureCategory: category,
+            failureClassification: classification,
             failureReason: sanitized
           });
 
@@ -1850,6 +2171,7 @@ export class VideoProcessor {
               frameIndex: i,
               timestamp: ts,
               category,
+              classification,
               reason: sanitized
             });
           }
@@ -1889,6 +2211,7 @@ export class VideoProcessor {
         return {
           status: overallTimedOut ? 'INSUFFICIENT_EVIDENCE' : 'ANALYSIS_UNAVAILABLE',
           executionStatus: overallTimedOut ? 'FAILED' : 'UNAVAILABLE',
+          failureClassification: overallTimedOut ? 'OCR_TIMEOUT' : 'OCR_INPUT_FAILURE',
           framesInspected: 0,
           totalCandidateFrames,
           coverageRatio: 0,
@@ -1912,9 +2235,9 @@ export class VideoProcessor {
           isPartial: true,
           limitations: overallTimedOut
             ? `Overall OCR execution budget (${timeoutMs}ms) expired before any frames completed analysis; continuous temporal interval coverage not verified.`
-            : 'Failed to extract video frames for OCR analysis; continuous temporal interval coverage not verified.',
+            : 'Failed to extract valid PNG video frames for OCR analysis; continuous temporal interval coverage not verified.',
           failureReason: zeroExtractedFailure,
-          executionDurationMs: Date.now() - startTime,
+          executionDurationMs: getElapsedMs(),
           detectedFrames: [],
           allExtractedText: []
         };
@@ -1933,7 +2256,7 @@ export class VideoProcessor {
       const succeededTimestamps: number[] = [];
 
       for (const ef of extractedFrames) {
-        // Strictly check remaining overall budget immediately before starting each Tesseract process
+        // Strictly check remaining monotonic budget immediately before starting each Tesseract process
         const remainingBeforeOcr = getRemainingOverallMs();
         if (remainingBeforeOcr <= 0) {
           overallTimedOut = true;
@@ -1954,7 +2277,7 @@ export class VideoProcessor {
           confidenceSummary: null
         };
 
-        const effectiveOcrTimeoutMs = Math.min(15000, remainingBeforeOcr);
+        const effectiveOcrTimeoutMs = Math.max(1, Math.min(perFrameTimeoutMs, 15000, remainingBeforeOcr));
 
         try {
           const { stdout } = await execFileAsync(
@@ -1972,6 +2295,7 @@ export class VideoProcessor {
             diag.tesseractSuccess = false;
             diag.tsvValid = false;
             diag.failureCategory = 'INVALID_OUTPUT';
+            diag.failureClassification = 'OCR_ENGINE_FAILURE';
             diag.failureReason = sanitizeReason(tsvValidation.error || 'Invalid TSV structure');
             frameDiagnosticsByIndex.set(ef.index, diag);
             if (ocrErrors.length < MAX_DIAGNOSTIC_ERRORS) {
@@ -2028,7 +2352,8 @@ export class VideoProcessor {
             errCodeStr === 'ETIMEDOUT' ||
             /timed?\s*out/i.test(String(ocrErr?.message || ''))
           );
-          const hitOverallBudget = isTimeout && (getRemainingOverallMs() <= 0 || effectiveOcrTimeoutMs < 15000);
+          const ocrFrameCapMs = Math.min(perFrameTimeoutMs, 15000);
+          const hitOverallBudget = isTimeout && (getRemainingOverallMs() <= 0 || effectiveOcrTimeoutMs < ocrFrameCapMs);
           if (hitOverallBudget) {
             overallTimedOut = true;
           } else if (isTimeout) {
@@ -2047,6 +2372,7 @@ export class VideoProcessor {
                 : exitCode !== null
                   ? 'NON_ZERO_EXIT'
                   : 'UNKNOWN_ERROR';
+          diag.failureClassification = isTimeout ? 'OCR_TIMEOUT' : 'OCR_ENGINE_FAILURE';
           const rawOcrErrMsg = hitOverallBudget
             ? `Overall OCR execution budget (${timeoutMs}ms) expired during OCR at ${ef.timestamp}s.`
             : isTimeout
@@ -2133,9 +2459,18 @@ export class VideoProcessor {
         ? sanitizeOcrDiagnostic(failureParts.join(' | '), 280)
         : undefined;
 
+      const failureClassification: OcrErrorClassification | undefined = executionTimedOut
+        ? 'OCR_TIMEOUT'
+        : framesOcrFailed > 0
+          ? 'OCR_ENGINE_FAILURE'
+          : framesExtractionFailed > 0
+            ? (extractionErrors[0]?.classification || 'OCR_INPUT_FAILURE')
+            : undefined;
+
       return {
         status,
         executionStatus,
+        failureClassification,
         framesInspected: framesSucceeded,
         totalCandidateFrames,
         coverageRatio,
@@ -2159,7 +2494,7 @@ export class VideoProcessor {
         isPartial,
         limitations,
         failureReason,
-        executionDurationMs: Date.now() - startTime,
+        executionDurationMs: getElapsedMs(),
         detectedFrames,
         allExtractedText: Array.from(allExtractedTextSet)
       };
