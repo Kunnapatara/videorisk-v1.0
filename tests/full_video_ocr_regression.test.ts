@@ -9,7 +9,8 @@ import {
   validateTesseractTsv,
   validatePngFrameFile,
   sanitizeOcrDiagnostic,
-  defaultMonotonicNowMs
+  defaultMonotonicNowMs,
+  MAX_OCR_PNG_ICCP_INFLATED_BYTES
 } from '../src/server/pipeline/videoProcessor';
 import { MediaMetadata } from '../src/types';
 
@@ -867,8 +868,452 @@ exit 0
 
     delete process.env.FFMPEG_PATH;
     process.env.TESSERACT_PATH = '/usr/bin/tesseract';
+
+    // -------------------------------------------------------------------------
+    // C4.1 – C4.6: Full PNG Semantic Validation (tRNS, sBIT, gAMA, iCCP, bKGD, Mutual Exclusion)
+    // -------------------------------------------------------------------------
+    const mkCustomPng = (
+      name: string,
+      ihdr: { w: number; h: number; bd: number; ct: number },
+      extraChunks: Array<{ type: string; data: Buffer }>,
+      idatRawScanlines: Buffer
+    ) => {
+      const p = path.resolve(testDir, name);
+      fs.writeFileSync(
+        p,
+        Buffer.concat([
+          PNG_SIG,
+          mkPngChunk('IHDR', mkIhdr(ihdr.w, ihdr.h, ihdr.bd, ihdr.ct)),
+          ...extraChunks.map((c) => mkPngChunk(c.type, c.data)),
+          mkPngChunk('IDAT', zlib.deflateSync(idatRawScanlines)),
+          mkPngChunk('IEND', Buffer.alloc(0))
+        ])
+      );
+      return p;
+    };
+
+    const u16be = (vals: number[]): Buffer => {
+      const out = Buffer.alloc(vals.length * 2);
+      vals.forEach((v, i) => out.writeUInt16BE(v, i * 2));
+      return out;
+    };
+
+    // C4.1 tRNS sample bit-depth bounds, forbidden alpha types, ordering, duplicates
+    assert.strictEqual(
+      validatePngFrameFile(mkCustomPng('c41_gray4_trns_max.png', { w: 1, h: 1, bd: 4, ct: 0 }, [{ type: 'tRNS', data: u16be([15]) }], Buffer.from([0, 0x10]))).valid,
+      true,
+      'D2.43a tRNS grayscale 4-bit legal max 15 accepted'
+    );
+    const trnsGray4Oob = validatePngFrameFile(
+      mkCustomPng('c41_gray4_trns_oob.png', { w: 1, h: 1, bd: 4, ct: 0 }, [{ type: 'tRNS', data: u16be([16]) }], Buffer.from([0, 0x10]))
+    );
+    assert.strictEqual(trnsGray4Oob.valid, false, 'D2.43b tRNS grayscale 4-bit 16 rejected');
+    assert.strictEqual(trnsGray4Oob.errorClass, 'INVALID_PNG_STRUCTURE');
+
+    assert.strictEqual(
+      validatePngFrameFile(mkCustomPng('c41_gray16_trns_max.png', { w: 1, h: 1, bd: 16, ct: 0 }, [{ type: 'tRNS', data: u16be([65535]) }], Buffer.from([0, 0, 0]))).valid,
+      true,
+      'D2.43c tRNS grayscale 16-bit max 65535 accepted'
+    );
+    assert.strictEqual(
+      validatePngFrameFile(mkCustomPng('c41_rgb8_trns_max.png', { w: 1, h: 1, bd: 8, ct: 2 }, [{ type: 'tRNS', data: u16be([0, 255, 128]) }], Buffer.from([0, 1, 2, 3]))).valid,
+      true,
+      'D2.43d tRNS RGB 8-bit legal max 255 accepted'
+    );
+    assert.strictEqual(
+      validatePngFrameFile(mkCustomPng('c41_rgb8_trns_oob.png', { w: 1, h: 1, bd: 8, ct: 2 }, [{ type: 'tRNS', data: u16be([0, 256, 0]) }], Buffer.from([0, 1, 2, 3]))).valid,
+      false,
+      'D2.43e tRNS RGB 8-bit sample 256 rejected'
+    );
+    assert.strictEqual(
+      validatePngFrameFile(mkCustomPng('c41_gray_alpha_trns.png', { w: 1, h: 1, bd: 8, ct: 4 }, [{ type: 'tRNS', data: u16be([0]) }], Buffer.from([0, 10, 255]))).valid,
+      false,
+      'D2.43f tRNS forbidden on grayscale+alpha colorType 4'
+    );
+    assert.strictEqual(
+      validatePngFrameFile(
+        mkCustomPng(
+          'c41_dup_trns.png',
+          { w: 1, h: 1, bd: 8, ct: 3 },
+          [
+            { type: 'PLTE', data: Buffer.from([0, 0, 0, 255, 255, 255]) },
+            { type: 'tRNS', data: Buffer.from([255]) },
+            { type: 'tRNS', data: Buffer.from([128]) }
+          ],
+          Buffer.from([0, 0])
+        )
+      ).valid,
+      false,
+      'D2.43g Duplicate tRNS rejected'
+    );
+    const trnsAfterIdatFile = path.resolve(testDir, 'c41_trns_after_idat.png');
+    fs.writeFileSync(
+      trnsAfterIdatFile,
+      Buffer.concat([
+        PNG_SIG,
+        mkPngChunk('IHDR', mkIhdr(1, 1, 8, 0)),
+        mkPngChunk('IDAT', zlib.deflateSync(Buffer.from([0, 42]))),
+        mkPngChunk('tRNS', u16be([0])),
+        mkPngChunk('IEND', Buffer.alloc(0))
+      ])
+    );
+    assert.strictEqual(validatePngFrameFile(trnsAfterIdatFile).valid, false, 'D2.43h tRNS after IDAT rejected');
+
+    // C4.2 sBIT across all supported colorTypes (0, 2, 3, 4, 6)
+    const sbitValidCases: Array<{ ct: number; bd: number; sbit: number[]; raw: number[]; extra?: Array<{ type: string; data: Buffer }> }> = [
+      { ct: 0, bd: 4, sbit: [4], raw: [0, 0x10] },
+      { ct: 2, bd: 8, sbit: [5, 6, 5], raw: [0, 1, 2, 3] },
+      { ct: 3, bd: 4, sbit: [8, 8, 8], raw: [0, 0x00], extra: [{ type: 'PLTE', data: Buffer.from([0, 0, 0]) }] },
+      { ct: 4, bd: 8, sbit: [8, 1], raw: [0, 10, 255] },
+      { ct: 6, bd: 16, sbit: [12, 12, 12, 16], raw: [0, 0, 1, 0, 2, 0, 3, 0, 4] }
+    ];
+    for (const sc of sbitValidCases) {
+      const res = validatePngFrameFile(
+        mkCustomPng(
+          `c42_sbit_valid_ct${sc.ct}_bd${sc.bd}.png`,
+          { w: 1, h: 1, bd: sc.bd, ct: sc.ct },
+          [{ type: 'sBIT', data: Buffer.from(sc.sbit) }, ...(sc.extra || [])],
+          Buffer.from(sc.raw)
+        )
+      );
+      assert.strictEqual(res.valid, true, `D2.44a Valid sBIT accepted for colorType=${sc.ct}, bitDepth=${sc.bd}`);
+    }
+    for (const badSbit of [
+      { label: 'zero_gray', ct: 0, bd: 8, sbit: [0], raw: [0, 42] },
+      { label: 'oob_gray4', ct: 0, bd: 4, sbit: [5], raw: [0, 0x10] },
+      { label: 'wrong_len_gray', ct: 0, bd: 8, sbit: [8, 8], raw: [0, 42] },
+      { label: 'zero_rgb', ct: 2, bd: 8, sbit: [8, 0, 8], raw: [0, 1, 2, 3] },
+      { label: 'oob_rgb', ct: 2, bd: 8, sbit: [8, 9, 8], raw: [0, 1, 2, 3] },
+      { label: 'oob_indexed_plte8', ct: 3, bd: 4, sbit: [8, 9, 8], raw: [0, 0x00], extra: [{ type: 'PLTE', data: Buffer.from([0, 0, 0]) }] },
+      { label: 'oob_grayalpha', ct: 4, bd: 8, sbit: [8, 9], raw: [0, 10, 255] },
+      { label: 'oob_rgba', ct: 6, bd: 8, sbit: [8, 8, 8, 9], raw: [0, 1, 2, 3, 255] },
+      { label: 'wrong_len_rgba', ct: 6, bd: 8, sbit: [8, 8, 8], raw: [0, 1, 2, 3, 255] }
+    ]) {
+      const res = validatePngFrameFile(
+        mkCustomPng(
+          `c42_sbit_bad_${badSbit.label}.png`,
+          { w: 1, h: 1, bd: badSbit.bd, ct: badSbit.ct },
+          [{ type: 'sBIT', data: Buffer.from(badSbit.sbit) }, ...(badSbit.extra || [])],
+          Buffer.from(badSbit.raw)
+        )
+      );
+      assert.strictEqual(res.valid, false, `D2.44b Invalid sBIT rejected (${badSbit.label})`);
+      assert.strictEqual(res.errorClass, 'INVALID_PNG_STRUCTURE');
+    }
+    assert.strictEqual(
+      validatePngFrameFile(
+        mkCustomPng(
+          'c42_sbit_after_plte.png',
+          { w: 1, h: 1, bd: 8, ct: 3 },
+          [
+            { type: 'PLTE', data: Buffer.from([0, 0, 0]) },
+            { type: 'sBIT', data: Buffer.from([8, 8, 8]) }
+          ],
+          Buffer.from([0, 0])
+        )
+      ).valid,
+      false,
+      'D2.44c sBIT after PLTE rejected'
+    );
+
+    // C4.3 gAMA
+    const mkGama = (val: number): Buffer => {
+      const b = Buffer.alloc(4);
+      b.writeUInt32BE(val >>> 0, 0);
+      return b;
+    };
+    assert.strictEqual(
+      validatePngFrameFile(mkCustomPng('c43_gama_std.png', { w: 1, h: 1, bd: 8, ct: 2 }, [{ type: 'gAMA', data: mkGama(45455) }], Buffer.from([0, 1, 2, 3]))).valid,
+      true,
+      'D2.45a Valid gAMA 45455 accepted'
+    );
+    assert.strictEqual(
+      validatePngFrameFile(mkCustomPng('c43_gama_1.png', { w: 1, h: 1, bd: 8, ct: 2 }, [{ type: 'gAMA', data: mkGama(1) }], Buffer.from([0, 1, 2, 3]))).valid,
+      true,
+      'D2.45b Valid small nonzero gAMA 1 accepted without arbitrary range restriction'
+    );
+    assert.strictEqual(
+      validatePngFrameFile(mkCustomPng('c43_gama_maxu32.png', { w: 1, h: 1, bd: 8, ct: 2 }, [{ type: 'gAMA', data: mkGama(0xffffffff) }], Buffer.from([0, 1, 2, 3]))).valid,
+      true,
+      'D2.45c Valid large uint32 gAMA accepted'
+    );
+    const gamaZero = validatePngFrameFile(
+      mkCustomPng('c43_gama_zero.png', { w: 1, h: 1, bd: 8, ct: 2 }, [{ type: 'gAMA', data: mkGama(0) }], Buffer.from([0, 1, 2, 3]))
+    );
+    assert.strictEqual(gamaZero.valid, false, 'D2.45d Zero gAMA rejected');
+    assert.strictEqual(gamaZero.errorClass, 'INVALID_PNG_STRUCTURE');
+    assert.strictEqual(
+      validatePngFrameFile(mkCustomPng('c43_gama_badlen.png', { w: 1, h: 1, bd: 8, ct: 2 }, [{ type: 'gAMA', data: Buffer.from([0, 1, 2]) }], Buffer.from([0, 1, 2, 3]))).valid,
+      false,
+      'D2.45e Invalid gAMA length rejected'
+    );
+
+    // C4.4 iCCP (profile name, NUL terminator, compression method, compressed stream, output limit, trailing data, ordering)
+    const sampleIccProfile = Buffer.from('00000080test_icc_profile_payload_videorisk');
+    const compressedIccProfile = zlib.deflateSync(sampleIccProfile);
+    const mkIccpPayload = (nameBuf: Buffer, method: number | null, compressedStream: Buffer, withNul = true): Buffer => {
+      const parts: Buffer[] = [nameBuf];
+      if (withNul) parts.push(Buffer.from([0x00]));
+      if (method !== null) parts.push(Buffer.from([method]));
+      parts.push(compressedStream);
+      return Buffer.concat(parts);
+    };
+
+    assert.strictEqual(
+      validatePngFrameFile(
+        mkCustomPng(
+          'c44_iccp_valid.png',
+          { w: 1, h: 1, bd: 8, ct: 2 },
+          [{ type: 'iCCP', data: mkIccpPayload(Buffer.from('sRGB IEC61966-2.1'), 0, compressedIccProfile) }],
+          Buffer.from([0, 1, 2, 3])
+        )
+      ).valid,
+      true,
+      'D2.46a Valid bounded iCCP chunk accepted'
+    );
+    assert.strictEqual(
+      validatePngFrameFile(
+        mkCustomPng(
+          'c44_iccp_missing_nul.png',
+          { w: 1, h: 1, bd: 8, ct: 2 },
+          [{ type: 'iCCP', data: Buffer.concat([Buffer.from('ProfileNoNul'), compressedIccProfile]) }],
+          Buffer.from([0, 1, 2, 3])
+        )
+      ).valid,
+      false,
+      'D2.46b iCCP without NUL terminator rejected'
+    );
+    assert.strictEqual(
+      validatePngFrameFile(
+        mkCustomPng(
+          'c44_iccp_empty_name.png',
+          { w: 1, h: 1, bd: 8, ct: 2 },
+          [{ type: 'iCCP', data: mkIccpPayload(Buffer.alloc(0), 0, compressedIccProfile) }],
+          Buffer.from([0, 1, 2, 3])
+        )
+      ).valid,
+      false,
+      'D2.46c iCCP with empty name rejected'
+    );
+    assert.strictEqual(
+      validatePngFrameFile(
+        mkCustomPng(
+          'c44_iccp_80char_name.png',
+          { w: 1, h: 1, bd: 8, ct: 2 },
+          [{ type: 'iCCP', data: mkIccpPayload(Buffer.alloc(80, 0x41), 0, compressedIccProfile) }],
+          Buffer.from([0, 1, 2, 3])
+        )
+      ).valid,
+      false,
+      'D2.46d iCCP name > 79 chars rejected'
+    );
+    for (const [nameLabel, badName] of [
+      ['leading_space', Buffer.from(' LeadingSpace')],
+      ['trailing_space', Buffer.from('TrailingSpace ')],
+      ['double_space', Buffer.from('Double  Space')],
+      ['control_char', Buffer.from('Ctrl\x07Name')],
+      ['del_char', Buffer.from('Del\x7fName')],
+      ['nbsp_0xa0', Buffer.from([0x41, 0xa0, 0x42])]
+    ] as Array<[string, Buffer]>) {
+      assert.strictEqual(
+        validatePngFrameFile(
+          mkCustomPng(
+            `c44_iccp_badname_${nameLabel}.png`,
+            { w: 1, h: 1, bd: 8, ct: 2 },
+            [{ type: 'iCCP', data: mkIccpPayload(badName, 0, compressedIccProfile) }],
+            Buffer.from([0, 1, 2, 3])
+          )
+        ).valid,
+        false,
+        `D2.46e iCCP invalid name (${nameLabel}) rejected`
+      );
+    }
+    assert.strictEqual(
+      validatePngFrameFile(
+        mkCustomPng(
+          'c44_iccp_bad_method.png',
+          { w: 1, h: 1, bd: 8, ct: 2 },
+          [{ type: 'iCCP', data: mkIccpPayload(Buffer.from('Profile'), 1, compressedIccProfile) }],
+          Buffer.from([0, 1, 2, 3])
+        )
+      ).valid,
+      false,
+      'D2.46f iCCP unsupported compression method 1 rejected'
+    );
+    const iccpTruncRes = validatePngFrameFile(
+      mkCustomPng(
+        'c44_iccp_trunc_zlib.png',
+        { w: 1, h: 1, bd: 8, ct: 2 },
+        [{ type: 'iCCP', data: mkIccpPayload(Buffer.from('Profile'), 0, compressedIccProfile.subarray(0, compressedIccProfile.length - 3)) }],
+        Buffer.from([0, 1, 2, 3])
+      )
+    );
+    assert.strictEqual(iccpTruncRes.valid, false, 'D2.46g iCCP truncated compressed stream rejected');
+    assert.strictEqual(iccpTruncRes.errorClass, 'PNG_DECOMPRESSION_FAILURE');
+
+    const iccpTrailRes = validatePngFrameFile(
+      mkCustomPng(
+        'c44_iccp_trailing_bytes.png',
+        { w: 1, h: 1, bd: 8, ct: 2 },
+        [{ type: 'iCCP', data: mkIccpPayload(Buffer.from('Profile'), 0, Buffer.concat([compressedIccProfile, Buffer.from([0x00])])) }],
+        Buffer.from([0, 1, 2, 3])
+      )
+    );
+    assert.strictEqual(iccpTrailRes.valid, false, 'D2.46h iCCP trailing byte after zlib stream rejected');
+    assert.strictEqual(iccpTrailRes.errorClass, 'PNG_DECOMPRESSION_FAILURE');
+
+    const iccpBombRes = validatePngFrameFile(
+      mkCustomPng(
+        'c44_iccp_bomb.png',
+        { w: 1, h: 1, bd: 8, ct: 2 },
+        [
+          {
+            type: 'iCCP',
+            data: mkIccpPayload(
+              Buffer.from('BombProfile'),
+              0,
+              zlib.deflateSync(Buffer.alloc(MAX_OCR_PNG_ICCP_INFLATED_BYTES + 1))
+            )
+          }
+        ],
+        Buffer.from([0, 1, 2, 3])
+      )
+    );
+    assert.strictEqual(iccpBombRes.valid, false, 'D2.46i iCCP excessive decompressed output rejected');
+    assert.strictEqual(iccpBombRes.errorClass, 'PNG_DECOMPRESSION_FAILURE');
+
+    // C4.5 bKGD across colorTypes 0, 2, 3, 4, 6 with boundary checks
+    assert.strictEqual(
+      validatePngFrameFile(mkCustomPng('c45_bkgd_gray4_ok.png', { w: 1, h: 1, bd: 4, ct: 0 }, [{ type: 'bKGD', data: u16be([15]) }], Buffer.from([0, 0x10]))).valid,
+      true,
+      'D2.47a bKGD grayscale 4-bit legal max 15 accepted'
+    );
+    assert.strictEqual(
+      validatePngFrameFile(mkCustomPng('c45_bkgd_gray4_oob.png', { w: 1, h: 1, bd: 4, ct: 0 }, [{ type: 'bKGD', data: u16be([16]) }], Buffer.from([0, 0x10]))).valid,
+      false,
+      'D2.47b bKGD grayscale 4-bit 16 rejected'
+    );
+    assert.strictEqual(
+      validatePngFrameFile(mkCustomPng('c45_bkgd_grayalpha8_ok.png', { w: 1, h: 1, bd: 8, ct: 4 }, [{ type: 'bKGD', data: u16be([255]) }], Buffer.from([0, 10, 255]))).valid,
+      true,
+      'D2.47c bKGD gray+alpha 8-bit legal max 255 accepted'
+    );
+    assert.strictEqual(
+      validatePngFrameFile(mkCustomPng('c45_bkgd_grayalpha8_oob.png', { w: 1, h: 1, bd: 8, ct: 4 }, [{ type: 'bKGD', data: u16be([256]) }], Buffer.from([0, 10, 255]))).valid,
+      false,
+      'D2.47d bKGD gray+alpha 8-bit 256 rejected'
+    );
+    assert.strictEqual(
+      validatePngFrameFile(mkCustomPng('c45_bkgd_rgb8_ok.png', { w: 1, h: 1, bd: 8, ct: 2 }, [{ type: 'bKGD', data: u16be([255, 128, 0]) }], Buffer.from([0, 1, 2, 3]))).valid,
+      true,
+      'D2.47e bKGD RGB 8-bit legal max 255 accepted'
+    );
+    assert.strictEqual(
+      validatePngFrameFile(mkCustomPng('c45_bkgd_rgb8_oob.png', { w: 1, h: 1, bd: 8, ct: 2 }, [{ type: 'bKGD', data: u16be([0, 0, 256]) }], Buffer.from([0, 1, 2, 3]))).valid,
+      false,
+      'D2.47f bKGD RGB 8-bit 256 rejected'
+    );
+    assert.strictEqual(
+      validatePngFrameFile(mkCustomPng('c45_bkgd_rgba16_ok.png', { w: 1, h: 1, bd: 16, ct: 6 }, [{ type: 'bKGD', data: u16be([65535, 0, 65535]) }], Buffer.from([0, 0, 1, 0, 2, 0, 3, 0, 4]))).valid,
+      true,
+      'D2.47g bKGD RGBA 16-bit max 65535 accepted'
+    );
+    assert.strictEqual(
+      validatePngFrameFile(
+        mkCustomPng(
+          'c45_bkgd_idx_ok.png',
+          { w: 1, h: 1, bd: 8, ct: 3 },
+          [
+            { type: 'PLTE', data: Buffer.from([0, 0, 0, 255, 255, 255]) },
+            { type: 'bKGD', data: Buffer.from([1]) }
+          ],
+          Buffer.from([0, 0])
+        )
+      ).valid,
+      true,
+      'D2.47h bKGD indexed boundary index (1 < 2) accepted'
+    );
+    assert.strictEqual(
+      validatePngFrameFile(
+        mkCustomPng(
+          'c45_bkgd_idx_oob.png',
+          { w: 1, h: 1, bd: 8, ct: 3 },
+          [
+            { type: 'PLTE', data: Buffer.from([0, 0, 0, 255, 255, 255]) },
+            { type: 'bKGD', data: Buffer.from([2]) }
+          ],
+          Buffer.from([0, 0])
+        )
+      ).valid,
+      false,
+      'D2.47i bKGD indexed out-of-range index (2 >= 2) rejected'
+    );
+    assert.strictEqual(
+      validatePngFrameFile(
+        mkCustomPng(
+          'c45_bkgd_before_plte.png',
+          { w: 1, h: 1, bd: 8, ct: 2 },
+          [
+            { type: 'bKGD', data: u16be([0, 0, 0]) },
+            { type: 'PLTE', data: Buffer.from([0, 0, 0]) }
+          ],
+          Buffer.from([0, 1, 2, 3])
+        )
+      ).valid,
+      false,
+      'D2.47j bKGD before optional PLTE rejected'
+    );
+
+    // C4.6 Mutual Exclusion (iCCP vs sRGB in both orders) + valid sRGB+gAMA+cHRM coexistence
+    assert.strictEqual(
+      validatePngFrameFile(
+        mkCustomPng(
+          'c46_iccp_then_srgb.png',
+          { w: 1, h: 1, bd: 8, ct: 2 },
+          [
+            { type: 'iCCP', data: mkIccpPayload(Buffer.from('Profile'), 0, compressedIccProfile) },
+            { type: 'sRGB', data: Buffer.from([0]) }
+          ],
+          Buffer.from([0, 1, 2, 3])
+        )
+      ).valid,
+      false,
+      'D2.48a iCCP followed by sRGB rejected'
+    );
+    assert.strictEqual(
+      validatePngFrameFile(
+        mkCustomPng(
+          'c46_srgb_then_iccp.png',
+          { w: 1, h: 1, bd: 8, ct: 2 },
+          [
+            { type: 'sRGB', data: Buffer.from([0]) },
+            { type: 'iCCP', data: mkIccpPayload(Buffer.from('Profile'), 0, compressedIccProfile) }
+          ],
+          Buffer.from([0, 1, 2, 3])
+        )
+      ).valid,
+      false,
+      'D2.48b sRGB followed by iCCP rejected'
+    );
+    assert.strictEqual(
+      validatePngFrameFile(
+        mkCustomPng(
+          'c46_srgb_gama_chrm_valid.png',
+          { w: 1, h: 1, bd: 8, ct: 2 },
+          [
+            { type: 'sRGB', data: Buffer.from([0]) },
+            { type: 'gAMA', data: mkGama(45455) },
+            { type: 'cHRM', data: Buffer.alloc(32, 1) }
+          ],
+          Buffer.from([0, 1, 2, 3])
+        )
+      ).valid,
+      true,
+      'D2.48c sRGB + gAMA + cHRM legal PNG spec coexistence accepted'
+    );
+
     assertNoTempOcrDirLeak('D2.c1_c4.cleanup');
-    console.log('  ✅ PASS: Full PNG integrity (C1-C4: signature, IHDR, critical/ancillary, reserved bit, complete zlib consumption, PLTE/tRNS/indexed bounds, zero trailing bytes) verified');
+    console.log('  ✅ PASS: Full PNG integrity (C1-C4 & C4.1-C4.6 semantic validation: tRNS, sBIT, gAMA, iCCP, bKGD, mutual exclusion) verified');
 
     // -------------------------------------------------------------------------
     // J. STRICT OVERALL TIMEOUT BUDGET ENFORCEMENT

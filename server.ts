@@ -4,22 +4,31 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { apiRouter, configureTrustProxy, secureUploadsHandler, validateAndGetMediaTokenSecret } from './src/server/routes/api';
+import { isProductionEnvironment } from './src/server/config/environment';
 
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-async function startServer() {
+export interface ServerAppOptions {
+  env?: NodeJS.ProcessEnv;
+  createViteServerFn?: (config: {
+    server: { middlewareMode: boolean };
+    appType: 'spa';
+  }) => Promise<{ middlewares: express.RequestHandler; close?: () => Promise<void> }>;
+}
+
+export async function createServerApp(options?: ServerAppOptions) {
+  const env = options?.env ?? process.env;
   const app = express();
-  const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
-  const isProd = process.env.NODE_ENV === 'production';
+  const isProd = isProductionEnvironment(env);
 
   // Validate critical security environment variables before accepting any traffic
-  validateAndGetMediaTokenSecret(process.env);
+  validateAndGetMediaTokenSecret(env);
 
   // Configure and validate reverse proxy trust settings at startup
-  configureTrustProxy(app, process.env.TRUST_PROXY);
+  configureTrustProxy(app, env.TRUST_PROXY);
 
   app.use(express.json({
     verify: (req: any, _res, buf) => {
@@ -42,6 +51,9 @@ async function startServer() {
   // Secure authorized delivery of uploaded media, proxies, and thumbnails
   app.use('/uploads', secureUploadsHandler);
 
+  let viteMiddlewareAttached = false;
+  let closeViteServer: (() => Promise<void>) | undefined;
+
   // In production, serve built client from dist/
   if (isProd) {
     const distPath = path.resolve(__dirname, 'dist');
@@ -56,12 +68,16 @@ async function startServer() {
   } else {
     // Vite middleware for development
     try {
-      const { createServer: createViteServer } = await import('vite');
+      const createViteServer =
+        options?.createViteServerFn ??
+        (await import('vite')).createServer;
       const vite = await createViteServer({
         server: { middlewareMode: true },
         appType: 'spa',
       });
       app.use(vite.middlewares);
+      viteMiddlewareAttached = true;
+      closeViteServer = typeof vite.close === 'function' ? () => vite.close!() : undefined;
       console.log('[VideoRisk] Dev mode: Vite middleware attached');
     } catch (e) {
       console.warn('[VideoRisk] Vite middleware load failed, falling back to static/API only:', e);
@@ -77,6 +93,13 @@ async function startServer() {
     });
   });
 
+  return { app, isProd, viteMiddlewareAttached, closeViteServer };
+}
+
+async function startServer() {
+  const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+  const { app, isProd, viteMiddlewareAttached, closeViteServer } = await createServerApp({ env: process.env });
+
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`[VideoRisk Server] Running at http://0.0.0.0:${PORT}`);
   });
@@ -84,7 +107,12 @@ async function startServer() {
   // Graceful shutdown handling for operational restarts and deployments
   const gracefulShutdown = (signal: string) => {
     console.log(`[VideoRisk Server] Received ${signal}. Initiating graceful shutdown...`);
-    server.close(() => {
+    server.close(async () => {
+      try {
+        if (closeViteServer) {
+          await closeViteServer();
+        }
+      } catch {}
       console.log('[VideoRisk Server] HTTP server closed cleanly.');
       process.exit(0);
     });
@@ -97,6 +125,8 @@ async function startServer() {
 
   process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
   process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+  return { server, app, isProd, viteMiddlewareAttached, closeViteServer };
 }
 
 // Start server when executed directly as entrypoint

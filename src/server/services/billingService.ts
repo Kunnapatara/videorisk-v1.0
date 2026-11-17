@@ -1,6 +1,7 @@
 import Stripe from 'stripe';
 import { storage, IStorageRepository } from '../storage';
 import {
+  isForbiddenProductionOriginHostname,
   isLoopbackHostname,
   isProductionEnvironment,
   resolveEnvironmentSecurity,
@@ -165,11 +166,11 @@ export class BillingService {
     if (configured) {
       try {
         const parsed = new URL(configured);
-        const isLoopback = isLoopbackHostname(parsed.hostname);
+        const isForbiddenProd = isForbiddenProductionOriginHostname(parsed.hostname);
         if (
           !parsed.username &&
           !parsed.password &&
-          ((parsed.protocol === 'https:' && (!isProd || !isLoopback)) || (isDevOrTest && parsed.protocol === 'http:'))
+          ((parsed.protocol === 'https:' && (!isProd || !isForbiddenProd)) || (isDevOrTest && parsed.protocol === 'http:'))
         ) {
           origins.add(parsed.origin);
         }
@@ -189,9 +190,10 @@ export class BillingService {
         if (trimmed && !trimmed.includes('@') && !trimmed.startsWith('//')) {
           try {
             const parsed = new URL(trimmed);
+            const isForbiddenProd = isForbiddenProductionOriginHostname(parsed.hostname);
             const isLoopback = isLoopbackHostname(parsed.hostname);
             if (!parsed.username && !parsed.password) {
-              if ((parsed.protocol === 'https:' && (!isProd || !isLoopback)) || (isDevOrTest && parsed.protocol === 'http:' && isLoopback)) {
+              if ((parsed.protocol === 'https:' && (!isProd || !isForbiddenProd)) || (isDevOrTest && parsed.protocol === 'http:' && isLoopback)) {
                 origins.add(parsed.origin);
               }
             }
@@ -255,7 +257,7 @@ export class BillingService {
         err.statusCode = 500;
         throw err;
       }
-      if (parsedBase.protocol !== 'https:' || parsedBase.username || parsedBase.password || isLoopbackHostname(parsedBase.hostname)) {
+      if (parsedBase.protocol !== 'https:' || parsedBase.username || parsedBase.password || isForbiddenProductionOriginHostname(parsedBase.hostname)) {
         const err: any = new Error('Server checkout origin misconfiguration: APP_BASE_URL must be a valid non-localhost HTTPS origin without credentials.');
         err.statusCode = 500;
         throw err;
@@ -315,8 +317,9 @@ export class BillingService {
       }
 
       const isLocalHost = isLoopbackHostname(parsed.hostname);
-      if (isProd && isLocalHost) {
-        const err: any = new Error('Localhost or loopback checkout origins are strictly forbidden in production/live payment mode.');
+      const isForbiddenProdHost = isForbiddenProductionOriginHostname(parsed.hostname);
+      if (isProd && isForbiddenProdHost) {
+        const err: any = new Error('Localhost, loopback, or unspecified checkout origins are strictly forbidden in production/live payment mode.');
         err.statusCode = 400;
         throw err;
       }
@@ -397,7 +400,7 @@ export class BillingService {
       }
       try {
         const parsedBase = new URL(configuredBase);
-        if (parsedBase.protocol !== 'https:' || parsedBase.username || parsedBase.password || isLoopbackHostname(parsedBase.hostname)) {
+        if (parsedBase.protocol !== 'https:' || parsedBase.username || parsedBase.password || isForbiddenProductionOriginHostname(parsedBase.hostname)) {
           throw new Error('Insecure base URL');
         }
       } catch {
@@ -452,8 +455,8 @@ export class BillingService {
     }
 
     const isLocalHost = isLoopbackHostname(parsed.hostname);
-    if (isProd && isLocalHost) {
-      const err: any = new Error('Localhost return URLs are strictly forbidden in production/live payment mode.');
+    if (isProd && isForbiddenProductionOriginHostname(parsed.hostname)) {
+      const err: any = new Error('Localhost, loopback, or unspecified return URLs are strictly forbidden in production/live payment mode.');
       err.statusCode = 400;
       throw err;
     }

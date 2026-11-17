@@ -199,6 +199,7 @@ const MAX_OCR_PNG_PIXELS = 67108864; // 64 MP cap
 const MAX_OCR_PNG_CHUNKS = 4096;
 const MAX_OCR_PNG_FILE_BYTES = 32 * 1024 * 1024; // 32 MB compressed file cap
 const MAX_OCR_PNG_INFLATED_BYTES = 64 * 1024 * 1024; // 64 MB decompressed scanline cap
+export const MAX_OCR_PNG_ICCP_INFLATED_BYTES = 4 * 1024 * 1024; // 4 MB decompressed ICC profile cap
 const PNG_MAGIC_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const ADAM7_PASSES: ReadonlyArray<readonly [number, number, number, number]> = [
   [0, 0, 8, 8],
@@ -310,6 +311,26 @@ function inspectPngChunkType(rawBytes: Buffer): {
     isCritical,
     tag
   };
+}
+
+function isValidPngIccpProfileName(nameBytes: Buffer): boolean {
+  if (nameBytes.length < 1 || nameBytes.length > 79) {
+    return false;
+  }
+  if (nameBytes[0] === 0x20 || nameBytes[nameBytes.length - 1] === 0x20) {
+    return false;
+  }
+  for (let i = 0; i < nameBytes.length; i++) {
+    const b = nameBytes[i];
+    const isPrintableLatin1 = (b >= 0x20 && b <= 0x7e) || (b >= 0xa1 && b <= 0xff);
+    if (!isPrintableLatin1) {
+      return false;
+    }
+    if (b === 0x20 && i > 0 && nameBytes[i - 1] === 0x20) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function paethPredictor(a: number, b: number, c: number): number {
@@ -741,6 +762,8 @@ export function validatePngFrameFile(filePath: string): PngFrameValidationResult
         idatFinished = true;
       }
 
+      const maxChannelSampleValue = (1 << bitDepth) - 1;
+
       if (chunkType === 'tRNS') {
         if (seenTrns || seenIdat) {
           return {
@@ -758,21 +781,49 @@ export function validatePngFrameFile(filePath: string): PngFrameValidationResult
             reason: `PNG tRNS chunk is forbidden for alpha-enabled colorType ${colorType}.`
           };
         }
-        if (colorType === 0 && chunkLen !== 2) {
-          return {
-            valid: false,
-            dimensions: null,
-            errorClass: 'INVALID_PNG_STRUCTURE',
-            reason: `Invalid PNG tRNS length (${chunkLen}) for grayscale colorType 0 (expected 2).`
-          };
+        if (colorType === 0) {
+          if (chunkLen !== 2) {
+            return {
+              valid: false,
+              dimensions: null,
+              errorClass: 'INVALID_PNG_STRUCTURE',
+              reason: `Invalid PNG tRNS length (${chunkLen}) for grayscale colorType 0 (expected 2).`
+            };
+          }
+          const graySample = chunkData.readUInt16BE(0);
+          if (graySample > maxChannelSampleValue) {
+            return {
+              valid: false,
+              dimensions: null,
+              errorClass: 'INVALID_PNG_STRUCTURE',
+              reason: `PNG tRNS grayscale sample value exceeds bit depth ${bitDepth} maximum.`
+            };
+          }
         }
-        if (colorType === 2 && chunkLen !== 6) {
-          return {
-            valid: false,
-            dimensions: null,
-            errorClass: 'INVALID_PNG_STRUCTURE',
-            reason: `Invalid PNG tRNS length (${chunkLen}) for RGB colorType 2 (expected 6).`
-          };
+        if (colorType === 2) {
+          if (chunkLen !== 6) {
+            return {
+              valid: false,
+              dimensions: null,
+              errorClass: 'INVALID_PNG_STRUCTURE',
+              reason: `Invalid PNG tRNS length (${chunkLen}) for RGB colorType 2 (expected 6).`
+            };
+          }
+          const rSample = chunkData.readUInt16BE(0);
+          const gSample = chunkData.readUInt16BE(2);
+          const bSample = chunkData.readUInt16BE(4);
+          if (
+            rSample > maxChannelSampleValue ||
+            gSample > maxChannelSampleValue ||
+            bSample > maxChannelSampleValue
+          ) {
+            return {
+              valid: false,
+              dimensions: null,
+              errorClass: 'INVALID_PNG_STRUCTURE',
+              reason: `PNG tRNS RGB sample value exceeds bit depth ${bitDepth} maximum.`
+            };
+          }
         }
         if (colorType === 3) {
           if (!seenPlte) {
@@ -794,6 +845,14 @@ export function validatePngFrameFile(filePath: string): PngFrameValidationResult
         }
         seenTrns = true;
       } else if (chunkType === 'sRGB') {
+        if (seenIccp) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'INVALID_PNG_STRUCTURE',
+            reason: 'PNG sRGB and iCCP chunks are mutually exclusive.'
+          };
+        }
         if (seenSrgb || seenPlte || seenIdat || chunkLen !== 1 || chunkData[0] > 3) {
           return {
             valid: false,
@@ -812,6 +871,15 @@ export function validatePngFrameFile(filePath: string): PngFrameValidationResult
             reason: 'Invalid or misplaced PNG gAMA chunk.'
           };
         }
+        const gamma = chunkData.readUInt32BE(0);
+        if (gamma === 0) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'INVALID_PNG_STRUCTURE',
+            reason: 'Invalid PNG gAMA value: gamma must be non-zero.'
+          };
+        }
         seenGama = true;
       } else if (chunkType === 'cHRM') {
         if (seenChrm || seenPlte || seenIdat || chunkLen !== 32) {
@@ -824,12 +892,91 @@ export function validatePngFrameFile(filePath: string): PngFrameValidationResult
         }
         seenChrm = true;
       } else if (chunkType === 'iCCP') {
-        if (seenIccp || seenPlte || seenIdat || chunkLen < 3) {
+        if (seenIccp || seenPlte || seenIdat) {
           return {
             valid: false,
             dimensions: null,
             errorClass: 'INVALID_PNG_STRUCTURE',
-            reason: 'Invalid or misplaced PNG iCCP chunk.'
+            reason: 'Invalid, duplicate, or misplaced PNG iCCP chunk.'
+          };
+        }
+        if (seenSrgb) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'INVALID_PNG_STRUCTURE',
+            reason: 'PNG iCCP and sRGB chunks are mutually exclusive.'
+          };
+        }
+        const nulIdx = chunkData.indexOf(0x00);
+        if (nulIdx < 1 || nulIdx > 79) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'INVALID_PNG_STRUCTURE',
+            reason: 'Invalid PNG iCCP profile name or missing NUL terminator.'
+          };
+        }
+        if (!isValidPngIccpProfileName(chunkData.subarray(0, nulIdx))) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'INVALID_PNG_STRUCTURE',
+            reason: 'PNG iCCP profile name contains invalid characters or spacing.'
+          };
+        }
+        if (nulIdx + 2 >= chunkLen) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'INVALID_PNG_STRUCTURE',
+            reason: 'Truncated PNG iCCP chunk missing compression method or profile data.'
+          };
+        }
+        const iccpCompressionMethod = chunkData[nulIdx + 1];
+        if (iccpCompressionMethod !== 0) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'INVALID_PNG_STRUCTURE',
+            reason: `Unsupported PNG iCCP compression method (${iccpCompressionMethod}).`
+          };
+        }
+        const compressedProfile = chunkData.subarray(nulIdx + 2);
+        let iccpInflated: Buffer;
+        let iccpConsumed = 0;
+        try {
+          const iccpRes = zlib.inflateSync(compressedProfile, {
+            info: true,
+            maxOutputLength: MAX_OCR_PNG_ICCP_INFLATED_BYTES
+          }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+          iccpInflated = iccpRes.buffer;
+          iccpConsumed = iccpRes.engine?.bytesWritten ?? 0;
+        } catch (err: any) {
+          const isBomb = err?.code === 'ERR_BUFFER_TOO_LARGE';
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'PNG_DECOMPRESSION_FAILURE',
+            reason: isBomb
+              ? `PNG iCCP compressed profile exceeds maximum decompressed limit (${MAX_OCR_PNG_ICCP_INFLATED_BYTES} bytes).`
+              : 'Invalid or truncated zlib stream inside PNG iCCP chunk.'
+          };
+        }
+        if (iccpConsumed !== compressedProfile.length) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'PNG_DECOMPRESSION_FAILURE',
+            reason: 'Unexpected trailing data after zlib stream inside PNG iCCP chunk.'
+          };
+        }
+        if (iccpInflated.length === 0) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'PNG_DECOMPRESSION_FAILURE',
+            reason: 'PNG iCCP compressed profile decompressed to empty data.'
           };
         }
         seenIccp = true;
@@ -842,6 +989,18 @@ export function validatePngFrameFile(filePath: string): PngFrameValidationResult
             errorClass: 'INVALID_PNG_STRUCTURE',
             reason: 'Invalid or misplaced PNG sBIT chunk.'
           };
+        }
+        const maxSbitBits = colorType === 3 ? 8 : bitDepth;
+        for (let i = 0; i < chunkLen; i++) {
+          const sbitVal = chunkData[i];
+          if (sbitVal < 1 || sbitVal > maxSbitBits) {
+            return {
+              valid: false,
+              dimensions: null,
+              errorClass: 'INVALID_PNG_STRUCTURE',
+              reason: `PNG sBIT significant bits value (${sbitVal}) outside valid range [1..${maxSbitBits}].`
+            };
+          }
         }
         seenSbit = true;
       } else if (chunkType === 'pHYs') {
@@ -860,8 +1019,7 @@ export function validatePngFrameFile(filePath: string): PngFrameValidationResult
           seenBkgd ||
           seenIdat ||
           (colorType === 3 && !seenPlte) ||
-          chunkLen !== expectedBkgdLen ||
-          (colorType === 3 && chunkData[0] >= paletteEntryCount)
+          chunkLen !== expectedBkgdLen
         ) {
           return {
             valid: false,
@@ -869,6 +1027,42 @@ export function validatePngFrameFile(filePath: string): PngFrameValidationResult
             errorClass: 'INVALID_PNG_STRUCTURE',
             reason: 'Invalid or misplaced PNG bKGD chunk.'
           };
+        }
+        if (colorType === 3) {
+          if (chunkData[0] >= paletteEntryCount) {
+            return {
+              valid: false,
+              dimensions: null,
+              errorClass: 'INVALID_PNG_STRUCTURE',
+              reason: 'PNG bKGD palette index exceeds PLTE entry count.'
+            };
+          }
+        } else if (colorType === 0 || colorType === 4) {
+          const grayBg = chunkData.readUInt16BE(0);
+          if (grayBg > maxChannelSampleValue) {
+            return {
+              valid: false,
+              dimensions: null,
+              errorClass: 'INVALID_PNG_STRUCTURE',
+              reason: `PNG bKGD grayscale sample exceeds bit depth ${bitDepth} maximum.`
+            };
+          }
+        } else {
+          const rBg = chunkData.readUInt16BE(0);
+          const gBg = chunkData.readUInt16BE(2);
+          const bBg = chunkData.readUInt16BE(4);
+          if (
+            rBg > maxChannelSampleValue ||
+            gBg > maxChannelSampleValue ||
+            bBg > maxChannelSampleValue
+          ) {
+            return {
+              valid: false,
+              dimensions: null,
+              errorClass: 'INVALID_PNG_STRUCTURE',
+              reason: `PNG bKGD RGB sample exceeds bit depth ${bitDepth} maximum.`
+            };
+          }
         }
         seenBkgd = true;
       } else if (chunkType === 'hIST') {

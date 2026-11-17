@@ -9,8 +9,10 @@ import { SqliteStorageRepository } from '../src/server/storage/sqliteStorage';
 import { billingService } from '../src/server/services/billingService';
 import { apiRouter, validateAndGetMediaTokenSecret } from '../src/server/routes/api';
 import {
+  isForbiddenProductionOriginHostname,
   isLoopbackHostname,
   isProductionEnvironment,
+  isUnspecifiedIpv6Hostname,
   resolveEnvironmentSecurity,
   validateMediaTokenSecret,
 } from '../src/server/config/environment';
@@ -2504,7 +2506,103 @@ export async function runStripeOriginAndRefundLifecycleTests() {
       delete process.env.MEDIA_TOKEN_SECRET;
       assert.ok(validateAndGetMediaTokenSecret(process.env).length >= 32, '6.7k Development fallback secret works when unset');
 
-      console.log('  ✅ PASS: All Task A1 loopback boundaries & Task A2 MEDIA_TOKEN_SECRET runtime/readiness/validator parity cases verified');
+      // 6.8 Group B: IPv6 Unspecified Address :: (helper accuracy + production-origin call-site rejection)
+      for (const unspecHost of [
+        '::',
+        '[::]',
+        '0:0:0:0:0:0:0:0',
+        '0000:0000:0000:0000:0000:0000:0000:0000',
+        '[0:0:0:0:0:0:0:0]',
+        '::0',
+        '[::0]',
+        '0::0',
+        '::%lo0',
+        '[::%lo0]',
+        '::0.0.0.0',
+        new URL('https://[::]:3000').hostname,
+        new URL('https://[0:0:0:0:0:0:0:0]:8443').hostname,
+      ]) {
+        assert.strictEqual(isUnspecifiedIpv6Hostname(unspecHost), true, `6.8a IPv6 unspecified variant '${unspecHost}' detected`);
+        assert.strictEqual(isLoopbackHostname(unspecHost), false, `6.8b '${unspecHost}' is NOT falsely classified as loopback`);
+        assert.strictEqual(isForbiddenProductionOriginHostname(unspecHost), true, `6.8c '${unspecHost}' is forbidden as a production origin host`);
+      }
+
+      // Preserve existing semantics for ::1, valid public IPv6, IPv4 0.0.0.0, and malformed IPv6
+      assert.strictEqual(isLoopbackHostname('::1'), true, '6.8d ::1 remains loopback');
+      assert.strictEqual(isUnspecifiedIpv6Hostname('::1'), false, '6.8e ::1 is not unspecified');
+      assert.strictEqual(isForbiddenProductionOriginHostname('::1'), true, '6.8f ::1 remains forbidden in prod');
+      assert.strictEqual(isLoopbackHostname('0.0.0.0'), true, '6.8g IPv4 0.0.0.0 behavior preserved');
+      assert.strictEqual(isUnspecifiedIpv6Hostname('0.0.0.0'), false, '6.8h IPv4 0.0.0.0 is distinct from IPv6 ::');
+      assert.strictEqual(isForbiddenProductionOriginHostname('0.0.0.0'), true, '6.8i IPv4 0.0.0.0 remains forbidden in prod');
+      for (const validNonLoopbackV6 of ['2001:4860:4860::8888', '[2001:4860:4860::8888]', '2606:4700:4700::1111']) {
+        assert.strictEqual(isLoopbackHostname(validNonLoopbackV6), false, `6.8j Non-loopback IPv6 ${validNonLoopbackV6}`);
+        assert.strictEqual(isUnspecifiedIpv6Hostname(validNonLoopbackV6), false, `6.8k Non-unspecified IPv6 ${validNonLoopbackV6}`);
+        assert.strictEqual(isForbiddenProductionOriginHostname(validNonLoopbackV6), false, `6.8l Public IPv6 ${validNonLoopbackV6} allowed`);
+      }
+      for (const badV6 of [':::', '[::', '::]', '::% ', '1:2:3', 'gggg::1', '::0::0']) {
+        assert.strictEqual(isLoopbackHostname(badV6), false, `6.8m Malformed IPv6 '${badV6}' safely rejected (loopback)`);
+        assert.strictEqual(isUnspecifiedIpv6Hostname(badV6), false, `6.8n Malformed IPv6 '${badV6}' safely rejected (unspecified)`);
+      }
+
+      // Verify actual production-origin call sites reject https://[::] variants
+      process.env.NODE_ENV = 'production';
+      process.env.PAYMENT_MODE = 'live';
+      process.env.STRIPE_SECRET_KEY = 'sk_live_mock1234567890abcdef';
+      process.env.STRIPE_WEBHOOK_SECRET = 'whsec_mock1234567890abcdef';
+      process.env.MEDIA_TOKEN_SECRET = 'vr_prod_media_token_secret_0123456789abcdef_strong';
+      process.env.APP_BASE_URL = 'https://videorisk.com';
+      process.env.ALLOWED_ORIGINS = 'https://app.videorisk.com,https://[::]:3000,https://[0:0:0:0:0:0:0:0]';
+      assert.deepStrictEqual(
+        billingService.getTrustedOrigins().sort(),
+        ['https://app.videorisk.com', 'https://videorisk.com'],
+        '6.8o getTrustedOrigins strips https://[::]:3000 and https://[0:0:0:0:0:0:0:0] in production'
+      );
+
+      for (const unspecOrigin of ['https://[::]', 'https://[::]:3000', 'https://[0:0:0:0:0:0:0:0]', 'https://[::0]']) {
+        process.env.APP_BASE_URL = 'https://videorisk.com';
+
+        const hdrRes = await fetch(`${baseUrl}/billing/checkout`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${taskAToken}`, Origin: unspecOrigin },
+          body: JSON.stringify({ planId: 'pro' }),
+        });
+        assert.strictEqual(hdrRes.status, 400, `6.8p Checkout rejects unspecified IPv6 Origin ${unspecOrigin}`);
+
+        assert.throws(
+          () => billingService.validatePortalReturnUrl(`${unspecOrigin}/pricing`),
+          (err: any) => err.statusCode === 400,
+          `6.8q Portal returnUrl rejects unspecified IPv6 ${unspecOrigin}`
+        );
+
+        const envUnspecCheck = validateBillingConfiguration('production', {
+          ...validProdLiveEnv,
+          APP_BASE_URL: unspecOrigin,
+        });
+        assert.strictEqual(envUnspecCheck.valid, false, `6.8r validate-env rejects APP_BASE_URL=${unspecOrigin} in production`);
+
+        const allowedUnspecCheck = validateBillingConfiguration('production', {
+          ...validProdLiveEnv,
+          ALLOWED_ORIGINS: unspecOrigin,
+        });
+        assert.strictEqual(allowedUnspecCheck.valid, false, `6.8s validate-env rejects ALLOWED_ORIGINS=${unspecOrigin} in production`);
+
+        process.env.APP_BASE_URL = unspecOrigin;
+        const readinessUnspecJson = await (await fetch(`${baseUrl}/health/readiness`)).json();
+        assert.strictEqual(
+          readinessUnspecJson.checks?.billing?.details?.originConfiguredValid,
+          false,
+          `6.8t Readiness marks APP_BASE_URL=${unspecOrigin} invalid in production`
+        );
+
+        const baseRejectRes = await fetch(`${baseUrl}/billing/checkout`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${taskAToken}` },
+          body: JSON.stringify({ planId: 'pro' }),
+        });
+        assert.strictEqual(baseRejectRes.status, 500, `6.8u Checkout fails closed when APP_BASE_URL=${unspecOrigin} in production`);
+      }
+
+      console.log('  ✅ PASS: All Task A1 loopback + Group B :: boundaries & Task A2 MEDIA_TOKEN_SECRET runtime/readiness/validator parity cases verified');
     } finally {
       for (const [k, v] of Object.entries(savedStripeEnv)) {
         if (v === undefined) delete process.env[k];

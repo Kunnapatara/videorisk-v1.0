@@ -114,6 +114,57 @@ function isValidDnsHostname(host: string): boolean {
   );
 }
 
+function parseIpv6Candidate(hostname: string): number[] | null {
+  if (typeof hostname !== 'string') return null;
+  const trimmed = hostname.trim();
+  if (!trimmed) return null;
+
+  // Hostnames never contain whitespace, schemes, paths, queries, fragments, userinfo, or backslashes
+  if (/[\s/@?#\\]/.test(trimmed)) return null;
+
+  const hasOpenBracket = trimmed.includes('[');
+  const hasCloseBracket = trimmed.includes(']');
+  let candidate = trimmed;
+
+  if (hasOpenBracket || hasCloseBracket) {
+    if (!trimmed.startsWith('[') || !trimmed.endsWith(']')) {
+      return null;
+    }
+    candidate = trimmed.slice(1, -1);
+    if (!candidate || candidate.includes('[') || candidate.includes(']')) {
+      return null;
+    }
+  }
+
+  const lower = candidate.toLowerCase();
+  if (!lower.includes(':')) return null;
+
+  // Support optional RFC 6874 IPv6 zone ID (e.g. ::1%lo0, ::%lo0)
+  let ipPart = lower;
+  const pctIdx = lower.indexOf('%');
+  if (pctIdx !== -1) {
+    const zone = lower.slice(pctIdx + 1);
+    ipPart = lower.slice(0, pctIdx);
+    if (!zone || !/^[a-z0-9._-]+$/.test(zone)) {
+      return null;
+    }
+  }
+
+  return parseIpv6Hextets(ipPart);
+}
+
+/**
+ * Explicit detector for the IPv6 unspecified address `::` and its normalized equivalents
+ * (`0:0:0:0:0:0:0:0`, `[::]`, `::0`, `::%lo0`, `::0.0.0.0`, etc.).
+ * Distinct from loopback so `isLoopbackHostname('::')` remains semantically false while
+ * production origin/security boundaries can reject both loopback and unspecified addresses.
+ */
+export function isUnspecifiedIpv6Hostname(hostname: string): boolean {
+  const hextets = parseIpv6Candidate(hostname);
+  if (!hextets) return false;
+  return hextets.every((h) => h === 0);
+}
+
 /**
  * Authoritative loopback hostname detector covering:
  * - localhost & *.localhost (case-insensitive, optional single trailing FQDN dot)
@@ -149,18 +200,7 @@ export function isLoopbackHostname(hostname: string): boolean {
 
   // Handle IPv6 addresses (any unescaped colon indicates IPv6 candidate; bare host:port without URL parsing is invalid)
   if (lower.includes(':')) {
-    // Support optional RFC 6874 IPv6 zone ID (e.g. ::1%lo0)
-    let ipPart = lower;
-    const pctIdx = lower.indexOf('%');
-    if (pctIdx !== -1) {
-      const zone = lower.slice(pctIdx + 1);
-      ipPart = lower.slice(0, pctIdx);
-      if (!zone || !/^[a-z0-9._-]+$/.test(zone)) {
-        return false;
-      }
-    }
-
-    const hextets = parseIpv6Hextets(ipPart);
+    const hextets = parseIpv6Candidate(trimmed);
     if (!hextets) return false;
 
     const first6Zero =
@@ -222,6 +262,13 @@ export function isLoopbackHostname(hostname: string): boolean {
   if (!isValidDnsHostname(hostNoDot)) return false;
 
   return hostNoDot === 'localhost' || hostNoDot.endsWith('.localhost');
+}
+
+/**
+ * Authoritative production-origin host guard: rejects loopback hosts AND unspecified IPv6 `::`.
+ */
+export function isForbiddenProductionOriginHostname(hostname: string): boolean {
+  return isLoopbackHostname(hostname) || isUnspecifiedIpv6Hostname(hostname);
 }
 
 export const MIN_PRODUCTION_MEDIA_TOKEN_SECRET_LENGTH = 32;

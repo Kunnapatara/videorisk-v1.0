@@ -15,7 +15,7 @@
 import dotenv from 'dotenv';
 import Stripe from 'stripe';
 import {
-  isLoopbackHostname,
+  isForbiddenProductionOriginHostname,
   resolveEnvironmentSecurity,
   validateMediaTokenSecret,
 } from '../src/server/config/environment';
@@ -309,11 +309,11 @@ export function validateBillingConfiguration(
           variable: varName,
           message: `Insecure scheme '${parsed.protocol}' in ${varName}. Production strictly requires https:// origins.`,
         });
-      } else if (effectiveProduction && isLoopbackHostname(parsed.hostname)) {
+      } else if (effectiveProduction && isForbiddenProductionOriginHostname(parsed.hostname)) {
         issues.push({
           type: 'ERROR',
           variable: varName,
-          message: `Loopback/localhost origin '${parsed.origin}' in ${varName} is forbidden in production/live payment mode.`,
+          message: `Loopback, localhost, or unspecified origin '${parsed.origin}' in ${varName} is forbidden in production/live payment mode.`,
         });
       } else if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
         issues.push({

@@ -16,7 +16,7 @@ import { ensureDemoFixtures, getDemoFixture } from '../fixtures/demoMedia';
 import { channelIntelligenceEngine } from '../intelligence/channelIntelligence';
 import { validateStripeWebhookSecret } from '../../../scripts/validate-env';
 import {
-  isLoopbackHostname,
+  isForbiddenProductionOriginHostname,
   isProductionEnvironment,
   resolveEnvironmentSecurity,
   validateMediaTokenSecret,
@@ -1301,7 +1301,7 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
           parsedBase.protocol === 'https:' &&
           !parsedBase.username &&
           !parsedBase.password &&
-          !isLoopbackHostname(parsedBase.hostname);
+          !isForbiddenProductionOriginHostname(parsedBase.hostname);
       } catch {
         isOriginHttpsValid = false;
       }
