@@ -50,6 +50,7 @@ export async function runGroupABSecurityRemediationTests(): Promise<void> {
 
   const trackedKeys = [
     'NODE_ENV',
+    'DEPLOYMENT_ENV',
     'PAYMENT_MODE',
     'STRIPE_SECRET_KEY',
     'ENABLE_DEV_RESET_TOKEN',
@@ -440,13 +441,15 @@ export async function runGroupABSecurityRemediationTests(): Promise<void> {
 
       // 1. Production (NODE_ENV=production), ENABLE_DEV_RESET_TOKEN unset -> NEVER exposed
       process.env.NODE_ENV = 'production';
+      delete process.env.DEPLOYMENT_ENV;
       delete process.env.PAYMENT_MODE;
       delete process.env.STRIPE_SECRET_KEY;
       delete process.env.ENABLE_DEV_RESET_TOKEN;
       const prodUnsetReg = await callForgot(testEmail, `198.51.100.${ipSeed + 1}`);
       const prodUnsetUnk = await callForgot(`unknown_${uniqueSuffix}@example.com`, `198.51.100.${ipSeed + 1}`);
       assert.strictEqual(prodUnsetReg.status, 200, 'B.1a Prod (unset) returns 200');
-      assert.strictEqual(prodUnsetReg.json.devToken, undefined, 'B.1b Prod (unset) NEVER returns devToken');
+      assert.strictEqual(prodUnsetReg.json.devResetToken, undefined, 'B.1b Prod (unset) NEVER returns devResetToken');
+      assert.strictEqual(prodUnsetReg.json.devToken, undefined, 'B.1b2 Prod (unset) NEVER returns devToken');
       assert.strictEqual(Object.keys(prodUnsetReg.json).sort().join(','), 'message,success', 'B.1c Prod (unset) returns only {success, message}');
       assert.strictEqual(prodUnsetReg.json.message, expectedNonEnumMsg, 'B.1d Prod registered msg matches non-enumerating message');
       assert.strictEqual(prodUnsetUnk.json.message, prodUnsetReg.json.message, 'B.1e Prod registered vs unknown email messages are identical');
@@ -456,8 +459,20 @@ export async function runGroupABSecurityRemediationTests(): Promise<void> {
       process.env.ENABLE_DEV_RESET_TOKEN = 'true';
       const prodOverride = await callForgot(testEmail, `198.51.100.${ipSeed + 2}`);
       assert.strictEqual(prodOverride.status, 200, 'B.2a Prod (ENABLE_DEV_RESET_TOKEN=true) returns 200');
-      assert.strictEqual(prodOverride.json.devToken, undefined, 'B.2b ENABLE_DEV_RESET_TOKEN=true does NOT expose devToken in NODE_ENV=production');
+      assert.strictEqual(prodOverride.json.devResetToken, undefined, 'B.2b ENABLE_DEV_RESET_TOKEN=true does NOT expose devResetToken in NODE_ENV=production');
       assert.strictEqual(Object.keys(prodOverride.json).sort().join(','), 'message,success', 'B.2c No alternate token fields exposed in response');
+
+      // 2d. Staging (DEPLOYMENT_ENV=staging + sk_test_), ENABLE_DEV_RESET_TOKEN=true -> NEVER exposed
+      process.env.NODE_ENV = 'production';
+      process.env.DEPLOYMENT_ENV = 'staging';
+      process.env.PAYMENT_MODE = 'test';
+      process.env.STRIPE_SECRET_KEY = 'sk_test_placeholder_000000';
+      process.env.ENABLE_DEV_RESET_TOKEN = 'true';
+      const stagingOverride = await callForgot(testEmail, `198.51.100.${ipSeed + 8}`);
+      assert.strictEqual(stagingOverride.status, 200, 'B.2d Staging returns 200');
+      assert.strictEqual(stagingOverride.json.devResetToken, undefined, 'B.2e Staging NEVER exposes devResetToken even when ENABLE_DEV_RESET_TOKEN=true');
+      assert.strictEqual(Object.keys(stagingOverride.json).sort().join(','), 'message,success', 'B.2f Staging response contains only {success, message}');
+      delete process.env.DEPLOYMENT_ENV;
 
       // 3. Canonical Production via NODE_ENV=development + PAYMENT_MODE=live + sk_live + ENABLE_DEV_RESET_TOKEN=true -> NEVER exposed
       process.env.NODE_ENV = 'development';
@@ -467,9 +482,9 @@ export async function runGroupABSecurityRemediationTests(): Promise<void> {
       const liveDevOverride = await callForgot(testEmail, `198.51.100.${ipSeed + 3}`);
       assert.strictEqual(liveDevOverride.status, 200, 'B.3a Dev+live payment returns 200');
       assert.strictEqual(
-        liveDevOverride.json.devToken,
+        liveDevOverride.json.devResetToken,
         undefined,
-        'B.3b ENABLE_DEV_RESET_TOKEN=true does NOT expose devToken when PAYMENT_MODE=live + NODE_ENV=development'
+        'B.3b ENABLE_DEV_RESET_TOKEN=true does NOT expose devResetToken when PAYMENT_MODE=live + NODE_ENV=development'
       );
 
       // 4. Development (NODE_ENV=development, no live payment), ENABLE_DEV_RESET_TOKEN=true -> Allowed under dev policy
@@ -479,18 +494,19 @@ export async function runGroupABSecurityRemediationTests(): Promise<void> {
       process.env.ENABLE_DEV_RESET_TOKEN = 'true';
       const devAllowed = await callForgot(testEmail, `198.51.100.${ipSeed + 4}`);
       assert.strictEqual(devAllowed.status, 200, 'B.4a Development returns 200');
-      assert.strictEqual(typeof devAllowed.json.devToken, 'string', 'B.4b Development exposes devToken under existing dev policy');
-      assert.strictEqual(devAllowed.json.devToken.length, 64, 'B.4c Development devToken has expected 32-byte hex format');
+      assert.strictEqual(devAllowed.json.devToken, undefined, 'B.4a2 Legacy devToken field absent');
+      assert.strictEqual(typeof devAllowed.json.devResetToken, 'string', 'B.4b Development exposes devResetToken under existing dev policy');
+      assert.strictEqual(devAllowed.json.devResetToken.length, 64, 'B.4c Development devResetToken has expected 32-byte hex format');
 
       // Verify non-enumeration for unknown email even in development
       const devUnknown = await callForgot(`nonexistent_${uniqueSuffix}@example.com`, `198.51.100.${ipSeed + 4}`);
-      assert.strictEqual(devUnknown.json.devToken, undefined, 'B.4d Unknown email never exposes devToken');
+      assert.strictEqual(devUnknown.json.devResetToken, undefined, 'B.4d Unknown email never exposes devResetToken');
 
       // Complete password reset using devAllowed token, verify session revocation & single-use
       const devResetConfirm = await fetch(`${baseUrl}/auth/reset-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-forwarded-for': `198.51.100.${ipSeed + 4}` },
-        body: JSON.stringify({ token: devAllowed.json.devToken, newPassword: pass2 }),
+        body: JSON.stringify({ token: devAllowed.json.devResetToken, newPassword: pass2 }),
       });
       assert.strictEqual(devResetConfirm.status, 200, 'B.4e Development reset token completes /auth/reset-password');
 
@@ -502,7 +518,7 @@ export async function runGroupABSecurityRemediationTests(): Promise<void> {
       const reuseRes = await fetch(`${baseUrl}/auth/reset-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-forwarded-for': `198.51.100.${ipSeed + 4}` },
-        body: JSON.stringify({ token: devAllowed.json.devToken, newPassword: pass3 }),
+        body: JSON.stringify({ token: devAllowed.json.devResetToken, newPassword: pass3 }),
       });
       assert.strictEqual(reuseRes.status, 400, 'B.4g Reusing already-used reset token fails with 400');
 
@@ -513,12 +529,12 @@ export async function runGroupABSecurityRemediationTests(): Promise<void> {
       process.env.ENABLE_DEV_RESET_TOKEN = 'true';
       const testAllowed = await callForgot(testEmail, `198.51.100.${ipSeed + 5}`);
       assert.strictEqual(testAllowed.status, 200, 'B.5a Test env returns 200');
-      assert.strictEqual(typeof testAllowed.json.devToken, 'string', 'B.5b Test env exposes devToken under existing test policy');
+      assert.strictEqual(typeof testAllowed.json.devResetToken, 'string', 'B.5b Test env exposes devResetToken under existing test policy');
 
       const testResetConfirm = await fetch(`${baseUrl}/auth/reset-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-forwarded-for': `198.51.100.${ipSeed + 5}` },
-        body: JSON.stringify({ token: testAllowed.json.devToken, newPassword: pass3 }),
+        body: JSON.stringify({ token: testAllowed.json.devResetToken, newPassword: pass3 }),
       });
       assert.strictEqual(testResetConfirm.status, 200, 'B.5c Test reset token completes /auth/reset-password');
 

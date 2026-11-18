@@ -54,9 +54,11 @@ export async function createServerApp(options?: ServerAppOptions) {
   let viteMiddlewareAttached = false;
   let closeViteServer: (() => Promise<void>) | undefined;
 
-  // In production, serve built client from dist/
+  // In production or staging, serve built client from dist/
   if (isProd) {
-    const distPath = path.resolve(__dirname, 'dist');
+    const distPath = path.basename(__dirname) === 'dist-server'
+      ? path.resolve(__dirname, '..', 'dist')
+      : path.resolve(__dirname, 'dist');
     app.use(express.static(distPath));
 
     app.get('*', (req, res, next) => {

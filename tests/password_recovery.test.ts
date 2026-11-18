@@ -73,7 +73,8 @@ export async function runPasswordRecoveryTests() {
       unknownData.message === 'If an account exists with that email address, password reset instructions have been generated.',
       'Message does not reveal whether the email exists'
     );
-    assert(!unknownData.devToken, 'No reset token generated for non-existent email');
+    assert(!unknownData.devResetToken, 'No reset token generated for non-existent email');
+    assert(!unknownData.devToken, 'Legacy devToken field absent for non-existent email');
 
     // Registered email
     const validResetRes = await fetch(`${baseUrl}/auth/forgot-password`, {
@@ -87,8 +88,9 @@ export async function runPasswordRecoveryTests() {
       validResetData.message === 'If an account exists with that email address, password reset instructions have been generated.',
       'Registered email returns identical non-enumerating message'
     );
-    assert(typeof validResetData.devToken === 'string', 'Development testing token provided in test environment');
-    const resetToken = validResetData.devToken;
+    assert(validResetData.devToken === undefined, 'Legacy devToken field removed in favor of devResetToken');
+    assert(typeof validResetData.devResetToken === 'string', 'Development testing token provided via devResetToken in test environment');
+    const resetToken = validResetData.devResetToken;
 
     // Verify token hash was stored, NOT the raw token
     const tokenHash = crypto.createHash('sha256').update(resetToken).digest('hex');

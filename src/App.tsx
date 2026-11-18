@@ -23,6 +23,7 @@ export function App() {
   const [activeReport, setActiveReport] = useState<RiskReport | null>(null);
   const [activeComparison, setActiveComparison] = useState<ReScanComparison | null>(null);
   const [intendedPlanId, setIntendedPlanId] = useState<string | null>(null);
+  const [initialResetToken, setInitialResetToken] = useState<string | null>(null);
 
   // Re-scan trigger parent ID
   const [rescanParentId, setRescanParentId] = useState<string | undefined>(undefined);
@@ -44,6 +45,17 @@ export function App() {
 
   useEffect(() => {
     fetchUser();
+    const params = new URLSearchParams(window.location.search);
+    const tokenFromUrl = params.get('resetToken');
+    if (tokenFromUrl && tokenFromUrl.trim().length > 0) {
+      setInitialResetToken(tokenFromUrl.trim());
+      setAuthModalInitialMode('reset');
+      setAuthModalOpen(true);
+      params.delete('resetToken');
+      const nextSearch = params.toString();
+      const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}${window.location.hash}`;
+      window.history.replaceState({}, document.title, nextUrl);
+    }
   }, []);
 
   // When user switches or logs in
@@ -272,6 +284,8 @@ export function App() {
         currentUser={user}
         isOpen={authModalOpen}
         initialMode={authModalInitialMode}
+        initialResetToken={initialResetToken}
+        onConsumeInitialResetToken={() => setInitialResetToken(null)}
         intendedPlanId={intendedPlanId}
         onIntendedPlanConfirmed={(planId) => {
           setIntendedPlanId(planId);

@@ -619,25 +619,38 @@ export class BillingService {
       throw new Error(`User not found: ${userId}`);
     }
 
-    const requireLive = envSec.isProduction;
+    const requireStrictStripe = envSec.isProduction;
+    const requireLive = envSec.requiresLivePayments;
+    const isStaging = envSec.isStaging;
 
-    // Production guard: fail fast if production credentials are missing or if test key is used in production
-    if (requireLive) {
+    // Production & Staging guard: fail fast if credentials are missing or mismatched with environment tier
+    if (requireStrictStripe) {
       if (!this.stripe) {
-        const err: any = new Error('Payment gateway is not configured for production. Please verify STRIPE_SECRET_KEY.');
+        const err: any = new Error(
+          isStaging
+            ? 'Payment gateway is not configured for staging. Please verify STRIPE_SECRET_KEY (sk_test_...).'
+            : 'Payment gateway is not configured for production. Please verify STRIPE_SECRET_KEY.'
+        );
         err.statusCode = 500;
         throw err;
       }
-      if (this.getStripeMode() !== 'live') {
+      if (requireLive && this.getStripeMode() !== 'live') {
         const err: any = new Error('Production mode requires a Stripe LIVE key (sk_live_... or rk_live_...). Found test mode credentials.');
         err.statusCode = 500;
         throw err;
       }
-      const priceId = this.getPriceIdForPlan(planId);
-      if (!priceId) {
-        const err: any = new Error(`Configured Stripe Price ID missing for plan '${planId}' in production.`);
+      if (isStaging && this.getStripeMode() !== 'test') {
+        const err: any = new Error('Staging mode requires a Stripe TEST key (sk_test_... or rk_test_...). Live mode credentials are forbidden in staging.');
         err.statusCode = 500;
         throw err;
+      }
+      if (requireLive) {
+        const priceId = this.getPriceIdForPlan(planId);
+        if (!priceId) {
+          const err: any = new Error(`Configured Stripe Price ID missing for plan '${planId}' in production.`);
+          err.statusCode = 500;
+          throw err;
+        }
       }
     }
 
@@ -707,9 +720,9 @@ export class BillingService {
       };
     }
 
-    // Development Simulation Mode (ONLY permitted when requireLive is false)
-    if (requireLive) {
-      throw new Error('Simulation checkout is strictly forbidden in production mode.');
+    // Development Simulation Mode (ONLY permitted when requireStrictStripe is false)
+    if (requireStrictStripe) {
+      throw new Error('Simulation checkout is strictly forbidden in production and staging modes.');
     }
 
     const simulatedSessionId = `sim_session_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;

@@ -8,6 +8,7 @@ import {
   videoProcessor,
   validateTesseractTsv,
   validatePngFrameFile,
+  validateIccProfileStructure,
   sanitizeOcrDiagnostic,
   defaultMonotonicNowMs,
   MAX_OCR_PNG_ICCP_INFLATED_BYTES
@@ -1411,6 +1412,204 @@ exit 0
       false,
       'D2.46q ICC profile with zeroed PCS illuminant rejected'
     );
+
+    // Group C2b (Task E): Complete ICC tag-table, 4-byte alignment, exact shared range vs partial overlap validation
+    const assertIccpInvalid = (label: string, iccBuf: Buffer, reasonRegex?: RegExp) => {
+      const direct = validateIccProfileStructure(iccBuf);
+      assert.strictEqual(direct.valid, false, `${label} (direct ICC check rejects)`);
+      if (reasonRegex) {
+        assert.ok(reasonRegex.test(direct.reason || ''), `${label} (reason matches ${reasonRegex})`);
+      }
+      const pngRes = validatePngFrameFile(
+        mkCustomPng(
+          `c44_taske_${label.replace(/[^a-z0-9_]/gi, '_').toLowerCase()}.png`,
+          { w: 1, h: 1, bd: 8, ct: 2 },
+          [{ type: 'iCCP', data: mkIccpPayload(Buffer.from('TaskEProfile'), 0, zlib.deflateSync(iccBuf)) }],
+          Buffer.from([0, 1, 2, 3])
+        )
+      );
+      assert.strictEqual(pngRes.valid, false, `${label} (PNG iCCP rejects)`);
+      assert.strictEqual(pngRes.errorClass, 'INVALID_PNG_STRUCTURE');
+    };
+
+    const buildSyntheticTwoTagIcc = (opts: {
+      tag0Offset?: number;
+      tag0Size?: number;
+      tag1Offset?: number;
+      tag1Size?: number;
+      tag1Sig?: string;
+      extraTailBytes?: number;
+    }): Buffer => {
+      const tagTableEnd = 128 + 4 + 2 * 12; // 156 (already 4-byte aligned)
+      const dataSize = 48 + (opts.extraTailBytes || 0);
+      const totalLen = tagTableEnd + dataSize;
+      const buf = Buffer.alloc(totalLen);
+      buf.writeUInt32BE(totalLen, 0);
+      buf.write('none', 4, 'ascii');
+      buf.writeUInt32BE(0x02400000, 8);
+      buf.write('mntr', 12, 'ascii');
+      buf.write('RGB ', 16, 'ascii');
+      buf.write('XYZ ', 20, 'ascii');
+      buf.writeUInt16BE(2026, 24);
+      buf.writeUInt16BE(1, 26);
+      buf.writeUInt16BE(1, 28);
+      buf.write('acsp', 36, 'ascii');
+      buf.writeInt32BE(Math.round(0.9642 * 65536), 68);
+      buf.writeInt32BE(Math.round(1.0 * 65536), 72);
+      buf.writeInt32BE(Math.round(0.8249 * 65536), 76);
+
+      buf.writeUInt32BE(2, 128);
+      // Tag 0 ('rTRC')
+      buf.write('rTRC', 132, 'ascii');
+      buf.writeUInt32BE(opts.tag0Offset ?? tagTableEnd, 136);
+      buf.writeUInt32BE(opts.tag0Size ?? 20, 140);
+      // Tag 1 ('gTRC')
+      buf.write(opts.tag1Sig ?? 'gTRC', 144, 'ascii');
+      buf.writeUInt32BE(opts.tag1Offset ?? (tagTableEnd + 24), 148);
+      buf.writeUInt32BE(opts.tag1Size ?? 20, 152);
+      return buf;
+    };
+
+    // Valid baseline + explicit exact shared tag-data range
+    assert.strictEqual(
+      validateIccProfileStructure(buildSyntheticTwoTagIcc({})).valid,
+      true,
+      'D2.46r Valid non-overlapping aligned two-tag ICC profile accepted'
+    );
+    assert.strictEqual(
+      validateIccProfileStructure(
+        buildSyntheticTwoTagIcc({
+          tag0Offset: 156,
+          tag0Size: 20,
+          tag1Offset: 156,
+          tag1Size: 20,
+        })
+      ).valid,
+      true,
+      'D2.46s Valid exact shared tag-data range ([156, 176) === [156, 176)) accepted'
+    );
+
+    // Invalid partial overlaps (subset, crossing boundary, same offset with different size)
+    assertIccpInvalid(
+      'partial_overlap_crossing',
+      buildSyntheticTwoTagIcc({
+        tag0Offset: 156,
+        tag0Size: 20,
+        tag1Offset: 168, // aligned % 4 === 0, starts inside [156, 176)
+        tag1Size: 20,
+      }),
+      /overlapping ICC tag data/i
+    );
+    assertIccpInvalid(
+      'partial_overlap_subset',
+      buildSyntheticTwoTagIcc({
+        tag0Offset: 156,
+        tag0Size: 24,
+        tag1Offset: 160,
+        tag1Size: 12,
+      }),
+      /overlapping ICC tag data/i
+    );
+    assertIccpInvalid(
+      'partial_overlap_same_offset_diff_size',
+      buildSyntheticTwoTagIcc({
+        tag0Offset: 156,
+        tag0Size: 20,
+        tag1Offset: 156,
+        tag1Size: 16,
+      }),
+      /overlapping ICC tag data/i
+    );
+
+    // Unaligned tag offset (not divisible by 4, e.g. 158 or 181 within bounds and non-overlapping)
+    assertIccpInvalid(
+      'unaligned_tag_offset_mod2',
+      buildSyntheticTwoTagIcc({
+        tag0Offset: 156,
+        tag0Size: 16,
+        tag1Offset: 174,
+        tag1Size: 12,
+      }),
+      /Unaligned ICC tag offset/i
+    );
+    assertIccpInvalid(
+      'unaligned_tag_offset_mod1',
+      buildSyntheticTwoTagIcc({
+        tag0Offset: 156,
+        tag0Size: 16,
+        tag1Offset: 177,
+        tag1Size: 12,
+      }),
+      /Unaligned ICC tag offset/i
+    );
+
+    // Out-of-bounds offset & size
+    assertIccpInvalid(
+      'oob_tag_offset',
+      buildSyntheticTwoTagIcc({
+        tag1Offset: 5000,
+        tag1Size: 12,
+      }),
+      /Out-of-bounds/i
+    );
+    assertIccpInvalid(
+      'oob_tag_size',
+      buildSyntheticTwoTagIcc({
+        tag1Offset: 180,
+        tag1Size: 40,
+      }),
+      /Out-of-bounds/i
+    );
+
+    // Tag data overlapping tag table or header
+    assertIccpInvalid(
+      'overlap_tag_table',
+      buildSyntheticTwoTagIcc({
+        tag0Offset: 132,
+        tag0Size: 20,
+      }),
+      /Out-of-bounds/i
+    );
+    assertIccpInvalid(
+      'overlap_header',
+      buildSyntheticTwoTagIcc({
+        tag0Offset: 64,
+        tag0Size: 20,
+      }),
+      /Out-of-bounds/i
+    );
+
+    // Malformed tag table (non-ASCII tag signature, zero tagCount, truncated tag table)
+    const nonAsciiSigIcc = buildSyntheticTwoTagIcc({});
+    nonAsciiSigIcc.writeUInt8(0x01, 144);
+    assertIccpInvalid('malformed_tag_signature', nonAsciiSigIcc, /non-ASCII ICC tag signature/i);
+
+    const zeroTagCountIcc = Buffer.from(sampleIccProfile);
+    zeroTagCountIcc.writeUInt32BE(0, 128);
+    assertIccpInvalid('zero_tag_count', zeroTagCountIcc, /tag count/i);
+
+    const truncTagTableIcc = Buffer.from(sampleIccProfile);
+    truncTagTableIcc.writeUInt32BE(50, 128); // 132 + 50*12 = 732 > length
+    assertIccpInvalid('truncated_tag_table', truncTagTableIcc, /Truncated ICC profile tag table/i);
+
+    // Truncated profile variants (<128 bytes, missing tag count)
+    assertIccpInvalid('truncated_120_bytes', sampleIccProfile.subarray(0, 120), /Truncated ICC profile/i);
+    const missingTagCountIcc = Buffer.alloc(130);
+    sampleIccProfile.subarray(0, 130).copy(missingTagCountIcc);
+    missingTagCountIcc.writeUInt32BE(130, 0);
+    assertIccpInvalid('truncated_130_bytes', missingTagCountIcc, /missing mandatory tag count/i);
+
+    // Verify all existing system Ghostscript ICC profiles if present (zero false positives)
+    const gsIccDir = '/usr/share/color/icc/ghostscript';
+    if (fs.existsSync(gsIccDir)) {
+      const gsProfiles = fs.readdirSync(gsIccDir).filter((f) => f.endsWith('.icc'));
+      assert.ok(gsProfiles.length > 0, 'D2.46t Ghostscript ICC fixture profiles available');
+      for (const gsFile of gsProfiles) {
+        const gsBuf = fs.readFileSync(path.join(gsIccDir, gsFile));
+        const gsRes = validateIccProfileStructure(gsBuf);
+        assert.strictEqual(gsRes.valid, true, `D2.46u System Ghostscript ICC profile '${gsFile}' accepted cleanly (${gsRes.reason || 'ok'})`);
+      }
+    }
 
     // C4.5 bKGD across colorTypes 0, 2, 3, 4, 6 with boundary checks
     assert.strictEqual(

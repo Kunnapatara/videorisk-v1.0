@@ -1,32 +1,45 @@
 import net from 'net';
 
+export type ValidDeploymentEnv = 'development' | 'test' | 'staging' | 'production';
 export type ValidPaymentMode = 'live' | 'production' | 'test' | 'simulation';
 
 export interface EnvironmentConflict {
   variable: string;
   code:
     | 'INVALID_PAYMENT_MODE'
+    | 'INVALID_DEPLOYMENT_ENV'
     | 'PROD_TEST_MODE_CONFLICT'
     | 'DEV_LIVE_PAYMENT_CONFLICT'
     | 'TEST_KEY_IN_LIVE_OR_PROD'
-    | 'LIVE_KEY_IN_DEV_OR_TEST';
+    | 'LIVE_KEY_IN_DEV_OR_TEST'
+    | 'LIVE_KEY_IN_STAGING'
+    | 'STAGING_LIVE_PAYMENT_CONFLICT'
+    | 'STAGING_PLATFORM_PROD_CONFLICT'
+    | 'DEPLOYMENT_NODE_ENV_CONFLICT';
   message: string;
 }
 
 export interface EnvironmentSecurityResolution {
   nodeEnv: string;
+  deploymentEnv: ValidDeploymentEnv | '';
   paymentMode: string;
   isNodeEnvProduction: boolean;
+  isExplicitStaging: boolean;
+  isStaging: boolean;
+  requiresLivePayments: boolean;
   isLivePaymentMode: boolean;
   hasLiveStripeKey: boolean;
   hasTestStripeKey: boolean;
   /**
-   * Authoritative canonical predicate across Stripe Live/Test mode, Trusted Origins,
+   * Authoritative canonical predicate across Trusted Origins,
    * Checkout Origin Validation, Portal Redirect URL Validation, HTTPS Enforcement,
-   * Readiness Checks, Media Token Secret enforcement, and Environment Validation.
+   * Readiness Checks, Media Token Secret enforcement, Demo Seeding, Password Reset Token Disclosure,
+   * and Server Vite/Static serving.
    *
-   * Any live-payment or production signal activates strict production security rules
-   * so Live Payment can NEVER operate with Development origin / localhost / HTTP rules.
+   * Any staging, live-payment, or production signal activates strict runtime production hardening
+   * so neither Staging nor Live Payment can operate with Development origin / localhost / HTTP rules,
+   * demo user seeding, or dev reset token disclosure.
+   * Live Stripe key enforcement is governed separately by `requiresLivePayments`.
    */
   isProduction: boolean;
   conflicts: EnvironmentConflict[];
@@ -34,6 +47,7 @@ export interface EnvironmentSecurityResolution {
 }
 
 const VALID_PAYMENT_MODE_SET = new Set<string>(['live', 'production', 'test', 'simulation']);
+const VALID_DEPLOYMENT_ENV_SET = new Set<string>(['development', 'test', 'staging', 'production']);
 
 function parseIpv4Octets(ip: string): [number, number, number, number] | null {
   if (!net.isIPv4(ip)) return null;
@@ -391,17 +405,68 @@ export function resolveEnvironmentSecurity(
   env: NodeJS.ProcessEnv = process.env
 ): EnvironmentSecurityResolution {
   const nodeEnv = (env.NODE_ENV || '').trim().toLowerCase();
+  const rawDeploymentEnv = (env.DEPLOYMENT_ENV || '').trim().toLowerCase();
   const paymentMode = (env.PAYMENT_MODE || '').trim().toLowerCase();
   const stripeKey = (env.STRIPE_SECRET_KEY || '').trim();
 
+  const isDeploymentEnvValid = !rawDeploymentEnv || VALID_DEPLOYMENT_ENV_SET.has(rawDeploymentEnv);
+  const deploymentEnv: ValidDeploymentEnv | '' = isDeploymentEnvValid
+    ? (rawDeploymentEnv as ValidDeploymentEnv | '')
+    : '';
+
   const isNodeEnvProduction = nodeEnv === 'production';
+  const isExplicitProduction = deploymentEnv === 'production';
+  const isExplicitStaging = deploymentEnv === 'staging';
+  const isExplicitDevOrTest = deploymentEnv === 'development' || deploymentEnv === 'test';
   const isLivePaymentMode = paymentMode === 'live' || paymentMode === 'production';
   const hasLiveStripeKey = isLiveStripeSecretKey(stripeKey);
   const hasTestStripeKey = isTestStripeSecretKey(stripeKey);
 
-  const isProduction = isNodeEnvProduction || isLivePaymentMode || hasLiveStripeKey;
+  const platformProdSignals: Array<[string, string | undefined]> = [
+    ['VERCEL_ENV', env.VERCEL_ENV],
+    ['RAILWAY_ENVIRONMENT', env.RAILWAY_ENVIRONMENT],
+    ['RAILWAY_ENVIRONMENT_NAME', env.RAILWAY_ENVIRONMENT_NAME],
+    ['RENDER_ENV', env.RENDER_ENV],
+    ['PLATFORM_ENV', env.PLATFORM_ENV],
+    ['APP_ENV', env.APP_ENV],
+  ];
+  const matchedPlatformProd = platformProdSignals.find(
+    ([, val]) => (val || '').trim().toLowerCase() === 'production'
+  );
+
+  // Runtime security hardening applies across BOTH staging and production (and any live payment signal).
+  const isProduction =
+    isNodeEnvProduction ||
+    isExplicitProduction ||
+    isExplicitStaging ||
+    isLivePaymentMode ||
+    hasLiveStripeKey ||
+    Boolean(matchedPlatformProd);
+
+  // Live billing enforcement applies to production / live payment contexts, and ALWAYS escalates if
+  // staging is combined with live payment or platform-level production indicators.
+  const requiresLivePayments =
+    isExplicitProduction ||
+    isLivePaymentMode ||
+    hasLiveStripeKey ||
+    Boolean(matchedPlatformProd) ||
+    (isNodeEnvProduction && !isExplicitStaging);
+
+  const isStaging =
+    isExplicitStaging &&
+    !isLivePaymentMode &&
+    !hasLiveStripeKey &&
+    !matchedPlatformProd;
 
   const conflicts: EnvironmentConflict[] = [];
+
+  if (rawDeploymentEnv && !isDeploymentEnvValid) {
+    conflicts.push({
+      variable: 'DEPLOYMENT_ENV',
+      code: 'INVALID_DEPLOYMENT_ENV',
+      message: `Unrecognized DEPLOYMENT_ENV='${rawDeploymentEnv}'. Allowed values are 'development', 'test', 'staging', or 'production'.`,
+    });
+  }
 
   if (paymentMode && !VALID_PAYMENT_MODE_SET.has(paymentMode)) {
     conflicts.push({
@@ -411,11 +476,64 @@ export function resolveEnvironmentSecurity(
     });
   }
 
-  if (isNodeEnvProduction && (paymentMode === 'test' || paymentMode === 'simulation')) {
+  if (isExplicitStaging && matchedPlatformProd) {
+    conflicts.push({
+      variable: 'DEPLOYMENT_ENV',
+      code: 'STAGING_PLATFORM_PROD_CONFLICT',
+      message: `Contradictory environment configuration: DEPLOYMENT_ENV='staging' cannot override ${matchedPlatformProd[0]}='production'.`,
+    });
+  }
+
+  if (isExplicitStaging && isLivePaymentMode) {
+    conflicts.push({
+      variable: 'PAYMENT_MODE',
+      code: 'STAGING_LIVE_PAYMENT_CONFLICT',
+      message: `Contradictory environment configuration: DEPLOYMENT_ENV='staging' cannot be combined with PAYMENT_MODE='${paymentMode}'. Staging must use test billing credentials.`,
+    });
+  }
+
+  if (isExplicitStaging && hasLiveStripeKey) {
+    conflicts.push({
+      variable: 'STRIPE_SECRET_KEY',
+      code: 'LIVE_KEY_IN_STAGING',
+      message: 'Contradictory environment configuration: Live Stripe key cannot be used when DEPLOYMENT_ENV=\'staging\'. Use sk_test_... / rk_test_... keys in staging.',
+    });
+  }
+
+  if (isExplicitProduction && (nodeEnv === 'development' || nodeEnv === 'test')) {
+    conflicts.push({
+      variable: 'DEPLOYMENT_ENV',
+      code: 'DEPLOYMENT_NODE_ENV_CONFLICT',
+      message: `Contradictory environment configuration: DEPLOYMENT_ENV='production' cannot be combined with NODE_ENV='${nodeEnv}'.`,
+    });
+  }
+
+  if (isExplicitStaging && (nodeEnv === 'development' || nodeEnv === 'test')) {
+    conflicts.push({
+      variable: 'DEPLOYMENT_ENV',
+      code: 'DEPLOYMENT_NODE_ENV_CONFLICT',
+      message: `Contradictory environment configuration: DEPLOYMENT_ENV='staging' cannot be combined with NODE_ENV='${nodeEnv}'. Use NODE_ENV='production' for optimized staging builds.`,
+    });
+  }
+
+  if (isExplicitDevOrTest && isNodeEnvProduction) {
+    conflicts.push({
+      variable: 'DEPLOYMENT_ENV',
+      code: 'DEPLOYMENT_NODE_ENV_CONFLICT',
+      message: `Contradictory environment configuration: DEPLOYMENT_ENV='${deploymentEnv}' cannot be combined with NODE_ENV='production'.`,
+    });
+  }
+
+  if (
+    (requiresLivePayments && !isExplicitStaging && (paymentMode === 'test' || paymentMode === 'simulation')) ||
+    (isExplicitStaging && paymentMode === 'simulation')
+  ) {
     conflicts.push({
       variable: 'PAYMENT_MODE',
       code: 'PROD_TEST_MODE_CONFLICT',
-      message: `Contradictory environment configuration: NODE_ENV='production' cannot be combined with PAYMENT_MODE='${paymentMode}'.`,
+      message: isExplicitStaging
+        ? `Contradictory environment configuration: PAYMENT_MODE='simulation' is forbidden in staging.`
+        : `Contradictory environment configuration: NODE_ENV='production' cannot be combined with PAYMENT_MODE='${paymentMode}'.`,
     });
   }
 
@@ -427,7 +545,7 @@ export function resolveEnvironmentSecurity(
     });
   }
 
-  if (isProduction && hasTestStripeKey) {
+  if (requiresLivePayments && hasTestStripeKey) {
     conflicts.push({
       variable: 'STRIPE_SECRET_KEY',
       code: 'TEST_KEY_IN_LIVE_OR_PROD',
@@ -451,8 +569,12 @@ export function resolveEnvironmentSecurity(
 
   return {
     nodeEnv,
+    deploymentEnv,
     paymentMode,
     isNodeEnvProduction,
+    isExplicitStaging,
+    isStaging,
+    requiresLivePayments,
     isLivePaymentMode,
     hasLiveStripeKey,
     hasTestStripeKey,

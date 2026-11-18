@@ -428,15 +428,21 @@ export function validateIccProfileStructure(profile: Buffer): { valid: boolean; 
     return { valid: false, reason: `Invalid ICC Profile Connection Space '${pcs}' (expected 'XYZ ' or 'Lab ').` };
   }
 
-  // Date & time (bytes 24..35): either all-zero (unused) or valid calendar date/time
+  // Date & time (bytes 24..35): either unset (all-zero or LittleCMS default month=1 with zero date/time) or valid calendar date/time
   const year = profile.readUInt16BE(24);
   const month = profile.readUInt16BE(26);
   const day = profile.readUInt16BE(28);
   const hour = profile.readUInt16BE(30);
   const minute = profile.readUInt16BE(32);
   const second = profile.readUInt16BE(34);
-  const allDateZero = year === 0 && month === 0 && day === 0 && hour === 0 && minute === 0 && second === 0;
-  if (!allDateZero) {
+  const isUnsetDate =
+    year === 0 &&
+    (month === 0 || month === 1) &&
+    day === 0 &&
+    hour === 0 &&
+    minute === 0 &&
+    second === 0;
+  if (!isUnsetDate) {
     if (
       year < 1990 || year > 2999 ||
       month < 1 || month > 12 ||
@@ -485,11 +491,20 @@ export function validateIccProfileStructure(profile: Buffer): { valid: boolean; 
     };
   }
 
+  const seenTagRanges: Array<{
+    index: number;
+    signature: string;
+    offset: number;
+    size: number;
+    end: number;
+  }> = [];
+
   for (let i = 0; i < tagCount; i++) {
     const entryOffset = 132 + i * 12;
     if (!isPrintableAscii4cc(profile, entryOffset)) {
       return { valid: false, reason: `Invalid non-ASCII ICC tag signature at entry ${i}.` };
     }
+    const tagSignature = profile.subarray(entryOffset, entryOffset + 4).toString('ascii');
     const tagOffset = profile.readUInt32BE(entryOffset + 4);
     const tagSize = profile.readUInt32BE(entryOffset + 8);
     if (tagOffset < tagTableEnd || tagSize < 8 || tagOffset + tagSize > profile.length) {
@@ -498,6 +513,37 @@ export function validateIccProfileStructure(profile: Buffer): { valid: boolean; 
         reason: `Out-of-bounds or truncated ICC tag data at entry ${i} (offset=${tagOffset}, size=${tagSize}, profileLength=${profile.length}).`
       };
     }
+
+    // ICC.1 Section 7.3.1: every tag data element offset must begin on a 4-byte boundary.
+    if (tagOffset % 4 !== 0) {
+      return {
+        valid: false,
+        reason: `Unaligned ICC tag offset at entry ${i} (${tagSignature}, offset=${tagOffset}; must be a multiple of 4 bytes).`
+      };
+    }
+
+    const tagEnd = tagOffset + tagSize;
+    // Per ICC.1 Section 7.3.1, multiple tags may share identical tag data blocks (exact same offset and size),
+    // whereas distinct tag data blocks must never partially overlap.
+    for (const prev of seenTagRanges) {
+      if (tagOffset === prev.offset && tagSize === prev.size) {
+        continue;
+      }
+      if (tagOffset < prev.end && prev.offset < tagEnd) {
+        return {
+          valid: false,
+          reason: `Invalid overlapping ICC tag data between entry ${prev.index} (${prev.signature}, [${prev.offset}, ${prev.end})) and entry ${i} (${tagSignature}, [${tagOffset}, ${tagEnd})).`
+        };
+      }
+    }
+
+    seenTagRanges.push({
+      index: i,
+      signature: tagSignature,
+      offset: tagOffset,
+      size: tagSize,
+      end: tagEnd,
+    });
   }
 
   return { valid: true };

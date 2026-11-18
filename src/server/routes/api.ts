@@ -12,6 +12,7 @@ import { speechTranscriptionAdapter } from '../pipeline/audioProcessor';
 import { thumbnailInspector } from '../pipeline/thumbnailInspector';
 import { creditService } from '../services/creditService';
 import { billingService, ALLOWED_PAID_PLANS } from '../services/billingService';
+import { emailService } from '../services/emailService';
 import { ensureDemoFixtures, getDemoFixture } from '../fixtures/demoMedia';
 import { channelIntelligenceEngine } from '../intelligence/channelIntelligence';
 import { validateStripeWebhookSecret } from '../../../scripts/validate-env';
@@ -1310,6 +1311,8 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
 
   let billingStatus: 'healthy' | 'degraded' | 'unhealthy' = 'healthy';
   let billingMessage = 'Billing operational.';
+  const requireLiveBilling = envSec.requiresLivePayments;
+  const isStagingBilling = envSec.isStaging;
   const billingMode = isKeyLive ? 'live' : (isKeyTest ? 'test' : (hasSecretKey ? 'custom' : 'disabled'));
 
   if (envSec.hasConflict) {
@@ -1317,9 +1320,11 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
     billingMessage = envSec.conflicts[0].message;
   } else if (!hasSecretKey && !hasWebhookSecret) {
     billingStatus = isProd ? 'degraded' : 'healthy';
-    billingMessage = isProd
-      ? 'Stripe billing credentials unconfigured in production environment.'
-      : 'Stripe credentials unconfigured; running in free/simulation billing mode.';
+    billingMessage = isStagingBilling
+      ? 'Stripe billing credentials unconfigured in staging environment.'
+      : isProd
+        ? 'Stripe billing credentials unconfigured in production environment.'
+        : 'Stripe credentials unconfigured; running in free/simulation billing mode.';
   } else if (!hasSecretKey || !hasWebhookSecret) {
     billingStatus = 'degraded';
     billingMessage = 'Partial billing configuration: both STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET are required for complete checkout & webhook processing.';
@@ -1329,25 +1334,44 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
   } else if (!isWebhookFormatValid) {
     billingStatus = 'degraded';
     billingMessage = 'Malformed STRIPE_WEBHOOK_SECRET (expected whsec_... format).';
-  } else if (isProd && !isKeyLive) {
+  } else if (isStagingBilling && isKeyLive) {
+    billingStatus = 'degraded';
+    billingMessage = 'Staging environment forbids Stripe live credentials (sk_live_...); configure sk_test_... keys instead.';
+  } else if (isStagingBilling && !isKeyTest) {
+    billingStatus = 'degraded';
+    billingMessage = 'Staging environment requires Stripe test credentials (sk_test_... or rk_test_...).';
+  } else if (requireLiveBilling && !isKeyLive) {
     billingStatus = 'degraded';
     billingMessage = 'Production requires Stripe live credentials (sk_live_...), but test key was detected.';
   } else if (isProd && !isOriginHttpsValid) {
     billingStatus = 'degraded';
-    billingMessage = 'Production requires a valid non-localhost HTTPS APP_BASE_URL for Stripe checkout and portal redirects.';
+    billingMessage = isStagingBilling
+      ? 'Staging requires a valid non-localhost HTTPS APP_BASE_URL for Stripe checkout and portal redirects.'
+      : 'Production requires a valid non-localhost HTTPS APP_BASE_URL for Stripe checkout and portal redirects.';
   } else {
     billingStatus = 'healthy';
-    billingMessage = `Stripe billing ready in ${billingMode} mode.`;
+    billingMessage = isStagingBilling
+      ? 'Stripe billing ready in staging (test) mode.'
+      : `Stripe billing ready in ${billingMode} mode.`;
   }
+
+  const keyValidForTier = isStagingBilling
+    ? isKeyTest
+    : requireLiveBilling
+      ? isKeyLive
+      : isKeyFormatValid;
 
   checks.billing = {
     status: billingStatus,
     message: billingMessage,
     details: {
       mode: billingMode,
+      deploymentEnv: envSec.deploymentEnv || (isProd ? 'production' : 'development'),
       isProductionMode: isProd,
+      isStagingMode: isStagingBilling,
+      requiresLivePayments: requireLiveBilling,
       originConfiguredValid: isOriginHttpsValid,
-      checkoutAvailable: hasSecretKey && isKeyFormatValid && !envSec.hasConflict && (!isProd || isOriginHttpsValid),
+      checkoutAvailable: hasSecretKey && keyValidForTier && !envSec.hasConflict && (!isProd || isOriginHttpsValid),
       webhooksAvailable: hasWebhookSecret && isWebhookFormatValid && !envSec.hasConflict
     }
   };
@@ -1827,7 +1851,7 @@ apiRouter.post('/auth/forgot-password', async (req: Request, res: Response) => {
     const normalizedEmail = email.toLowerCase().trim();
     const user = await storage.users.getUserByEmail(normalizedEmail);
 
-    let devToken: string | undefined;
+    let devResetToken: string | undefined;
 
     if (user) {
       const rawToken = crypto.randomBytes(32).toString('hex');
@@ -1836,14 +1860,24 @@ apiRouter.post('/auth/forgot-password', async (req: Request, res: Response) => {
 
       await storage.passwordReset.createResetToken(user.id, tokenHash, expiresAt);
 
-      // Safe development/test-only exposure; raw reset tokens are NEVER returned in Production Mode,
+      // Safe development/test-only exposure; raw reset tokens are NEVER returned in Production or Staging Mode,
       // even when ENABLE_DEV_RESET_TOKEN=true.
       if (!isProductionEnvironment(process.env)) {
-        devToken = rawToken;
+        devResetToken = rawToken;
       }
 
-      if (process.env.SMTP_HOST && process.env.SMTP_USER) {
-        console.log(`[Auth] Dispatched password reset notification for account: ${user.email}`);
+      // Real configurable SMTP delivery; non-enumerating and fail-safe on missing config or transport failure.
+      try {
+        await emailService.sendPasswordResetEmail(
+          {
+            recipientEmail: user.email,
+            resetToken: rawToken,
+            expiresInMinutes: 60,
+          },
+          process.env
+        );
+      } catch {
+        // Delivery failure must never disclose account existence or SMTP internals via HTTP response
       }
     }
 
@@ -1851,7 +1885,7 @@ apiRouter.post('/auth/forgot-password', async (req: Request, res: Response) => {
     res.json({
       success: true,
       message: 'If an account exists with that email address, password reset instructions have been generated.',
-      ...(devToken ? { devToken } : {})
+      ...(devResetToken ? { devResetToken } : {})
     });
   } catch (err: any) {
     res.status(500).json({ error: 'Unable to process password reset request.' });

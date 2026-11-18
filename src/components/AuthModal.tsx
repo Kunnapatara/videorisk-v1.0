@@ -25,6 +25,8 @@ interface AuthModalProps {
   onClose: () => void;
   onUserChanged: (user: UserAccount | null) => void;
   initialMode?: 'account' | 'login' | 'register' | 'switch' | 'forgot' | 'reset';
+  initialResetToken?: string | null;
+  onConsumeInitialResetToken?: () => void;
   intendedPlanId?: string | null;
   onIntendedPlanConfirmed?: (planId: string) => void;
   onExplorePricing?: () => void;
@@ -62,6 +64,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   onClose,
   onUserChanged,
   initialMode,
+  initialResetToken,
+  onConsumeInitialResetToken,
   intendedPlanId,
   onIntendedPlanConfirmed,
   onExplorePricing
@@ -95,7 +99,11 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     if (isOpen) {
       setError(null);
       setSuccess(null);
-      if (initialMode) {
+      if (initialResetToken) {
+        setResetToken(initialResetToken);
+        setMode('reset');
+        onConsumeInitialResetToken?.();
+      } else if (initialMode) {
         setMode(initialMode);
       } else {
         setMode(currentUser ? 'account' : 'login');
@@ -105,7 +113,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         loadBillingData();
       }
     }
-  }, [isOpen, currentUser, initialMode]);
+  }, [isOpen, currentUser, initialMode, initialResetToken]);
 
   const loadAccountsIfAvailable = async () => {
     try {

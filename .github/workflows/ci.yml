@@ -54,7 +54,7 @@ jobs:
       - name: Validate environment and plan configuration
         run: npx tsx scripts/validate-env.ts --mode=ci
 
-      - name: Run Master Verification Suites (Suites 1-24)
+      - name: Run Master Verification Suites (Suites 1-25)
         run: npm test
 
       - name: Run security remediation and production enforcement suite
@@ -69,5 +69,8 @@ jobs:
       - name: Run checkout origin security and Stripe refund lifecycle suite (test HMAC signatures, mocked SDK)
         run: npm run test:billing
 
-      - name: Run production build
-        run: npm run build
+      - name: Run production build (client + Node 22 backend bundle)
+        run: |
+          npm run build
+          test -f dist/index.html
+          test -f dist-server/server.mjs

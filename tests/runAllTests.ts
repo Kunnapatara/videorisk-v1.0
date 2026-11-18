@@ -126,6 +126,10 @@ async function main() {
     const { runGroupABSecurityRemediationTests } = await import('./security_remediation_group_ab.test');
     await runGroupABSecurityRemediationTests();
 
+    // Run Suite 25: Production Readiness Remediation (SMTP Email, devResetToken Contract, Staging Stripe Config)
+    const { runProductionReadinessTests } = await import('./production_readiness_remediation.test');
+    await runProductionReadinessTests();
+
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log(`\n🎉 ALL AUTOMATED VERIFICATION SUITES COMPLETED SUCCESSFULLY in ${elapsed}s!`);
     process.exit(0);

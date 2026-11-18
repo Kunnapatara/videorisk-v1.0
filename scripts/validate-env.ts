@@ -7,6 +7,7 @@
  * Usage:
  *   npx tsx scripts/validate-env.ts                     # Production check (default)
  *   npx tsx scripts/validate-env.ts --mode=production  # Explicit production check
+ *   npx tsx scripts/validate-env.ts --mode=staging     # Explicit staging check (NODE_ENV=production + sk_test_)
  *   npx tsx scripts/validate-env.ts --mode=test        # Test mode check
  *   npx tsx scripts/validate-env.ts --mode=development # Development mode check
  *   npx tsx scripts/validate-env.ts --live-check       # Optional live Stripe API check (requires ALLOW_LIVE_STRIPE_CHECK=true)
@@ -29,7 +30,7 @@ export interface ValidationIssue {
 }
 
 export interface ValidationSummary {
-  mode: 'production' | 'test' | 'development' | 'ci';
+  mode: 'production' | 'staging' | 'test' | 'development' | 'ci';
   valid: boolean;
   errorsCount: number;
   warningsCount: number;
@@ -81,7 +82,7 @@ export function validateStripeWebhookSecret(secret?: string | null): {
  * Validates billing environment configuration
  */
 export function validateBillingConfiguration(
-  mode: 'production' | 'test' | 'development' | 'ci' = 'production',
+  mode: 'production' | 'staging' | 'test' | 'development' | 'ci' = 'production',
   env: NodeJS.ProcessEnv = process.env
 ): ValidationSummary {
   const issues: ValidationIssue[] = [];
@@ -92,17 +93,31 @@ export function validateBillingConfiguration(
   const paymentProvider = env.PAYMENT_PROVIDER?.trim() || '';
   const paymentMode = envSec.paymentMode;
 
-  // Escalate to strict production rules whenever production mode is targeted OR live payment signals are active
+  const isStagingTarget =
+    (mode === 'staging' || (mode !== 'ci' && mode !== 'production' && envSec.isStaging)) &&
+    !envSec.requiresLivePayments;
+
+  const hasExplicitLiveSignal =
+    envSec.isLivePaymentMode ||
+    envSec.hasLiveStripeKey;
+
+  // Escalate to strict live production billing whenever production mode is targeted OR explicit live payment signals are active
   const effectiveProduction =
     mode === 'production' ||
-    envSec.isLivePaymentMode ||
-    envSec.hasLiveStripeKey ||
-    (mode !== 'ci' && envSec.isNodeEnvProduction);
+    hasExplicitLiveSignal ||
+    (mode !== 'ci' && mode !== 'staging' && envSec.requiresLivePayments);
 
-  // Flag explicit cross-variable conflicts (NODE_ENV vs PAYMENT_MODE vs target mode)
+  // Strict runtime hardening (HTTPS origins, webhooks, MEDIA_TOKEN_SECRET, zero simulation) applies to both staging and production
+  const enforceRuntimeHardening = effectiveProduction || isStagingTarget;
+
+  // Flag explicit cross-variable conflicts (DEPLOYMENT_ENV vs NODE_ENV vs PAYMENT_MODE vs target mode)
   for (const conflict of envSec.conflicts) {
     // Key conflicts are emitted in section 1 with maskSecret details below
-    if (conflict.code === 'TEST_KEY_IN_LIVE_OR_PROD' || conflict.code === 'LIVE_KEY_IN_DEV_OR_TEST') {
+    if (
+      conflict.code === 'TEST_KEY_IN_LIVE_OR_PROD' ||
+      conflict.code === 'LIVE_KEY_IN_DEV_OR_TEST' ||
+      conflict.code === 'LIVE_KEY_IN_STAGING'
+    ) {
       continue;
     }
     issues.push({
@@ -110,6 +125,23 @@ export function validateBillingConfiguration(
       variable: conflict.variable,
       message: conflict.message,
     });
+  }
+
+  if (mode === 'staging') {
+    if (envSec.deploymentEnv && envSec.deploymentEnv !== 'staging') {
+      issues.push({
+        type: 'ERROR',
+        variable: 'DEPLOYMENT_ENV',
+        message: `Contradictory environment configuration: DEPLOYMENT_ENV='${envSec.deploymentEnv}' cannot run under '--mode=staging'.`,
+      });
+    }
+    if (envSec.isLivePaymentMode && !envSec.conflicts.some((c) => c.code === 'STAGING_LIVE_PAYMENT_CONFLICT')) {
+      issues.push({
+        type: 'ERROR',
+        variable: 'PAYMENT_MODE',
+        message: `Contradictory environment configuration: PAYMENT_MODE='${paymentMode}' is forbidden under '--mode=staging'.`,
+      });
+    }
   }
 
   if ((mode === 'test' || mode === 'development') && envSec.isLivePaymentMode) {
@@ -130,6 +162,14 @@ export function validateBillingConfiguration(
     });
   }
 
+  if (mode === 'production' && envSec.isExplicitStaging) {
+    issues.push({
+      type: 'ERROR',
+      variable: 'DEPLOYMENT_ENV',
+      message: `Contradictory environment configuration: DEPLOYMENT_ENV='staging' cannot satisfy '--mode=production'.`,
+    });
+  }
+
   // 1. Stripe Secret Key Validation
   if (!secretKey) {
     if (effectiveProduction) {
@@ -137,6 +177,12 @@ export function validateBillingConfiguration(
         type: 'ERROR',
         variable: 'STRIPE_SECRET_KEY',
         message: 'Missing required Stripe secret key in production environment.',
+      });
+    } else if (isStagingTarget) {
+      issues.push({
+        type: 'ERROR',
+        variable: 'STRIPE_SECRET_KEY',
+        message: 'Missing required Stripe test secret key (expected sk_test_... or rk_test_...) in staging environment.',
       });
     } else if (mode === 'test') {
       issues.push({
@@ -162,14 +208,30 @@ export function validateBillingConfiguration(
     const isTestKey = secretKey.startsWith('sk_test_') || secretKey.startsWith('rk_test_');
 
     const isNonProdContext =
+      mode === 'staging' ||
       mode === 'test' ||
       mode === 'development' ||
+      envSec.isStaging ||
       envSec.nodeEnv === 'development' ||
       envSec.nodeEnv === 'test' ||
       paymentMode === 'test' ||
       paymentMode === 'simulation';
 
-    if (isNonProdContext) {
+    if (isStagingTarget && !effectiveProduction) {
+      if (isLiveKey) {
+        issues.push({
+          type: 'ERROR',
+          variable: 'STRIPE_SECRET_KEY',
+          message: `Accidental live key (${maskSecret(secretKey)}) in staging mode! Staging strictly requires sk_test_... or rk_test_... to prevent real charges.`,
+        });
+      } else if (!isTestKey) {
+        issues.push({
+          type: 'ERROR',
+          variable: 'STRIPE_SECRET_KEY',
+          message: `Malformed staging Stripe key: must begin with 'sk_test_' or 'rk_test_'. Found: ${maskSecret(secretKey)}.`,
+        });
+      }
+    } else if (isNonProdContext) {
       if (isLiveKey) {
         issues.push({
           type: 'ERROR',
@@ -218,11 +280,13 @@ export function validateBillingConfiguration(
 
   // 2. Stripe Webhook Secret Validation
   if (!webhookSecret) {
-    if (effectiveProduction) {
+    if (enforceRuntimeHardening) {
       issues.push({
         type: 'ERROR',
         variable: 'STRIPE_WEBHOOK_SECRET',
-        message: 'Missing required STRIPE_WEBHOOK_SECRET in production. Stripe webhook signature verification will fail closed.',
+        message: isStagingTarget
+          ? 'Missing required STRIPE_WEBHOOK_SECRET in staging. Stripe webhook signature verification will fail closed.'
+          : 'Missing required STRIPE_WEBHOOK_SECRET in production. Stripe webhook signature verification will fail closed.',
       });
     } else if (mode === 'test') {
       issues.push({
@@ -254,7 +318,7 @@ export function validateBillingConfiguration(
           variable: plan.envVar!,
           message: `Missing Stripe Price ID for ${plan.name} plan ($${plan.priceUsd}, ${plan.credits} credits). Set ${plan.envVar}=price_... in production.`,
         });
-      } else if (mode === 'test') {
+      } else if (isStagingTarget || mode === 'test') {
         issues.push({
           type: 'WARNING',
           variable: plan.envVar!,
@@ -281,11 +345,11 @@ export function validateBillingConfiguration(
     });
   }
 
-  if (effectiveProduction && paymentMode === 'simulation') {
+  if (enforceRuntimeHardening && paymentMode === 'simulation') {
     issues.push({
       type: 'ERROR',
       variable: 'PAYMENT_MODE',
-      message: "PAYMENT_MODE='simulation' is strictly forbidden in production/live mode. Set to 'live' or leave unset.",
+      message: "PAYMENT_MODE='simulation' is strictly forbidden in production/staging/live mode.",
     });
   }
 
@@ -303,17 +367,17 @@ export function validateBillingConfiguration(
     }
     try {
       const parsed = new URL(rawOrigin);
-      if (effectiveProduction && parsed.protocol !== 'https:') {
+      if (enforceRuntimeHardening && parsed.protocol !== 'https:') {
         issues.push({
           type: 'ERROR',
           variable: varName,
-          message: `Insecure scheme '${parsed.protocol}' in ${varName}. Production strictly requires https:// origins.`,
+          message: `Insecure scheme '${parsed.protocol}' in ${varName}. Production and staging strictly require https:// origins.`,
         });
-      } else if (effectiveProduction && isForbiddenProductionOriginHostname(parsed.hostname)) {
+      } else if (enforceRuntimeHardening && isForbiddenProductionOriginHostname(parsed.hostname)) {
         issues.push({
           type: 'ERROR',
           variable: varName,
-          message: `Loopback, localhost, or unspecified origin '${parsed.origin}' in ${varName} is forbidden in production/live payment mode.`,
+          message: `Loopback, localhost, or unspecified origin '${parsed.origin}' in ${varName} is forbidden in production/staging/live payment mode.`,
         });
       } else if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
         issues.push({
@@ -332,11 +396,13 @@ export function validateBillingConfiguration(
   };
 
   if (!appBaseUrl) {
-    if (effectiveProduction) {
+    if (enforceRuntimeHardening) {
       issues.push({
-        type: envSec.isLivePaymentMode && !envSec.isNodeEnvProduction ? 'ERROR' : 'WARNING',
+        type: (envSec.isLivePaymentMode && !envSec.isNodeEnvProduction) || isStagingTarget ? 'ERROR' : 'WARNING',
         variable: 'APP_BASE_URL',
-        message: 'APP_BASE_URL is not set. Production checkout & portal redirect origin resolution will fail closed until APP_BASE_URL is configured.',
+        message: isStagingTarget
+          ? 'APP_BASE_URL is not set. Staging checkout & portal redirect origin resolution requires an explicit HTTPS origin.'
+          : 'APP_BASE_URL is not set. Production checkout & portal redirect origin resolution will fail closed until APP_BASE_URL is configured.',
       });
     } else if (mode === 'test') {
       issues.push({
@@ -363,7 +429,7 @@ export function validateBillingConfiguration(
   }
 
   // 6. Media Access Token Secret Validation (shared canonical rule with runtime API & readiness)
-  const mediaSecretValidation = validateMediaTokenSecret(env.MEDIA_TOKEN_SECRET, effectiveProduction);
+  const mediaSecretValidation = validateMediaTokenSecret(env.MEDIA_TOKEN_SECRET, enforceRuntimeHardening);
   if (!mediaSecretValidation.valid) {
     issues.push({
       type: 'ERROR',
@@ -446,19 +512,22 @@ export async function runValidatorCli(
 ): Promise<number> {
   const args = cliArgs || process.argv.slice(2);
   const env = cliEnv || process.env;
-  let mode: 'production' | 'test' | 'development' | 'ci' = 'production';
+  let mode: 'production' | 'staging' | 'test' | 'development' | 'ci' = 'production';
 
   for (const arg of args) {
     if (arg === '--mode=production') mode = 'production';
+    if (arg === '--mode=staging') mode = 'staging';
     if (arg === '--mode=test') mode = 'test';
     if (arg === '--mode=development') mode = 'development';
     if (arg === '--mode=ci') mode = 'ci';
   }
 
   if (!args.some((a) => a.startsWith('--mode='))) {
+    const depEnv = (env.DEPLOYMENT_ENV || '').trim().toLowerCase();
     if (env.CI === 'true') mode = 'ci';
-    else if (env.NODE_ENV === 'test') mode = 'test';
-    else if (env.NODE_ENV === 'development') mode = 'development';
+    else if (depEnv === 'staging') mode = 'staging';
+    else if (env.NODE_ENV === 'test' || depEnv === 'test') mode = 'test';
+    else if (env.NODE_ENV === 'development' || depEnv === 'development') mode = 'development';
     else mode = 'production';
   }
 
