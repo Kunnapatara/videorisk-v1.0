@@ -363,7 +363,7 @@ export function validateIccProfileStructure(profile: Buffer): { valid: boolean; 
   if (profile.length < 128) {
     return {
       valid: false,
-      reason: `Invalid ICC profile in PNG iCCP chunk: decompressed length (${profile.length} bytes) is shorter than the mandatory 128-byte ICC header.`
+      reason: `Truncated ICC profile in PNG iCCP chunk: decompressed length (${profile.length} bytes) is shorter than the mandatory 128-byte ICC header.`
     };
   }
 
