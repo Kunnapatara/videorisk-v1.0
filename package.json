@@ -14,6 +14,7 @@
     "test:phase4-6": "DATABASE_PATH=data/videorisk_test.db tsx tests/phase4_6_gap_closure.test.ts",
     "test:regression": "DATABASE_PATH=data/videorisk_test.db tsx tests/remediation_regression.test.ts",
     "test:billing": "DATABASE_PATH=data/videorisk_test.db tsx tests/stripe_origin_and_refund_lifecycle.test.ts",
+    "test:security": "DATABASE_PATH=data/videorisk_test.db tsx tests/server_production_predicate.test.ts && DATABASE_PATH=data/videorisk_test.db tsx tests/security_remediation_group_ab.test.ts",
     "test:all": "DATABASE_PATH=data/videorisk_test.db tsx tests/runAllTests.ts && DATABASE_PATH=data/videorisk_test.db tsx tests/phase4_6_gap_closure.test.ts && DATABASE_PATH=data/videorisk_test.db tsx tests/remediation_regression.test.ts && DATABASE_PATH=data/videorisk_test.db tsx tests/stripe_origin_and_refund_lifecycle.test.ts",
     "validate:env": "tsx scripts/validate-env.ts"
   },

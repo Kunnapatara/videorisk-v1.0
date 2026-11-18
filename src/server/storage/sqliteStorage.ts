@@ -45,6 +45,7 @@ import {
   UploadRecord
 } from './index';
 import { validateTestDatabaseTarget } from './testIsolation';
+import { isProductionEnvironment } from '../config/environment';
 
 export interface MigrationRecord {
   version: number;
@@ -55,10 +56,12 @@ export interface MigrationRecord {
 export class SqliteStorageRepository implements IStorageRepository {
   public db: DatabaseSync;
   public dbPath: string;
+  private env: NodeJS.ProcessEnv;
   private txQueue: Promise<void> = Promise.resolve();
   private static asyncLocalStorage = new AsyncLocalStorage<{ depth: number }>();
 
   constructor(customPath?: string, env: NodeJS.ProcessEnv = process.env) {
+    this.env = env;
     if (customPath) {
       this.dbPath = path.resolve(customPath);
     } else if (env.DATABASE_PATH) {
@@ -857,7 +860,8 @@ export class SqliteStorageRepository implements IStorageRepository {
   }
 
   private seedDefaultUsersIfNeeded() {
-    if (process.env.NODE_ENV === 'production') return;
+    // SECURITY: Never seed demo/default accounts when canonical production mode is active.
+    if (isProductionEnvironment(this.env)) return;
 
     const count = (this.db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number }).count;
     if (count > 0) return;
@@ -937,6 +941,9 @@ export class SqliteStorageRepository implements IStorageRepository {
     },
 
     getOrCreateDefaultUser: async (): Promise<UserAccount> => {
+      if (isProductionEnvironment(this.env)) {
+        throw new Error('Default demo user is disabled in production.');
+      }
       const existing = await this.users.getUser('user_default');
       if (existing) return existing;
       const all = await this.users.listUsers();
@@ -1183,7 +1190,7 @@ export class SqliteStorageRepository implements IStorageRepository {
       return this.consumeRateLimits(specs);
     },
     clearRateLimits: async (filter?: { keyPrefix?: string; key?: string }): Promise<void> => {
-      if (process.env.NODE_ENV === 'production' && !filter?.keyPrefix && !filter?.key) {
+      if (isProductionEnvironment(this.env) && !filter?.keyPrefix && !filter?.key) {
         throw new Error('Refusing to clear all rate limits in production environment without a target key or prefix filter.');
       }
 
@@ -1195,7 +1202,7 @@ export class SqliteStorageRepository implements IStorageRepository {
         }
         // Exact literal prefix comparison using substr() to prevent SQL LIKE wildcard interpretation of '_' or '%'
         this.db.prepare('DELETE FROM rate_limits WHERE substr(key, 1, ?) = ?;').run(filter.keyPrefix.length, filter.keyPrefix);
-      } else if (process.env.NODE_ENV !== 'production') {
+      } else if (!isProductionEnvironment(this.env)) {
         // Only delete test-scoped keys by default in non-production, preserving unrelated records
         this.db.prepare(`
           DELETE FROM rate_limits 
@@ -1210,7 +1217,7 @@ export class SqliteStorageRepository implements IStorageRepository {
       }
     },
     clearTestRateLimits: async (prefix: string = 'test_'): Promise<void> => {
-      if (process.env.NODE_ENV === 'production') {
+      if (isProductionEnvironment(this.env)) {
         throw new Error('Refusing to run clearTestRateLimits in production environment.');
       }
       if (!prefix || prefix.length === 0) {

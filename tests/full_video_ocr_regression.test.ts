@@ -1048,8 +1048,118 @@ exit 0
       'D2.45e Invalid gAMA length rejected'
     );
 
-    // C4.4 iCCP (profile name, NUL terminator, compression method, compressed stream, output limit, trailing data, ordering)
-    const sampleIccProfile = Buffer.from('00000080test_icc_profile_payload_videorisk');
+    // C4.4 iCCP (profile name, NUL terminator, compression method, compressed stream, output limit, trailing data, ICC structure, ordering)
+    // Provenance & License: Deterministic, spec-compliant ICC.1-2001-04 (v2.4.0) sRGB Display ('mntr', 'RGB ', 'XYZ ')
+    // profile synthesized directly from the public ICC.1 specification for VideoRisk PNG iCCP validation tests (MIT-compatible test fixture).
+    const buildGenuineDeterministicSrgbIccProfile = (): Buffer => {
+      const s15Fixed16 = (val: number): number => Math.round(val * 65536);
+      const pad4 = (buf: Buffer): Buffer => {
+        const rem = buf.length % 4;
+        return rem === 0 ? buf : Buffer.concat([buf, Buffer.alloc(4 - rem)]);
+      };
+      const mkXyzTag = (x: number, y: number, z: number): Buffer => {
+        const b = Buffer.alloc(20);
+        b.write('XYZ ', 0, 'ascii');
+        b.writeUInt32BE(0, 4);
+        b.writeInt32BE(s15Fixed16(x), 8);
+        b.writeInt32BE(s15Fixed16(y), 12);
+        b.writeInt32BE(s15Fixed16(z), 16);
+        return b;
+      };
+      const mkCurvGammaTag = (gammaFixed8_8: number): Buffer => {
+        const b = Buffer.alloc(14);
+        b.write('curv', 0, 'ascii');
+        b.writeUInt32BE(0, 4);
+        b.writeUInt32BE(1, 8); // 1-entry gamma curve
+        b.writeUInt16BE(gammaFixed8_8, 12); // e.g., 2.2 -> 0x0233
+        return b;
+      };
+      const mkTextTag = (text: string): Buffer => {
+        const str = Buffer.from(text + '\0', 'ascii');
+        const b = Buffer.alloc(8 + str.length);
+        b.write('text', 0, 'ascii');
+        b.writeUInt32BE(0, 4);
+        str.copy(b, 8);
+        return b;
+      };
+      const mkDescTag = (desc: string): Buffer => {
+        const asciiBuf = Buffer.from(desc + '\0', 'ascii');
+        // ICC v2 'desc' (textDescriptionType): 4-byte sig + 4-byte reserved + 4-byte asciiLen + ascii + 8-byte unicode header + 69-byte scriptcode
+        const b = Buffer.alloc(12 + asciiBuf.length + 8 + 69);
+        b.write('desc', 0, 'ascii');
+        b.writeUInt32BE(0, 4);
+        b.writeUInt32BE(asciiBuf.length, 8);
+        asciiBuf.copy(b, 12);
+        return b;
+      };
+
+      const trcTag = mkCurvGammaTag(0x0233); // gamma ~2.2
+      const tagEntries: Array<{ sig: string; data: Buffer; sharedWith?: string }> = [
+        { sig: 'desc', data: mkDescTag('VideoRisk Test sRGB IEC61966-2.1') },
+        { sig: 'cprt', data: mkTextTag('VideoRisk Test Fixture (ICC.1-2001-04)') },
+        { sig: 'wtpt', data: mkXyzTag(0.9505, 1.0000, 1.0890) },
+        { sig: 'rXYZ', data: mkXyzTag(0.4361, 0.2225, 0.0139) },
+        { sig: 'gXYZ', data: mkXyzTag(0.3851, 0.7169, 0.0971) },
+        { sig: 'bXYZ', data: mkXyzTag(0.1431, 0.0606, 0.7141) },
+        { sig: 'rTRC', data: trcTag },
+        { sig: 'gTRC', data: trcTag, sharedWith: 'rTRC' },
+        { sig: 'bTRC', data: trcTag, sharedWith: 'rTRC' },
+      ];
+
+      const headerSize = 128;
+      const tagTableSize = 4 + tagEntries.length * 12;
+      let cursor = headerSize + tagTableSize;
+      const offsets = new Map<string, { offset: number; size: number }>();
+      const dataChunks: Buffer[] = [];
+
+      for (const entry of tagEntries) {
+        if (entry.sharedWith && offsets.has(entry.sharedWith)) {
+          offsets.set(entry.sig, offsets.get(entry.sharedWith)!);
+          continue;
+        }
+        const padded = pad4(entry.data);
+        offsets.set(entry.sig, { offset: cursor, size: entry.data.length });
+        dataChunks.push(padded);
+        cursor += padded.length;
+      }
+
+      const header = Buffer.alloc(headerSize);
+      header.writeUInt32BE(cursor, 0); // Profile size
+      header.write('none', 4, 'ascii'); // Preferred CMM type
+      header.writeUInt32BE(0x02400000, 8); // ICC v2.4.0
+      header.write('mntr', 12, 'ascii'); // Display device class
+      header.write('RGB ', 16, 'ascii'); // Data colour space
+      header.write('XYZ ', 20, 'ascii'); // PCS
+      // Creation date/time: 2026-01-01 00:00:00 UTC
+      header.writeUInt16BE(2026, 24);
+      header.writeUInt16BE(1, 26);
+      header.writeUInt16BE(1, 28);
+      header.writeUInt16BE(0, 30);
+      header.writeUInt16BE(0, 32);
+      header.writeUInt16BE(0, 34);
+      header.write('acsp', 36, 'ascii'); // Mandatory ICC profile file signature
+      header.writeUInt32BE(0, 40); // Primary platform
+      header.writeUInt32BE(0, 44); // Profile flags
+      header.writeUInt32BE(0, 64); // Rendering intent: 0 (Perceptual)
+      // PCS illuminant D50
+      header.writeInt32BE(s15Fixed16(0.9642), 68);
+      header.writeInt32BE(s15Fixed16(1.0000), 72);
+      header.writeInt32BE(s15Fixed16(0.8249), 76);
+
+      const tagTable = Buffer.alloc(tagTableSize);
+      tagTable.writeUInt32BE(tagEntries.length, 0);
+      tagEntries.forEach((entry, idx) => {
+        const rec = offsets.get(entry.sig)!;
+        const pos = 4 + idx * 12;
+        tagTable.write(entry.sig, pos, 'ascii');
+        tagTable.writeUInt32BE(rec.offset, pos + 4);
+        tagTable.writeUInt32BE(rec.size, pos + 8);
+      });
+
+      return Buffer.concat([header, tagTable, ...dataChunks]);
+    };
+
+    const sampleIccProfile = buildGenuineDeterministicSrgbIccProfile();
     const compressedIccProfile = zlib.deflateSync(sampleIccProfile);
     const mkIccpPayload = (nameBuf: Buffer, method: number | null, compressedStream: Buffer, withNul = true): Buffer => {
       const parts: Buffer[] = [nameBuf];
@@ -1069,7 +1179,7 @@ exit 0
         )
       ).valid,
       true,
-      'D2.46a Valid bounded iCCP chunk accepted'
+      'D2.46a Valid genuine ICC.1 profile inside iCCP chunk accepted'
     );
     assert.strictEqual(
       validatePngFrameFile(
@@ -1181,6 +1291,126 @@ exit 0
     );
     assert.strictEqual(iccpBombRes.valid, false, 'D2.46i iCCP excessive decompressed output rejected');
     assert.strictEqual(iccpBombRes.errorClass, 'PNG_DECOMPRESSION_FAILURE');
+
+    // Group C2: Structural ICC profile validation regressions inside valid zlib iCCP streams
+    const fakeAsciiIcc = Buffer.from('00000080test_icc_profile_payload_videorisk');
+    const badShortIccRes = validatePngFrameFile(
+      mkCustomPng(
+        'c44_iccp_fake_short.png',
+        { w: 1, h: 1, bd: 8, ct: 2 },
+        [{ type: 'iCCP', data: mkIccpPayload(Buffer.from('FakeShort'), 0, zlib.deflateSync(fakeAsciiIcc)) }],
+        Buffer.from([0, 1, 2, 3])
+      )
+    );
+    assert.strictEqual(badShortIccRes.valid, false, 'D2.46j Fake short ASCII ICC payload (<128 bytes) rejected');
+    assert.strictEqual(badShortIccRes.errorClass, 'INVALID_PNG_STRUCTURE');
+
+    const sizeMismatchLarge = Buffer.from(sampleIccProfile);
+    sizeMismatchLarge.writeUInt32BE(sampleIccProfile.length + 100, 0);
+    assert.strictEqual(
+      validatePngFrameFile(
+        mkCustomPng(
+          'c44_iccp_size_mismatch_large.png',
+          { w: 1, h: 1, bd: 8, ct: 2 },
+          [{ type: 'iCCP', data: mkIccpPayload(Buffer.from('SizeMismatch'), 0, zlib.deflateSync(sizeMismatchLarge)) }],
+          Buffer.from([0, 1, 2, 3])
+        )
+      ).valid,
+      false,
+      'D2.46k ICC profile with declared size > actual payload length rejected'
+    );
+
+    const sizeMismatchSmall = Buffer.from(sampleIccProfile);
+    sizeMismatchSmall.writeUInt32BE(132, 0);
+    assert.strictEqual(
+      validatePngFrameFile(
+        mkCustomPng(
+          'c44_iccp_size_mismatch_small.png',
+          { w: 1, h: 1, bd: 8, ct: 2 },
+          [{ type: 'iCCP', data: mkIccpPayload(Buffer.from('SizeSmall'), 0, zlib.deflateSync(sizeMismatchSmall)) }],
+          Buffer.from([0, 1, 2, 3])
+        )
+      ).valid,
+      false,
+      'D2.46l ICC profile with declared size < actual payload length rejected'
+    );
+
+    const truncatedIccPayload = sampleIccProfile.subarray(0, sampleIccProfile.length - 16);
+    assert.strictEqual(
+      validatePngFrameFile(
+        mkCustomPng(
+          'c44_iccp_truncated_icc.png',
+          { w: 1, h: 1, bd: 8, ct: 2 },
+          [{ type: 'iCCP', data: mkIccpPayload(Buffer.from('TruncICC'), 0, zlib.deflateSync(truncatedIccPayload)) }],
+          Buffer.from([0, 1, 2, 3])
+        )
+      ).valid,
+      false,
+      'D2.46m Truncated ICC profile inside valid zlib stream rejected'
+    );
+
+    const badMagicIcc = Buffer.from(sampleIccProfile);
+    badMagicIcc.write('fake', 36, 'ascii');
+    assert.strictEqual(
+      validatePngFrameFile(
+        mkCustomPng(
+          'c44_iccp_bad_acsp.png',
+          { w: 1, h: 1, bd: 8, ct: 2 },
+          [{ type: 'iCCP', data: mkIccpPayload(Buffer.from('BadMagic'), 0, zlib.deflateSync(badMagicIcc)) }],
+          Buffer.from([0, 1, 2, 3])
+        )
+      ).valid,
+      false,
+      'D2.46n ICC profile without acsp signature at byte 36 rejected'
+    );
+
+    const badClassIcc = Buffer.from(sampleIccProfile);
+    badClassIcc.write('xxxx', 12, 'ascii');
+    assert.strictEqual(
+      validatePngFrameFile(
+        mkCustomPng(
+          'c44_iccp_bad_class.png',
+          { w: 1, h: 1, bd: 8, ct: 2 },
+          [{ type: 'iCCP', data: mkIccpPayload(Buffer.from('BadClass'), 0, zlib.deflateSync(badClassIcc)) }],
+          Buffer.from([0, 1, 2, 3])
+        )
+      ).valid,
+      false,
+      'D2.46o ICC profile with invalid device/profile class rejected'
+    );
+
+    const badTagOobIcc = Buffer.from(sampleIccProfile);
+    // Point first tag data offset + size beyond profile length
+    badTagOobIcc.writeUInt32BE(sampleIccProfile.length + 64, 132 + 8);
+    assert.strictEqual(
+      validatePngFrameFile(
+        mkCustomPng(
+          'c44_iccp_oob_tag.png',
+          { w: 1, h: 1, bd: 8, ct: 2 },
+          [{ type: 'iCCP', data: mkIccpPayload(Buffer.from('OobTag'), 0, zlib.deflateSync(badTagOobIcc)) }],
+          Buffer.from([0, 1, 2, 3])
+        )
+      ).valid,
+      false,
+      'D2.46p ICC profile with out-of-bounds tag entry rejected'
+    );
+
+    const badIlluminantIcc = Buffer.from(sampleIccProfile);
+    badIlluminantIcc.writeInt32BE(0, 68);
+    badIlluminantIcc.writeInt32BE(0, 72);
+    badIlluminantIcc.writeInt32BE(0, 76);
+    assert.strictEqual(
+      validatePngFrameFile(
+        mkCustomPng(
+          'c44_iccp_bad_illuminant.png',
+          { w: 1, h: 1, bd: 8, ct: 2 },
+          [{ type: 'iCCP', data: mkIccpPayload(Buffer.from('BadIllum'), 0, zlib.deflateSync(badIlluminantIcc)) }],
+          Buffer.from([0, 1, 2, 3])
+        )
+      ).valid,
+      false,
+      'D2.46q ICC profile with zeroed PCS illuminant rejected'
+    );
 
     // C4.5 bKGD across colorTypes 0, 2, 3, 4, 6 with boundary checks
     assert.strictEqual(

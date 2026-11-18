@@ -333,6 +333,176 @@ function isValidPngIccpProfileName(nameBytes: Buffer): boolean {
   return true;
 }
 
+const VALID_ICC_PROFILE_CLASSES = new Set<string>([
+  'scnr', 'mntr', 'prtr', 'link', 'spac', 'abst', 'nmcl', 'cenc', 'mid ', 'mlut'
+]);
+
+const VALID_ICC_COLOR_SPACES = new Set<string>([
+  'XYZ ', 'Lab ', 'Luv ', 'YCbr', 'Yxy ', 'RGB ', 'GRAY', 'HSV ', 'HLS ', 'CMYK', 'CMY ',
+  '2CLR', '3CLR', '4CLR', '5CLR', '6CLR', '7CLR', '8CLR', '9CLR',
+  'ACLR', 'BCLR', 'CCLR', 'DCLR', 'ECLR', 'FCLR'
+]);
+
+const VALID_ICC_PCS_SPACES = new Set<string>(['XYZ ', 'Lab ']);
+
+function isPrintableAscii4cc(buf: Buffer, offset: number): boolean {
+  for (let i = 0; i < 4; i++) {
+    const b = buf[offset + i];
+    if (b < 0x20 || b > 0x7e) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Validates the binary structure of a decompressed ICC profile extracted from a PNG `iCCP` chunk
+ * against the ICC.1 specification header (128 bytes) and tag table requirements.
+ */
+export function validateIccProfileStructure(profile: Buffer): { valid: boolean; reason?: string } {
+  if (profile.length < 128) {
+    return {
+      valid: false,
+      reason: `Invalid ICC profile in PNG iCCP chunk: decompressed length (${profile.length} bytes) is shorter than the mandatory 128-byte ICC header.`
+    };
+  }
+
+  const declaredSize = profile.readUInt32BE(0);
+  if (declaredSize < 128 || declaredSize > MAX_OCR_PNG_ICCP_INFLATED_BYTES) {
+    return {
+      valid: false,
+      reason: `Invalid ICC profile header size (${declaredSize} bytes): outside allowed bounds [128..${MAX_OCR_PNG_ICCP_INFLATED_BYTES}].`
+    };
+  }
+  if (declaredSize !== profile.length) {
+    return {
+      valid: false,
+      reason: `ICC profile size mismatch in PNG iCCP chunk: header declares ${declaredSize} bytes, but decompressed payload has ${profile.length} bytes.`
+    };
+  }
+
+  // Mandatory ICC signature at bytes 36..39
+  const magic = profile.subarray(36, 40).toString('latin1');
+  if (magic !== 'acsp') {
+    return {
+      valid: false,
+      reason: `Invalid ICC profile signature at offset 36: expected 'acsp'.`
+    };
+  }
+
+  // Version bytes 8..11: major [2..5], BCD minor/bugfix nibbles [0..9], reserved bytes 10..11 == 0
+  const majorVersion = profile[8];
+  const minorNibble = (profile[9] >> 4) & 0x0f;
+  const bugfixNibble = profile[9] & 0x0f;
+  const versionReserved = profile.readUInt16BE(10);
+  if (majorVersion < 2 || majorVersion > 5 || minorNibble > 9 || bugfixNibble > 9 || versionReserved !== 0) {
+    return {
+      valid: false,
+      reason: `Invalid ICC profile version header (${majorVersion}.${minorNibble}.${bugfixNibble}).`
+    };
+  }
+
+  // Device/profile class (bytes 12..15)
+  if (!isPrintableAscii4cc(profile, 12)) {
+    return { valid: false, reason: 'Invalid non-ASCII ICC profile class signature.' };
+  }
+  const profileClass = profile.subarray(12, 16).toString('ascii');
+  if (!VALID_ICC_PROFILE_CLASSES.has(profileClass)) {
+    return { valid: false, reason: `Unsupported or invalid ICC profile class '${profileClass}'.` };
+  }
+
+  // Data colour space (bytes 16..19) & PCS (bytes 20..23)
+  if (!isPrintableAscii4cc(profile, 16) || !isPrintableAscii4cc(profile, 20)) {
+    return { valid: false, reason: 'Invalid non-ASCII ICC colour space or PCS signature.' };
+  }
+  const colorSpace = profile.subarray(16, 20).toString('ascii');
+  const pcs = profile.subarray(20, 24).toString('ascii');
+  if (!VALID_ICC_COLOR_SPACES.has(colorSpace)) {
+    return { valid: false, reason: `Invalid ICC data colour space '${colorSpace}'.` };
+  }
+  if (profileClass === 'link') {
+    if (!VALID_ICC_COLOR_SPACES.has(pcs)) {
+      return { valid: false, reason: `Invalid ICC DeviceLink PCS colour space '${pcs}'.` };
+    }
+  } else if (!VALID_ICC_PCS_SPACES.has(pcs)) {
+    return { valid: false, reason: `Invalid ICC Profile Connection Space '${pcs}' (expected 'XYZ ' or 'Lab ').` };
+  }
+
+  // Date & time (bytes 24..35): either all-zero (unused) or valid calendar date/time
+  const year = profile.readUInt16BE(24);
+  const month = profile.readUInt16BE(26);
+  const day = profile.readUInt16BE(28);
+  const hour = profile.readUInt16BE(30);
+  const minute = profile.readUInt16BE(32);
+  const second = profile.readUInt16BE(34);
+  const allDateZero = year === 0 && month === 0 && day === 0 && hour === 0 && minute === 0 && second === 0;
+  if (!allDateZero) {
+    if (
+      year < 1990 || year > 2999 ||
+      month < 1 || month > 12 ||
+      day < 1 || day > 31 ||
+      hour > 23 || minute > 59 || second > 59
+    ) {
+      return { valid: false, reason: 'Invalid ICC profile creation date/time header.' };
+    }
+  }
+
+  // Rendering intent (bytes 64..67): 0..3 per ICC.1
+  const renderingIntent = profile.readUInt32BE(64);
+  if (renderingIntent > 3) {
+    return { valid: false, reason: `Invalid ICC profile rendering intent (${renderingIntent}).` };
+  }
+
+  // PCS illuminant (bytes 68..79, s15Fixed16 XYZ): must be positive and finite (standard D50 is ~0.9642, 1.0, 0.8249)
+  const illX = profile.readInt32BE(68) / 65536;
+  const illY = profile.readInt32BE(72) / 65536;
+  const illZ = profile.readInt32BE(76) / 65536;
+  if (!(illX > 0.1 && illX < 4.0 && illY > 0.1 && illY < 4.0 && illZ > 0.1 && illZ < 4.0)) {
+    return { valid: false, reason: 'Invalid ICC profile PCS illuminant XYZ values.' };
+  }
+
+  // Mandatory tag table starting at byte 128
+  if (profile.length < 132) {
+    return {
+      valid: false,
+      reason: `Truncated ICC profile: missing mandatory tag count field (${profile.length} bytes).`
+    };
+  }
+
+  const tagCount = profile.readUInt32BE(128);
+  if (tagCount < 1 || tagCount > 4096) {
+    return {
+      valid: false,
+      reason: `Invalid ICC profile tag count (${tagCount}).`
+    };
+  }
+
+  const tagTableEnd = 132 + tagCount * 12;
+  if (tagTableEnd > profile.length) {
+    return {
+      valid: false,
+      reason: `Truncated ICC profile tag table: requires ${tagTableEnd} bytes for ${tagCount} tags, got ${profile.length} bytes.`
+    };
+  }
+
+  for (let i = 0; i < tagCount; i++) {
+    const entryOffset = 132 + i * 12;
+    if (!isPrintableAscii4cc(profile, entryOffset)) {
+      return { valid: false, reason: `Invalid non-ASCII ICC tag signature at entry ${i}.` };
+    }
+    const tagOffset = profile.readUInt32BE(entryOffset + 4);
+    const tagSize = profile.readUInt32BE(entryOffset + 8);
+    if (tagOffset < tagTableEnd || tagSize < 8 || tagOffset + tagSize > profile.length) {
+      return {
+        valid: false,
+        reason: `Out-of-bounds or truncated ICC tag data at entry ${i} (offset=${tagOffset}, size=${tagSize}, profileLength=${profile.length}).`
+      };
+    }
+  }
+
+  return { valid: true };
+}
+
 function paethPredictor(a: number, b: number, c: number): number {
   const p = a + b - c;
   const pa = Math.abs(p - a);
@@ -977,6 +1147,15 @@ export function validatePngFrameFile(filePath: string): PngFrameValidationResult
             dimensions: null,
             errorClass: 'PNG_DECOMPRESSION_FAILURE',
             reason: 'PNG iCCP compressed profile decompressed to empty data.'
+          };
+        }
+        const iccValidation = validateIccProfileStructure(iccpInflated);
+        if (!iccValidation.valid) {
+          return {
+            valid: false,
+            dimensions: null,
+            errorClass: 'INVALID_PNG_STRUCTURE',
+            reason: iccValidation.reason || 'PNG iCCP contains malformed ICC profile data.'
           };
         }
         seenIccp = true;

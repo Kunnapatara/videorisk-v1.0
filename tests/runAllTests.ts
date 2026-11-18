@@ -118,6 +118,14 @@ async function main() {
     const { runPhase123IntegrityEnforcementTests } = await import('./phase1_2_3_integrity_enforcement.test');
     await runPhase123IntegrityEnforcementTests();
 
+    // Run Suite 23: Canonical Production Predicate & Server Mode Enforcement
+    const { runServerProductionPredicateTests } = await import('./server_production_predicate.test');
+    await runServerProductionPredicateTests();
+
+    // Run Suite 24: Group A & B Production Security Remediation (Storage, Whisper, Reset Token)
+    const { runGroupABSecurityRemediationTests } = await import('./security_remediation_group_ab.test');
+    await runGroupABSecurityRemediationTests();
+
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log(`\n🎉 ALL AUTOMATED VERIFICATION SUITES COMPLETED SUCCESSFULLY in ${elapsed}s!`);
     process.exit(0);

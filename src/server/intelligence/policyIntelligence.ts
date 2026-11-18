@@ -21,6 +21,7 @@ import {
 import { AudioAnalysisResult } from '../pipeline/audioProcessor';
 import { VideoAnalysisResult } from '../pipeline/videoProcessor';
 import { contextAnalyzer } from './contextAnalyzer';
+import { isProductionEnvironment } from '../config/environment';
 
 export interface IntelligenceInput {
   scanId: string;
@@ -1580,7 +1581,7 @@ export interface ComparisonOptions {
       // Report fields (e.g. evaluatedPoliciesCount) MUST NEVER authorize a bypass.
       // Explicit test-only injection is permitted ONLY when explicitly flagged in test options AND executing under an active test environment.
       const isTestEnv = (
-        process.env.NODE_ENV !== 'production' &&
+        !isProductionEnvironment(process.env) &&
         (process.env.NODE_ENV === 'test' ||
          process.env.VIDEORISK_TEST_RUN === 'true') &&
         Boolean(process.argv && process.argv.some(arg => arg.includes('.test.') || arg.includes('/tests/') || arg.endsWith('test.ts') || arg.includes('runAllTests'))) &&
@@ -1913,7 +1914,7 @@ export interface ComparisonOptions {
     options?: ComparisonOptions
   ): ReScanComparison {
     const isTestEnv = (
-      process.env.NODE_ENV !== 'production' &&
+      !isProductionEnvironment(process.env) &&
       (process.env.NODE_ENV === 'test' ||
        process.env.VIDEORISK_TEST_RUN === 'true') &&
       Boolean(process.argv && process.argv.some(arg => arg.includes('.test.') || arg.includes('/tests/') || arg.endsWith('test.ts') || arg.includes('runAllTests'))) &&

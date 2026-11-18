@@ -22,6 +22,7 @@ import {
   StripeRefundRecord
 } from '../../types';
 import { OFFICIAL_PRICING_PLANS } from './pricingCatalogue';
+import { isProductionEnvironment } from '../config/environment';
 
 export interface RateLimitStatus {
   allowed: boolean;
@@ -181,6 +182,7 @@ export interface IStorageRepository {
 // In-Memory Storage with pure JSON file persistence (for fast test isolation and fallback)
 export class InMemoryStorageRepository implements IStorageRepository {
   private dataFile: string;
+  private env: NodeJS.ProcessEnv;
   private writeLock: Promise<void> = Promise.resolve();
   private state: {
     users: Record<string, UserAccount>;
@@ -203,13 +205,14 @@ export class InMemoryStorageRepository implements IStorageRepository {
     stripeRefunds: Record<string, StripeRefundRecord>;
   };
 
-  constructor(customDataFile?: string) {
+  constructor(customDataFile?: string, env: NodeJS.ProcessEnv = process.env) {
+    this.env = env;
     if (customDataFile) {
       this.dataFile = path.resolve(customDataFile);
-    } else if (process.env.STORE_PATH) {
-      this.dataFile = path.resolve(process.env.STORE_PATH);
-    } else if (process.env.DATA_DIR) {
-      this.dataFile = path.resolve(process.env.DATA_DIR, 'store.json');
+    } else if (env.STORE_PATH) {
+      this.dataFile = path.resolve(env.STORE_PATH);
+    } else if (env.DATA_DIR) {
+      this.dataFile = path.resolve(env.DATA_DIR, 'store.json');
     } else {
       this.dataFile = path.resolve(process.cwd(), 'data', 'store.json');
     }
@@ -240,7 +243,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
 
   private seedDefaultUserIfNeeded() {
     // SECURITY: Do NOT seed default or demo credentials in production mode!
-    if (process.env.NODE_ENV === 'production') {
+    if (isProductionEnvironment(this.env)) {
       return;
     }
 
@@ -458,7 +461,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
       return newUser;
     },
     getOrCreateDefaultUser: async () => {
-      if (process.env.NODE_ENV === 'production') {
+      if (isProductionEnvironment(this.env)) {
         throw new Error('Default demo user is disabled in production.');
       }
       const defaultId = 'user_default';
@@ -1005,7 +1008,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
       return this.consumeRateLimits(specs);
     },
     clearRateLimits: async (filter?: { keyPrefix?: string; key?: string }): Promise<void> => {
-      if (process.env.NODE_ENV === 'production' && !filter?.keyPrefix && !filter?.key) {
+      if (isProductionEnvironment(this.env) && !filter?.keyPrefix && !filter?.key) {
         throw new Error('Refusing to clear all rate limits in production environment without a target key or prefix filter.');
       }
 
@@ -1016,7 +1019,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
           throw new Error('A non-empty literal prefix is required when keyPrefix filter is specified.');
         }
         this.state.rateLimits = this.state.rateLimits.filter(r => !r.key.startsWith(filter.keyPrefix!));
-      } else if (process.env.NODE_ENV !== 'production') {
+      } else if (!isProductionEnvironment(this.env)) {
         // In non-prod default cleanup, only remove test-scoped entries
         this.state.rateLimits = this.state.rateLimits.filter(r =>
           !r.key.startsWith('test_') &&
@@ -1031,7 +1034,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
       this.save();
     },
     clearTestRateLimits: async (prefix: string = 'test_'): Promise<void> => {
-      if (process.env.NODE_ENV === 'production') {
+      if (isProductionEnvironment(this.env)) {
         throw new Error('Refusing to run clearTestRateLimits in production environment.');
       }
       if (!prefix || prefix.length === 0) {
@@ -1364,11 +1367,11 @@ export class InMemoryStorageRepository implements IStorageRepository {
 export { SqliteStorageRepository, migrateJsonToSqlite } from './sqliteStorage';
 import { SqliteStorageRepository, migrateJsonToSqlite } from './sqliteStorage';
 
-export function createStorage(customPath?: string): IStorageRepository {
-  if (process.env.STORAGE_ENGINE === 'memory') {
-    return new InMemoryStorageRepository(customPath);
+export function createStorage(customPath?: string, env: NodeJS.ProcessEnv = process.env): IStorageRepository {
+  if (env.STORAGE_ENGINE === 'memory') {
+    return new InMemoryStorageRepository(customPath, env);
   }
-  return new SqliteStorageRepository(customPath);
+  return new SqliteStorageRepository(customPath, env);
 }
 
 // Default system-of-record storage instance:

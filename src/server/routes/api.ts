@@ -1836,8 +1836,9 @@ apiRouter.post('/auth/forgot-password', async (req: Request, res: Response) => {
 
       await storage.passwordReset.createResetToken(user.id, tokenHash, expiresAt);
 
-      // Safe development-only exposure for testing/local verification
-      if (!isProductionEnvironment(process.env) || process.env.ENABLE_DEV_RESET_TOKEN === 'true') {
+      // Safe development/test-only exposure; raw reset tokens are NEVER returned in Production Mode,
+      // even when ENABLE_DEV_RESET_TOKEN=true.
+      if (!isProductionEnvironment(process.env)) {
         devToken = rawToken;
       }
 

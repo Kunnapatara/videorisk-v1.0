@@ -54,8 +54,11 @@ jobs:
       - name: Validate environment and plan configuration
         run: npx tsx scripts/validate-env.ts --mode=ci
 
-      - name: Run Master Verification Suites (Suites 1-22)
+      - name: Run Master Verification Suites (Suites 1-24)
         run: npm test
+
+      - name: Run security remediation and production enforcement suite
+        run: npm run test:security
 
       - name: Run Phase 4-6 gap closure suite
         run: npm run test:phase4-6

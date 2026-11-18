@@ -10,6 +10,7 @@ import {
   DetectorExecutionStatus,
   DetectorReport 
 } from '../../types';
+import { isProductionEnvironment } from '../config/environment';
 
 const execFileAsync = promisify(execFile);
 
@@ -303,6 +304,33 @@ const OPENAI_WHISPER_MODEL_NAMES = new Set<string>([
   'medium', 'medium.en',
   'large', 'large-v1', 'large-v2', 'large-v3', 'turbo'
 ]);
+
+/**
+ * Determines whether Whisper runtime compatibility verification must be enforced
+ * prior to transcription. Uses the canonical `isProductionEnvironment()` predicate
+ * so live-payment configurations cannot bypass production compatibility checks
+ * even when NODE_ENV=development.
+ */
+export function shouldEnforceWhisperCompatibility(
+  options: {
+    verifyCompatibility?: boolean;
+    audioFixturePath?: string;
+    modelConfigured: boolean;
+  },
+  env: NodeJS.ProcessEnv = process.env
+): boolean {
+  const hasSpeechFixtureEnv = Boolean(options.audioFixturePath || env.WHISPER_COMPAT_AUDIO_PATH);
+  const compatEnvFlag = (env.WHISPER_VERIFY_COMPATIBILITY || '').trim().toLowerCase();
+  const compatExplicitlyDisabled = options.verifyCompatibility === false || compatEnvFlag === 'false';
+  const compatExplicitlyRequired = options.verifyCompatibility === true || compatEnvFlag === 'true';
+  return (
+    compatExplicitlyRequired ||
+    (!compatExplicitlyDisabled && (
+      isProductionEnvironment(env) ||
+      (options.modelConfigured && hasSpeechFixtureEnv)
+    ))
+  );
+}
 
 /**
  * Adapter for optional local Speech-to-Text transcription.
@@ -2176,17 +2204,15 @@ export class SpeechTranscriptionAdapter {
     }
 
     // Enforce runtime compatibility verification when explicitly required (WHISPER_VERIFY_COMPATIBILITY=true
-    // or verifyCompatibility=true), in production unless explicitly disabled, or when a speech fixture is configured.
-    const hasSpeechFixtureEnv = Boolean(options?.audioFixturePath || process.env.WHISPER_COMPAT_AUDIO_PATH);
-    const compatEnvFlag = (process.env.WHISPER_VERIFY_COMPATIBILITY || '').trim().toLowerCase();
-    const compatExplicitlyDisabled = options?.verifyCompatibility === false || compatEnvFlag === 'false';
-    const compatExplicitlyRequired = options?.verifyCompatibility === true || compatEnvFlag === 'true';
-    const shouldVerifyCompatibility =
-      compatExplicitlyRequired ||
-      (!compatExplicitlyDisabled && (
-        process.env.NODE_ENV === 'production' ||
-        (validation.modelConfigured && hasSpeechFixtureEnv)
-      ));
+    // or verifyCompatibility=true), in canonical Production Mode unless explicitly disabled, or when a speech fixture is configured.
+    const shouldVerifyCompatibility = shouldEnforceWhisperCompatibility(
+      {
+        verifyCompatibility: options?.verifyCompatibility,
+        audioFixturePath: options?.audioFixturePath,
+        modelConfigured: validation.modelConfigured
+      },
+      process.env
+    );
 
     let compatibilityVerified = false;
     let runtimeCompatibilityStatus: WhisperRuntimeCompatibilityStatus = 'UNVERIFIED';
