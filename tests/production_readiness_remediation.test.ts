@@ -93,6 +93,17 @@ export async function runProductionReadinessTests(): Promise<void> {
     // =========================================================================
     console.log('\n[Task A & B: Password Reset SMTP Delivery & Contract]');
 
+    for (const testIp of [
+      '203.0.113.101',
+      '203.0.113.102',
+      '203.0.113.103',
+      '203.0.113.104',
+      '203.0.113.105',
+      '203.0.113.106',
+    ]) {
+      await storage.rateLimits.clearRateLimits?.({ key: testIp });
+    }
+
     const suffix = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
     const testEmail = `readiness_reset_${suffix}@example.com`;
     const initialPass = 'InitialReadinessPass123!';

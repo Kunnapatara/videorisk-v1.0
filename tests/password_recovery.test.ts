@@ -183,8 +183,83 @@ export async function runPasswordRecoveryTests() {
     const hasRateLimited = limitResponses.some(r => r.status === 429);
     assert(hasRateLimited, 'Exceeding request threshold triggers 429 Too Many Requests');
 
+    // ---------------------------------------------------------
+    // 5. Standardized 8-Char Password Policy & Compatibility
+    // ---------------------------------------------------------
+    console.log('\n[5. Standardized Password Security Policy (8-Char Minimum)]');
+    const policyIp = `198.51.100.${Math.floor(Math.random() * 200) + 10}`;
+
+    // 5.1 Registration rejects < 8 characters (6 and 7 chars)
+    for (const shortPwd of ['abc123', 'seven77']) {
+      const shortReg = await fetch(`${baseUrl}/auth/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-forwarded-for': policyIp },
+        body: JSON.stringify({ email: `short_${Date.now()}_${shortPwd.length}@videorisk.com`, password: shortPwd })
+      });
+      assert(shortReg.status === 400, `Registration rejects ${shortPwd.length}-char password with 400`);
+      const errBody = await shortReg.json();
+      assert(errBody.error === 'Password must be at least 8 characters long.', 'Registration returns standardized 8-char policy error');
+    }
+
+    // 5.2 Registration accepts exactly 8 characters
+    const exact8Email = `exact8_${Date.now()}@videorisk.com`;
+    const okReg = await fetch(`${baseUrl}/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-forwarded-for': policyIp },
+      body: JSON.stringify({ email: exact8Email, password: 'exact8ch' })
+    });
+    assert(okReg.status === 201, 'Registration accepts 8-character password (201)');
+
+    // 5.3 Password reset enforces identical 8-character minimum
+    const fpRes = await fetch(`${baseUrl}/auth/forgot-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-forwarded-for': policyIp },
+      body: JSON.stringify({ email: exact8Email })
+    });
+    const fpData = await fpRes.json();
+    const shortReset = await fetch(`${baseUrl}/auth/reset-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-forwarded-for': policyIp },
+      body: JSON.stringify({ token: fpData.devResetToken, newPassword: 'seven77' })
+    });
+    assert(shortReset.status === 400, 'Reset password rejects 7-char password with 400');
+
+    const okReset = await fetch(`${baseUrl}/auth/reset-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-forwarded-for': policyIp },
+      body: JSON.stringify({ token: fpData.devResetToken, newPassword: 'new8char' })
+    });
+    assert(okReset.status === 200, 'Reset password accepts 8-char password (200)');
+
+    // 5.4 Existing pre-policy account with shorter password hash remains usable via login
+    const legacyEmail = `legacy_user_${Date.now()}@videorisk.com`;
+    const legacySalt = crypto.randomBytes(16).toString('hex');
+    const legacyPass = 'pro123'; // 6 chars pre-existing hash
+    const legacyHash = crypto.scryptSync(legacyPass, legacySalt, 64).toString('hex');
+    await storage.users.createUser(legacyEmail, legacyHash, legacySalt, 10, 'free');
+
+    const legacyLogin = await fetch(`${baseUrl}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-forwarded-for': policyIp },
+      body: JSON.stringify({ email: legacyEmail, password: legacyPass })
+    });
+    assert(legacyLogin.status === 200, 'Existing pre-policy account remains able to sign in without forced reset');
+
+    // 5.5 Frontend AuthModal & metadata capability accuracy assertions
+    const authModalSource = fs.readFileSync(path.resolve(process.cwd(), 'src/components/AuthModal.tsx'), 'utf8');
+    assert(authModalSource.includes('Password (min 8 characters)'), 'AuthModal register label matches 8-character policy');
+    assert(!authModalSource.includes('minLength={6}'), 'AuthModal no longer uses minLength={6}');
+    assert(authModalSource.includes('password.length < 8'), 'AuthModal enforces 8-character register check client-side');
+
+    const metadataJson = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'metadata.json'), 'utf8'));
+    assert(
+      Array.isArray(metadataJson.majorCapabilities) &&
+      !metadataJson.majorCapabilities.includes('MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API'),
+      'metadata.json no longer advertises unimplemented Gemini server-side API capability'
+    );
+
     console.log('======================================================');
-    console.log('TEST SUITE 8 COMPLETE: All Password Recovery assertions passed!');
+    console.log('TEST SUITE 8 COMPLETE: All Password Recovery & Policy assertions passed!');
     console.log('======================================================');
   } finally {
     server.close();

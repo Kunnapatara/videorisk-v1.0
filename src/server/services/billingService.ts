@@ -16,6 +16,7 @@ import {
 } from '../../types';
 
 export const ALLOWED_PAID_PLANS = ['creator', 'pro', 'agency', 'audit_once'] as const;
+export const RECURRING_SUBSCRIPTION_PLANS = ['creator', 'pro', 'agency'] as const;
 export type AllowedPaidPlan = typeof ALLOWED_PAID_PLANS[number];
 
 export interface CheckoutSessionOptions {
@@ -498,22 +499,27 @@ export class BillingService {
   }
 
   /**
-   * Reverse-maps a Stripe price ID to our internal plan identifier
+   * Reverse-maps a Stripe price ID to our internal plan identifier.
+   * Only explicitly configured STRIPE_PRICE_* env vars are accepted in production;
+   * standard fallback test price IDs are restricted to non-production environments.
    */
   public getPlanFromPriceId(priceId: string): AllowedPaidPlan | null {
     if (!priceId || typeof priceId !== 'string') return null;
     const cleanId = priceId.trim();
+    if (!cleanId) return null;
 
-    if (process.env.STRIPE_PRICE_CREATOR && cleanId === process.env.STRIPE_PRICE_CREATOR) return 'creator';
-    if (process.env.STRIPE_PRICE_PRO && cleanId === process.env.STRIPE_PRICE_PRO) return 'pro';
-    if (process.env.STRIPE_PRICE_AGENCY && cleanId === process.env.STRIPE_PRICE_AGENCY) return 'agency';
-    if (process.env.STRIPE_PRICE_AUDIT_ONCE && cleanId === process.env.STRIPE_PRICE_AUDIT_ONCE) return 'audit_once';
+    if (process.env.STRIPE_PRICE_CREATOR && cleanId === process.env.STRIPE_PRICE_CREATOR.trim()) return 'creator';
+    if (process.env.STRIPE_PRICE_PRO && cleanId === process.env.STRIPE_PRICE_PRO.trim()) return 'pro';
+    if (process.env.STRIPE_PRICE_AGENCY && cleanId === process.env.STRIPE_PRICE_AGENCY.trim()) return 'agency';
+    if (process.env.STRIPE_PRICE_AUDIT_ONCE && cleanId === process.env.STRIPE_PRICE_AUDIT_ONCE.trim()) return 'audit_once';
 
-    // Standard fallback price identifiers for test suites, CI, and dev simulation
-    if (cleanId === 'price_creator' || cleanId === 'price_creator_test' || cleanId === 'price_creator_123') return 'creator';
-    if (cleanId === 'price_pro' || cleanId === 'price_pro_test' || cleanId === 'price_pro_123') return 'pro';
-    if (cleanId === 'price_agency' || cleanId === 'price_agency_test' || cleanId === 'price_agency_123') return 'agency';
-    if (cleanId === 'price_audit_once' || cleanId === 'price_audit_test' || cleanId === 'price_audit_123') return 'audit_once';
+    // Standard fallback price identifiers for test suites, CI, and dev simulation only
+    if (!this.isProduction) {
+      if (cleanId === 'price_creator' || cleanId === 'price_creator_test' || cleanId === 'price_creator_123') return 'creator';
+      if (cleanId === 'price_pro' || cleanId === 'price_pro_test' || cleanId === 'price_pro_123') return 'pro';
+      if (cleanId === 'price_agency' || cleanId === 'price_agency_test' || cleanId === 'price_agency_123') return 'agency';
+      if (cleanId === 'price_audit_once' || cleanId === 'price_audit_test' || cleanId === 'price_audit_123') return 'audit_once';
+    }
 
     return null;
   }
@@ -2400,6 +2406,7 @@ export class BillingService {
               eventType: event.type,
               processedAt: new Date().toISOString(),
               userId: sub.userId,
+              outcome: 'ignored_out_of_order',
             };
             return { alreadyProcessed: false };
           }
@@ -2419,28 +2426,83 @@ export class BillingService {
             }
           }
 
+          const rawPriceId = subscription.items?.data?.[0]?.price?.id;
+          const cleanPriceId = typeof rawPriceId === 'string' && rawPriceId.trim().length > 0
+            ? rawPriceId.trim()
+            : null;
+
+          let mappedPlanId: AllowedPaidPlan | null = null;
+          let rejectionOutcome: 'rejected_unmapped_price' | 'rejected_missing_price' | null = null;
+          let rejectionReason = '';
+
+          if (cleanPriceId) {
+            const resolvedFromPrice = this.getPlanFromPriceId(cleanPriceId);
+            const isValidPaidSubscriptionPlan =
+              resolvedFromPrice !== null &&
+              ALLOWED_PAID_PLANS.includes(resolvedFromPrice) &&
+              RECURRING_SUBSCRIPTION_PLANS.includes(resolvedFromPrice as any);
+
+            if (isValidPaidSubscriptionPlan) {
+              mappedPlanId = resolvedFromPrice;
+            } else {
+              rejectionOutcome = 'rejected_unmapped_price';
+              rejectionReason = resolvedFromPrice === 'audit_once'
+                ? `Price ID '${cleanPriceId}' maps to one-time plan 'audit_once', which is not a recurring subscription plan.`
+                : `Unrecognized or unconfigured Stripe Price ID '${cleanPriceId}'.`;
+            }
+          } else {
+            // Missing Price ID: NEVER trust unverified metadata, user.plan, or default to 'pro'.
+            // Preserve an existing subscription's plan ONLY on customer.subscription.updated when
+            // an already-verified subscription record exists with an authorized paid plan and entitled state.
+            const canPreserveExistingAuthorizedSub =
+              event.type === 'customer.subscription.updated' &&
+              Boolean(sub) &&
+              (sub.status !== 'canceled' || status === 'canceled') &&
+              ALLOWED_PAID_PLANS.includes(sub.planId as any) &&
+              RECURRING_SUBSCRIPTION_PLANS.includes(sub.planId as any) &&
+              this.isSubscriptionEntitled(sub.status, sub.currentPeriodEnd);
+
+            if (canPreserveExistingAuthorizedSub) {
+              mappedPlanId = sub.planId as AllowedPaidPlan;
+            } else {
+              rejectionOutcome = 'rejected_missing_price';
+              rejectionReason = sub
+                ? `Missing Stripe Price ID on ${event.type} for subscription '${subId}' whose existing state ('${sub.status}', plan '${sub.planId}') does not authorize entitlement preservation.`
+                : `Missing Stripe Price ID on ${event.type} for unrecorded subscription '${subId}'.`;
+            }
+          }
+
+          if (!mappedPlanId) {
+            console.error(
+              `[BillingService] DIAGNOSTIC: Rejected ${event.type} (${event.id}) — ${rejectionReason} ` +
+              `subId=${subId}, customerId=${customerId || 'none'}, userId=${userId || 'unresolved'}, ` +
+              `priceId=${cleanPriceId || 'missing'}, status=${status}, existingSubPlan=${sub?.planId || 'none'}. ` +
+              `Existing entitlements and credits preserved unchanged.`
+            );
+            state.webhookEvents[event.id] = {
+              eventId: event.id,
+              provider: 'stripe',
+              eventType: event.type,
+              processedAt: new Date().toISOString(),
+              userId: userId || undefined,
+              creditsGranted: 0,
+              outcome: rejectionOutcome || 'rejected_missing_price',
+              diagnostic: {
+                reason: rejectionReason,
+                subscriptionId: subId,
+                customerId: customerId || undefined,
+                priceId: cleanPriceId,
+                incomingStatus: status,
+                existingPlanId: sub?.planId || null,
+              },
+            };
+            break;
+          }
+
           if (userId) {
             const user = state.users[userId];
             if (user) {
               if (customerId) user.stripeCustomerId = customerId;
-
-              const priceId = subscription.items?.data?.[0]?.price?.id;
-              let mappedPlanId: AllowedPaidPlan | null = null;
-              if (priceId) {
-                mappedPlanId = this.getPlanFromPriceId(priceId);
-              }
-              if (!mappedPlanId && subscription.metadata?.planId && ALLOWED_PAID_PLANS.includes(subscription.metadata.planId as any)) {
-                mappedPlanId = subscription.metadata.planId as AllowedPaidPlan;
-              }
-              if (!mappedPlanId && sub?.planId && ALLOWED_PAID_PLANS.includes(sub.planId as any) && sub.planId !== 'free') {
-                mappedPlanId = sub.planId as AllowedPaidPlan;
-              }
-              if (!mappedPlanId && user.plan && ALLOWED_PAID_PLANS.includes(user.plan as any) && user.plan !== 'free') {
-                mappedPlanId = user.plan as AllowedPaidPlan;
-              }
-              if (!mappedPlanId) {
-                mappedPlanId = 'pro';
-              }
 
               state.subscriptions[subId] = {
                 id: subId,
@@ -2464,6 +2526,9 @@ export class BillingService {
             eventType: event.type,
             processedAt: new Date().toISOString(),
             userId: userId || undefined,
+            creditsGranted: 0,
+            planGranted: mappedPlanId,
+            outcome: 'processed',
           };
           break;
         }

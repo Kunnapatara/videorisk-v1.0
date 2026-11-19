@@ -1209,8 +1209,8 @@ export class SqliteStorageRepository implements IStorageRepository {
           WHERE substr(key, 1, 5) = 'test_'
              OR substr(key, 1, 11) = 'concurrent_'
              OR substr(key, 1, 9) = 'uploader_'
-             OR substr(key, 1, 12) = '198.51.100.'
-             OR substr(key, 1, 12) = '203.0.113.'
+             OR substr(key, 1, 11) = '198.51.100.'
+             OR substr(key, 1, 10) = '203.0.113.'
              OR substr(key, 1, 8) = '192.0.2.'
              OR key = '127.0.0.1';
         `).run();

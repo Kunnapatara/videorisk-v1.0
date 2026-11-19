@@ -676,6 +676,15 @@ export interface WebhookEventRecord {
   userId?: string;
   creditsGranted?: number;
   planGranted?: string;
+  outcome?: 'processed' | 'ignored_out_of_order' | 'rejected_unmapped_price' | 'rejected_missing_price';
+  diagnostic?: {
+    reason: string;
+    subscriptionId?: string;
+    customerId?: string;
+    priceId?: string | null;
+    incomingStatus?: string;
+    existingPlanId?: string | null;
+  };
 }
 
 export type CreditTransactionType = 

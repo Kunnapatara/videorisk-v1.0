@@ -2611,6 +2611,147 @@ export async function runStripeOriginAndRefundLifecycleTests() {
       restoreEnv();
     }
 
+    // ------------------------------------------------------------------------
+    // 7. TARGETED REMEDIATION: UNKNOWN & MISSING PRICE ID ESCALATION HARDENING
+    // ------------------------------------------------------------------------
+    console.log('\n[7. Targeted Remediation — Unknown & Missing Stripe Price ID Entitlement Hardening]');
+    const sec7DbPath = path.join(tempSqliteDir, `sec7_price_escalation_${Date.now()}.db`);
+    const sec7Repo = new SqliteStorageRepository(sec7DbPath);
+    billingService.setStorageForTest(sec7Repo);
+    billingService.setStripeClientForTest(mockStripeSdk);
+    process.env.STRIPE_SECRET_KEY = 'sk_test_mock_key_1234567890abcdef';
+    process.env.STRIPE_WEBHOOK_SECRET = webhookSecret;
+    process.env.STRIPE_PRICE_CREATOR = 'price_sec7_creator';
+    process.env.STRIPE_PRICE_PRO = 'price_sec7_pro';
+    process.env.STRIPE_PRICE_AGENCY = 'price_sec7_agency';
+    const sec7Ts = Math.floor(Date.now() / 1000);
+
+    try {
+      // 7.1 Recognized Price ID maps to exact plan
+      const recUser = await sec7Repo.users.createUser(`sec7_rec_${Date.now()}@videorisk.test`, 'h', 's', 10, 'free');
+      const recSubId = `sub_sec7_rec_${Date.now()}`;
+      const evRecognized = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_sec7_rec_${Date.now()}`,
+        created: sec7Ts,
+        type: 'customer.subscription.created',
+        data: {
+          object: {
+            id: recSubId,
+            customer: `cus_sec7_rec_${Date.now()}`,
+            status: 'active',
+            current_period_end: sec7Ts + 30 * 86400,
+            metadata: { userId: recUser.id },
+            items: { data: [{ price: { id: 'price_sec7_creator' } }] },
+          },
+        },
+      });
+      await billingService.handleWebhook(evRecognized.rawBody, evRecognized.signature);
+      assert.strictEqual((await sec7Repo.users.getUser(recUser.id))?.plan, 'creator', '7.1 Recognized configured Price ID maps to creator');
+
+      // 7.2 Unknown Price ID + invalid metadata does NOT grant Pro or credits + records admin diagnostic
+      const freeUser = await sec7Repo.users.createUser(`sec7_free_${Date.now()}@videorisk.test`, 'h', 's', 10, 'free');
+      const unkSubId = `sub_sec7_unk_${Date.now()}`;
+      const unkEventId = `evt_sec7_unk_${Date.now()}`;
+      const evUnknown = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: unkEventId,
+        created: sec7Ts,
+        type: 'customer.subscription.updated',
+        data: {
+          object: {
+            id: unkSubId,
+            customer: `cus_sec7_unk_${Date.now()}`,
+            status: 'active',
+            current_period_end: sec7Ts + 30 * 86400,
+            metadata: { userId: freeUser.id, planId: 'agency' },
+            items: { data: [{ price: { id: 'price_unmapped_attacker_123' } }] },
+          },
+        },
+      });
+      await billingService.handleWebhook(evUnknown.rawBody, evUnknown.signature);
+      const freeUserAfterUnk = await sec7Repo.users.getUser(freeUser.id);
+      assert.strictEqual(freeUserAfterUnk?.plan, 'free', '7.2a Unknown Price ID + agency metadata does NOT grant paid plan');
+      assert.strictEqual(freeUserAfterUnk?.creditsRemaining, 10, '7.2b Unknown Price ID does NOT create additional credits');
+      assert.strictEqual((await sec7Repo.billing.getCreditTransactions(freeUser.id)).length, 1, '7.2c Credit ledger unchanged (only INITIAL_GRANT)');
+      assert.strictEqual(await sec7Repo.billing.getSubscription(unkSubId), null, '7.2d No subscription record created for unknown Price ID');
+
+      // Verify persisted webhook diagnostic payload for administrators
+      const diagRow = (sec7Repo as any).db.prepare('SELECT payload_json FROM webhook_events WHERE event_id = ?').get(unkEventId) as any;
+      const diagPayload = JSON.parse(diagRow.payload_json);
+      assert.strictEqual(diagPayload.outcome, 'rejected_unmapped_price', '7.2e Diagnostic outcome persisted in webhook_events');
+      assert.strictEqual(diagPayload.diagnostic?.priceId, 'price_unmapped_attacker_123', '7.2f Offending Price ID persisted in diagnostic');
+
+      // 7.3 Repeated delivery of identical invalid event is idempotent and leaves state unchanged
+      const replayRes = await billingService.handleWebhook(evUnknown.rawBody, evUnknown.signature);
+      assert.strictEqual(replayRes.alreadyProcessed, true, '7.3a Replayed invalid event returns alreadyProcessed=true');
+      assert.strictEqual((await sec7Repo.users.getUser(freeUser.id))?.plan, 'free', '7.3b Replay keeps plan=free');
+      assert.strictEqual((await sec7Repo.users.getUser(freeUser.id))?.creditsRemaining, 10, '7.3c Replay keeps credits=10');
+
+      // 7.4 Subsequent valid subscription event still works cleanly
+      const evSubsequentValid = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_sec7_valid_next_${Date.now()}`,
+        created: sec7Ts + 10,
+        type: 'customer.subscription.created',
+        data: {
+          object: {
+            id: unkSubId,
+            customer: `cus_sec7_unk_${Date.now()}`,
+            status: 'active',
+            current_period_end: sec7Ts + 30 * 86400,
+            metadata: { userId: freeUser.id },
+            items: { data: [{ price: { id: 'price_sec7_pro' } }] },
+          },
+        },
+      });
+      await billingService.handleWebhook(evSubsequentValid.rawBody, evSubsequentValid.signature);
+      assert.strictEqual((await sec7Repo.users.getUser(freeUser.id))?.plan, 'pro', '7.4 Subsequent valid event activates pro cleanly');
+
+      // 7.5 Invalid subscription event does NOT overwrite existing valid subscription entitlement
+      const evBadUpdate = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_sec7_bad_overwrite_${Date.now()}`,
+        created: sec7Ts + 20,
+        type: 'customer.subscription.updated',
+        data: {
+          object: {
+            id: unkSubId,
+            customer: `cus_sec7_unk_${Date.now()}`,
+            status: 'canceled',
+            metadata: { userId: freeUser.id, planId: 'creator' },
+            items: { data: [{ price: { id: 'price_bogus_overwrite' } }] },
+          },
+        },
+      });
+      await billingService.handleWebhook(evBadUpdate.rawBody, evBadUpdate.signature);
+      assert.strictEqual((await sec7Repo.users.getUser(freeUser.id))?.plan, 'pro', '7.5a Invalid event does not overwrite existing valid pro entitlement');
+      assert.strictEqual((await sec7Repo.billing.getSubscription(unkSubId))?.status, 'active', '7.5b Existing active subscription status preserved');
+
+      // 7.6 Existing user plan + missing Price ID cannot manufacture a new subscription entitlement
+      const existingPlanUser = await sec7Repo.users.createUser(`sec7_exist_${Date.now()}@videorisk.test`, 'h', 's', 50, 'pro');
+      const manufacturedSubId = `sub_sec7_mfg_${Date.now()}`;
+      const evMissingPriceExistingUser = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_sec7_missing_mfg_${Date.now()}`,
+        created: sec7Ts,
+        type: 'customer.subscription.created',
+        data: {
+          object: {
+            id: manufacturedSubId,
+            customer: `cus_sec7_mfg_${Date.now()}`,
+            status: 'active',
+            metadata: { userId: existingPlanUser.id, planId: 'agency' },
+          },
+        },
+      });
+      await billingService.handleWebhook(evMissingPriceExistingUser.rawBody, evMissingPriceExistingUser.signature);
+      assert.strictEqual(await sec7Repo.billing.getSubscription(manufacturedSubId), null, '7.6a Existing user.plan + missing Price ID cannot manufacture subscription');
+      assert.strictEqual((await sec7Repo.users.getUser(existingPlanUser.id))?.creditsRemaining, 50, '7.6b No credits manufactured');
+      console.log('  ✅ PASS: All signed Stripe unknown/missing Price ID escalation hardening tests verified');
+    } finally {
+      billingService.setStorageForTest(null);
+      (sec7Repo as any).db.close();
+      delete process.env.STRIPE_PRICE_CREATOR;
+      delete process.env.STRIPE_PRICE_PRO;
+      delete process.env.STRIPE_PRICE_AGENCY;
+    }
+
     console.log('\n======================================================');
     console.log('🎉 ALL CHECKOUT ORIGIN & STRIPE REFUND TESTS PASSED!');
     console.log('======================================================\n');

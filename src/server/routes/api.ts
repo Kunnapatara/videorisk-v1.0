@@ -25,6 +25,7 @@ import {
 import { ScanJob, ScanMode, UserAccount, CrossVideoPattern, ChannelCoverageReport, ChannelCoverageDetail, ChannelPatternsResponse, CrossVideoComparisonStatus } from '../../types';
 
 export const apiRouter = Router();
+export const MIN_PASSWORD_LENGTH = 8;
 
 // Ensure upload directory exists
 const uploadDir = path.resolve(process.cwd(), 'uploads');
@@ -1717,8 +1718,8 @@ apiRouter.post('/auth/register', async (req: Request, res: Response) => {
     if (!email || typeof email !== 'string' || !email.includes('@')) {
       return res.status(400).json({ error: 'A valid email address is required.' });
     }
-    if (!password || typeof password !== 'string' || password.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters long.' });
+    if (!password || typeof password !== 'string' || password.length < MIN_PASSWORD_LENGTH) {
+      return res.status(400).json({ error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters long.` });
     }
 
     const normalizedEmail = email.toLowerCase().trim();
@@ -1899,8 +1900,8 @@ apiRouter.post('/auth/reset-password', async (req: Request, res: Response) => {
     if (!token || typeof token !== 'string') {
       return res.status(400).json({ error: 'Reset token is required.' });
     }
-    if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 8) {
-      return res.status(400).json({ error: 'New password must be at least 8 characters long.' });
+    if (!newPassword || typeof newPassword !== 'string' || newPassword.length < MIN_PASSWORD_LENGTH) {
+      return res.status(400).json({ error: `New password must be at least ${MIN_PASSWORD_LENGTH} characters long.` });
     }
 
     const clientIp = getClientIp(req);
