@@ -1417,9 +1417,21 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
         ? 'READY'
         : !sttValidation.modelConfigured
           ? 'NOT_CONFIGURED'
-          : sttValidation.diagnosticCode === 'MODEL_INCOMPATIBLE' || sttValidation.diagnosticCode === 'MODEL_NOT_READABLE'
+          : sttValidation.diagnosticCode === 'MODEL_INCOMPATIBLE' ||
+              sttValidation.diagnosticCode === 'MODEL_NOT_READABLE' ||
+              sttValidation.diagnosticCode === 'MODEL_SHA256_MISMATCH' ||
+              sttValidation.diagnosticCode === 'MODEL_EXPECTED_HASH_MISSING' ||
+              sttValidation.diagnosticCode === 'MODEL_EXPECTED_HASH_INVALID'
             ? sttValidation.diagnosticCode
             : 'MISSING_MODEL';
+
+    const modelSha256Details = {
+      modelSha256Verified: Boolean(sttValidation.modelSha256Verified),
+      modelIntegrityStatus: sttValidation.modelIntegrityStatus || 'NOT_APPLICABLE',
+      modelSha256Source: sttValidation.modelSha256Source || 'none',
+      modelSha256: sttValidation.modelSha256 || null,
+      expectedModelSha256: sttValidation.expectedModelSha256 || null,
+    };
 
     const strictProvenanceMode = (process.env.WHISPER_STRICT_PROVENANCE || '').trim().toLowerCase() === 'true';
 
@@ -1432,6 +1444,7 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
           runtimeType: sttValidation.runtimeType,
           binaryStatus,
           modelStatus,
+          ...modelSha256Details,
           runtimeCompatibilityStatus: 'UNCONFIGURED',
           runtimeCompatible: false,
           runtimeExecutionStatus: 'UNCONFIGURED',
@@ -1467,6 +1480,7 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
           validationStatus: sttValidation.status,
           binaryStatus,
           modelStatus,
+          ...modelSha256Details,
           runtimeCompatibilityStatus: 'FAILED',
           runtimeCompatible: false,
           runtimeExecutionStatus: 'FAILED',
@@ -1506,6 +1520,7 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
           validationStatus: sttValidation.status,
           binaryStatus,
           modelStatus,
+          ...modelSha256Details,
           runtimeCompatibilityStatus: 'UNVERIFIED',
           runtimeCompatible: false,
           runtimeExecutionStatus: 'UNVERIFIED',
@@ -1556,6 +1571,7 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
             validationStatus: sttValidation.status,
             binaryStatus,
             modelStatus,
+            ...modelSha256Details,
             runtimeCompatibilityStatus: compat.runtimeCompatibilityStatus,
             runtimeCompatible: compat.runtimeCompatible,
             runtimeExecutionStatus: compat.runtimeExecutionStatus,
@@ -1594,6 +1610,7 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
             validationStatus: sttValidation.status,
             binaryStatus,
             modelStatus,
+            ...modelSha256Details,
             runtimeCompatibilityStatus: compat.runtimeCompatibilityStatus,
             runtimeCompatible: false,
             runtimeExecutionStatus: 'UNVERIFIED',
@@ -1630,6 +1647,7 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
             validationStatus: sttValidation.status,
             binaryStatus,
             modelStatus,
+            ...modelSha256Details,
             runtimeCompatibilityStatus: compat.runtimeCompatibilityStatus,
             runtimeCompatible: false,
             runtimeExecutionStatus: compat.runtimeExecutionStatus,

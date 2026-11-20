@@ -169,3 +169,41 @@ curl -s http://localhost:3000/api/health/readiness | jq '.checks.whisperStt'
 2. **Memory (RAM):** `ggml-base.en.bin` uses ~`147 MB` weights + `~160 MB` compute/KV buffers (~`320–400 MB` RSS per concurrent process). Larger models (`medium`, `large-v3`) require `2–4+ GB` RAM.
 3. **CPU Latency & Timeouts:** Measured `~4.6s` on 11s audio (`~0.42x` real-time) on a 2-vCPU x86_64 host with AVX2/AVX512. On hosts without AVX2/F16C, or for long multi-minute videos, `transcribe()` enforces a hard `60,000ms` subprocess timeout (`audioProcessor.ts`) — long videos on CPU-only hosts can hit `TRANSCRIPTION_TIMEOUT` and fail closed as `ANALYSIS_UNAVAILABLE`.
 4. **Scope & Accuracy Limits of This Verification:** Measured `0.00%` WER is on a single clean studio/archival 11s English recording (`jfk_1961_inaugural_16k.wav`). It does **not** benchmark Thai (`th`) speech, background music overlap, heavy compression noise, or multi-speaker overlapping dialogue.
+
+---
+
+## 7. Automated Model SHA-256 & Production Host Verification
+
+### Automated GGML Model SHA-256 Verification
+- Trusted checksum manifest: `src/server/config/whisperModels.json` (`ggml-base.en.bin` -> `a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002`).
+- Env overrides:
+  - `WHISPER_MODEL_SHA256=<64-hex>` (explicit expected SHA-256 override)
+  - `WHISPER_REQUIRE_MODEL_SHA256=true` (fail closed with `MODEL_EXPECTED_HASH_MISSING` if model is not in manifest and env hash is unset)
+  - `WHISPER_MODEL_MANIFEST_PATH=<path>` (override manifest file)
+- Any SHA-256 mismatch or post-provisioning byte mutation fails closed immediately with `MODEL_SHA256_MISMATCH` (`ANALYSIS_UNAVAILABLE` on `transcribe()` and `degraded` on `/api/health/readiness`), bypassing cached compatibility results.
+- CI-safe SHA-256 contract suite: `npm run test:whisper:sha256`
+
+### Production Deployment Verification Script (`scripts/verify-whisper-prod.ts`)
+Read-only, non-destructive host verification checking Binary + `ldd` + `ffmpeg`/`ffprobe`, Model SHA-256, Offline Ed25519 key hygiene & rotation (`WHISPER_TRUSTED_PUBLIC_KEYS` / `WHISPER_STRICT_PROVENANCE=true`), and Persistent vs Temporary storage paths:
+
+```bash
+# Production host check (strict: requires ENV binary, model, Ed25519 public key, non-tmpfs persistent volumes)
+npm run verify:whisper:prod -- --mode=production
+
+# Local verification container inspection (reflects local container only, NOT production sign-off)
+npm run verify:whisper:prod -- --mode=local
+```
+
+Exit codes:
+- `0` = **PASS** (all checks passed)
+- `1` = **FAIL** (hard failure: checksum mismatch, missing library, tmpfs persistent volume in prod, leaked private key, etc.)
+- `2` = **BLOCKED** (missing required ENV / Ed25519 public keys / host provisioning, zero hard failures)
+
+| Storage Path | Classification | Purpose & Verification Requirement |
+| :--- | :--- | :--- |
+| `DATA_DIR` / `DATABASE_PATH` dir | **PERSISTENT** | SQLite database (`videorisk.db`); writable dir, non-`tmpfs` volume |
+| `uploads/` & `uploads/proxies/` | **PERSISTENT** | Uploaded media, thumbnails & playback proxies; non-`tmpfs` volume |
+| `dirname(WHISPER_MODEL_PATH)` | **PERSISTENT** | Provisioned GGML weights; readable, non-`tmpfs` volume |
+| `os.tmpdir()` (`vr_whisper_*`) | **TEMPORARY** | Transient 16kHz WAV & JSON output; cleaned up after every run |
+| `uploads/ocr_frames/` | **TEMPORARY** | Per-scan OCR PNG staging frames; cleaned up via `cleanupFrames()` |
+

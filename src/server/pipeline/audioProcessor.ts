@@ -197,6 +197,9 @@ export type WhisperDiagnosticCode =
   | 'MODEL_NOT_FOUND'
   | 'MODEL_NOT_READABLE'
   | 'MODEL_INCOMPATIBLE'
+  | 'MODEL_SHA256_MISMATCH'
+  | 'MODEL_EXPECTED_HASH_MISSING'
+  | 'MODEL_EXPECTED_HASH_INVALID'
   | 'RUNTIME_INIT_FAILED'
   | 'SPEECH_FIXTURE_NOT_FOUND'
   | 'SPEECH_FIXTURE_INVALID'
@@ -205,6 +208,14 @@ export type WhisperDiagnosticCode =
   | 'EMPTY_TRANSCRIPTION_OUTPUT'
   | 'VERIFICATION_PASSED'
   | 'READY';
+
+export type WhisperModelIntegrityStatus =
+  | 'VERIFIED'
+  | 'MISMATCH'
+  | 'MISSING_EXPECTED_HASH'
+  | 'INVALID_EXPECTED_HASH'
+  | 'MISSING_MODEL'
+  | 'NOT_APPLICABLE';
 
 export interface WhisperRuntimeValidation {
   isConfigured: boolean;
@@ -215,6 +226,11 @@ export interface WhisperRuntimeValidation {
   modelConfigured: boolean;
   modelFound: boolean;
   modelPath?: string;
+  modelSha256?: string;
+  expectedModelSha256?: string;
+  modelSha256Source?: 'env' | 'manifest' | 'none';
+  modelSha256Verified?: boolean;
+  modelIntegrityStatus?: WhisperModelIntegrityStatus;
   runtimeType: 'openai_whisper' | 'whisper_cpp' | 'unconfigured';
   supportedLanguages: string[];
   status: 'READY' | 'MISSING_EXECUTABLE' | 'NON_EXECUTABLE' | 'MISSING_MODEL' | 'UNCONFIGURED' | 'ERROR';
@@ -365,6 +381,9 @@ export class SpeechTranscriptionAdapter {
       validation.runtimeType,
       safeStatKey(validation.executablePath),
       safeStatKey(validation.modelPath),
+      `modelSha:${validation.modelSha256 || 'none'}`,
+      `modelExp:${validation.expectedModelSha256 || 'none'}`,
+      `modelInt:${validation.modelIntegrityStatus || 'none'}`,
       safeStatKey(fixturePath),
       `sha:${fixtureSha256}`,
       expectedTranscript !== undefined ? `exp:${expectedTranscript}` : 'exp:unset',
@@ -375,6 +394,114 @@ export class SpeechTranscriptionAdapter {
   private computeFileSha256(filePath: string): string {
     const buf = fs.readFileSync(filePath);
     return crypto.createHash('sha256').update(buf).digest('hex');
+  }
+
+  private async computeFileSha256Async(filePath: string): Promise<string> {
+    return await new Promise<string>((resolve, reject) => {
+      const hash = crypto.createHash('sha256');
+      const stream = fs.createReadStream(filePath);
+      stream.on('data', (chunk) => hash.update(chunk));
+      stream.on('error', (err) => reject(err));
+      stream.on('end', () => resolve(hash.digest('hex')));
+    });
+  }
+
+  private resolveExpectedModelSha256(
+    modelPath: string,
+    options?: {
+      expectedModelSha256?: string;
+      trustedModelManifestPath?: string;
+    }
+  ): {
+    source: 'env' | 'manifest' | 'none';
+    expectedSha256?: string;
+    validFormat: boolean;
+    error?: string;
+  } {
+    const sha256HexRegex = /^[a-f0-9]{64}$/;
+    if (options?.expectedModelSha256 !== undefined) {
+      const normalized = String(options.expectedModelSha256).trim().toLowerCase();
+      if (!sha256HexRegex.test(normalized)) {
+        return {
+          source: 'env',
+          expectedSha256: normalized,
+          validFormat: false,
+          error: 'Explicit expectedModelSha256 must be a valid 64-character lowercase/uppercase SHA-256 hex digest.'
+        };
+      }
+      return { source: 'env', expectedSha256: normalized, validFormat: true };
+    }
+
+    const rawEnvHash = process.env.WHISPER_MODEL_SHA256;
+    if (rawEnvHash !== undefined && rawEnvHash.trim().length > 0) {
+      const normalized = rawEnvHash.trim().toLowerCase();
+      if (!sha256HexRegex.test(normalized)) {
+        return {
+          source: 'env',
+          expectedSha256: normalized,
+          validFormat: false,
+          error: 'Configured WHISPER_MODEL_SHA256 must be a valid 64-character SHA-256 hex digest.'
+        };
+      }
+      return { source: 'env', expectedSha256: normalized, validFormat: true };
+    }
+
+    const explicitManifestOverride = options?.trustedModelManifestPath || process.env.WHISPER_MODEL_MANIFEST_PATH;
+    const defaultManifestPath = path.resolve(process.cwd(), 'src', 'server', 'config', 'whisperModels.json');
+    const manifestPath = explicitManifestOverride || defaultManifestPath;
+
+    if (!fs.existsSync(manifestPath)) {
+      if (explicitManifestOverride) {
+        return {
+          source: 'manifest',
+          validFormat: false,
+          error: `Configured Whisper model manifest not found at ${manifestPath}.`
+        };
+      }
+      return { source: 'none', validFormat: true };
+    }
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    } catch (err: any) {
+      return {
+        source: 'manifest',
+        validFormat: false,
+        error: `Malformed Whisper model manifest JSON at ${manifestPath}: ${err?.message || err}`
+      };
+    }
+
+    const models = Array.isArray(parsed?.models) ? parsed.models : null;
+    if (!models) {
+      return {
+        source: 'manifest',
+        validFormat: false,
+        error: `Invalid Whisper model manifest schema at ${manifestPath}: missing 'models' array.`
+      };
+    }
+
+    const modelBase = path.basename(modelPath);
+    const entry = models.find((m: any) => m && typeof m.filename === 'string' && m.filename === modelBase);
+    if (!entry) {
+      return { source: 'none', validFormat: true };
+    }
+
+    const normalizedManifestHash = typeof entry.expectedSha256 === 'string' ? entry.expectedSha256.trim().toLowerCase() : '';
+    if (!sha256HexRegex.test(normalizedManifestHash)) {
+      return {
+        source: 'manifest',
+        expectedSha256: normalizedManifestHash || undefined,
+        validFormat: false,
+        error: `Invalid expectedSha256 in Whisper model manifest for '${modelBase}'.`
+      };
+    }
+
+    return {
+      source: 'manifest',
+      expectedSha256: normalizedManifestHash,
+      validFormat: true
+    };
   }
 
   private normalizeTranscriptTokens(txt: string): string[] {
@@ -1026,9 +1153,13 @@ export class SpeechTranscriptionAdapter {
   }
 
   /**
-   * Validates local Whisper runtime installation, executable status, CLI identity contract, and model validity.
+   * Validates local Whisper runtime installation, executable status, CLI identity contract, and model validity (including SHA-256 verification).
    */
-  public async validateRuntime(): Promise<WhisperRuntimeValidation> {
+  public async validateRuntime(options?: {
+    requireModelSha256?: boolean;
+    expectedModelSha256?: string;
+    trustedModelManifestPath?: string;
+  }): Promise<WhisperRuntimeValidation> {
     const sttPath = process.env.WHISPER_PATH || process.env.LOCAL_STT_PATH;
     const modelPath = process.env.WHISPER_MODEL_PATH;
 
@@ -1306,6 +1437,92 @@ export class SpeechTranscriptionAdapter {
 
     const isModelConfigured = Boolean(modelPath);
     let modelFound = false;
+    let modelSha256: string | undefined;
+    let expectedModelSha256: string | undefined;
+    let modelSha256Source: 'env' | 'manifest' | 'none' = 'none';
+    let modelSha256Verified = false;
+    let modelIntegrityStatus: WhisperModelIntegrityStatus = 'NOT_APPLICABLE';
+
+    const verifyModelFileSha256 = async (p: string): Promise<{
+      ok: boolean;
+      status?: 'ERROR';
+      diagnosticCode?: WhisperDiagnosticCode;
+      reason?: string;
+      actualSha256?: string;
+      expectedSha256?: string;
+      source: 'env' | 'manifest' | 'none';
+      verified: boolean;
+      integrityStatus: WhisperModelIntegrityStatus;
+    }> => {
+      const actualSha256 = await this.computeFileSha256Async(p);
+      const expected = this.resolveExpectedModelSha256(p, options);
+      const requireHash = Boolean(
+        options?.requireModelSha256 ||
+        (process.env.WHISPER_REQUIRE_MODEL_SHA256 || '').trim().toLowerCase() === 'true'
+      );
+
+      if (!expected.validFormat) {
+        return {
+          ok: false,
+          status: 'ERROR',
+          diagnosticCode: 'MODEL_EXPECTED_HASH_INVALID',
+          reason: expected.error || 'Expected Whisper model SHA-256 is invalid.',
+          actualSha256,
+          expectedSha256: expected.expectedSha256,
+          source: expected.source,
+          verified: false,
+          integrityStatus: 'INVALID_EXPECTED_HASH',
+        };
+      }
+
+      if (!expected.expectedSha256) {
+        if (requireHash) {
+          return {
+            ok: false,
+            status: 'ERROR',
+            diagnosticCode: 'MODEL_EXPECTED_HASH_MISSING',
+            reason: `Expected SHA-256 checksum is missing for Whisper model '${path.basename(p)}' while SHA-256 verification is required (set WHISPER_MODEL_SHA256 or register in whisperModels.json).`,
+            actualSha256,
+            source: 'none',
+            verified: false,
+            integrityStatus: 'MISSING_EXPECTED_HASH',
+          };
+        }
+        return {
+          ok: true,
+          actualSha256,
+          source: 'none',
+          verified: false,
+          integrityStatus: 'MISSING_EXPECTED_HASH',
+        };
+      }
+
+      const actualBuf = Buffer.from(actualSha256, 'hex');
+      const expectedBuf = Buffer.from(expected.expectedSha256, 'hex');
+      const hashesMatch = actualBuf.length === expectedBuf.length && crypto.timingSafeEqual(actualBuf, expectedBuf);
+      if (!hashesMatch) {
+        return {
+          ok: false,
+          status: 'ERROR',
+          diagnosticCode: 'MODEL_SHA256_MISMATCH',
+          reason: `Whisper model SHA-256 mismatch for '${path.basename(p)}': expected ${expected.expectedSha256} (${expected.source}), got ${actualSha256}.`,
+          actualSha256,
+          expectedSha256: expected.expectedSha256,
+          source: expected.source,
+          verified: false,
+          integrityStatus: 'MISMATCH',
+        };
+      }
+
+      return {
+        ok: true,
+        actualSha256,
+        expectedSha256: expected.expectedSha256,
+        source: expected.source,
+        verified: true,
+        integrityStatus: 'VERIFIED',
+      };
+    };
 
     if (runtimeType === 'whisper_cpp') {
       if (!isModelConfigured || !modelPath) {
@@ -1317,6 +1534,8 @@ export class SpeechTranscriptionAdapter {
           version: versionStr,
           modelConfigured: false,
           modelFound: false,
+          modelSha256Verified: false,
+          modelIntegrityStatus: 'MISSING_MODEL',
           runtimeType,
           supportedLanguages: ['en', 'th'],
           status: 'MISSING_MODEL',
@@ -1335,6 +1554,8 @@ export class SpeechTranscriptionAdapter {
           modelConfigured: true,
           modelFound: false,
           modelPath,
+          modelSha256Verified: false,
+          modelIntegrityStatus: 'MISSING_MODEL',
           runtimeType,
           supportedLanguages: ['en', 'th'],
           status: modelCheck.status || 'MISSING_MODEL',
@@ -1342,11 +1563,40 @@ export class SpeechTranscriptionAdapter {
           details: modelCheck.reason || `Invalid WHISPER_MODEL_PATH at ${modelPath}`
         };
       }
+      const hashCheck = await verifyModelFileSha256(modelPath);
+      modelSha256 = hashCheck.actualSha256;
+      expectedModelSha256 = hashCheck.expectedSha256;
+      modelSha256Source = hashCheck.source;
+      modelSha256Verified = hashCheck.verified;
+      modelIntegrityStatus = hashCheck.integrityStatus;
+      if (!hashCheck.ok) {
+        return {
+          isConfigured: true,
+          executableFound: true,
+          executablePath: sttPath,
+          isExecutable: true,
+          version: versionStr,
+          modelConfigured: true,
+          modelFound: false,
+          modelPath,
+          modelSha256,
+          expectedModelSha256,
+          modelSha256Source,
+          modelSha256Verified: false,
+          modelIntegrityStatus,
+          runtimeType,
+          supportedLanguages: ['en', 'th'],
+          status: hashCheck.status || 'ERROR',
+          diagnosticCode: hashCheck.diagnosticCode || 'MODEL_SHA256_MISMATCH',
+          details: hashCheck.reason || `Model SHA-256 verification failed for ${modelPath}`
+        };
+      }
       modelFound = true;
     } else if (runtimeType === 'openai_whisper') {
       if (isModelConfigured && modelPath) {
         if (OPENAI_WHISPER_MODEL_NAMES.has(modelPath.trim())) {
           modelFound = true;
+          modelIntegrityStatus = 'NOT_APPLICABLE';
         } else {
           const modelCheck = validateModelFile(modelPath, 'openai_whisper');
           if (!modelCheck.valid) {
@@ -1359,11 +1609,41 @@ export class SpeechTranscriptionAdapter {
               modelConfigured: true,
               modelFound: false,
               modelPath,
+              modelSha256Verified: false,
+              modelIntegrityStatus: 'MISSING_MODEL',
               runtimeType,
               supportedLanguages: ['en', 'th'],
               status: modelCheck.status || 'MISSING_MODEL',
               diagnosticCode: modelCheck.diagnosticCode || 'MODEL_INCOMPATIBLE',
               details: modelCheck.reason || `Invalid WHISPER_MODEL_PATH at ${modelPath}`
+            };
+          }
+          const hashCheck = await verifyModelFileSha256(modelPath);
+          modelSha256 = hashCheck.actualSha256;
+          expectedModelSha256 = hashCheck.expectedSha256;
+          modelSha256Source = hashCheck.source;
+          modelSha256Verified = hashCheck.verified;
+          modelIntegrityStatus = hashCheck.integrityStatus;
+          if (!hashCheck.ok) {
+            return {
+              isConfigured: true,
+              executableFound: true,
+              executablePath: sttPath,
+              isExecutable: true,
+              version: versionStr,
+              modelConfigured: true,
+              modelFound: false,
+              modelPath,
+              modelSha256,
+              expectedModelSha256,
+              modelSha256Source,
+              modelSha256Verified: false,
+              modelIntegrityStatus,
+              runtimeType,
+              supportedLanguages: ['en', 'th'],
+              status: hashCheck.status || 'ERROR',
+              diagnosticCode: hashCheck.diagnosticCode || 'MODEL_SHA256_MISMATCH',
+              details: hashCheck.reason || `Model SHA-256 verification failed for ${modelPath}`
             };
           }
           modelFound = true;
@@ -1380,11 +1660,18 @@ export class SpeechTranscriptionAdapter {
       modelConfigured: isModelConfigured,
       modelFound,
       modelPath,
+      modelSha256,
+      expectedModelSha256,
+      modelSha256Source,
+      modelSha256Verified,
+      modelIntegrityStatus,
       runtimeType,
       supportedLanguages: ['en', 'th'],
       status: 'READY',
       diagnosticCode: 'READY',
-      details: `Verified ${runtimeType} binary and model preflight requirements (speech execution compatibility must be verified separately via verifyRuntimeCompatibility).`
+      details: modelSha256Verified
+        ? `Verified ${runtimeType} binary, model header, and SHA-256 (${modelSha256Source}) preflight requirements.`
+        : `Verified ${runtimeType} binary and model header preflight requirements (model SHA-256 status: ${modelIntegrityStatus}; speech execution compatibility verified separately).`
     };
   }
 
@@ -1402,6 +1689,9 @@ export class SpeechTranscriptionAdapter {
     trustedManifest?: TrustedSpeechFixtureManifest;
     trustedPublicKeys?: Record<string, string>;
     strictAttestationMode?: boolean;
+    requireModelSha256?: boolean;
+    expectedModelSha256?: string;
+    trustedModelManifestPath?: string;
   }): Promise<WhisperCompatibilityResult> {
     return this.verifyRuntimeCompatibility({
       audioFixturePath: options?.audioFixturePath,
@@ -1412,7 +1702,10 @@ export class SpeechTranscriptionAdapter {
       trustedManifestPath: options?.trustedManifestPath,
       trustedManifest: options?.trustedManifest,
       trustedPublicKeys: options?.trustedPublicKeys,
-      strictAttestationMode: options?.strictAttestationMode
+      strictAttestationMode: options?.strictAttestationMode,
+      requireModelSha256: options?.requireModelSha256,
+      expectedModelSha256: options?.expectedModelSha256,
+      trustedModelManifestPath: options?.trustedModelManifestPath
     });
   }
 
@@ -1440,6 +1733,9 @@ export class SpeechTranscriptionAdapter {
     trustedManifest?: TrustedSpeechFixtureManifest;
     trustedPublicKeys?: Record<string, string>;
     strictAttestationMode?: boolean;
+    requireModelSha256?: boolean;
+    expectedModelSha256?: string;
+    trustedModelManifestPath?: string;
   }): Promise<WhisperCompatibilityResult> {
     const startTime = Date.now();
     const timeoutMs = options?.timeoutMs ?? 20000;
@@ -1451,7 +1747,11 @@ export class SpeechTranscriptionAdapter {
       ? 'SYNTHETIC_FIXTURE'
       : 'UNTRUSTED_NO_MANIFEST_ENTRY';
 
-    const validation = await this.validateRuntime();
+    const validation = await this.validateRuntime({
+      requireModelSha256: options?.requireModelSha256,
+      expectedModelSha256: options?.expectedModelSha256,
+      trustedModelManifestPath: options?.trustedModelManifestPath,
+    });
 
     if (validation.status !== 'READY' || (validation.runtimeType !== 'whisper_cpp' && validation.runtimeType !== 'openai_whisper')) {
       const code: WhisperDiagnosticCode =
@@ -2149,12 +2449,19 @@ export class SpeechTranscriptionAdapter {
       trustedManifest?: TrustedSpeechFixtureManifest;
       trustedPublicKeys?: Record<string, string>;
       strictAttestationMode?: boolean;
+      requireModelSha256?: boolean;
+      expectedModelSha256?: string;
+      trustedModelManifestPath?: string;
     }
   ): Promise<LocalTranscriptionResult> {
     const startTime = Date.now();
 
-    // Enforce preflight runtime validation before transcription
-    const validation = await this.validateRuntime();
+    // Enforce preflight runtime validation before transcription (including SHA-256 verification)
+    const validation = await this.validateRuntime({
+      requireModelSha256: options?.requireModelSha256,
+      expectedModelSha256: options?.expectedModelSha256,
+      trustedModelManifestPath: options?.trustedModelManifestPath,
+    });
     if (validation.status === 'UNCONFIGURED') {
       return {
         status: 'NOT_ASSESSED',
@@ -2233,7 +2540,10 @@ export class SpeechTranscriptionAdapter {
         trustedManifestPath: options?.trustedManifestPath,
         trustedManifest: options?.trustedManifest,
         trustedPublicKeys: options?.trustedPublicKeys,
-        strictAttestationMode: options?.strictAttestationMode
+        strictAttestationMode: options?.strictAttestationMode,
+        requireModelSha256: options?.requireModelSha256,
+        expectedModelSha256: options?.expectedModelSha256,
+        trustedModelManifestPath: options?.trustedModelManifestPath
       });
       runtimeExecutionStatus = compat.runtimeExecutionStatus;
       runtimeCompatibilityStatus = compat.runtimeCompatibilityStatus;

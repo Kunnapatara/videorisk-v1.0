@@ -133,3 +133,26 @@ Record before signing off staging Stripe verification:
 - Stripe CLI / Test Mode Event IDs (`evt_...`)
 - Checkout Session (`cs_test_...`), Subscription (`sub_...`), Invoice (`in_...`), Charge/Refund (`re_...`) IDs
 - SQLite row snapshots before and after each transition
+
+---
+
+## 5. Automated Stripe Test Mode E2E Verification Harness
+
+Repository includes an isolated, non-destructive verification harness (`scripts/verify-stripe-test-mode-e2e.ts`) covering `Checkout -> Invalid Signature 400 -> Paid Subscription Webhook -> Subscription Update (incl. omitted current_period_end) -> Unknown Price Guard -> Idempotency Replay -> Partial/Full Refund Clawback -> Cancellation -> Cleanup`:
+
+```bash
+# Offline preflight only (verifies safety guards, rawBody server middleware, auth & SQLite billing schema; exit 0)
+npm run verify:stripe:e2e -- --preflight-only
+
+# Full real Stripe Test Mode API E2E (requires sk_test_... + whsec_...; exits 2 BLOCKED if unset)
+STRIPE_SECRET_KEY=sk_test_... STRIPE_WEBHOOK_SECRET=whsec_... npm run verify:stripe:e2e
+
+# Non-ENV safety-guard & harness contract test suite
+npm run test:stripe:harness
+```
+
+Safety guarantees enforced before any execution:
+- Refuses `sk_live_...` / `rk_live_...`, `PAYMENT_MODE=live`, `PAYMENT_MODE=production`, and `DEPLOYMENT_ENV=production` (exit `1`).
+- Always runs against a dedicated ephemeral SQLite database inside `os.tmpdir()` (refuses `videorisk.db`, exit `1`).
+- Exits cleanly with code `2` (`BLOCKED — AWAITING ENV`) when `STRIPE_SECRET_KEY` or `STRIPE_WEBHOOK_SECRET` are absent — never claims mocked behavior as live Stripe API verification.
+

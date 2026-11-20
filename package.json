@@ -21,6 +21,10 @@
     "test:billing": "DATABASE_PATH=data/videorisk_test.db tsx tests/stripe_origin_and_refund_lifecycle.test.ts",
     "test:security": "DATABASE_PATH=data/videorisk_test.db tsx tests/server_production_predicate.test.ts && DATABASE_PATH=data/videorisk_test.db tsx tests/security_remediation_group_ab.test.ts",
     "test:whisper:real": "DATABASE_PATH=data/videorisk_test.db tsx tests/whisper_real_verification.test.ts",
+    "test:whisper:sha256": "DATABASE_PATH=data/videorisk_test.db tsx tests/whisper_model_sha256.test.ts",
+    "test:stripe:harness": "DATABASE_PATH=data/videorisk_test.db tsx tests/stripe_test_mode_e2e_harness.test.ts",
+    "verify:whisper:prod": "tsx scripts/verify-whisper-prod.ts",
+    "verify:stripe:e2e": "tsx scripts/verify-stripe-test-mode-e2e.ts",
     "test:all": "DATABASE_PATH=data/videorisk_test.db tsx tests/runAllTests.ts && DATABASE_PATH=data/videorisk_test.db tsx tests/phase4_6_gap_closure.test.ts && DATABASE_PATH=data/videorisk_test.db tsx tests/remediation_regression.test.ts && DATABASE_PATH=data/videorisk_test.db tsx tests/stripe_origin_and_refund_lifecycle.test.ts",
     "validate:env": "tsx scripts/validate-env.ts"
   },

@@ -148,6 +148,9 @@ export async function runWhisperRealVerificationTests() {
     WHISPER_PATH: process.env.WHISPER_PATH,
     LOCAL_STT_PATH: process.env.LOCAL_STT_PATH,
     WHISPER_MODEL_PATH: process.env.WHISPER_MODEL_PATH,
+    WHISPER_MODEL_SHA256: process.env.WHISPER_MODEL_SHA256,
+    WHISPER_REQUIRE_MODEL_SHA256: process.env.WHISPER_REQUIRE_MODEL_SHA256,
+    WHISPER_MODEL_MANIFEST_PATH: process.env.WHISPER_MODEL_MANIFEST_PATH,
     WHISPER_COMPAT_AUDIO_PATH: process.env.WHISPER_COMPAT_AUDIO_PATH,
     WHISPER_COMPAT_EXPECTED_TRANSCRIPT: process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT,
     WHISPER_COMPAT_SYNTHETIC_FIXTURE: process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE,
@@ -163,6 +166,9 @@ export async function runWhisperRealVerificationTests() {
     process.env.WHISPER_PATH = whisperBin;
     delete process.env.LOCAL_STT_PATH;
     process.env.WHISPER_MODEL_PATH = whisperModel;
+    delete process.env.WHISPER_MODEL_SHA256;
+    delete process.env.WHISPER_MODEL_MANIFEST_PATH;
+    process.env.WHISPER_REQUIRE_MODEL_SHA256 = 'true';
     process.env.WHISPER_COMPAT_AUDIO_PATH = fixtureWavPath;
     process.env.WHISPER_SPEECH_MANIFEST_PATH = manifestPath;
     delete process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT;
@@ -173,18 +179,26 @@ export async function runWhisperRealVerificationTests() {
     speechTranscriptionAdapter.clearCompatibilityCache();
 
     // ------------------------------------------------------------------------
-    // 1. REAL BINARY & MODEL PREFLIGHT VALIDATION
+    // 1. REAL BINARY & MODEL PREFLIGHT VALIDATION (INCLUDING SHA-256)
     // ------------------------------------------------------------------------
-    console.log('[1. Real whisper-cli & GGML Model Preflight Validation]');
-    const validation = await speechTranscriptionAdapter.validateRuntime();
+    console.log('[1. Real whisper-cli & GGML Model Preflight + SHA-256 Validation]');
+    const validation = await speechTranscriptionAdapter.validateRuntime({ requireModelSha256: true });
     assert.strictEqual(validation.status, 'READY', `1.1 Expected READY preflight, got ${validation.status} (${validation.details})`);
     assert.strictEqual(validation.runtimeType, 'whisper_cpp', '1.2 Runtime identity verified as whisper_cpp');
     assert.strictEqual(validation.executableFound, true, '1.3 Executable found');
     assert.strictEqual(validation.isExecutable, true, '1.4 Executable permission verified');
     assert.strictEqual(validation.modelFound, true, '1.5 GGML model header & readability verified');
+    assert.strictEqual(validation.modelSha256Verified, true, '1.6 Model SHA-256 verified via trusted whisperModels.json');
+    assert.strictEqual(validation.modelIntegrityStatus, 'VERIFIED', '1.7 modelIntegrityStatus=VERIFIED');
+    assert.strictEqual(validation.modelSha256Source, 'manifest', '1.8 Expected SHA-256 resolved from trusted manifest');
+    assert.strictEqual(
+      validation.modelSha256,
+      'a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002',
+      '1.9 Actual ggml-base.en.bin SHA-256 matches upstream Git LFS hash'
+    );
     console.log(`  Binary : ${validation.executablePath} (${validation.version || 'version-detected'})`);
-    console.log(`  Model  : ${validation.modelPath}`);
-    console.log('  ✅ PASS: Real whisper-cli preflight READY');
+    console.log(`  Model  : ${validation.modelPath} (SHA-256=${validation.modelSha256})`);
+    console.log('  ✅ PASS: Real whisper-cli preflight & model SHA-256 READY');
 
     // ------------------------------------------------------------------------
     // 2. REAL HUMAN SPEECH COMPATIBILITY, PROVENANCE & WER BENCHMARK
@@ -331,7 +345,9 @@ export async function runWhisperRealVerificationTests() {
       assert.strictEqual(w?.details?.provenanceTrustTier, 'MAINTAINER_ATTESTED', '5.6 provenanceTrustTier=MAINTAINER_ATTESTED');
       assert.strictEqual(w?.details?.speechTranscriptStatus, 'SPEECH_TRANSCRIPT_VERIFIED', '5.7 speechTranscriptStatus=SPEECH_TRANSCRIPT_VERIFIED');
       assert.strictEqual(w?.details?.speechTranscriptVerified, true, '5.8 speechTranscriptVerified=true');
-      console.log('  ✅ PASS: /api/health/readiness accurately reports verified real Whisper STT');
+      assert.strictEqual(w?.details?.modelSha256Verified, true, '5.9 modelSha256Verified=true');
+      assert.strictEqual(w?.details?.modelIntegrityStatus, 'VERIFIED', '5.10 modelIntegrityStatus=VERIFIED');
+      console.log('  ✅ PASS: /api/health/readiness accurately reports verified real Whisper STT & model SHA-256');
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
@@ -382,6 +398,101 @@ export async function runWhisperRealVerificationTests() {
     assert.strictEqual(timeoutRes.diagnosticCode, 'TRANSCRIPTION_TIMEOUT', `6.10 Timeout diagnosticCode=TRANSCRIPTION_TIMEOUT (got ${timeoutRes.diagnosticCode})`);
     assert.strictEqual(timeoutRes.runtimeExecutionStatus, 'FAILED', '6.11 Timeout marks runtimeExecutionStatus=FAILED');
     console.log('  ✅ PASS: All fail-closed real failure modes verified (corrupted audio, missing model, timeout)');
+
+    // ------------------------------------------------------------------------
+    // 7. AUTOMATED WHISPER MODEL SHA-256 VERIFICATION MATRIX (5 CASES)
+    // ------------------------------------------------------------------------
+    console.log('\n[7. Automated Whisper Model SHA-256 Verification (Match, Mismatch, Missing, Invalid, Post-Provision Tamper)]');
+
+    // 7A. Match via explicit WHISPER_MODEL_SHA256
+    process.env.WHISPER_MODEL_PATH = whisperModel;
+    process.env.WHISPER_MODEL_SHA256 = 'a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002';
+    process.env.WHISPER_REQUIRE_MODEL_SHA256 = 'true';
+    const shaEnvMatch = await speechTranscriptionAdapter.validateRuntime();
+    assert.strictEqual(shaEnvMatch.status, 'READY', '7.1a Model SHA-256 match via WHISPER_MODEL_SHA256 returns READY');
+    assert.strictEqual(shaEnvMatch.modelSha256Verified, true, '7.1b modelSha256Verified=true');
+    assert.strictEqual(shaEnvMatch.modelSha256Source, 'env', '7.1c Source=env');
+
+    // 7B. Mismatch fails closed & blocks transcribe()
+    process.env.WHISPER_MODEL_SHA256 = '0'.repeat(64);
+    const shaMismatch = await speechTranscriptionAdapter.validateRuntime();
+    assert.strictEqual(shaMismatch.status, 'ERROR', '7.2a Model SHA-256 mismatch fails closed with ERROR');
+    assert.strictEqual(shaMismatch.diagnosticCode, 'MODEL_SHA256_MISMATCH', '7.2b diagnosticCode=MODEL_SHA256_MISMATCH');
+    assert.strictEqual(shaMismatch.modelFound, false, '7.2c modelFound=false on mismatch');
+    assert.strictEqual(shaMismatch.modelSha256Verified, false, '7.2d modelSha256Verified=false on mismatch');
+    assert.strictEqual(shaMismatch.modelIntegrityStatus, 'MISMATCH', '7.2e modelIntegrityStatus=MISMATCH');
+    const shaMismatchTx = await speechTranscriptionAdapter.transcribe(speechMp4Path, 11.0, { verifyCompatibility: false });
+    assert.strictEqual(shaMismatchTx.status, 'ANALYSIS_UNAVAILABLE', '7.2f Mismatch blocks transcribe() fail-closed');
+    assert.strictEqual(shaMismatchTx.diagnosticCode, 'MODEL_SHA256_MISMATCH', '7.2g transcribe() surfaces MODEL_SHA256_MISMATCH');
+
+    // 7C. Missing expected hash on unmanifested model fails closed when required, and never reports VERIFIED when optional
+    const unmanifestedModel = path.join(workDir, 'custom_unmanifested_ggml.bin');
+    fs.writeFileSync(unmanifestedModel, Buffer.concat([Buffer.from('lmgg', 'ascii'), Buffer.alloc(128, 0x05)]));
+    delete process.env.WHISPER_MODEL_SHA256;
+    process.env.WHISPER_MODEL_PATH = unmanifestedModel;
+    process.env.WHISPER_REQUIRE_MODEL_SHA256 = 'true';
+    const missingExpectedRequired = await speechTranscriptionAdapter.validateRuntime();
+    assert.strictEqual(missingExpectedRequired.status, 'ERROR', '7.3a Missing expected SHA-256 fails closed when required');
+    assert.strictEqual(missingExpectedRequired.diagnosticCode, 'MODEL_EXPECTED_HASH_MISSING', '7.3b diagnosticCode=MODEL_EXPECTED_HASH_MISSING');
+    assert.strictEqual(missingExpectedRequired.modelIntegrityStatus, 'MISSING_EXPECTED_HASH', '7.3c modelIntegrityStatus=MISSING_EXPECTED_HASH');
+    assert.strictEqual(missingExpectedRequired.modelSha256Verified, false, '7.3d Never marks modelSha256Verified=true when hash missing');
+    const missingExpectedTx = await speechTranscriptionAdapter.transcribe(speechMp4Path, 11.0, { verifyCompatibility: false });
+    assert.strictEqual(missingExpectedTx.status, 'ANALYSIS_UNAVAILABLE', '7.3e Missing expected hash blocks transcribe()');
+
+    delete process.env.WHISPER_REQUIRE_MODEL_SHA256;
+    const missingExpectedUnverified = await speechTranscriptionAdapter.validateRuntime();
+    assert.strictEqual(missingExpectedUnverified.modelSha256Verified, false, '7.3f Optional mode still refuses to claim modelSha256Verified=true');
+    assert.strictEqual(missingExpectedUnverified.modelIntegrityStatus, 'MISSING_EXPECTED_HASH', '7.3g Reports MISSING_EXPECTED_HASH honestly');
+
+    // 7D. Invalid expected hash format fails closed
+    process.env.WHISPER_MODEL_SHA256 = 'not-a-valid-sha256-hex';
+    const invalidExpected = await speechTranscriptionAdapter.validateRuntime();
+    assert.strictEqual(invalidExpected.status, 'ERROR', '7.4a Malformed WHISPER_MODEL_SHA256 fails closed');
+    assert.strictEqual(invalidExpected.diagnosticCode, 'MODEL_EXPECTED_HASH_INVALID', '7.4b diagnosticCode=MODEL_EXPECTED_HASH_INVALID');
+    assert.strictEqual(invalidExpected.modelIntegrityStatus, 'INVALID_EXPECTED_HASH', '7.4c modelIntegrityStatus=INVALID_EXPECTED_HASH');
+    assert.strictEqual(invalidExpected.modelSha256Verified, false, '7.4d modelSha256Verified=false');
+
+    // 7E. Post-provisioning tampering (copy real ggml-base.en.bin, verify READY + warm cache, mutate 1 byte preserving exact size -> must fail closed!)
+    const tamperModelCopy = path.join(workDir, 'ggml-base.en.bin'); // Same basename -> matches trusted manifest OR env hash
+    fs.copyFileSync(whisperModel, tamperModelCopy);
+    delete process.env.WHISPER_MODEL_SHA256;
+    process.env.WHISPER_MODEL_PATH = tamperModelCopy;
+    process.env.WHISPER_REQUIRE_MODEL_SHA256 = 'true';
+    speechTranscriptionAdapter.clearCompatibilityCache();
+    const preTamperCompat = await speechTranscriptionAdapter.verifyRuntimeCompatibility({
+      audioFixturePath: fixtureWavPath,
+      trustedManifestPath: manifestPath,
+      useCache: true,
+    });
+    assert.strictEqual(preTamperCompat.compatible, true, '7.5a Provisioned model copy initially passes compatibility & warms cache');
+    assert.strictEqual(preTamperCompat.validation.modelSha256Verified, true, '7.5b Initial copy SHA-256 verified');
+
+    // Mutate 1 byte near end of file (exact same byte length!)
+    const fdTamper = fs.openSync(tamperModelCopy, 'r+');
+    try {
+      const oneByte = Buffer.alloc(1);
+      const targetOffset = fs.statSync(tamperModelCopy).size - 64;
+      fs.readSync(fdTamper, oneByte, 0, 1, targetOffset);
+      oneByte[0] = oneByte[0] ^ 0xff;
+      fs.writeSync(fdTamper, oneByte, 0, 1, targetOffset);
+    } finally {
+      fs.closeSync(fdTamper);
+    }
+
+    const postTamperCompat = await speechTranscriptionAdapter.verifyRuntimeCompatibility({
+      audioFixturePath: fixtureWavPath,
+      trustedManifestPath: manifestPath,
+      useCache: true,
+    });
+    assert.strictEqual(postTamperCompat.compatible, false, '7.5c Post-provisioning 1-byte tamper invalidates compatibility even with cache enabled');
+    assert.strictEqual(postTamperCompat.diagnosticCode, 'MODEL_SHA256_MISMATCH', '7.5d Post-tamper compat surfaces MODEL_SHA256_MISMATCH');
+    const postTamperTx = await speechTranscriptionAdapter.transcribe(speechMp4Path, 11.0, {
+      verifyCompatibility: false,
+      requireModelSha256: true,
+    });
+    assert.strictEqual(postTamperTx.status, 'ANALYSIS_UNAVAILABLE', '7.5e Post-tamper blocks transcribe() even when verifyCompatibility=false');
+    assert.strictEqual(postTamperTx.diagnosticCode, 'MODEL_SHA256_MISMATCH', '7.5f Post-tamper transcribe() surfaces MODEL_SHA256_MISMATCH');
+    console.log('  ✅ PASS: All 5 Whisper Model SHA-256 scenarios (match, mismatch, missing, invalid, post-provisioning tamper) verified');
 
     console.log('\n======================================================');
     console.log('🎉 ALL REAL WHISPER.CPP VERIFICATION CHECKS PASSED!');
