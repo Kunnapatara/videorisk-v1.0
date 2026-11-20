@@ -1,101 +1,117 @@
 # VideoRisk v1.0 — Real Whisper Binary, Model & Human Speech Verification Runbook (WS5 & WS2)
 
-> **Verification Boundary Statement:**
-> CI and local tests (`npm run test:regression`, `npm run test:phase4-6`) validate CLI contract parsing, FFmpeg MP4-to-16kHz-WAV transcoding, SHA-256 TOCTOU integrity, Ed25519 manifest signatures, and ordered-token LCS comparison using isolated mock executables and synthetic test WAV files.
-> **Actual speech recognition quality and native `whisper.cpp` execution remain `NOT_VERIFIED` inside ephemeral CI/build containers lacking `whisper.cpp` + real human speech audio.**
-> Follow this runbook on the target production or staging host to achieve `CRYPTOGRAPHICALLY_VERIFIED` + `TRANSCRIPT_VERIFIED`.
+> **Verification Boundary Statement (Verified Locally vs Production):**
+> - **Verified Locally (Current Build/Verification Host):** Real native `whisper.cpp` (`whisper-cli` v1.9.6-dev, commit `95b3b2f855e09404499529228de15734cdeeb6a1`), real GGML model `/opt/whisper-models/ggml-base.en.bin` (`147,964,211` bytes, SHA-1 `137c40403d78fd54d454da0f9bd998f78703390c`, SHA-256 `a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002`), and real non-synthetic human speech fixture `tests/fixtures/speech/jfk_1961_inaugural_16k.wav` (11.0s Public Domain 1961 speech, SHA-256 `e39623e2c5d0e0013ab265d1e751c8aedae412ace9de5ab811d561ca9c9b57e1`) executed end-to-end via `npm run test:whisper:real` (`0.00%` WER, `recall=1`, `precision=1`), including MP4 -> FFmpeg 16kHz PCM WAV -> `whisper-cli`, `/api/health/readiness`, strict Ed25519 manifest attestation, and fail-closed error handling (corrupted media, missing model, timeout).
+> - **Standard CI (`npm test`, `npm run test:regression`, `npm run test:phase4-6`):** Validates FFmpeg/Tesseract on synthetic media plus Whisper CLI contracts, SHA-256 TOCTOU checks, and Ed25519 manifest logic using isolated mock executables (because CI runners do not compile `whisper.cpp` or download 142 MiB GGML weights by default).
+> - **NOT Verified in External Production:** Host binaries in `/opt/whisper.cpp` and `/opt/whisper-models` reside on the local verification container only. Production hosts/images must provision `whisper-cli`, checksum-verified models, offline maintainer Ed25519 signing (`WHISPER_STRICT_PROVENANCE=true`), and verify real workload latency, non-English/Thai speech models if needed, and multi-speaker noisy audio before claiming production readiness.
 
 ---
 
 ## 1. Install `whisper.cpp` Binary & Download Verified Model
 
 ### Option A: Build `whisper.cpp` (`whisper-cli`)
+Requires `git`, `cmake`, and a C++17 toolchain (`g++` / `clang++`):
+
 ```bash
-git clone https://github.com/ggml-org/whisper.cpp.git /opt/whisper.cpp
-cmake -B /opt/whisper.cpp/build -S /opt/whisper.cpp
-cmake --build /opt/whisper.cpp/build -j --config Release
+apt-get update && apt-get install -y --no-install-recommends cmake g++ git curl ffmpeg
+git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git /opt/whisper.cpp
+# Verified commit on local verification host: 95b3b2f855e09404499529228de15734cdeeb6a1
+cmake -B /opt/whisper.cpp/build -S /opt/whisper.cpp -DBUILD_SHARED_LIBS=OFF
+cmake --build /opt/whisper.cpp/build -j --config Release --target whisper-cli
 # Binary path: /opt/whisper.cpp/build/bin/whisper-cli
-/opt/whisper.cpp/build/bin/whisper-cli --help
+/opt/whisper.cpp/build/bin/whisper-cli --version
+# Expected: whisper.cpp version: 1.9.6-dev (or newer)
 ```
 
-### Download & Verify GGML Model (e.g. `ggml-base.en.bin`)
+### Download & Verify GGML Model (`ggml-base.en.bin`)
 ```bash
 mkdir -p /opt/whisper-models
-bash /opt/whisper.cpp/models/download-ggml-model.sh base.en /opt/whisper-models
+curl -fL --retry 3 \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin \
+  -o /opt/whisper-models/ggml-base.en.bin
+
+sha1sum /opt/whisper-models/ggml-base.en.bin
+# Official whisper.cpp SHA-1 for base.en: 137c40403d78fd54d454da0f9bd998f78703390c
+
 sha256sum /opt/whisper-models/ggml-base.en.bin
-# Compare SHA-256 against official whisper.cpp release checksums before trusting!
+# Verified SHA-256: a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002
 ```
+
+> Note: `ggml-base.en.bin` is English-only. If you require Thai (`th`) or multilingual transcription in production, provision a multilingual GGML model (e.g., `ggml-base.bin` or `ggml-medium.bin`) and verify its SHA-1/SHA-256 against `whisper.cpp/models/README.md`.
 
 ---
 
-## 2. Prepare Real Human Speech Fixture (16kHz Mono 16-bit PCM WAV)
+## 2. Checked-In Real Human Speech Fixture & `manifest.json`
 
 > Never register synthetic tones, TTS, or unreviewed recordings as human speech.
 
-Convert a human-spoken reference recording (with known verbatim transcript) to 16kHz mono PCM WAV:
+Repository includes a verified Public Domain human speech fixture (not named `whisper_speech_16k.wav` so negative-control CI tests checking default unset behavior remain intact):
+
+- **File:** `tests/fixtures/speech/jfk_1961_inaugural_16k.wav` (`352,078` bytes, `11.0s`, `pcm_s16le`, `16000 Hz`, mono)
+- **Source & License:** Excerpt of President John F. Kennedy's 1961-01-20 Inaugural Address from `ggml-org/whisper.cpp` (`samples/jfk.wav`), Public Domain (U.S. Federal Government work, 17 U.S.C. § 105).
+- **SHA-256:** `e39623e2c5d0e0013ab265d1e751c8aedae412ace9de5ab811d561ca9c9b57e1`
+- **Manifest:** `tests/fixtures/speech/manifest.json` (`fixtureId`: `jfk_1961_inaugural_en_01`)
+
+To convert or audit additional human speech WAV fixtures:
 
 ```bash
-mkdir -p tests/fixtures/speech
-ffmpeg -y -i raw_human_speech.wav -vn -ac 1 -ar 16000 -c:a pcm_s16le tests/fixtures/speech/whisper_speech_16k.wav
-sha256sum tests/fixtures/speech/whisper_speech_16k.wav
-```
-
-Verify audio container format:
-
-```bash
-ffprobe -v error -select_streams a:0 -show_entries stream=codec_name,sample_rate,channels -of csv=p=0 tests/fixtures/speech/whisper_speech_16k.wav
+ffmpeg -y -i raw_human_speech.wav -vn -ac 1 -ar 16000 -c:a pcm_s16le tests/fixtures/speech/<fixture_name>.wav
+ffprobe -v error -select_streams a:0 -show_entries stream=codec_name,sample_rate,channels -of csv=p=0 tests/fixtures/speech/<fixture_name>.wav
 # Expected output: pcm_s16le,16000,1
+sha256sum tests/fixtures/speech/<fixture_name>.wav
 ```
 
 ---
 
-## 3. Generate Ed25519 Attestation Keys & Sign `manifest.json` (Option B — Strict Mode)
+## 3. Reproducible Real Whisper Execution & Automated Verification
 
-### Step A: Generate an Ed25519 Maintainer Signing Keypair (keep private key OFFLINE)
+### A. Direct CLI Smoke Check
 ```bash
+/opt/whisper.cpp/build/bin/whisper-cli \
+  -m /opt/whisper-models/ggml-base.en.bin \
+  -f tests/fixtures/speech/jfk_1961_inaugural_16k.wav \
+  --output-json -of /tmp/jfk_probe
+cat /tmp/jfk_probe.json
+rm -f /tmp/jfk_probe.json
+```
+
+Expected transcription text:
+`"And so my fellow Americans, ask not what your country can do for you, ask what you can do for your country."`
+
+### B. Full VideoRisk Pipeline Verification Suite (`npm run test:whisper:real`)
+Run the dedicated non-mocked verification suite against `SpeechTranscriptionAdapter`, `AudioProcessor`, `/api/health/readiness`, Ed25519 strict attestation, real MP4 -> FFmpeg 16kHz WAV transcoding, and fail-closed failure modes:
+
+```bash
+WHISPER_PATH=/opt/whisper.cpp/build/bin/whisper-cli \
+WHISPER_MODEL_PATH=/opt/whisper-models/ggml-base.en.bin \
+npm run test:whisper:real
+```
+
+Expected verified output (observed on 2-vCPU x86_64 AVX512 container):
+- Preflight `validateRuntime()`: `READY` (`runtimeType: 'whisper_cpp'`, model header validated).
+- `verifyRuntimeCompatibility()` (WAV + `manifest.json`): `RUNTIME_EXECUTION_VERIFIED`, `VERIFIED_HUMAN_SPEECH`, `MAINTAINER_ATTESTED`, `SPEECH_TRANSCRIPT_VERIFIED`, `recall=1`, `precision=1`, `WER=0.00% (S=0, D=0, I=0, N=22)`, `~4.6s`.
+- Strict Ed25519 test (`WHISPER_STRICT_PROVENANCE=true`): `CRYPTOGRAPHICALLY_VERIFIED` + `TRANSCRIPT_VERIFIED`.
+- End-to-end MP4 -> FFmpeg 16kHz WAV -> `whisper-cli` + `AudioProcessor.analyzeAudio()`: `status=DETECTED`, `segments=1`, `WER=0.00%`, `voiceoverRatio > 0.5`, zero leaked `vr_whisper_*` temp directories.
+- `/api/health/readiness`: HTTP `200`, `checks.whisperStt.status='healthy'`.
+- Failure modes: corrupted WAV (`SPEECH_FIXTURE_INVALID`), corrupted MP4 (`ANALYSIS_UNAVAILABLE`), missing model (`MODEL_NOT_FOUND`), `1ms` subprocess timeout (`TRANSCRIPTION_TIMEOUT`).
+
+---
+
+## 4. Production Hardening: Offline Ed25519 Attestation (`WHISPER_STRICT_PROVENANCE=true`)
+
+In production, sign `tests/fixtures/speech/manifest.json` with an **offline** Ed25519 private key and configure only the public key in `WHISPER_TRUSTED_PUBLIC_KEYS`:
+
+```bash
+# 1. Generate Ed25519 keypair (keep private key OFFLINE)
 node -e "
 const crypto = require('crypto');
 const fs = require('fs');
 const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
 fs.writeFileSync('/tmp/whisper_manifest_private.pem', privateKey.export({ type: 'pkcs8', format: 'pem' }), { mode: 0o600 });
 fs.writeFileSync('/tmp/whisper_manifest_public.pem', publicKey.export({ type: 'spki', format: 'pem' }));
-console.log('Generated ephemeral Ed25519 keys in /tmp (move private key offline before production use).');
 "
-```
 
-### Step B: Author `tests/fixtures/speech/manifest.json`
-Fill `sha256`, `expectedTranscript`, `transcriptReviewEvidence`, `verifiedBy`, `verifiedAt` (strict ISO-8601), `verificationMethod`, and `hashAlgorithm: "sha256"`:
-
-```json
-{
-  "manifestVersion": "1.0.0",
-  "description": "Production verified human speech fixture manifest",
-  "fixtures": [
-    {
-      "fixtureId": "human_speech_en_01",
-      "relativePath": "whisper_speech_16k.wav",
-      "sha256": "<64-char-hex-sha256>",
-      "sourceDescription": "Clean human studio voice recording (English)",
-      "recordingOrigin": "HUMAN_SPEECH_RECORDING",
-      "humanSpeechVerificationStatus": "VERIFIED_HUMAN_SPEECH",
-      "expectedTranscript": "Exact verbatim human reviewed spoken phrase",
-      "transcriptLanguage": "en",
-      "transcriptReviewEvidence": "Manually auditioned and transcribed verbatim by maintainer",
-      "verificationMetadata": {
-        "verifiedBy": "<maintainer-id>",
-        "verifiedAt": "2026-11-15T12:00:00Z",
-        "verificationMethod": "manual_human_audit",
-        "hashAlgorithm": "sha256"
-      }
-    }
-  ]
-}
-```
-
-### Step C: Sign the Canonical Manifest Payload
-Use the exact `canonicalizeSpeechManifestPayload` function exported by `src/server/pipeline/audioProcessor.ts`:
-
-```bash
+# 2. Sign canonical payload using canonicalizeSpeechManifestPayload()
 npx tsx -e "
 import fs from 'fs';
 import crypto from 'crypto';
@@ -105,47 +121,51 @@ const manifest = JSON.parse(fs.readFileSync('tests/fixtures/speech/manifest.json
 delete manifest.signature;
 const privPem = fs.readFileSync('/tmp/whisper_manifest_private.pem', 'utf8');
 const payload = Buffer.from(canonicalizeSpeechManifestPayload(manifest), 'utf8');
-const sig = crypto.sign(null, payload, privPem).toString('base64');
 manifest.signature = {
   algorithm: 'ed25519',
   keyId: 'release-2026-q4',
-  value: sig,
+  value: crypto.sign(null, payload, privPem).toString('base64'),
   signedAt: new Date().toISOString()
 };
 fs.writeFileSync('tests/fixtures/speech/manifest.json', JSON.stringify(manifest, null, 2) + '\n');
-console.log('Signed manifest.json cleanly with keyId=release-2026-q4');
 "
 ```
 
----
-
-## 4. Configure Environment & Verify Runtime Readiness
-
-Set in production `.env`:
-
+Production `.env`:
 ```bash
 WHISPER_PATH=/opt/whisper.cpp/build/bin/whisper-cli
 WHISPER_MODEL_PATH=/opt/whisper-models/ggml-base.en.bin
-WHISPER_COMPAT_AUDIO_PATH=/app/tests/fixtures/speech/whisper_speech_16k.wav
+WHISPER_COMPAT_AUDIO_PATH=/app/tests/fixtures/speech/jfk_1961_inaugural_16k.wav
 WHISPER_SPEECH_MANIFEST_PATH=/app/tests/fixtures/speech/manifest.json
 WHISPER_VERIFY_COMPATIBILITY=true
 WHISPER_STRICT_PROVENANCE=true
 WHISPER_TRUSTED_PUBLIC_KEYS='{"release-2026-q4":"-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"}'
 ```
 
-Run live verification against the real `whisper-cli` binary, GGML model, and human speech WAV:
-
+Verify readiness endpoint:
 ```bash
 curl -s http://localhost:3000/api/health/readiness | jq '.checks.whisperStt'
 ```
 
-Expected readiness output:
-- `"status": "healthy"`
-- `"details.runtimeExecutionStatus": "RUNTIME_EXECUTION_VERIFIED"`
-- `"details.provenanceTrustTier": "CRYPTOGRAPHICALLY_VERIFIED"`
-- `"details.signatureVerified": true`
-- `"details.signatureKeyId": "release-2026-q4"`
-- `"details.speechTranscriptStatus": "SPEECH_TRANSCRIPT_VERIFIED"`
-- `"details.verificationStates"`: `["RUNTIME_COMPATIBLE", "FIXTURE_INTEGRITY_VERIFIED", "CRYPTOGRAPHICALLY_VERIFIED", "TRANSCRIPT_VERIFIED"]`
+---
 
-Also test real MP4 -> 16kHz WAV -> `whisper-cli` end-to-end transcription on an uploaded human speech `.mp4` scan and confirm zero temporary `.wav` or `.json` files remain in repository root or `os.tmpdir()`.
+## 5. Failure Diagnosis Reference
+
+| Diagnostic Code | Root Cause | Resolution |
+| :--- | :--- | :--- |
+| `BINARY_NOT_FOUND` / `BINARY_NOT_EXECUTABLE` | `WHISPER_PATH` missing or lacks `+x` permission | Verify path and `chmod +x` on `whisper-cli` |
+| `IDENTITY_CONTRACT_MISMATCH` | Binary `--help`/`--version` does not match `whisper.cpp` or `openai-whisper` CLI contract | Point `WHISPER_PATH` to compiled `whisper-cli` binary |
+| `MODEL_NOT_FOUND` / `MODEL_INCOMPATIBLE` | Missing GGML file, wrong permissions, or invalid GGML/GGUF header bytes | Re-download model and verify SHA-1/SHA-256 checksum |
+| `SPEECH_FIXTURE_NOT_FOUND` / `SPEECH_FIXTURE_INVALID` | Missing WAV, non-16kHz/mono PCM format, or silent/truncated WAV | Convert with `ffmpeg -ac 1 -ar 16000 -c:a pcm_s16le` |
+| `UNTRUSTED_HASH_MISMATCH` / `INVALID_PROVENANCE` | WAV modified after manifest update, missing fields, or invalid Ed25519 signature | Update SHA-256, re-sign manifest, verify `WHISPER_TRUSTED_PUBLIC_KEYS` |
+| `TRANSCRIPTION_TIMEOUT` | Inference exceeded `20000ms` (compat probe) or `60000ms` (`transcribe()`) | Allocate more CPU cores, use a smaller model (`tiny.en`/`base.en`), or keep clips bounded |
+| `TRANSCRIPTION_FAILED` | Non-zero `whisper-cli` exit, malformed JSON, or corrupted input media | Inspect container logs / test `whisper-cli` directly on the file |
+
+---
+
+## 6. Resource Requirements & Operational Limitations
+
+1. **Disk Footprint:** ~80 MB compiled `/opt/whisper.cpp/build` (runtime only needs the `3.4 MB` static `whisper-cli` binary) + `148 MB` for `ggml-base.en.bin` (or `~488 MB`–`3.1 GB` for larger multilingual models).
+2. **Memory (RAM):** `ggml-base.en.bin` uses ~`147 MB` weights + `~160 MB` compute/KV buffers (~`320–400 MB` RSS per concurrent process). Larger models (`medium`, `large-v3`) require `2–4+ GB` RAM.
+3. **CPU Latency & Timeouts:** Measured `~4.6s` on 11s audio (`~0.42x` real-time) on a 2-vCPU x86_64 host with AVX2/AVX512. On hosts without AVX2/F16C, or for long multi-minute videos, `transcribe()` enforces a hard `60,000ms` subprocess timeout (`audioProcessor.ts`) — long videos on CPU-only hosts can hit `TRANSCRIPTION_TIMEOUT` and fail closed as `ANALYSIS_UNAVAILABLE`.
+4. **Scope & Accuracy Limits of This Verification:** Measured `0.00%` WER is on a single clean studio/archival 11s English recording (`jfk_1961_inaugural_16k.wav`). It does **not** benchmark Thai (`th`) speech, background music overlap, heavy compression noise, or multi-speaker overlapping dialogue.

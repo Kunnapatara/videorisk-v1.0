@@ -2743,7 +2743,202 @@ export async function runStripeOriginAndRefundLifecycleTests() {
       await billingService.handleWebhook(evMissingPriceExistingUser.rawBody, evMissingPriceExistingUser.signature);
       assert.strictEqual(await sec7Repo.billing.getSubscription(manufacturedSubId), null, '7.6a Existing user.plan + missing Price ID cannot manufacture subscription');
       assert.strictEqual((await sec7Repo.users.getUser(existingPlanUser.id))?.creditsRemaining, 50, '7.6b No credits manufactured');
-      console.log('  ✅ PASS: All signed Stripe unknown/missing Price ID escalation hardening tests verified');
+
+      // 7.7 Test A — Existing active -> past_due with missing Price ID & missing current_period_end
+      const testAUser = await sec7Repo.users.createUser(`sec7_testA_${Date.now()}@videorisk.test`, 'h', 's', 20, 'free');
+      const testACus = `cus_sec7_A_${Date.now()}`;
+      const testASub = `sub_sec7_A_${Date.now()}`;
+      const testAPeriodEndSec = sec7Ts + 2 * 86400; // Future period end within 7-day grace window
+      const testAPeriodEndIso = new Date(testAPeriodEndSec * 1000).toISOString();
+      const evAInit = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_sec7_A_init_${Date.now()}`,
+        created: sec7Ts,
+        type: 'customer.subscription.created',
+        data: {
+          object: {
+            id: testASub,
+            customer: testACus,
+            status: 'active',
+            current_period_end: testAPeriodEndSec,
+            metadata: { userId: testAUser.id },
+            items: { data: [{ price: { id: 'price_sec7_pro' } }] },
+          },
+        },
+      });
+      await billingService.handleWebhook(evAInit.rawBody, evAInit.signature);
+
+      const evTestAPastDue = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_sec7_A_past_due_${Date.now()}`,
+        created: sec7Ts + 5,
+        type: 'customer.subscription.updated',
+        data: {
+          object: {
+            id: testASub,
+            customer: testACus,
+            status: 'past_due',
+            // Intentionally NO items / Price ID and NO current_period_end
+          },
+        },
+      });
+      await billingService.handleWebhook(evTestAPastDue.rawBody, evTestAPastDue.signature);
+      const testASubAfter = await sec7Repo.billing.getSubscription(testASub);
+      const testAUserAfter = await sec7Repo.users.getUser(testAUser.id);
+      assert.strictEqual(testASubAfter?.status, 'past_due', '7.7a Test A: status transitions to past_due');
+      assert.strictEqual(testASubAfter?.currentPeriodEnd, testAPeriodEndIso, '7.7b Test A: original currentPeriodEnd preserved (never wiped to undefined/null)');
+      assert.strictEqual(testASubAfter?.planId, 'pro', '7.7c Test A: existing authorized plan preserved');
+      assert.strictEqual(testAUserAfter?.subscriptionStatus, 'past_due', '7.7d Test A: user subscriptionStatus updated to past_due');
+      assert.strictEqual(testAUserAfter?.plan, 'pro', '7.7e Test A: entitlement retained under past_due grace rule using preserved currentPeriodEnd');
+      assert.strictEqual(testAUserAfter?.creditsRemaining, 20, '7.7f Test A: credits unchanged');
+
+      // Also verify Test A2: past_due within 7-day grace AFTER period_end (-2 days) preserves period_end & stays entitled,
+      // while period_end > 7 days ago (-10 days) transitions to unentitled free plan.
+      const testA2User = await sec7Repo.users.createUser(`sec7_testA2_${Date.now()}@videorisk.test`, 'h', 's', 15, 'free');
+      const testA2Sub = `sub_sec7_A2_${Date.now()}`;
+      const testA2GraceSec = sec7Ts - 2 * 86400; // 2 days past period end -> within 7-day grace
+      const testA2GraceIso = new Date(testA2GraceSec * 1000).toISOString();
+      const evA2Init = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_sec7_A2_init_${Date.now()}`,
+        created: sec7Ts,
+        type: 'customer.subscription.created',
+        data: {
+          object: {
+            id: testA2Sub,
+            customer: `cus_sec7_A2_${Date.now()}`,
+            status: 'active',
+            current_period_end: testA2GraceSec,
+            metadata: { userId: testA2User.id },
+            items: { data: [{ price: { id: 'price_sec7_creator' } }] },
+          },
+        },
+      });
+      await billingService.handleWebhook(evA2Init.rawBody, evA2Init.signature);
+      const evA2PastDue = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_sec7_A2_past_due_${Date.now()}`,
+        created: sec7Ts + 5,
+        type: 'customer.subscription.updated',
+        data: { object: { id: testA2Sub, status: 'past_due' } },
+      });
+      await billingService.handleWebhook(evA2PastDue.rawBody, evA2PastDue.signature);
+      assert.strictEqual((await sec7Repo.billing.getSubscription(testA2Sub))?.currentPeriodEnd, testA2GraceIso, '7.7g Test A2: past-periodEnd (-2d) preserved cleanly');
+      assert.strictEqual((await sec7Repo.users.getUser(testA2User.id))?.plan, 'creator', '7.7h Test A2: 7-day grace window keeps creator entitlement');
+
+      // 7.8 Test B — Existing active -> canceled with missing Price ID & missing current_period_end
+      const testBUser = await sec7Repo.users.createUser(`sec7_testB_${Date.now()}@videorisk.test`, 'h', 's', 30, 'free');
+      const testBCus = `cus_sec7_B_${Date.now()}`;
+      const testBSub = `sub_sec7_B_${Date.now()}`;
+      const testBPeriodEndSec = sec7Ts + 10 * 86400; // Future prepaid period end
+      const testBPeriodEndIso = new Date(testBPeriodEndSec * 1000).toISOString();
+      const evBInit = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_sec7_B_init_${Date.now()}`,
+        created: sec7Ts,
+        type: 'customer.subscription.created',
+        data: {
+          object: {
+            id: testBSub,
+            customer: testBCus,
+            status: 'active',
+            current_period_end: testBPeriodEndSec,
+            metadata: { userId: testBUser.id },
+            items: { data: [{ price: { id: 'price_sec7_agency' } }] },
+          },
+        },
+      });
+      await billingService.handleWebhook(evBInit.rawBody, evBInit.signature);
+
+      const evBCancel = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_sec7_B_cancel_${Date.now()}`,
+        created: sec7Ts + 5,
+        type: 'customer.subscription.updated',
+        data: {
+          object: {
+            id: testBSub,
+            customer: testBCus,
+            status: 'canceled',
+            // Intentionally NO Price ID and NO current_period_end
+          },
+        },
+      });
+      await billingService.handleWebhook(evBCancel.rawBody, evBCancel.signature);
+      const testBSubAfter = await sec7Repo.billing.getSubscription(testBSub);
+      const testBUserAfter = await sec7Repo.users.getUser(testBUser.id);
+      assert.strictEqual(testBSubAfter?.status, 'canceled', '7.8a Test B: status transitions to canceled');
+      assert.strictEqual(testBSubAfter?.currentPeriodEnd, testBPeriodEndIso, '7.8b Test B: original currentPeriodEnd preserved on canceled transition');
+      assert.strictEqual(testBUserAfter?.subscriptionStatus, 'canceled', '7.8c Test B: user subscriptionStatus updated to canceled');
+      assert.strictEqual(testBUserAfter?.plan, 'agency', '7.8d Test B: prepaid agency entitlement retained until preserved currentPeriodEnd');
+
+      // 7.9 Test C — Existing authorized subscription + missing Price ID + incoming valid current_period_end uses NEW value
+      const testCNewPeriodEndSec = sec7Ts + 45 * 86400;
+      const testCNewPeriodEndIso = new Date(testCNewPeriodEndSec * 1000).toISOString();
+      const evCUpdatePeriodEnd = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_sec7_C_new_period_${Date.now()}`,
+        created: sec7Ts + 10,
+        type: 'customer.subscription.updated',
+        data: {
+          object: {
+            id: testASub,
+            customer: testACus,
+            status: 'active',
+            current_period_end: testCNewPeriodEndSec,
+            // Intentionally NO Price ID, WITH incoming valid current_period_end
+          },
+        },
+      });
+      await billingService.handleWebhook(evCUpdatePeriodEnd.rawBody, evCUpdatePeriodEnd.signature);
+      const testASubAfterNewEnd = await sec7Repo.billing.getSubscription(testASub);
+      assert.strictEqual(testASubAfterNewEnd?.currentPeriodEnd, testCNewPeriodEndIso, '7.9a Test C: incoming valid current_period_end overrides preserved period end');
+      assert.strictEqual(testASubAfterNewEnd?.status, 'active', '7.9b Test C: status updated to active');
+      assert.strictEqual((await sec7Repo.users.getUser(testAUser.id))?.plan, 'pro', '7.9c Test C: plan entitlement active');
+
+      // 7.10 Test D & E & F — Unknown Price ID rejected, Missing Price ID on unauthorized sub rejected, and Idempotency preserves period end & credits
+      const replayPastDue = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: JSON.parse(evTestAPastDue.rawBody.toString('utf8')).id,
+        created: sec7Ts + 5,
+        type: 'customer.subscription.updated',
+        data: { object: { id: testASub, customer: testACus, status: 'past_due' } },
+      });
+      const idempRes = await billingService.handleWebhook(replayPastDue.rawBody, replayPastDue.signature);
+      assert.strictEqual(idempRes.alreadyProcessed, true, '7.10a Test F: repeated missing-Price-ID event returns alreadyProcessed=true');
+      assert.strictEqual((await sec7Repo.billing.getSubscription(testASub))?.currentPeriodEnd, testCNewPeriodEndIso, '7.10b Test F: replay does not revert or wipe currentPeriodEnd');
+      assert.strictEqual((await sec7Repo.billing.getSubscription(testASub))?.status, 'active', '7.10c Test F: replay does not overwrite active status');
+      assert.strictEqual((await sec7Repo.users.getUser(testAUser.id))?.creditsRemaining, 20, '7.10d Test F: replay grants 0 additional credits');
+
+      // Test E extra: Missing Price ID on an EXPIRED/UNENTITLED existing subscription must NOT inherit or preserve entitlement
+      const expiredSubUser = await sec7Repo.users.createUser(`sec7_exp_${Date.now()}@videorisk.test`, 'h', 's', 10, 'free');
+      const expiredSubId = `sub_sec7_exp_${Date.now()}`;
+      const expiredPastSec = sec7Ts - 20 * 86400; // 20 days past -> canceled & unentitled
+      const evExpiredInit = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_sec7_exp_init_${Date.now()}`,
+        created: sec7Ts,
+        type: 'customer.subscription.created',
+        data: {
+          object: {
+            id: expiredSubId,
+            customer: `cus_sec7_exp_${Date.now()}`,
+            status: 'canceled',
+            current_period_end: expiredPastSec,
+            metadata: { userId: expiredSubUser.id },
+            items: { data: [{ price: { id: 'price_sec7_pro' } }] },
+          },
+        },
+      });
+      await billingService.handleWebhook(evExpiredInit.rawBody, evExpiredInit.signature);
+      assert.strictEqual((await sec7Repo.users.getUser(expiredSubUser.id))?.plan, 'free', '7.10e Precondition: expired canceled sub is free');
+      const evExpiredMissingPriceReactivate = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+        id: `evt_sec7_exp_reactivate_${Date.now()}`,
+        created: sec7Ts + 5,
+        type: 'customer.subscription.updated',
+        data: {
+          object: {
+            id: expiredSubId,
+            status: 'active',
+            metadata: { userId: expiredSubUser.id, planId: 'pro' },
+          },
+        },
+      });
+      await billingService.handleWebhook(evExpiredMissingPriceReactivate.rawBody, evExpiredMissingPriceReactivate.signature);
+      assert.strictEqual((await sec7Repo.users.getUser(expiredSubUser.id))?.plan, 'free', '7.10f Test E: unentitled/expired sub + missing Price ID cannot manufacture active entitlement');
+      assert.strictEqual((await sec7Repo.billing.getSubscription(expiredSubId))?.status, 'canceled', '7.10g Test E: expired canceled sub remains canceled');
+      console.log('  ✅ PASS: All signed Stripe unknown/missing Price ID & period-end preservation regression tests (Tests A–F) verified');
     } finally {
       billingService.setStorageForTest(null);
       (sec7Repo as any).db.close();

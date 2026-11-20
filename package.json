@@ -20,11 +20,11 @@
     "test:regression": "DATABASE_PATH=data/videorisk_test.db tsx tests/remediation_regression.test.ts",
     "test:billing": "DATABASE_PATH=data/videorisk_test.db tsx tests/stripe_origin_and_refund_lifecycle.test.ts",
     "test:security": "DATABASE_PATH=data/videorisk_test.db tsx tests/server_production_predicate.test.ts && DATABASE_PATH=data/videorisk_test.db tsx tests/security_remediation_group_ab.test.ts",
+    "test:whisper:real": "DATABASE_PATH=data/videorisk_test.db tsx tests/whisper_real_verification.test.ts",
     "test:all": "DATABASE_PATH=data/videorisk_test.db tsx tests/runAllTests.ts && DATABASE_PATH=data/videorisk_test.db tsx tests/phase4_6_gap_closure.test.ts && DATABASE_PATH=data/videorisk_test.db tsx tests/remediation_regression.test.ts && DATABASE_PATH=data/videorisk_test.db tsx tests/stripe_origin_and_refund_lifecycle.test.ts",
     "validate:env": "tsx scripts/validate-env.ts"
   },
   "dependencies": {
-    "@google/genai": "^2.4.0",
     "@tailwindcss/vite": "^4.3.3",
     "@types/nodemailer": "^8.0.2",
     "@vitejs/plugin-react": "^6.1.1",

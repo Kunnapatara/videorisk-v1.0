@@ -2393,9 +2393,11 @@ export class BillingService {
           const customerId = typeof subscription.customer === 'string' ? subscription.customer : subscription.customer?.id;
           const status = subscription.status;
           const cancelAtPeriodEnd = Boolean((subscription as any).cancel_at_period_end);
-          const currentPeriodEnd = (subscription as any).current_period_end 
-            ? new Date((subscription as any).current_period_end * 1000).toISOString() 
-            : undefined;
+          const rawPeriodEndSec = (subscription as any).current_period_end;
+          const incomingCurrentPeriodEnd =
+            typeof rawPeriodEndSec === 'number' && Number.isFinite(rawPeriodEndSec) && rawPeriodEndSec > 0
+              ? new Date(rawPeriodEndSec * 1000).toISOString()
+              : undefined;
 
           const sub = state.subscriptions[subId];
           if (sub && isOutOfOrder(sub, status)) {
@@ -2431,6 +2433,13 @@ export class BillingService {
             ? rawPriceId.trim()
             : null;
 
+          const isExistingAuthorizedSub =
+            Boolean(sub) &&
+            (sub.status !== 'canceled' || status === 'canceled') &&
+            ALLOWED_PAID_PLANS.includes(sub.planId as any) &&
+            RECURRING_SUBSCRIPTION_PLANS.includes(sub.planId as any) &&
+            this.isSubscriptionEntitled(sub.status, sub.currentPeriodEnd);
+
           let mappedPlanId: AllowedPaidPlan | null = null;
           let rejectionOutcome: 'rejected_unmapped_price' | 'rejected_missing_price' | null = null;
           let rejectionReason = '';
@@ -2456,14 +2465,10 @@ export class BillingService {
             // an already-verified subscription record exists with an authorized paid plan and entitled state.
             const canPreserveExistingAuthorizedSub =
               event.type === 'customer.subscription.updated' &&
-              Boolean(sub) &&
-              (sub.status !== 'canceled' || status === 'canceled') &&
-              ALLOWED_PAID_PLANS.includes(sub.planId as any) &&
-              RECURRING_SUBSCRIPTION_PLANS.includes(sub.planId as any) &&
-              this.isSubscriptionEntitled(sub.status, sub.currentPeriodEnd);
+              isExistingAuthorizedSub;
 
             if (canPreserveExistingAuthorizedSub) {
-              mappedPlanId = sub.planId as AllowedPaidPlan;
+              mappedPlanId = sub!.planId as AllowedPaidPlan;
             } else {
               rejectionOutcome = 'rejected_missing_price';
               rejectionReason = sub
@@ -2499,6 +2504,11 @@ export class BillingService {
             break;
           }
 
+          const canPreservePeriodEnd =
+            event.type === 'customer.subscription.updated' && isExistingAuthorizedSub;
+          const effectiveCurrentPeriodEnd =
+            incomingCurrentPeriodEnd ?? (canPreservePeriodEnd ? sub?.currentPeriodEnd : undefined);
+
           if (userId) {
             const user = state.users[userId];
             if (user) {
@@ -2509,14 +2519,14 @@ export class BillingService {
                 userId: user.id,
                 planId: mappedPlanId,
                 status: status as any,
-                currentPeriodEnd,
+                currentPeriodEnd: effectiveCurrentPeriodEnd,
                 cancelAtPeriodEnd,
                 lastEventCreated: mergeLastCreated(sub?.lastEventCreated),
                 createdAt: sub?.createdAt || new Date().toISOString(),
                 updatedAt: new Date(Math.max(Date.now(), eventCreatedMs)).toISOString(),
               };
 
-              this.applyUserSubscriptionEntitlement(state, user, subId, status, mappedPlanId, currentPeriodEnd);
+              this.applyUserSubscriptionEntitlement(state, user, subId, status, mappedPlanId, effectiveCurrentPeriodEnd);
             }
           }
 

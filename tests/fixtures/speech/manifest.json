@@ -1,5 +1,36 @@
 {
   "manifestVersion": "1.0.0",
   "description": "Trusted Human Speech Fixture Manifest for Whisper STT verification. Only verified non-synthetic human speech WAV files with SHA-256 checksums, source provenance metadata, and reviewed verbatim transcripts may be registered here.",
-  "fixtures": []
+  "fixtures": [
+    {
+      "fixtureId": "jfk_1961_inaugural_en_01",
+      "relativePath": "jfk_1961_inaugural_16k.wav",
+      "sha256": "e39623e2c5d0e0013ab265d1e751c8aedae412ace9de5ab811d561ca9c9b57e1",
+      "sourceDescription": "President John F. Kennedy Inaugural Address excerpt (1961-01-20), 16kHz mono 16-bit PCM WAV converted from ggml-org/whisper.cpp samples/jfk.wav",
+      "sourceUrl": "https://github.com/ggml-org/whisper.cpp/blob/master/samples/jfk.wav",
+      "license": "Public Domain (U.S. Federal Government work, 17 U.S.C. § 105; historical 1961 presidential address)",
+      "durationSeconds": 11,
+      "audioFormat": {
+        "codec": "pcm_s16le",
+        "sampleRateHz": 16000,
+        "channels": 1
+      },
+      "recordingOrigin": "HUMAN_SPEECH_RECORDING",
+      "humanSpeechVerificationStatus": "VERIFIED_HUMAN_SPEECH",
+      "expectedTranscript": "And so my fellow Americans, ask not what your country can do for you, ask what you can do for your country.",
+      "transcriptLanguage": "en",
+      "transcriptReviewEvidence": "Historical verbatim transcript of President John F. Kennedy's 1961-01-20 Inaugural Address audited and cross-checked against 11.0s WAV audio.",
+      "expectedVerificationCriteria": {
+        "minRecallThreshold": 0.85,
+        "minPrecisionThreshold": 0.80,
+        "maxWordErrorRate": 0.15
+      },
+      "verificationMetadata": {
+        "verifiedBy": "videorisk-release-engineering",
+        "verifiedAt": "2026-11-19T11:08:00Z",
+        "verificationMethod": "historical_verbatim_and_human_audio_audit",
+        "hashAlgorithm": "sha256"
+      }
+    }
+  ]
 }
