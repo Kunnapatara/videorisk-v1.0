@@ -87,3 +87,26 @@ Operational constraints for real hosting:
 - **Stripe Billing Verification**:
   - Follow `docs/STRIPE_TEST_MODE_RUNBOOK.md` in an authorized `DEPLOYMENT_ENV=staging` environment to verify real Stripe Test Mode Checkout, HMAC webhook signatures, subscription lifecycle updates, cancellations, payment failures, and partial/full refunds end-to-end.
 
+---
+
+## 6. Staging vs. Production Environment Isolation & Pre-Launch Gates
+
+Never share secrets, webhook endpoints, Stripe accounts/keys, domains, or SQLite/upload storage paths between **Staging** and **Production**:
+
+| Control | Staging (`DEPLOYMENT_ENV=staging`) | Production (`DEPLOYMENT_ENV=production`) |
+| :--- | :--- | :--- |
+| Domain & HTTPS | Dedicated staging domain (`https://staging.<domain>`) | Dedicated production domain (`https://<domain>`) |
+| Runtime & Payments | `NODE_ENV=production`, `PAYMENT_MODE=test` | `NODE_ENV=production`, `PAYMENT_MODE=live` |
+| Stripe Keys | `sk_test_...` / `rk_test_...` + Staging `whsec_...` | `sk_live_...` / `rk_live_...` + Production `whsec_...` |
+| Stripe Price IDs | Test-mode `price_...` IDs for all 4 paid plans | Live-mode `price_...` IDs (required; startup/validator fail closed if missing) |
+| Simulation Fallback | Disabled (`ALLOW_SIMULATION_WEBHOOK=false`, 403/400 fail-closed) | Disabled (`ALLOW_SIMULATION_WEBHOOK=false`, 403/400 fail-closed) |
+| `MEDIA_TOKEN_SECRET` | Dedicated Staging random secret (`>= 32` chars) | Distinct Production random secret (`>= 32` chars) |
+| Storage & Backups | Isolated Staging `DATABASE_PATH` & `uploads/` volume | Dedicated persistent Production `DATABASE_PATH` & `uploads/` volume + scheduled backups |
+| Logging & Redaction | `maskSecret()` / `sanitizeLogOutput()` redacts keys & tokens | Same redaction enforced; zero `.env` commits or secret echoes |
+
+### Pre-Launch Gate Sequence
+1. Validate configuration with `npm run validate:env -- --mode=staging` (in Staging) or `npm run validate:env -- --mode=production` (in Production; optional `--live-check` only with `ALLOW_LIVE_STRIPE_CHECK=true`).
+2. Build and start the Node 22 ESM bundle (`npm run build && npm start`) and verify `GET /api/health/liveness` (`200`) and `GET /api/health/readiness` (`checks.database`, `checks.storage`, `checks.mediaSecurity`, `checks.billing`, `checks.whisperStt`).
+3. Verify host Whisper provisioning (if enabled) with `npm run verify:whisper:prod -- --mode=production`.
+4. Complete Category 2 Stripe Test Mode Checkout-to-Webhook verification in Staging per `docs/STRIPE_TEST_MODE_RUNBOOK.md` before activating any Live Stripe credentials in Production.
+
