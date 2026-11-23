@@ -20,6 +20,7 @@ import {
   resolveEnvironmentSecurity,
   validateMediaTokenSecret,
 } from '../src/server/config/environment';
+import { resolveSmtpConfiguration } from '../src/server/services/emailService';
 
 dotenv.config({ quiet: true });
 
@@ -322,7 +323,7 @@ export function validateBillingConfiguration(
         issues.push({
           type: 'WARNING',
           variable: plan.envVar!,
-          message: `Missing test Price ID for ${plan.name} plan. Billing service will dynamically generate test price line items.`,
+          message: `Missing test Price ID for ${plan.name} plan. Checkout falls back to inline price_data, but customer.subscription.* webhooks in staging require a configured Test Mode price_... ID.`,
         });
       }
     } else {
@@ -441,6 +442,54 @@ export function validateBillingConfiguration(
       type: 'INFO',
       variable: 'MEDIA_TOKEN_SECRET',
       message: mediaSecretValidation.message,
+    });
+  }
+
+  // 7. Optional Password Reset Email Delivery (SMTP — never required for server startup, required for real reset email)
+  const smtpResolution = resolveSmtpConfiguration(env);
+  const rawSmtpHost = (env.SMTP_HOST || '').trim();
+  if (!rawSmtpHost) {
+    if (enforceRuntimeHardening) {
+      issues.push({
+        type: 'WARNING',
+        variable: 'SMTP_HOST',
+        message:
+          'Optional SMTP email delivery is not configured (server startup succeeds, but real password-reset emails will not be delivered until SMTP_HOST, SMTP_FROM, and credentials are configured and live-verified).',
+      });
+    } else {
+      issues.push({
+        type: 'INFO',
+        variable: 'SMTP_HOST',
+        message: 'SMTP_HOST not set; password-reset email dispatch is disabled.',
+      });
+    }
+  } else if (!smtpResolution.configured) {
+    const reason = smtpResolution.reason || 'SMTP_INVALID';
+    let targetVar = 'SMTP_HOST';
+    let detailMsg = `Invalid SMTP configuration (${reason}).`;
+    if (reason === 'SMTP_AUTH_INCOMPLETE') {
+      targetVar = (env.SMTP_USER || '').trim() ? 'SMTP_PASS' : 'SMTP_USER';
+      detailMsg = 'Incomplete SMTP credentials: both SMTP_USER and SMTP_PASS must be set together (values redacted).';
+    } else if (reason === 'INVALID_SMTP_PORT') {
+      targetVar = 'SMTP_PORT';
+      detailMsg = 'Invalid SMTP_PORT: expected integer port 1-65535.';
+    } else if (reason === 'INVALID_SMTP_SECURE') {
+      targetVar = 'SMTP_SECURE';
+      detailMsg = "Invalid SMTP_SECURE: expected 'true' or 'false'.";
+    } else if (reason === 'MISSING_SMTP_FROM' || reason === 'INVALID_SMTP_FROM') {
+      targetVar = 'SMTP_FROM';
+      detailMsg = 'Missing or invalid SMTP_FROM / EMAIL_FROM sender address.';
+    }
+    issues.push({
+      type: 'ERROR',
+      variable: targetVar,
+      message: detailMsg,
+    });
+  } else {
+    issues.push({
+      type: 'INFO',
+      variable: 'SMTP_HOST',
+      message: 'SMTP settings syntax-validated (verify live password-reset email delivery before enabling Password Reset or Production).',
     });
   }
 

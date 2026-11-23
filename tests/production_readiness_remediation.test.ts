@@ -308,6 +308,34 @@ export async function runProductionReadinessTests(): Promise<void> {
     assert.strictEqual(validateBillingConfiguration('staging', validStagingEnv).valid, true, 'C.1e validateBillingConfiguration(--mode=staging) passes');
     assert.strictEqual(validateBillingConfiguration('production', validStagingEnv).valid, false, 'C.1f Staging config is rejected when evaluated as --mode=production');
 
+    // SMTP consistency in validateBillingConfiguration: unset -> warning only (non-blocking), invalid -> error, zero secret leakage
+    const stagingNoSmtp = validateBillingConfiguration('staging', validStagingEnv);
+    assert.ok(
+      stagingNoSmtp.issues.some((i) => i.variable === 'SMTP_HOST' && i.type === 'WARNING'),
+      'C.1g Unset SMTP_HOST in staging emits non-blocking WARNING'
+    );
+    const stagingBadSmtpAuth = validateBillingConfiguration('staging', {
+      ...validStagingEnv,
+      SMTP_HOST: 'smtp.example.org',
+      SMTP_USER: 'secret_smtp_user_leak_guard',
+      SMTP_FROM: 'VideoRisk <no-reply@videorisk.com>',
+    });
+    assert.strictEqual(stagingBadSmtpAuth.valid, false, 'C.1h Incomplete SMTP auth in staging fails validation');
+    assert.ok(
+      !JSON.stringify(stagingBadSmtpAuth.issues).includes('secret_smtp_user_leak_guard'),
+      'C.1i SMTP validation errors never disclose credential values'
+    );
+    const stagingValidSmtp = validateBillingConfiguration('staging', {
+      ...validStagingEnv,
+      SMTP_HOST: 'smtp.example.org',
+      SMTP_PORT: '587',
+      SMTP_SECURE: 'false',
+      SMTP_USER: 'smtp_user',
+      SMTP_PASS: 'smtp_pass',
+      SMTP_FROM: 'VideoRisk <no-reply@videorisk.com>',
+    });
+    assert.strictEqual(stagingValidSmtp.valid, true, 'C.1j Valid SMTP settings pass staging configuration validation');
+
     // Staging rejects live Stripe key & PAYMENT_MODE=live & platform production flags
     const stagingWithLiveKey = resolveEnvironmentSecurity({
       ...validStagingEnv,

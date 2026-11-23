@@ -192,7 +192,12 @@ curl -s http://localhost:3000/api/health/readiness | jq '.checks.whisperStt'
   - `npm run test:stripe:harness` (`PASS` without requiring Stripe secrets or prod DB)
 
 ### Production Deployment Verification Script (`scripts/verify-whisper-prod.ts`)
-Read-only, non-destructive host verification checking Binary + `ldd` + `ffmpeg`/`ffprobe`, Model SHA-256, Offline Ed25519 key hygiene & rotation (`WHISPER_TRUSTED_PUBLIC_KEYS` / `WHISPER_STRICT_PROVENANCE=true`), and Persistent vs Temporary storage paths:
+Non-destructive host verification checking Binary + `ldd` + `ffmpeg`/`ffprobe`, Model SHA-256, Offline Ed25519 key hygiene & rotation (`WHISPER_TRUSTED_PUBLIC_KEYS` / `WHISPER_STRICT_PROVENANCE=true`), and Persistent vs Temporary storage paths.
+
+**Temporary Write/Delete Probe Behavior (`verify-whisper-prod.ts`):**
+- To verify directory write permissions in `DATA_DIR`/`DATABASE_PATH` dir, `uploads/`, `uploads/proxies/` (if present), and `os.tmpdir()`, the script creates a temporary probe file (`.vr_storage_probe_<pid>_<timestamp>_<hex>.tmp`), writes small test data (`"ok"`), and immediately deletes the temporary file upon completion (including cleanup on error).
+- It **does NOT** open, alter, or modify SQLite database contents (`videorisk.db`), and **does NOT** delete or overwrite any existing user data or media files.
+- `dirname(WHISPER_MODEL_PATH)` is inspected read-only (`fs.accessSync(..., R_OK)`).
 
 ```bash
 # Production host check (strict: requires ENV binary, model, Ed25519 public key, non-tmpfs persistent volumes)

@@ -55,12 +55,15 @@ npm run validate:env -- --mode=staging     # staging check
 npm run validate:env -- --mode=production  # live production check
 ```
 
-Required critical variables in **Staging** & **Production**:
+Required core startup & billing variables in **Staging** & **Production**:
 - `APP_BASE_URL` (valid non-localhost `https://...` origin)
 - `MEDIA_TOKEN_SECRET` (cryptographic secret `>= 32` characters, non-placeholder)
-- `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` (+ `STRIPE_PRICE_*` in production)
-- `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM` (required for real password-reset email delivery)
-- `TRUST_PROXY` (`1` or explicit proxy/CIDR if running behind Nginx / ALB / Cloud Run)
+- `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` (`STRIPE_PRICE_*` required in Production; strongly recommended in Staging for `customer.subscription.*` webhooks)
+
+Optional / feature-scoped configuration in **Staging** & **Production**:
+- `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM` / `EMAIL_FROM` (**NOT required for server startup**, but **required before enabling real Password Reset email delivery** because `devResetToken` is suppressed in Staging & Production; live SMTP email delivery must be verified prior to enabling Password Reset or Production launch)
+- `TRUST_PROXY` (`1` or explicit proxy/CIDR when deployed behind Nginx / ALB / Cloud Run)
+- `WHISPER_PATH`, `WHISPER_MODEL_PATH`, `WHISPER_REQUIRE_MODEL_SHA256`, `WHISPER_COMPAT_AUDIO_PATH`, `WHISPER_SPEECH_MANIFEST_PATH`, `WHISPER_STRICT_PROVENANCE`, `WHISPER_TRUSTED_PUBLIC_KEYS` (optional local Whisper STT; omitted leaves acoustic analysis active)
 
 ---
 
