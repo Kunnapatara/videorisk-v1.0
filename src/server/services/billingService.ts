@@ -765,7 +765,7 @@ export class BillingService {
         throw new Error(`Webhook Error: ${err.message}`);
       }
 
-      const { alreadyProcessed } = await this.processVerifiedEvent(event);
+      const { alreadyProcessed } = await this.processVerifiedEvent(event, { signatureVerified: true });
       return {
         received: true,
         eventType: event.type,
@@ -776,9 +776,11 @@ export class BillingService {
 
     // Non-production environment
     let event: Stripe.Event;
+    let signatureVerified = false;
     if (this.stripe && webhookSecret && signature) {
       try {
         event = this.stripe.webhooks.constructEvent(rawBody, signature, webhookSecret);
+        signatureVerified = true;
       } catch (err: any) {
         console.error('[BillingService] Webhook signature verification failed:', err.message);
         throw new Error(`Webhook Error: ${err.message}`);
@@ -796,7 +798,7 @@ export class BillingService {
       throw new Error('Stripe Webhook verification failed: secret unconfigured and simulation webhooks are not enabled.');
     }
 
-    const { alreadyProcessed } = await this.processVerifiedEvent(event);
+    const { alreadyProcessed } = await this.processVerifiedEvent(event, { signatureVerified });
     return {
       received: true,
       eventType: event.type,
@@ -1936,7 +1938,11 @@ export class BillingService {
   /**
    * Executes transactional state updates for verified webhook events
    */
-  private async processVerifiedEvent(event: Stripe.Event): Promise<{ alreadyProcessed: boolean }> {
+  private async processVerifiedEvent(
+    event: Stripe.Event,
+    verificationContext?: { signatureVerified: boolean }
+  ): Promise<{ alreadyProcessed: boolean }> {
+    const signatureVerified = Boolean(verificationContext?.signatureVerified);
     return await this.getActiveStorage().runTransaction(async (state) => {
       // Idempotency check inside transaction
       if (state.webhookEvents[event.id]) {
@@ -2017,17 +2023,32 @@ export class BillingService {
             ? session.subscription
             : session.subscription?.id;
 
+          const sessionLivemode = typeof event.livemode === 'boolean'
+            ? event.livemode
+            : (typeof session.livemode === 'boolean' ? session.livemode : undefined);
+          const isExplicitSynthetic = Boolean((event as any).isSynthetic === true || session.metadata?.isSynthetic === 'true');
+          const buildCheckoutWebhookRecord = (creditsGranted?: number): WebhookEventRecord => ({
+            eventId: event.id,
+            provider: 'stripe',
+            eventType: event.type,
+            processedAt: new Date().toISOString(),
+            userId: user.id,
+            ...(creditsGranted !== undefined ? { creditsGranted } : {}),
+            planGranted: planId,
+            sessionId: session.id,
+            dataObjectId: session.id,
+            customerId: sessionCustomerId,
+            subscriptionId: sessionSubId,
+            livemode: sessionLivemode,
+            signatureVerified,
+            ...(isExplicitSynthetic ? { isSynthetic: true } : {}),
+          });
+
           // Payment status verification
           const isPaid = session.payment_status === 'paid' || session.payment_status === 'no_payment_required';
           if (!isPaid) {
             console.warn(`[BillingService] Checkout session ${session.id} payment status is '${session.payment_status}'. Entitlements withheld.`);
-            state.webhookEvents[event.id] = {
-              eventId: event.id,
-              provider: 'stripe',
-              eventType: event.type,
-              processedAt: new Date().toISOString(),
-              userId: user.id,
-            };
+            state.webhookEvents[event.id] = buildCheckoutWebhookRecord(undefined);
             return { alreadyProcessed: false };
           }
 
@@ -2066,15 +2087,7 @@ export class BillingService {
               this.applyUserSubscriptionEntitlement(state, user, sessionSubId, 'canceled', 'free');
             }
             this.reconcilePendingRefundsForPayment(state, refundedPayment, user, new Date().toISOString());
-            state.webhookEvents[event.id] = {
-              eventId: event.id,
-              provider: 'stripe',
-              eventType: event.type,
-              processedAt: new Date().toISOString(),
-              userId: user.id,
-              creditsGranted: 0,
-              planGranted: planId,
-            };
+            state.webhookEvents[event.id] = buildCheckoutWebhookRecord(0);
             state.webhookEvents[session.id] = state.webhookEvents[event.id];
             return { alreadyProcessed: false };
           }
@@ -2129,15 +2142,7 @@ export class BillingService {
               status: 'paid',
             });
             this.reconcilePendingRefundsForPayment(state, existingOrSyncedPayment, user, new Date().toISOString());
-            state.webhookEvents[event.id] = {
-              eventId: event.id,
-              provider: 'stripe',
-              eventType: event.type,
-              processedAt: new Date().toISOString(),
-              userId: user.id,
-              creditsGranted: 0,
-              planGranted: planId,
-            };
+            state.webhookEvents[event.id] = buildCheckoutWebhookRecord(0);
             state.webhookEvents[session.id] = state.webhookEvents[event.id];
             return { alreadyProcessed: false };
           }
@@ -2187,15 +2192,7 @@ export class BillingService {
             status: 'paid',
           });
 
-          state.webhookEvents[event.id] = {
-            eventId: event.id,
-            provider: 'stripe',
-            eventType: event.type,
-            processedAt: new Date().toISOString(),
-            userId: user.id,
-            creditsGranted: creditAllocation,
-            planGranted: planId,
-          };
+          state.webhookEvents[event.id] = buildCheckoutWebhookRecord(creditAllocation);
           state.webhookEvents[session.id] = state.webhookEvents[event.id];
 
           recordCreditTx(state, {

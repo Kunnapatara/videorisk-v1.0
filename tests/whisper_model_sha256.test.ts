@@ -80,6 +80,7 @@ export async function runWhisperModelSha256Tests() {
     WHISPER_COMPAT_EXPECTED_TRANSCRIPT: process.env.WHISPER_COMPAT_EXPECTED_TRANSCRIPT,
     WHISPER_COMPAT_SYNTHETIC_FIXTURE: process.env.WHISPER_COMPAT_SYNTHETIC_FIXTURE,
     WHISPER_VERIFY_COMPATIBILITY: process.env.WHISPER_VERIFY_COMPATIBILITY,
+    WHISPER_LANGUAGE: process.env.WHISPER_LANGUAGE,
   };
 
   try {
@@ -306,6 +307,161 @@ export async function runWhisperModelSha256Tests() {
     assert.strictEqual(reqCompat.compatible, false, '6.9 Enabling WHISPER_REQUIRE_MODEL_SHA256 bypasses warm compat cache and fails closed');
     assert.strictEqual(reqCompat.diagnosticCode, 'MODEL_EXPECTED_HASH_MISSING', '6.10 diagnosticCode=MODEL_EXPECTED_HASH_MISSING');
     console.log('  ✅ PASS: Case 6 (Anti-downgrade ENV/manifest protection & cache invalidation)');
+
+    // Case 7: Whisper Model Language Capability Consistency & Anti-Overclaim Protection
+    console.log('\n[Case 7] Whisper Model Language Capability Consistency (English-only vs Unconfigured vs Multilingual Metadata)');
+    const { audioProcessor } = await import('../src/server/pipeline/audioProcessor');
+
+    // 7a. Unconfigured runtime never claims ['en', 'th']
+    delete process.env.WHISPER_PATH;
+    delete process.env.LOCAL_STT_PATH;
+    delete process.env.WHISPER_MODEL_PATH;
+    delete process.env.WHISPER_LANGUAGE;
+    speechTranscriptionAdapter.clearCompatibilityCache();
+    const unconfiguredVal = await speechTranscriptionAdapter.validateRuntime();
+    assert.strictEqual(unconfiguredVal.status, 'UNCONFIGURED', '7.1a Status UNCONFIGURED');
+    assert.deepStrictEqual(unconfiguredVal.supportedLanguages, [], '7.1b Unconfigured runtime reports empty supportedLanguages=[]');
+    assert.strictEqual(unconfiguredVal.thaiSpeechSupported, false, '7.1c Unconfigured runtime never claims thaiSpeechSupported=true');
+
+    // 7b. Built-in whisperModels.json + ggml-base.en.bin must report modelType=english-only, supportedLanguages=['en'], thaiSpeechSupported=false
+    const builtInManifest = JSON.parse(
+      fs.readFileSync(path.resolve(process.cwd(), 'src', 'server', 'config', 'whisperModels.json'), 'utf8')
+    );
+    const builtInBaseEn = (builtInManifest.models || []).find((m: any) => m.filename === 'ggml-base.en.bin');
+    assert.ok(builtInBaseEn, '7.2a Built-in whisperModels.json registers ggml-base.en.bin');
+    assert.strictEqual(builtInBaseEn.modelType, 'english-only', '7.2b Built-in registry specifies modelType=english-only');
+    assert.deepStrictEqual(builtInBaseEn.supportedLanguages, ['en'], '7.2c Built-in registry restricts supportedLanguages to [en]');
+    assert.strictEqual(builtInBaseEn.thaiSpeechSupported, false, '7.2d Built-in registry sets thaiSpeechSupported=false');
+
+    const englishOnlyModel = path.join(workDir, 'ggml-base.en.bin');
+    fs.writeFileSync(englishOnlyModel, modelPayload);
+    const englishOnlySha = crypto.createHash('sha256').update(modelPayload).digest('hex');
+    const enOnlyManifest = path.join(workDir, 'en_only_manifest.json');
+    fs.writeFileSync(
+      enOnlyManifest,
+      JSON.stringify({
+        manifestVersion: '1.0.0',
+        models: [
+          {
+            filename: 'ggml-base.en.bin',
+            modelName: 'base.en',
+            modelType: 'english-only',
+            supportedLanguages: ['en'],
+            thaiSpeechSupported: false,
+            sizeBytes: modelPayload.length,
+            expectedSha256: builtInBaseEn.expectedSha256,
+          },
+          {
+            filename: 'ggml-mock-base.en.bin',
+            modelName: 'mock-base.en',
+            modelType: 'english-only',
+            supportedLanguages: ['en'],
+            thaiSpeechSupported: false,
+            sizeBytes: modelPayload.length,
+            expectedSha256: englishOnlySha,
+          },
+        ],
+      })
+    );
+    const mockEnOnlyModel = path.join(workDir, 'ggml-mock-base.en.bin');
+    fs.writeFileSync(mockEnOnlyModel, modelPayload);
+
+    process.env.WHISPER_PATH = mockBin;
+    process.env.WHISPER_MODEL_PATH = mockEnOnlyModel;
+    process.env.WHISPER_MODEL_MANIFEST_PATH = enOnlyManifest;
+    process.env.WHISPER_REQUIRE_MODEL_SHA256 = 'true';
+    process.env.WHISPER_VERIFY_COMPATIBILITY = 'false';
+    delete process.env.WHISPER_LANGUAGE;
+    speechTranscriptionAdapter.clearCompatibilityCache();
+
+    const enVal = await speechTranscriptionAdapter.validateRuntime();
+    assert.strictEqual(enVal.status, 'READY', '7.3a English-only verified model READY when WHISPER_LANGUAGE unset');
+    assert.strictEqual(enVal.modelName, 'mock-base.en', '7.3b modelName populated');
+    assert.strictEqual(enVal.modelType, 'english-only', '7.3c modelType=english-only');
+    assert.deepStrictEqual(enVal.supportedLanguages, ['en'], '7.3d supportedLanguages=[en] only (never [en, th])');
+    assert.strictEqual(enVal.thaiSpeechSupported, false, '7.3e thaiSpeechSupported=false');
+    assert.ok(enVal.languageLimitation?.toLowerCase().includes('not supported'), '7.3f Clear English-only Thai limitation');
+
+    // 7c. WHISPER_LANGUAGE=th on English-only model must FAIL CLOSED (MODEL_INCOMPATIBLE)
+    process.env.WHISPER_LANGUAGE = 'th';
+    speechTranscriptionAdapter.clearCompatibilityCache();
+    const thaiOnEnVal = await speechTranscriptionAdapter.validateRuntime();
+    assert.strictEqual(thaiOnEnVal.status, 'ERROR', '7.4a WHISPER_LANGUAGE=th on .en model fails closed');
+    assert.strictEqual(thaiOnEnVal.diagnosticCode, 'MODEL_INCOMPATIBLE', '7.4b diagnosticCode=MODEL_INCOMPATIBLE');
+    assert.strictEqual(thaiOnEnVal.thaiSpeechSupported, false, '7.4c thaiSpeechSupported remains false');
+    const thaiOnEnTx = await speechTranscriptionAdapter.transcribe(dummyVideo, 5.0, { verifyCompatibility: false });
+    assert.strictEqual(thaiOnEnTx.status, 'ANALYSIS_UNAVAILABLE', '7.4d transcribe() fails closed for WHISPER_LANGUAGE=th on .en model');
+    assert.strictEqual(thaiOnEnTx.diagnosticCode, 'MODEL_INCOMPATIBLE', '7.4e transcribe() diagnosticCode=MODEL_INCOMPATIBLE');
+
+    // 7d. Multilingual filename/metadata claiming ['en', 'th'] MUST NOT claim 'th' without real Thai speech verification
+    delete process.env.WHISPER_LANGUAGE;
+    const multilingualModel = path.join(workDir, 'ggml-base.bin');
+    fs.writeFileSync(multilingualModel, modelPayload);
+    const multilingualManifest = path.join(workDir, 'multilingual_manifest.json');
+    fs.writeFileSync(
+      multilingualManifest,
+      JSON.stringify({
+        manifestVersion: '1.0.0',
+        models: [
+          {
+            filename: 'ggml-base.bin',
+            modelName: 'base',
+            modelType: 'multilingual',
+            supportedLanguages: ['en', 'th'],
+            thaiSpeechSupported: true,
+            sizeBytes: modelPayload.length,
+            expectedSha256: englishOnlySha,
+          },
+        ],
+      })
+    );
+    process.env.WHISPER_MODEL_PATH = multilingualModel;
+    process.env.WHISPER_MODEL_MANIFEST_PATH = multilingualManifest;
+    speechTranscriptionAdapter.clearCompatibilityCache();
+    const multiMetaOnly = await speechTranscriptionAdapter.validateRuntime();
+    assert.strictEqual(multiMetaOnly.status, 'READY', '7.5a Multilingual model READY');
+    assert.strictEqual(multiMetaOnly.modelType, 'multilingual', '7.5b modelType=multilingual');
+    assert.deepStrictEqual(multiMetaOnly.supportedLanguages, ['en'], '7.5c Does NOT claim th from filename/metadata alone');
+    assert.strictEqual(multiMetaOnly.thaiSpeechSupported, false, '7.5d thaiSpeechSupported=false without verified Thai speech fixture');
+    assert.ok(multiMetaOnly.languageLimitation?.includes('NOT claimed from filename or metadata'), '7.5e Explicit anti-metadata-only limitation message');
+
+    // 7e. transcribe() and /api/health/readiness reflect honest English-only capability & limitations
+    process.env.WHISPER_MODEL_PATH = mockEnOnlyModel;
+    process.env.WHISPER_MODEL_MANIFEST_PATH = enOnlyManifest;
+    speechTranscriptionAdapter.clearCompatibilityCache();
+
+    const enTx = await speechTranscriptionAdapter.transcribe(compatWav, 0.5, { verifyCompatibility: false });
+    assert.strictEqual(enTx.status, 'DETECTED', '7.6a English-only transcribe() executes cleanly on audio');
+    assert.strictEqual(enTx.modelType, 'english-only', '7.6b transcribe() carries modelType=english-only');
+    assert.deepStrictEqual(enTx.supportedLanguages, ['en'], '7.6c transcribe() carries supportedLanguages=[en]');
+    assert.strictEqual(enTx.thaiSpeechSupported, false, '7.6d transcribe() carries thaiSpeechSupported=false');
+    assert.ok(enTx.limitations.includes('Thai'), '7.6e transcribe() limitations surface Thai limitation');
+
+    const audioRes = await audioProcessor.analyzeAudio(compatWav, 0.5);
+    assert.deepStrictEqual(audioRes.detectors?.audio_transcription?.details?.supportedLanguages, ['en'], '7.6f Detector details expose supportedLanguages=[en]');
+    assert.strictEqual(audioRes.detectors?.audio_transcription?.details?.thaiSpeechSupported, false, '7.6g Detector details expose thaiSpeechSupported=false');
+
+    const appLang = express();
+    appLang.use('/api', apiRouter);
+    const serverLang = await new Promise<import('http').Server>((resolve) => {
+      const s = appLang.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    try {
+      const addr = serverLang.address() as any;
+      const res = await fetch(`http://127.0.0.1:${addr.port}/api/health/readiness`);
+      const body = await res.json();
+      const wsDetails = body?.checks?.whisperStt?.details;
+      assert.strictEqual(wsDetails?.modelName, 'mock-base.en', '7.7a Readiness exposes modelName');
+      assert.strictEqual(wsDetails?.modelType, 'english-only', '7.7b Readiness exposes modelType=english-only');
+      assert.deepStrictEqual(wsDetails?.supportedLanguages, ['en'], '7.7c Readiness exposes supportedLanguages=[en]');
+      assert.strictEqual(wsDetails?.thaiSpeechSupported, false, '7.7d Readiness exposes thaiSpeechSupported=false');
+      assert.strictEqual(wsDetails?.thaiSpeechVerified, false, '7.7e Readiness exposes thaiSpeechVerified=false');
+      assert.strictEqual(wsDetails?.transcriptionLanguage, 'en', '7.7f Readiness exposes transcriptionLanguage=en');
+      assert.ok(String(wsDetails?.languageLimitation || '').includes('Thai'), '7.7g Readiness exposes clear Thai limitation');
+    } finally {
+      await new Promise<void>((resolve) => serverLang.close(() => resolve()));
+    }
+    console.log('  ✅ PASS: Case 7 (Whisper language capability consistency & anti-overclaim checks)');
 
     console.log('\n======================================================');
     console.log('🎉 ALL WHISPER MODEL SHA-256 CONTRACT TESTS PASSED!');

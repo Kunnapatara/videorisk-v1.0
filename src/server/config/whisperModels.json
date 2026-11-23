@@ -6,12 +6,15 @@
       "filename": "ggml-base.en.bin",
       "modelName": "base.en",
       "format": "ggml",
+      "modelType": "english-only",
+      "supportedLanguages": ["en"],
+      "thaiSpeechSupported": false,
       "sizeBytes": 147964211,
       "expectedSha256": "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
       "upstreamSha1": "137c40403d78fd54d454da0f9bd998f78703390c",
       "sourceUrl": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
       "lfsPointerUrl": "https://huggingface.co/ggerganov/whisper.cpp/raw/main/ggml-base.en.bin",
-      "notes": "English-only base GGML model verified against HuggingFace Git LFS oid sha256 and official whisper.cpp SHA-1."
+      "notes": "English-only base GGML model verified against HuggingFace Git LFS oid sha256 and official whisper.cpp SHA-1. Does NOT support Thai (th) or non-English transcription."
     }
   ]
 }

@@ -168,7 +168,12 @@ curl -s http://localhost:3000/api/health/readiness | jq '.checks.whisperStt'
 1. **Disk Footprint:** ~80 MB compiled `/opt/whisper.cpp/build` (runtime only needs the `3.4 MB` static `whisper-cli` binary) + `148 MB` for `ggml-base.en.bin` (or `~488 MB`–`3.1 GB` for larger multilingual models).
 2. **Memory (RAM):** `ggml-base.en.bin` uses ~`147 MB` weights + `~160 MB` compute/KV buffers (~`320–400 MB` RSS per concurrent process). Larger models (`medium`, `large-v3`) require `2–4+ GB` RAM.
 3. **CPU Latency & Timeouts:** Measured `~4.6s` on 11s audio (`~0.42x` real-time) on a 2-vCPU x86_64 host with AVX2/AVX512. On hosts without AVX2/F16C, or for long multi-minute videos, `transcribe()` enforces a hard `60,000ms` subprocess timeout (`audioProcessor.ts`) — long videos on CPU-only hosts can hit `TRANSCRIPTION_TIMEOUT` and fail closed as `ANALYSIS_UNAVAILABLE`.
-4. **Scope & Accuracy Limits of This Verification:** Measured `0.00%` WER is on a single clean studio/archival 11s English recording (`jfk_1961_inaugural_16k.wav`). It does **not** benchmark Thai (`th`) speech, background music overlap, heavy compression noise, or multi-speaker overlapping dialogue.
+4. **Scope & Language Capability Consistency (`ggml-base.en.bin` vs Thai `th`):**
+   - `src/server/config/whisperModels.json` pins `ggml-base.en.bin` with `"modelType": "english-only"`, `"supportedLanguages": ["en"]`, and `"thaiSpeechSupported": false`.
+   - `validateRuntime()`, `transcribe()`, `AudioProcessor.analyzeAudio()`, and `GET /api/health/readiness` (`checks.whisperStt.details`) all report `modelName`, `modelType`, `supportedLanguages`, `verifiedLanguages`, `thaiSpeechSupported`, `thaiSpeechVerified`, `transcriptionLanguage`, and `languageLimitation`.
+   - **Fail-Closed `WHISPER_LANGUAGE` Guard:** Setting `WHISPER_LANGUAGE=th` (or any non-`en` language) against an `.en` model immediately fails closed with `ERROR` / `MODEL_INCOMPATIBLE` (`ANALYSIS_UNAVAILABLE` on `transcribe()` and `degraded` on `/api/health/readiness`).
+   - **No Metadata-Only Thai Claims:** Even if a multilingual model filename (e.g. `ggml-base.bin`) or manifest metadata is configured, `'th'` and `thaiSpeechSupported: true` / `thaiSpeechVerified: true` are **never** claimed solely from filename or metadata without a passing Thai human speech verification fixture.
+   - Measured `0.00%` WER is on a single clean archival 11s English recording (`jfk_1961_inaugural_16k.wav`); Thai (`th`) speech, background music overlap, heavy compression noise, and multi-speaker overlapping dialogue remain unverified on the default `ggml-base.en.bin` model.
 
 ---
 

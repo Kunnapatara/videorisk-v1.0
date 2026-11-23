@@ -1,7 +1,15 @@
 import assert from 'assert';
 import { execFile } from 'child_process';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { promisify } from 'util';
+import { DatabaseSync } from 'node:sqlite';
+import Stripe from 'stripe';
 import {
+  evaluateRealCheckoutWebhookRow,
+  findVerifiedRealCheckoutWebhook,
+  isGenuineStripeWebhookEventId,
   parseStripeHarnessCliArgs,
   runStripeTestModeE2E,
   validateStripeE2ESafetyGuards,
@@ -216,6 +224,303 @@ export async function runStripeTestModeE2EHarnessTests() {
   assert.ok(realSubprocessStdout.includes('BLOCKED — AWAITING ENV'), '4.28 Category 2 CLI outputs BLOCKED — AWAITING ENV');
   console.log('  ✅ PASS: Category 1 vs Category 2 boundaries and fail-closed guards enforced');
 
+  // 5. Stripe Webhook-to-Checkout Session Correlation & Anti-Spoofing Regression Tests
+  console.log('\n[5. Stripe Webhook-to-Checkout Session Correlation Regression Tests]');
+  const corrWorkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vr_stripe_corr_test_'));
+  const corrDbPath = path.join(corrWorkDir, 'webhook_correlation.db');
+  const testDb = new DatabaseSync(corrDbPath);
+  try {
+    testDb.exec(`
+      CREATE TABLE webhook_events (
+        event_id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        processed_at TEXT NOT NULL,
+        user_id TEXT,
+        credits_granted INTEGER,
+        plan_granted TEXT,
+        payload_json TEXT NOT NULL
+      );
+    `);
+
+    const insertWebhook = testDb.prepare(`
+      INSERT OR REPLACE INTO webhook_events (
+        event_id, provider, event_type, processed_at, user_id, credits_granted, plan_granted, payload_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const target = {
+      sessionId: 'cs_test_a1TargetCheckoutSession999',
+      ownerUserId: 'user_corr_01',
+      customerId: 'cus_TargetCustomer01',
+      subscriptionId: 'sub_TargetSub01',
+    };
+
+    const insertRow = (eventId: string, overrides: Record<string, any> = {}, userId = target.ownerUserId) => {
+      const payload = {
+        eventId,
+        provider: 'stripe',
+        eventType: 'checkout.session.completed',
+        processedAt: new Date().toISOString(),
+        userId,
+        creditsGranted: 150,
+        planGranted: 'pro',
+        sessionId: target.sessionId,
+        dataObjectId: target.sessionId,
+        customerId: target.customerId,
+        subscriptionId: target.subscriptionId,
+        livemode: false,
+        signatureVerified: true,
+        ...overrides,
+      };
+      insertWebhook.run(
+        eventId,
+        'stripe',
+        'checkout.session.completed',
+        payload.processedAt,
+        userId,
+        150,
+        'pro',
+        JSON.stringify(payload)
+      );
+    };
+
+    // 5.1 Genuine matching Checkout Session event is accepted
+    assert.strictEqual(isGenuineStripeWebhookEventId('evt_1RealStripeEvent0001'), true, '5.1a Genuine Stripe evt_ ID recognized');
+    assert.strictEqual(isGenuineStripeWebhookEventId('evt_synth_12345678901234'), false, '5.1b evt_synth_ rejected');
+    assert.strictEqual(isGenuineStripeWebhookEventId('evt_test_12345678901234'), false, '5.1c evt_test_ rejected');
+
+    insertRow('evt_1RealStripeEvent0001');
+    const validLookup = findVerifiedRealCheckoutWebhook(testDb, target);
+    assert.ok(validLookup.matched, '5.1d Matching genuine Checkout Session webhook accepted');
+    assert.strictEqual(validLookup.matched.event_id, 'evt_1RealStripeEvent0001', '5.1e Returned expected genuine event_id');
+    testDb.exec('DELETE FROM webhook_events');
+
+    // 5.2 Same user_id but DIFFERENT Checkout Session must be REJECTED (even if customerId/subscriptionId match or differ)
+    insertRow('evt_1DifferentSessionSameUser01', {
+      sessionId: 'cs_test_otherSessionSameUser888',
+      dataObjectId: 'cs_test_otherSessionSameUser888',
+    });
+    const diffSessionLookup = findVerifiedRealCheckoutWebhook(testDb, target);
+    assert.strictEqual(diffSessionLookup.matched, null, '5.2a Same user different Checkout Session rejected');
+    assert.ok(
+      diffSessionLookup.rejections.some((r) => r.reason.includes('different Checkout Session') && r.claimsTargetSession === false),
+      '5.2b Rejection explicitly reports different Checkout Session and claimsTargetSession=false'
+    );
+    testDb.exec('DELETE FROM webhook_events');
+
+    // 5.3 Synthetic event using evt_ prefix must be REJECTED
+    insertRow('evt_synth_RealPrefixSpoof01', { isSynthetic: true });
+    insertRow('evt_test_HarnessEvent0002', {});
+    insertRow('evt_1RealLookingIdButSynth03', { isSynthetic: true });
+    const synthLookup = findVerifiedRealCheckoutWebhook(testDb, target);
+    assert.strictEqual(synthLookup.matched, null, '5.3a Synthetic events using evt_ prefix rejected');
+    assert.strictEqual(synthLookup.rejections.length, 3, '5.3b All 3 synthetic evt_ variants rejected');
+    assert.ok(
+      synthLookup.rejections.every((r) => r.claimsTargetSession === true),
+      '5.3c Spoofed events targeting sessionId are flagged claimsTargetSession=true to fail closed'
+    );
+    testDb.exec('DELETE FROM webhook_events');
+
+    // 5.4 Mismatched Customer ID must be REJECTED
+    insertRow('evt_1WrongCustomerEvent0004', { customerId: 'cus_DifferentCustomer99' });
+    const wrongCustLookup = findVerifiedRealCheckoutWebhook(testDb, target);
+    assert.strictEqual(wrongCustLookup.matched, null, '5.4a Mismatched customerId rejected');
+    assert.ok(
+      wrongCustLookup.rejections[0]?.reason.includes('customerId'),
+      '5.4b Rejection reason cites customerId mismatch'
+    );
+    testDb.exec('DELETE FROM webhook_events');
+
+    // 5.5 Mismatched Subscription ID must be REJECTED (and subscriptionId on one-time session rejected)
+    insertRow('evt_1WrongSubEvent0005', { subscriptionId: 'sub_DifferentSub99' });
+    const wrongSubLookup = findVerifiedRealCheckoutWebhook(testDb, target);
+    assert.strictEqual(wrongSubLookup.matched, null, '5.5a Mismatched subscriptionId rejected');
+    assert.ok(
+      wrongSubLookup.rejections[0]?.reason.includes('subscriptionId'),
+      '5.5b Rejection reason cites subscriptionId mismatch'
+    );
+    const missingSubEval = evaluateRealCheckoutWebhookRow(
+      {
+        event_id: 'evt_1MissingSubEvent0005b',
+        provider: 'stripe',
+        event_type: 'checkout.session.completed',
+        user_id: target.ownerUserId,
+        payload_json: JSON.stringify({
+          sessionId: target.sessionId,
+          dataObjectId: target.sessionId,
+          customerId: target.customerId,
+          livemode: false,
+          signatureVerified: true,
+        }),
+      },
+      target
+    );
+    assert.strictEqual(missingSubEval.valid, false, '5.5c Missing subscriptionId for subscription session rejected');
+    testDb.exec('DELETE FROM webhook_events');
+
+    // 5.6 livemode=true (or omitted) must be REJECTED
+    insertRow('evt_1LiveModeEvent0006', { livemode: true });
+    insertRow('evt_1MissingLivemode0006b', { livemode: undefined });
+    const liveLookup = findVerifiedRealCheckoutWebhook(testDb, target);
+    assert.strictEqual(liveLookup.matched, null, '5.6a livemode=true and missing livemode rejected');
+    assert.ok(
+      liveLookup.rejections.some((r) => r.reason.includes('livemode=true')),
+      '5.6b Explicit livemode=true rejection reason surfaced'
+    );
+    testDb.exec('DELETE FROM webhook_events');
+
+    // 5.7 Missing signature verification proof (signatureVerified=false or omitted) must be REJECTED
+    insertRow('evt_1UnsignedEvent0007', { signatureVerified: false });
+    insertRow('evt_1OmittedSigEvent0007b', { signatureVerified: undefined });
+    const unsignedLookup = findVerifiedRealCheckoutWebhook(testDb, target);
+    assert.strictEqual(unsignedLookup.matched, null, '5.7a Unsigned / unverified webhook events rejected');
+    assert.ok(
+      unsignedLookup.rejections.every((r) => r.reason.includes('signature verification')),
+      '5.7b Signature verification rejection reason surfaced'
+    );
+    testDb.exec('DELETE FROM webhook_events');
+
+    // 5.8 End-to-end BillingService persistence verification (real Stripe signature vs ALLOW_SIMULATION_WEBHOOK)
+    const savedEnvBilling = {
+      VIDEORISK_TEST_RUN: process.env.VIDEORISK_TEST_RUN,
+      TEST_DATABASE_PATH: process.env.TEST_DATABASE_PATH,
+      DATABASE_PATH: process.env.DATABASE_PATH,
+      DATA_DIR: process.env.DATA_DIR,
+      NODE_ENV: process.env.NODE_ENV,
+      DEPLOYMENT_ENV: process.env.DEPLOYMENT_ENV,
+      PAYMENT_MODE: process.env.PAYMENT_MODE,
+      STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY,
+      STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET,
+      ALLOW_SIMULATION_WEBHOOK: process.env.ALLOW_SIMULATION_WEBHOOK,
+    };
+
+    try {
+      const billingDbPath = path.join(corrWorkDir, 'billing_webhook_persistence.db');
+      const webhookSecret = 'whsec_test_correlation_regression_secret_123456';
+      process.env.VIDEORISK_TEST_RUN = 'true';
+      process.env.TEST_DATABASE_PATH = billingDbPath;
+      process.env.DATABASE_PATH = billingDbPath;
+      process.env.DATA_DIR = corrWorkDir;
+      process.env.NODE_ENV = 'test';
+      process.env.DEPLOYMENT_ENV = 'test';
+      process.env.PAYMENT_MODE = 'test';
+      process.env.STRIPE_SECRET_KEY = 'sk_test_1234567890correlationregressiontest';
+      process.env.STRIPE_WEBHOOK_SECRET = webhookSecret;
+
+      const { SqliteStorageRepository } = await import('../src/server/storage/sqliteStorage');
+      const { billingService } = await import('../src/server/services/billingService');
+      const isolatedRepo = new SqliteStorageRepository(billingDbPath, process.env);
+      billingService.setStorageForTest(isolatedRepo);
+      billingService.reconfigure();
+
+      try {
+        const regUser = await isolatedRepo.users.createUser(
+          'webhook_persist_01@example.test',
+          'hash_not_used',
+          'salt_not_used',
+          0,
+          'free'
+        );
+
+        // (a) Signed genuine-format webhook event via stripe.webhooks.generateTestHeaderString
+        const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+          apiVersion: '2025-02-24.acacia' as any,
+          typescript: true,
+        });
+        const signedSessionId = 'cs_test_a1BillingPersistSigned01';
+        const signedEventPayload = JSON.stringify({
+          id: 'evt_1BillingPersistSigned01',
+          object: 'event',
+          api_version: '2025-02-24.acacia',
+          created: Math.floor(Date.now() / 1000),
+          livemode: false,
+          type: 'checkout.session.completed',
+          data: {
+            object: {
+              id: signedSessionId,
+              object: 'checkout.session',
+              client_reference_id: regUser.id,
+              customer: 'cus_PersistSigned01',
+              subscription: 'sub_PersistSigned01',
+              payment_status: 'paid',
+              status: 'complete',
+              livemode: false,
+              amount_total: 1900,
+              currency: 'usd',
+              metadata: { userId: regUser.id, planId: 'pro' },
+            },
+          },
+        });
+        const validHeader = stripe.webhooks.generateTestHeaderString({
+          payload: signedEventPayload,
+          secret: webhookSecret,
+        });
+        await billingService.handleWebhook(Buffer.from(signedEventPayload, 'utf8'), validHeader);
+
+        const signedLookup = findVerifiedRealCheckoutWebhook(isolatedRepo.db, {
+          sessionId: signedSessionId,
+          ownerUserId: regUser.id,
+          customerId: 'cus_PersistSigned01',
+          subscriptionId: 'sub_PersistSigned01',
+        });
+        assert.ok(signedLookup.matched, '5.8a BillingService persists signatureVerified=true & correlation metadata for signed webhook');
+        assert.strictEqual(signedLookup.matched.event_id, 'evt_1BillingPersistSigned01', '5.8b Matched persisted evt_ ID');
+
+        // (b) Unsigned simulation-fallback webhook event (ALLOW_SIMULATION_WEBHOOK=true, no signature) MUST NOT pass real webhook lookup
+        process.env.ALLOW_SIMULATION_WEBHOOK = 'true';
+        const unsignedSessionId = 'cs_test_a1BillingPersistUnsigned02';
+        const unsignedEventPayload = JSON.stringify({
+          id: 'evt_1BillingPersistUnsigned02',
+          object: 'event',
+          created: Math.floor(Date.now() / 1000),
+          livemode: false,
+          type: 'checkout.session.completed',
+          data: {
+            object: {
+              id: unsignedSessionId,
+              object: 'checkout.session',
+              client_reference_id: regUser.id,
+              customer: 'cus_PersistUnsigned02',
+              subscription: 'sub_PersistUnsigned02',
+              payment_status: 'paid',
+              status: 'complete',
+              livemode: false,
+              amount_total: 1900,
+              currency: 'usd',
+              metadata: { userId: regUser.id, planId: 'pro' },
+            },
+          },
+        });
+        await billingService.handleWebhook(Buffer.from(unsignedEventPayload, 'utf8'), '');
+
+        const unsignedBillingLookup = findVerifiedRealCheckoutWebhook(isolatedRepo.db, {
+          sessionId: unsignedSessionId,
+          ownerUserId: regUser.id,
+          customerId: 'cus_PersistUnsigned02',
+          subscriptionId: 'sub_PersistUnsigned02',
+        });
+        assert.strictEqual(unsignedBillingLookup.matched, null, '5.8c Simulation-fallback webhook without signature verification is REJECTED');
+        assert.ok(
+          unsignedBillingLookup.rejections.some((r) => r.eventId === 'evt_1BillingPersistUnsigned02' && r.reason.includes('signature verification')),
+          '5.8d Rejection explicitly cites missing signature verification'
+        );
+      } finally {
+        billingService.setStorageForTest(null);
+        await isolatedRepo.close().catch(() => {});
+      }
+    } finally {
+      for (const [k, v] of Object.entries(savedEnvBilling)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+    console.log('  ✅ PASS: All 7 Stripe Webhook-to-Checkout Session correlation & anti-spoofing tests passed');
+  } finally {
+    try { testDb.close(); } catch { /* ignore */ }
+    fs.rmSync(corrWorkDir, { recursive: true, force: true });
+  }
+
   console.log('\n======================================================');
   console.log('🎉 ALL STRIPE TEST MODE E2E HARNESS TESTS PASSED!');
   console.log('======================================================\n');
@@ -225,3 +530,4 @@ runStripeTestModeE2EHarnessTests().catch((err) => {
   console.error('\n❌ STRIPE TEST MODE E2E HARNESS TESTS FAILED:', err);
   process.exit(1);
 });
+

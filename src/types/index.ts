@@ -676,6 +676,13 @@ export interface WebhookEventRecord {
   userId?: string;
   creditsGranted?: number;
   planGranted?: string;
+  sessionId?: string;
+  dataObjectId?: string;
+  customerId?: string;
+  subscriptionId?: string;
+  livemode?: boolean;
+  signatureVerified?: boolean;
+  isSynthetic?: boolean;
   outcome?: 'processed' | 'ignored_out_of_order' | 'rejected_unmapped_price' | 'rejected_missing_price';
   diagnostic?: {
     reason: string;

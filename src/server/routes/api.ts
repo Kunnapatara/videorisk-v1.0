@@ -1433,6 +1433,17 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
       expectedModelSha256: sttValidation.expectedModelSha256 || null,
     };
 
+    const baseLanguageDetails = {
+      modelName: sttValidation.modelName || null,
+      modelType: sttValidation.modelType || 'unconfigured',
+      supportedLanguages: Array.isArray(sttValidation.supportedLanguages) ? sttValidation.supportedLanguages : [],
+      verifiedLanguages: [] as string[],
+      thaiSpeechSupported: Boolean(sttValidation.thaiSpeechSupported),
+      thaiSpeechVerified: false,
+      transcriptionLanguage: sttValidation.transcriptionLanguage || 'unset',
+      languageLimitation: sttValidation.languageLimitation || null,
+    };
+
     const strictProvenanceMode = (process.env.WHISPER_STRICT_PROVENANCE || '').trim().toLowerCase() === 'true';
 
     if (sttValidation.status === 'UNCONFIGURED') {
@@ -1445,6 +1456,7 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
           binaryStatus,
           modelStatus,
           ...modelSha256Details,
+          ...baseLanguageDetails,
           runtimeCompatibilityStatus: 'UNCONFIGURED',
           runtimeCompatible: false,
           runtimeExecutionStatus: 'UNCONFIGURED',
@@ -1481,6 +1493,7 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
           binaryStatus,
           modelStatus,
           ...modelSha256Details,
+          ...baseLanguageDetails,
           runtimeCompatibilityStatus: 'FAILED',
           runtimeCompatible: false,
           runtimeExecutionStatus: 'FAILED',
@@ -1521,6 +1534,7 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
           binaryStatus,
           modelStatus,
           ...modelSha256Details,
+          ...baseLanguageDetails,
           runtimeCompatibilityStatus: 'UNVERIFIED',
           runtimeCompatible: false,
           runtimeExecutionStatus: 'UNVERIFIED',
@@ -1560,6 +1574,16 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
       if (compat.compatible) {
         const speechVerified = compat.speechTranscriptVerified === true && compat.speechTranscriptStatus === 'SPEECH_TRANSCRIPT_VERIFIED';
         const compatStatus = speechVerified ? 'SPEECH_TRANSCRIPT_VERIFIED' : 'RUNTIME_EXECUTION_VERIFIED';
+        const verifiedLanguages = Array.isArray(compat.verifiedLanguages)
+          ? compat.verifiedLanguages
+          : (speechVerified && compat.fixtureProvenance?.transcriptLanguage
+              ? [String(compat.fixtureProvenance.transcriptLanguage).trim().toLowerCase()]
+              : []);
+        const thaiSpeechVerified = Boolean(
+          compat.thaiSpeechVerified &&
+          verifiedLanguages.includes('th') &&
+          compat.validation?.modelType !== 'english-only'
+        );
         checks.whisperStt = {
           status: 'healthy',
           message: speechVerified
@@ -1572,6 +1596,11 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
             binaryStatus,
             modelStatus,
             ...modelSha256Details,
+            ...baseLanguageDetails,
+            supportedLanguages: compat.validation?.supportedLanguages || baseLanguageDetails.supportedLanguages,
+            thaiSpeechSupported: Boolean(compat.validation?.thaiSpeechSupported),
+            verifiedLanguages,
+            thaiSpeechVerified,
             runtimeCompatibilityStatus: compat.runtimeCompatibilityStatus,
             runtimeCompatible: compat.runtimeCompatible,
             runtimeExecutionStatus: compat.runtimeExecutionStatus,
@@ -1611,6 +1640,7 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
             binaryStatus,
             modelStatus,
             ...modelSha256Details,
+            ...baseLanguageDetails,
             runtimeCompatibilityStatus: compat.runtimeCompatibilityStatus,
             runtimeCompatible: false,
             runtimeExecutionStatus: 'UNVERIFIED',
@@ -1648,6 +1678,7 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
             binaryStatus,
             modelStatus,
             ...modelSha256Details,
+            ...baseLanguageDetails,
             runtimeCompatibilityStatus: compat.runtimeCompatibilityStatus,
             runtimeCompatible: false,
             runtimeExecutionStatus: compat.runtimeExecutionStatus,
@@ -1680,6 +1711,14 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
       message: 'Whisper STT readiness check encountered an unexpected error.',
       details: {
         configured: true,
+        modelName: null,
+        modelType: 'unconfigured',
+        supportedLanguages: [],
+        verifiedLanguages: [],
+        thaiSpeechSupported: false,
+        thaiSpeechVerified: false,
+        transcriptionLanguage: 'unset',
+        languageLimitation: 'Whisper STT readiness check failed unexpectedly; language capability is unverified.',
         runtimeCompatibilityStatus: 'FAILED',
         runtimeCompatible: false,
         runtimeExecutionStatus: 'FAILED',

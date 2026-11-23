@@ -172,6 +172,12 @@ export interface LocalTranscriptionResult {
   transcriptText?: string;
   segments?: Array<{ start: number; end: number; text: string; confidence?: number }>;
   diagnosticCode?: WhisperDiagnosticCode;
+  modelName?: string;
+  modelType?: WhisperModelType;
+  supportedLanguages?: string[];
+  thaiSpeechSupported?: boolean;
+  transcriptionLanguage?: string;
+  languageLimitation?: string;
   compatibilityVerified?: boolean; // Runtime compatibility ONLY (never implies speech transcript verification)
   runtimeCompatible?: boolean;
   runtimeCompatibilityStatus?: WhisperRuntimeCompatibilityStatus;
@@ -185,6 +191,19 @@ export interface LocalTranscriptionResult {
   failureReason?: string;
   limitations: string;
   executionDurationMs: number;
+}
+
+export type WhisperModelType = 'english-only' | 'multilingual' | 'unconfigured' | 'unknown';
+
+export interface WhisperModelLanguageProfile {
+  modelName?: string;
+  modelType: WhisperModelType;
+  supportedLanguages: string[];
+  thaiSpeechSupported: boolean;
+  transcriptionLanguage: string;
+  compatibleWithRequestedLanguage: boolean;
+  languageLimitation: string;
+  error?: string;
 }
 
 export type WhisperDiagnosticCode =
@@ -226,6 +245,8 @@ export interface WhisperRuntimeValidation {
   modelConfigured: boolean;
   modelFound: boolean;
   modelPath?: string;
+  modelName?: string;
+  modelType?: WhisperModelType;
   modelSha256?: string;
   expectedModelSha256?: string;
   modelSha256Source?: 'env' | 'manifest' | 'none';
@@ -233,6 +254,9 @@ export interface WhisperRuntimeValidation {
   modelIntegrityStatus?: WhisperModelIntegrityStatus;
   runtimeType: 'openai_whisper' | 'whisper_cpp' | 'unconfigured';
   supportedLanguages: string[];
+  thaiSpeechSupported?: boolean;
+  transcriptionLanguage?: string;
+  languageLimitation?: string;
   status: 'READY' | 'MISSING_EXECUTABLE' | 'NON_EXECUTABLE' | 'MISSING_MODEL' | 'UNCONFIGURED' | 'ERROR';
   diagnosticCode?: WhisperDiagnosticCode;
   details?: string;
@@ -251,6 +275,8 @@ export interface WhisperCompatibilityResult {
   verificationStates: SpeechVerificationState[];
   speechTranscriptStatus: WhisperSpeechTranscriptStatus;
   speechTranscriptVerified: boolean;
+  verifiedLanguages?: string[];
+  thaiSpeechVerified?: boolean;
   runtimeType: 'openai_whisper' | 'whisper_cpp' | 'unconfigured';
   validation: WhisperRuntimeValidation;
   transcriptText?: string;
@@ -321,6 +347,120 @@ const OPENAI_WHISPER_MODEL_NAMES = new Set<string>([
   'large', 'large-v1', 'large-v2', 'large-v3', 'turbo'
 ]);
 
+export function normalizeWhisperLanguageCode(raw?: string | null): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim().toLowerCase();
+  if (!trimmed) return undefined;
+  const primary = trimmed.split(/[-_]/)[0];
+  return primary || undefined;
+}
+
+/**
+ * Resolves honest model language capability and runtime compatibility without ever claiming
+ * Thai (`th`) support solely from filename or metadata when Thai speech verification is absent.
+ */
+export function resolveWhisperModelLanguageProfile(
+  modelPath: string | undefined,
+  runtimeType: 'openai_whisper' | 'whisper_cpp' | 'unconfigured',
+  options?: {
+    manifestEntry?: {
+      modelName?: string;
+      modelType?: string;
+      supportedLanguages?: unknown;
+      thaiSpeechSupported?: unknown;
+    } | null;
+    requestedLanguage?: string;
+    modelFound?: boolean;
+    thaiVerified?: boolean;
+  }
+): WhisperModelLanguageProfile {
+  const requestedLanguage = normalizeWhisperLanguageCode(options?.requestedLanguage ?? process.env.WHISPER_LANGUAGE);
+  const rawModelPath = typeof modelPath === 'string' ? modelPath.trim() : '';
+  const baseName = rawModelPath ? path.basename(rawModelPath) : '';
+  const strippedName = baseName
+    ? baseName.replace(/^ggml-/i, '').replace(/\.(?:bin|gguf|pt)$/i, '')
+    : '';
+  const manifestName = typeof options?.manifestEntry?.modelName === 'string' && options.manifestEntry.modelName.trim()
+    ? options.manifestEntry.modelName.trim()
+    : undefined;
+  const derivedModelName = manifestName || (strippedName || undefined);
+
+  if (runtimeType === 'unconfigured' || !rawModelPath || !options?.modelFound) {
+    return {
+      ...(derivedModelName ? { modelName: derivedModelName } : {}),
+      modelType: 'unconfigured',
+      supportedLanguages: [],
+      thaiSpeechSupported: false,
+      transcriptionLanguage: requestedLanguage || 'unset',
+      compatibleWithRequestedLanguage: true,
+      languageLimitation:
+        'Whisper STT runtime/model is unconfigured or unavailable on disk; neither English (en) nor Thai (th) transcription is active.',
+    };
+  }
+
+  const ENGLISH_ONLY_PATTERN = /(?:^|\.)en(?:[-_]q\d.*)?$/i;
+  const MULTILINGUAL_PATTERN = /^(?:tiny|base|small|medium|large(?:-v[123](?:-turbo)?)?|turbo)(?:[-_]q\d.*)?$/i;
+
+  const isEnglishOnlyByName =
+    ENGLISH_ONLY_PATTERN.test(strippedName) ||
+    (derivedModelName ? ENGLISH_ONLY_PATTERN.test(derivedModelName) : false);
+
+  const manifestLangs = Array.isArray(options?.manifestEntry?.supportedLanguages)
+    ? options!.manifestEntry!.supportedLanguages
+        .map((l) => normalizeWhisperLanguageCode(String(l)))
+        .filter((l): l is string => Boolean(l))
+    : [];
+  const manifestIsEnglishOnly =
+    options?.manifestEntry?.modelType === 'english-only' ||
+    options?.manifestEntry?.thaiSpeechSupported === false ||
+    (manifestLangs.length > 0 && manifestLangs.every((l) => l === 'en'));
+
+  if (isEnglishOnlyByName || manifestIsEnglishOnly) {
+    const modelLabel = derivedModelName || baseName;
+    const effectiveLang = requestedLanguage || 'en';
+    const incompatible = Boolean(requestedLanguage && requestedLanguage !== 'en');
+    return {
+      modelName: modelLabel,
+      modelType: 'english-only',
+      supportedLanguages: ['en'],
+      thaiSpeechSupported: false,
+      transcriptionLanguage: effectiveLang,
+      compatibleWithRequestedLanguage: !incompatible,
+      languageLimitation:
+        `English-only Whisper model ('${modelLabel}'): supportedLanguages=['en'] only. Thai ('th') and non-English speech transcription are NOT supported; Thai speech audits remain incomplete on this model.`,
+      ...(incompatible
+        ? {
+            error: `Configured WHISPER_LANGUAGE='${requestedLanguage}' is incompatible with English-only Whisper model '${modelLabel}' (${baseName}). Only English ('en') transcription is supported by '.en' models.`,
+          }
+        : {}),
+    };
+  }
+
+  const isKnownMultilingual =
+    options?.manifestEntry?.modelType === 'multilingual' ||
+    MULTILINGUAL_PATTERN.test(strippedName) ||
+    (derivedModelName ? MULTILINGUAL_PATTERN.test(derivedModelName) : false);
+  const modelType: WhisperModelType = isKnownMultilingual ? 'multilingual' : 'unknown';
+  const modelLabel = derivedModelName || baseName;
+  const thaiVerified = Boolean(options?.thaiVerified);
+
+  // Never claim 'th' or thaiSpeechSupported=true solely from filename/metadata without real Thai speech verification
+  const supportedLanguages = thaiVerified ? ['en', 'th'] : ['en'];
+  const effectiveLang = requestedLanguage || 'auto';
+
+  return {
+    modelName: modelLabel,
+    modelType,
+    supportedLanguages,
+    thaiSpeechSupported: thaiVerified,
+    transcriptionLanguage: effectiveLang,
+    compatibleWithRequestedLanguage: true,
+    languageLimitation: thaiVerified
+      ? `Whisper model '${modelLabel}' has verified Thai ('th') and English ('en') speech transcription support.`
+      : `Whisper model '${modelLabel}' (${modelType}) has NOT been verified with a Thai ('th') human speech fixture; Thai speech capability is NOT claimed from filename or metadata alone (thaiSpeechSupported=false).`,
+  };
+}
+
 /**
  * Determines whether Whisper runtime compatibility verification must be enforced
  * prior to transcription. Uses the canonical `isProductionEnvironment()` predicate
@@ -356,9 +496,11 @@ export function shouldEnforceWhisperCompatibility(
  */
 export class SpeechTranscriptionAdapter {
   private compatibilityCache = new Map<string, WhisperCompatibilityResult>();
+  private verifiedSpeechLanguages = new Set<string>();
 
   public clearCompatibilityCache(): void {
     this.compatibilityCache.clear();
+    this.verifiedSpeechLanguages.clear();
   }
 
   private getRuntimeFingerprint(
@@ -385,6 +527,8 @@ export class SpeechTranscriptionAdapter {
       `modelExp:${validation.expectedModelSha256 || 'none'}`,
       `modelSrc:${validation.modelSha256Source || 'none'}`,
       `modelInt:${validation.modelIntegrityStatus || 'none'}`,
+      `lang:${validation.transcriptionLanguage || 'unset'}`,
+      `modelType:${validation.modelType || 'unknown'}`,
       safeStatKey(fixturePath),
       `sha:${fixtureSha256}`,
       expectedTranscript !== undefined ? `exp:${expectedTranscript}` : 'exp:unset',
@@ -419,6 +563,12 @@ export class SpeechTranscriptionAdapter {
     validFormat: boolean;
     error?: string;
     conflictingOverrideSha256?: string;
+    manifestMetadata?: {
+      modelName?: string;
+      modelType?: string;
+      supportedLanguages?: string[];
+      thaiSpeechSupported?: boolean;
+    };
   } {
     const sha256HexRegex = /^[a-f0-9]{64}$/;
     const modelBase = path.basename(modelPath);
@@ -433,6 +583,12 @@ export class SpeechTranscriptionAdapter {
       expectedSha256?: string;
       validFormat: boolean;
       error?: string;
+      metadata?: {
+        modelName?: string;
+        modelType?: string;
+        supportedLanguages?: string[];
+        thaiSpeechSupported?: boolean;
+      };
     } => {
       if (!fs.existsSync(manifestPath)) {
         if (requiredIfMissing) {
@@ -470,12 +626,20 @@ export class SpeechTranscriptionAdapter {
         return { found: false, validFormat: true };
       }
 
+      const metadata = {
+        ...(typeof entry.modelName === 'string' && entry.modelName.trim() ? { modelName: entry.modelName.trim() } : {}),
+        ...(typeof entry.modelType === 'string' && entry.modelType.trim() ? { modelType: entry.modelType.trim() } : {}),
+        ...(Array.isArray(entry.supportedLanguages) ? { supportedLanguages: entry.supportedLanguages.map((l: unknown) => String(l)) } : {}),
+        ...(typeof entry.thaiSpeechSupported === 'boolean' ? { thaiSpeechSupported: entry.thaiSpeechSupported } : {}),
+      };
+
       const normalizedManifestHash = typeof entry.expectedSha256 === 'string' ? entry.expectedSha256.trim().toLowerCase() : '';
       if (!sha256HexRegex.test(normalizedManifestHash)) {
         return {
           found: true,
           expectedSha256: normalizedManifestHash || undefined,
           validFormat: false,
+          metadata,
           error: `Invalid expectedSha256 in Whisper model manifest for '${modelBase}'.`
         };
       }
@@ -483,7 +647,8 @@ export class SpeechTranscriptionAdapter {
       return {
         found: true,
         expectedSha256: normalizedManifestHash,
-        validFormat: true
+        validFormat: true,
+        metadata
       };
     };
 
@@ -494,6 +659,7 @@ export class SpeechTranscriptionAdapter {
         source: 'manifest',
         expectedSha256: builtInEntry.expectedSha256,
         validFormat: false,
+        manifestMetadata: builtInEntry.metadata,
         error: builtInEntry.error
       };
     }
@@ -506,6 +672,7 @@ export class SpeechTranscriptionAdapter {
           source: 'manifest',
           expectedSha256: overrideEntry.expectedSha256,
           validFormat: false,
+          manifestMetadata: overrideEntry.metadata,
           error: overrideEntry.error
         };
       }
@@ -515,11 +682,14 @@ export class SpeechTranscriptionAdapter {
           expectedSha256: builtInEntry.expectedSha256,
           validFormat: true,
           conflictingOverrideSha256: overrideEntry.expectedSha256,
+          manifestMetadata: builtInEntry.metadata,
           error: `Manifest override at ${explicitManifestOverride} conflicts with trusted built-in registry for '${modelBase}'.`
         };
       }
       if (overrideEntry.found) {
-        manifestEntry = overrideEntry;
+        manifestEntry = builtInEntry.found
+          ? { ...overrideEntry, metadata: builtInEntry.metadata ?? overrideEntry.metadata }
+          : overrideEntry;
       }
     }
 
@@ -530,6 +700,7 @@ export class SpeechTranscriptionAdapter {
           source: 'env',
           expectedSha256: normalized,
           validFormat: false,
+          manifestMetadata: manifestEntry.metadata,
           error: 'Explicit expectedModelSha256 must be a valid 64-character lowercase/uppercase SHA-256 hex digest.'
         };
       }
@@ -539,10 +710,11 @@ export class SpeechTranscriptionAdapter {
           expectedSha256: manifestEntry.expectedSha256,
           validFormat: true,
           conflictingOverrideSha256: normalized,
+          manifestMetadata: manifestEntry.metadata,
           error: `Explicit expectedModelSha256 conflicts with trusted manifest checksum for '${modelBase}'.`
         };
       }
-      return { source: 'env', expectedSha256: normalized, validFormat: true };
+      return { source: 'env', expectedSha256: normalized, validFormat: true, manifestMetadata: manifestEntry.metadata };
     }
 
     const rawEnvHash = process.env.WHISPER_MODEL_SHA256;
@@ -553,6 +725,7 @@ export class SpeechTranscriptionAdapter {
           source: 'env',
           expectedSha256: normalized,
           validFormat: false,
+          manifestMetadata: manifestEntry.metadata,
           error: 'Configured WHISPER_MODEL_SHA256 must be a valid 64-character SHA-256 hex digest.'
         };
       }
@@ -562,21 +735,23 @@ export class SpeechTranscriptionAdapter {
           expectedSha256: manifestEntry.expectedSha256,
           validFormat: true,
           conflictingOverrideSha256: normalized,
+          manifestMetadata: manifestEntry.metadata,
           error: `WHISPER_MODEL_SHA256 conflicts with trusted manifest checksum for '${modelBase}'.`
         };
       }
-      return { source: 'env', expectedSha256: normalized, validFormat: true };
+      return { source: 'env', expectedSha256: normalized, validFormat: true, manifestMetadata: manifestEntry.metadata };
     }
 
     if (manifestEntry.found && manifestEntry.expectedSha256) {
       return {
         source: 'manifest',
         expectedSha256: manifestEntry.expectedSha256,
-        validFormat: true
+        validFormat: true,
+        manifestMetadata: manifestEntry.metadata
       };
     }
 
-    return { source: 'none', validFormat: true };
+    return { source: 'none', validFormat: true, manifestMetadata: manifestEntry.metadata };
   }
 
   private normalizeTranscriptTokens(txt: string): string[] {
@@ -1228,15 +1403,24 @@ export class SpeechTranscriptionAdapter {
   }
 
   /**
-   * Validates local Whisper runtime installation, executable status, CLI identity contract, and model validity (including SHA-256 verification).
+   * Validates local Whisper runtime installation, executable status, CLI identity contract, model validity (SHA-256),
+   * and honest language capability consistency.
    */
   public async validateRuntime(options?: {
     requireModelSha256?: boolean;
     expectedModelSha256?: string;
     trustedModelManifestPath?: string;
+    language?: string;
+    thaiVerified?: boolean;
   }): Promise<WhisperRuntimeValidation> {
     const sttPath = process.env.WHISPER_PATH || process.env.LOCAL_STT_PATH;
     const modelPath = process.env.WHISPER_MODEL_PATH;
+    const requestedLanguage = normalizeWhisperLanguageCode(options?.language ?? process.env.WHISPER_LANGUAGE);
+    const unconfiguredLangProfile = resolveWhisperModelLanguageProfile(modelPath, 'unconfigured', {
+      requestedLanguage,
+      modelFound: false,
+      thaiVerified: false,
+    });
 
     if (!sttPath) {
       return {
@@ -1245,8 +1429,13 @@ export class SpeechTranscriptionAdapter {
         isExecutable: false,
         modelConfigured: Boolean(modelPath),
         modelFound: false,
+        ...(unconfiguredLangProfile.modelName ? { modelName: unconfiguredLangProfile.modelName } : {}),
+        modelType: unconfiguredLangProfile.modelType,
         runtimeType: 'unconfigured',
-        supportedLanguages: ['en', 'th'],
+        supportedLanguages: unconfiguredLangProfile.supportedLanguages,
+        thaiSpeechSupported: unconfiguredLangProfile.thaiSpeechSupported,
+        transcriptionLanguage: unconfiguredLangProfile.transcriptionLanguage,
+        languageLimitation: unconfiguredLangProfile.languageLimitation,
         status: 'UNCONFIGURED',
         diagnosticCode: 'UNCONFIGURED',
         details: 'Neither WHISPER_PATH nor LOCAL_STT_PATH is defined in the environment.'
@@ -1261,8 +1450,13 @@ export class SpeechTranscriptionAdapter {
         isExecutable: false,
         modelConfigured: Boolean(modelPath),
         modelFound: false,
+        ...(unconfiguredLangProfile.modelName ? { modelName: unconfiguredLangProfile.modelName } : {}),
+        modelType: unconfiguredLangProfile.modelType,
         runtimeType: 'unconfigured',
-        supportedLanguages: ['en', 'th'],
+        supportedLanguages: unconfiguredLangProfile.supportedLanguages,
+        thaiSpeechSupported: unconfiguredLangProfile.thaiSpeechSupported,
+        transcriptionLanguage: unconfiguredLangProfile.transcriptionLanguage,
+        languageLimitation: unconfiguredLangProfile.languageLimitation,
         status: 'MISSING_EXECUTABLE',
         diagnosticCode: 'BINARY_NOT_FOUND',
         details: `Configured STT executable does not exist at ${sttPath}`
@@ -1280,8 +1474,13 @@ export class SpeechTranscriptionAdapter {
           isExecutable: false,
           modelConfigured: Boolean(modelPath),
           modelFound: false,
+          ...(unconfiguredLangProfile.modelName ? { modelName: unconfiguredLangProfile.modelName } : {}),
+          modelType: unconfiguredLangProfile.modelType,
           runtimeType: 'unconfigured',
-          supportedLanguages: ['en', 'th'],
+          supportedLanguages: unconfiguredLangProfile.supportedLanguages,
+          thaiSpeechSupported: unconfiguredLangProfile.thaiSpeechSupported,
+          transcriptionLanguage: unconfiguredLangProfile.transcriptionLanguage,
+          languageLimitation: unconfiguredLangProfile.languageLimitation,
           status: 'NON_EXECUTABLE',
           diagnosticCode: 'BINARY_NOT_EXECUTABLE',
           details: `Configured STT path at ${sttPath} is a directory, not an executable file.`
@@ -1295,8 +1494,13 @@ export class SpeechTranscriptionAdapter {
         isExecutable: false,
         modelConfigured: Boolean(modelPath),
         modelFound: false,
+        ...(unconfiguredLangProfile.modelName ? { modelName: unconfiguredLangProfile.modelName } : {}),
+        modelType: unconfiguredLangProfile.modelType,
         runtimeType: 'unconfigured',
-        supportedLanguages: ['en', 'th'],
+        supportedLanguages: unconfiguredLangProfile.supportedLanguages,
+        thaiSpeechSupported: unconfiguredLangProfile.thaiSpeechSupported,
+        transcriptionLanguage: unconfiguredLangProfile.transcriptionLanguage,
+        languageLimitation: unconfiguredLangProfile.languageLimitation,
         status: 'MISSING_EXECUTABLE',
         diagnosticCode: 'BINARY_NOT_FOUND',
         details: `Unable to inspect STT file at ${sttPath}: ${statErr?.message || statErr}`
@@ -1314,8 +1518,13 @@ export class SpeechTranscriptionAdapter {
         isExecutable: false,
         modelConfigured: Boolean(modelPath),
         modelFound: false,
+        ...(unconfiguredLangProfile.modelName ? { modelName: unconfiguredLangProfile.modelName } : {}),
+        modelType: unconfiguredLangProfile.modelType,
         runtimeType: 'unconfigured',
-        supportedLanguages: ['en', 'th'],
+        supportedLanguages: unconfiguredLangProfile.supportedLanguages,
+        thaiSpeechSupported: unconfiguredLangProfile.thaiSpeechSupported,
+        transcriptionLanguage: unconfiguredLangProfile.transcriptionLanguage,
+        languageLimitation: unconfiguredLangProfile.languageLimitation,
         status: 'NON_EXECUTABLE',
         diagnosticCode: 'BINARY_NOT_EXECUTABLE',
         details: `Binary at ${sttPath} lacks execution permissions (X_OK).`
@@ -1354,8 +1563,13 @@ export class SpeechTranscriptionAdapter {
         isExecutable: true,
         modelConfigured: Boolean(modelPath),
         modelFound: false,
+        ...(unconfiguredLangProfile.modelName ? { modelName: unconfiguredLangProfile.modelName } : {}),
+        modelType: unconfiguredLangProfile.modelType,
         runtimeType: 'unconfigured',
-        supportedLanguages: ['en', 'th'],
+        supportedLanguages: unconfiguredLangProfile.supportedLanguages,
+        thaiSpeechSupported: unconfiguredLangProfile.thaiSpeechSupported,
+        transcriptionLanguage: unconfiguredLangProfile.transcriptionLanguage,
+        languageLimitation: unconfiguredLangProfile.languageLimitation,
         status: 'ERROR',
         diagnosticCode: 'IDENTITY_PROBE_FAILED',
         details: `STT executable at ${sttPath} failed both '--help' and '--version' identity probes.`
@@ -1393,8 +1607,13 @@ export class SpeechTranscriptionAdapter {
         isExecutable: true,
         modelConfigured: Boolean(modelPath),
         modelFound: false,
+        ...(unconfiguredLangProfile.modelName ? { modelName: unconfiguredLangProfile.modelName } : {}),
+        modelType: unconfiguredLangProfile.modelType,
         runtimeType: 'unconfigured',
-        supportedLanguages: ['en', 'th'],
+        supportedLanguages: unconfiguredLangProfile.supportedLanguages,
+        thaiSpeechSupported: unconfiguredLangProfile.thaiSpeechSupported,
+        transcriptionLanguage: unconfiguredLangProfile.transcriptionLanguage,
+        languageLimitation: unconfiguredLangProfile.languageLimitation,
         status: 'ERROR',
         diagnosticCode: 'IDENTITY_CONTRACT_MISMATCH',
         details: `Executable at ${sttPath} failed runtime identity verification: output from '--help'/'--version' does not match supported whisper_cpp or openai_whisper contracts.`
@@ -1517,6 +1736,12 @@ export class SpeechTranscriptionAdapter {
     let modelSha256Source: 'env' | 'manifest' | 'none' = 'none';
     let modelSha256Verified = false;
     let modelIntegrityStatus: WhisperModelIntegrityStatus = 'NOT_APPLICABLE';
+    let resolvedManifestMetadata: {
+      modelName?: string;
+      modelType?: string;
+      supportedLanguages?: string[];
+      thaiSpeechSupported?: boolean;
+    } | undefined;
 
     const verifyModelFileSha256 = async (p: string): Promise<{
       ok: boolean;
@@ -1528,6 +1753,12 @@ export class SpeechTranscriptionAdapter {
       source: 'env' | 'manifest' | 'none';
       verified: boolean;
       integrityStatus: WhisperModelIntegrityStatus;
+      manifestMetadata?: {
+        modelName?: string;
+        modelType?: string;
+        supportedLanguages?: string[];
+        thaiSpeechSupported?: boolean;
+      };
     }> => {
       const actualSha256 = await this.computeFileSha256Async(p);
       const expected = this.resolveExpectedModelSha256(p, options);
@@ -1547,6 +1778,7 @@ export class SpeechTranscriptionAdapter {
           source: expected.source,
           verified: false,
           integrityStatus: 'INVALID_EXPECTED_HASH',
+          manifestMetadata: expected.manifestMetadata,
         };
       }
 
@@ -1561,6 +1793,7 @@ export class SpeechTranscriptionAdapter {
           source: expected.source,
           verified: false,
           integrityStatus: 'MISMATCH',
+          manifestMetadata: expected.manifestMetadata,
         };
       }
 
@@ -1575,6 +1808,7 @@ export class SpeechTranscriptionAdapter {
             source: 'none',
             verified: false,
             integrityStatus: 'MISSING_EXPECTED_HASH',
+            manifestMetadata: expected.manifestMetadata,
           };
         }
         return {
@@ -1583,6 +1817,7 @@ export class SpeechTranscriptionAdapter {
           source: 'none',
           verified: false,
           integrityStatus: 'MISSING_EXPECTED_HASH',
+          manifestMetadata: expected.manifestMetadata,
         };
       }
 
@@ -1600,6 +1835,7 @@ export class SpeechTranscriptionAdapter {
           source: expected.source,
           verified: false,
           integrityStatus: 'MISMATCH',
+          manifestMetadata: expected.manifestMetadata,
         };
       }
 
@@ -1610,11 +1846,16 @@ export class SpeechTranscriptionAdapter {
         source: expected.source,
         verified: true,
         integrityStatus: 'VERIFIED',
+        manifestMetadata: expected.manifestMetadata,
       };
     };
 
     if (runtimeType === 'whisper_cpp') {
       if (!isModelConfigured || !modelPath) {
+        const missingLangProfile = resolveWhisperModelLanguageProfile(undefined, runtimeType, {
+          requestedLanguage,
+          modelFound: false,
+        });
         return {
           isConfigured: true,
           executableFound: true,
@@ -1623,10 +1864,14 @@ export class SpeechTranscriptionAdapter {
           version: versionStr,
           modelConfigured: false,
           modelFound: false,
+          modelType: missingLangProfile.modelType,
           modelSha256Verified: false,
           modelIntegrityStatus: 'MISSING_MODEL',
           runtimeType,
-          supportedLanguages: ['en', 'th'],
+          supportedLanguages: missingLangProfile.supportedLanguages,
+          thaiSpeechSupported: false,
+          transcriptionLanguage: missingLangProfile.transcriptionLanguage,
+          languageLimitation: missingLangProfile.languageLimitation,
           status: 'MISSING_MODEL',
           diagnosticCode: 'MODEL_NOT_CONFIGURED',
           details: 'whisper_cpp runtime strictly requires a valid GGML/GGUF model file via WHISPER_MODEL_PATH.'
@@ -1634,6 +1879,10 @@ export class SpeechTranscriptionAdapter {
       }
       const modelCheck = validateModelFile(modelPath, 'whisper_cpp');
       if (!modelCheck.valid) {
+        const invalidLangProfile = resolveWhisperModelLanguageProfile(modelPath, runtimeType, {
+          requestedLanguage,
+          modelFound: false,
+        });
         return {
           isConfigured: true,
           executableFound: true,
@@ -1643,10 +1892,15 @@ export class SpeechTranscriptionAdapter {
           modelConfigured: true,
           modelFound: false,
           modelPath,
+          ...(invalidLangProfile.modelName ? { modelName: invalidLangProfile.modelName } : {}),
+          modelType: invalidLangProfile.modelType,
           modelSha256Verified: false,
           modelIntegrityStatus: 'MISSING_MODEL',
           runtimeType,
-          supportedLanguages: ['en', 'th'],
+          supportedLanguages: invalidLangProfile.supportedLanguages,
+          thaiSpeechSupported: false,
+          transcriptionLanguage: invalidLangProfile.transcriptionLanguage,
+          languageLimitation: invalidLangProfile.languageLimitation,
           status: modelCheck.status || 'MISSING_MODEL',
           diagnosticCode: modelCheck.diagnosticCode || 'MODEL_INCOMPATIBLE',
           details: modelCheck.reason || `Invalid WHISPER_MODEL_PATH at ${modelPath}`
@@ -1658,7 +1912,13 @@ export class SpeechTranscriptionAdapter {
       modelSha256Source = hashCheck.source;
       modelSha256Verified = hashCheck.verified;
       modelIntegrityStatus = hashCheck.integrityStatus;
+      resolvedManifestMetadata = hashCheck.manifestMetadata;
       if (!hashCheck.ok) {
+        const hashFailProfile = resolveWhisperModelLanguageProfile(modelPath, runtimeType, {
+          manifestEntry: resolvedManifestMetadata,
+          requestedLanguage,
+          modelFound: false,
+        });
         return {
           isConfigured: true,
           executableFound: true,
@@ -1668,13 +1928,18 @@ export class SpeechTranscriptionAdapter {
           modelConfigured: true,
           modelFound: false,
           modelPath,
+          ...(hashFailProfile.modelName ? { modelName: hashFailProfile.modelName } : {}),
+          modelType: hashFailProfile.modelType,
           modelSha256,
           expectedModelSha256,
           modelSha256Source,
           modelSha256Verified: false,
           modelIntegrityStatus,
           runtimeType,
-          supportedLanguages: ['en', 'th'],
+          supportedLanguages: hashFailProfile.supportedLanguages,
+          thaiSpeechSupported: false,
+          transcriptionLanguage: hashFailProfile.transcriptionLanguage,
+          languageLimitation: hashFailProfile.languageLimitation,
           status: hashCheck.status || 'ERROR',
           diagnosticCode: hashCheck.diagnosticCode || 'MODEL_SHA256_MISMATCH',
           details: hashCheck.reason || `Model SHA-256 verification failed for ${modelPath}`
@@ -1689,6 +1954,10 @@ export class SpeechTranscriptionAdapter {
         } else {
           const modelCheck = validateModelFile(modelPath, 'openai_whisper');
           if (!modelCheck.valid) {
+            const invalidLangProfile = resolveWhisperModelLanguageProfile(modelPath, runtimeType, {
+              requestedLanguage,
+              modelFound: false,
+            });
             return {
               isConfigured: true,
               executableFound: true,
@@ -1698,10 +1967,15 @@ export class SpeechTranscriptionAdapter {
               modelConfigured: true,
               modelFound: false,
               modelPath,
+              ...(invalidLangProfile.modelName ? { modelName: invalidLangProfile.modelName } : {}),
+              modelType: invalidLangProfile.modelType,
               modelSha256Verified: false,
               modelIntegrityStatus: 'MISSING_MODEL',
               runtimeType,
-              supportedLanguages: ['en', 'th'],
+              supportedLanguages: invalidLangProfile.supportedLanguages,
+              thaiSpeechSupported: false,
+              transcriptionLanguage: invalidLangProfile.transcriptionLanguage,
+              languageLimitation: invalidLangProfile.languageLimitation,
               status: modelCheck.status || 'MISSING_MODEL',
               diagnosticCode: modelCheck.diagnosticCode || 'MODEL_INCOMPATIBLE',
               details: modelCheck.reason || `Invalid WHISPER_MODEL_PATH at ${modelPath}`
@@ -1713,7 +1987,13 @@ export class SpeechTranscriptionAdapter {
           modelSha256Source = hashCheck.source;
           modelSha256Verified = hashCheck.verified;
           modelIntegrityStatus = hashCheck.integrityStatus;
+          resolvedManifestMetadata = hashCheck.manifestMetadata;
           if (!hashCheck.ok) {
+            const hashFailProfile = resolveWhisperModelLanguageProfile(modelPath, runtimeType, {
+              manifestEntry: resolvedManifestMetadata,
+              requestedLanguage,
+              modelFound: false,
+            });
             return {
               isConfigured: true,
               executableFound: true,
@@ -1723,13 +2003,18 @@ export class SpeechTranscriptionAdapter {
               modelConfigured: true,
               modelFound: false,
               modelPath,
+              ...(hashFailProfile.modelName ? { modelName: hashFailProfile.modelName } : {}),
+              modelType: hashFailProfile.modelType,
               modelSha256,
               expectedModelSha256,
               modelSha256Source,
               modelSha256Verified: false,
               modelIntegrityStatus,
               runtimeType,
-              supportedLanguages: ['en', 'th'],
+              supportedLanguages: hashFailProfile.supportedLanguages,
+              thaiSpeechSupported: false,
+              transcriptionLanguage: hashFailProfile.transcriptionLanguage,
+              languageLimitation: hashFailProfile.languageLimitation,
               status: hashCheck.status || 'ERROR',
               diagnosticCode: hashCheck.diagnosticCode || 'MODEL_SHA256_MISMATCH',
               details: hashCheck.reason || `Model SHA-256 verification failed for ${modelPath}`
@@ -1738,6 +2023,42 @@ export class SpeechTranscriptionAdapter {
           modelFound = true;
         }
       }
+    }
+
+    const thaiVerified = Boolean(options?.thaiVerified || this.verifiedSpeechLanguages.has('th'));
+    const langProfile = resolveWhisperModelLanguageProfile(modelPath, runtimeType, {
+      manifestEntry: resolvedManifestMetadata,
+      requestedLanguage,
+      modelFound,
+      thaiVerified,
+    });
+
+    if (!langProfile.compatibleWithRequestedLanguage) {
+      return {
+        isConfigured: true,
+        executableFound: true,
+        executablePath: sttPath,
+        isExecutable: true,
+        version: versionStr,
+        modelConfigured: isModelConfigured,
+        modelFound,
+        modelPath,
+        ...(langProfile.modelName ? { modelName: langProfile.modelName } : {}),
+        modelType: langProfile.modelType,
+        modelSha256,
+        expectedModelSha256,
+        modelSha256Source,
+        modelSha256Verified,
+        modelIntegrityStatus,
+        runtimeType,
+        supportedLanguages: langProfile.supportedLanguages,
+        thaiSpeechSupported: langProfile.thaiSpeechSupported,
+        transcriptionLanguage: langProfile.transcriptionLanguage,
+        languageLimitation: langProfile.languageLimitation,
+        status: 'ERROR',
+        diagnosticCode: 'MODEL_INCOMPATIBLE',
+        details: langProfile.error || langProfile.languageLimitation
+      };
     }
 
     return {
@@ -1749,13 +2070,18 @@ export class SpeechTranscriptionAdapter {
       modelConfigured: isModelConfigured,
       modelFound,
       modelPath,
+      ...(langProfile.modelName ? { modelName: langProfile.modelName } : {}),
+      modelType: langProfile.modelType,
       modelSha256,
       expectedModelSha256,
       modelSha256Source,
       modelSha256Verified,
       modelIntegrityStatus,
       runtimeType,
-      supportedLanguages: ['en', 'th'],
+      supportedLanguages: langProfile.supportedLanguages,
+      thaiSpeechSupported: langProfile.thaiSpeechSupported,
+      transcriptionLanguage: langProfile.transcriptionLanguage,
+      languageLimitation: langProfile.languageLimitation,
       status: 'READY',
       diagnosticCode: 'READY',
       details: modelSha256Verified
@@ -2063,17 +2389,22 @@ export class SpeechTranscriptionAdapter {
 
     const sttPath = validation.executablePath!;
     const modelPath = validation.modelPath;
+    const explicitLang = normalizeWhisperLanguageCode(process.env.WHISPER_LANGUAGE);
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vr_whisper_compat_'));
 
     try {
       const outPrefix = path.join(tmpDir, 'whisper_out');
       const cliArgs: string[] = validation.runtimeType === 'whisper_cpp'
-        ? ['-m', modelPath!, '-f', canonicalFixturePath, '--output-json', '-of', outPrefix]
+        ? [
+            '-m', modelPath!, '-f', canonicalFixturePath, '--output-json', '-of', outPrefix,
+            ...(explicitLang ? ['-l', explicitLang] : [])
+          ]
         : [
             canonicalFixturePath,
             '--output_format', 'json',
             '--output_dir', tmpDir,
-            ...(modelPath ? ['--model', modelPath] : [])
+            ...(modelPath ? ['--model', modelPath] : []),
+            ...(explicitLang ? ['--language', explicitLang] : [])
           ];
 
       let stdout = '';
@@ -2480,6 +2811,25 @@ export class SpeechTranscriptionAdapter {
       }
       verificationStates.push(speechVerified ? 'TRANSCRIPT_VERIFIED' : 'NOT_VERIFIED');
 
+      const fixtureLang = normalizeWhisperLanguageCode(provenance.transcriptLanguage);
+      const verifiedLanguages: string[] = [];
+      if (speechVerified && fixtureLang && validation.modelType !== 'english-only') {
+        verifiedLanguages.push(fixtureLang);
+        if (fixtureLang === 'th') {
+          this.verifiedSpeechLanguages.add('th');
+        }
+      } else if (speechVerified && fixtureLang === 'en') {
+        verifiedLanguages.push('en');
+      }
+      const thaiSpeechVerified = verifiedLanguages.includes('th') && validation.modelType !== 'english-only';
+      const updatedValidation: WhisperRuntimeValidation = thaiSpeechVerified
+        ? {
+            ...validation,
+            supportedLanguages: Array.from(new Set([...validation.supportedLanguages, 'th'])),
+            thaiSpeechSupported: true,
+          }
+        : validation;
+
       const passResult: WhisperCompatibilityResult = {
         compatible: true,
         runtimeCompatible: true,
@@ -2493,8 +2843,10 @@ export class SpeechTranscriptionAdapter {
         verificationStates,
         speechTranscriptStatus,
         speechTranscriptVerified: speechVerified,
+        verifiedLanguages,
+        thaiSpeechVerified,
         runtimeType: validation.runtimeType,
-        validation,
+        validation: updatedValidation,
         audioFixturePath: resolvedFixturePath,
         transcriptText: extractedText,
         segmentsCount,
@@ -2542,20 +2894,32 @@ export class SpeechTranscriptionAdapter {
       requireModelSha256?: boolean;
       expectedModelSha256?: string;
       trustedModelManifestPath?: string;
+      language?: string;
     }
   ): Promise<LocalTranscriptionResult> {
     const startTime = Date.now();
 
-    // Enforce preflight runtime validation before transcription (including SHA-256 verification)
+    // Enforce preflight runtime validation before transcription (including SHA-256 and language capability)
     const validation = await this.validateRuntime({
       requireModelSha256: options?.requireModelSha256,
       expectedModelSha256: options?.expectedModelSha256,
       trustedModelManifestPath: options?.trustedModelManifestPath,
+      language: options?.language,
     });
+    const langFields = {
+      ...(validation.modelName ? { modelName: validation.modelName } : {}),
+      ...(validation.modelType ? { modelType: validation.modelType } : {}),
+      supportedLanguages: validation.supportedLanguages,
+      thaiSpeechSupported: Boolean(validation.thaiSpeechSupported),
+      ...(validation.transcriptionLanguage ? { transcriptionLanguage: validation.transcriptionLanguage } : {}),
+      ...(validation.languageLimitation ? { languageLimitation: validation.languageLimitation } : {}),
+    };
+
     if (validation.status === 'UNCONFIGURED') {
       return {
         status: 'NOT_ASSESSED',
         diagnosticCode: 'UNCONFIGURED',
+        ...langFields,
         compatibilityVerified: false,
         runtimeCompatible: false,
         runtimeCompatibilityStatus: 'UNCONFIGURED',
@@ -2584,6 +2948,7 @@ export class SpeechTranscriptionAdapter {
       return {
         status: 'ANALYSIS_UNAVAILABLE',
         diagnosticCode: validation.diagnosticCode,
+        ...langFields,
         compatibilityVerified: false,
         runtimeCompatible: false,
         runtimeCompatibilityStatus: 'FAILED',
@@ -2595,7 +2960,9 @@ export class SpeechTranscriptionAdapter {
         speechTranscriptStatus: 'SPEECH_TRANSCRIPT_UNVERIFIED',
         speechTranscriptVerified: false,
         failureReason,
-        limitations: `Whisper runtime validation failed with status ${validation.status}.`,
+        limitations: validation.diagnosticCode === 'MODEL_INCOMPATIBLE' && validation.languageLimitation
+          ? `${failureReason} (${validation.languageLimitation})`
+          : `Whisper runtime validation failed with status ${validation.status}.`,
         executionDurationMs: Date.now() - startTime
       };
     }
@@ -2647,6 +3014,7 @@ export class SpeechTranscriptionAdapter {
         return {
           status: 'ANALYSIS_UNAVAILABLE',
           diagnosticCode: compat.diagnosticCode,
+          ...langFields,
           compatibilityVerified: false,
           runtimeCompatible: false,
           runtimeCompatibilityStatus: compat.runtimeCompatibilityStatus,
@@ -2667,6 +3035,7 @@ export class SpeechTranscriptionAdapter {
 
     const sttPath = validation.executablePath!;
     const modelPath = validation.modelPath;
+    const requestedTxLang = normalizeWhisperLanguageCode(options?.language ?? process.env.WHISPER_LANGUAGE);
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vr_whisper_tx_'));
 
     try {
@@ -2763,12 +3132,18 @@ export class SpeechTranscriptionAdapter {
           }
         }
 
-        cliArgs = ['-m', modelPath, '-f', sttInputPath, '--output-json', '-of', outPrefix];
+        cliArgs = [
+          '-m', modelPath, '-f', sttInputPath, '--output-json', '-of', outPrefix,
+          ...(requestedTxLang ? ['-l', requestedTxLang] : [])
+        ];
       } else {
         // Verified openai_whisper CLI
         cliArgs = [videoPath, '--output_format', 'json', '--output_dir', tmpDir];
         if (modelPath) {
           cliArgs.push('--model', modelPath);
+        }
+        if (requestedTxLang) {
+          cliArgs.push('--language', requestedTxLang);
         }
       }
 
@@ -2986,6 +3361,9 @@ export class SpeechTranscriptionAdapter {
         : validSegments.map(s => s.text).join(' ').trim();
 
       let limitationNotes = 'Transcribed via local STT executable; automated transcripts may contain phonetic inaccuracies.';
+      if (validation.languageLimitation && !validation.thaiSpeechSupported) {
+        limitationNotes += ` ${validation.languageLimitation}`;
+      }
       if (rejectedTimestampsCount > 0) {
         limitationNotes += ` Note: ${rejectedTimestampsCount} invalid or out-of-order segment timestamp(s) were rejected.`;
       }
@@ -3007,6 +3385,7 @@ export class SpeechTranscriptionAdapter {
         status,
         transcriptText,
         segments: validSegments,
+        ...langFields,
         compatibilityVerified,
         runtimeCompatible: compatibilityVerified,
         runtimeCompatibilityStatus,
@@ -4090,7 +4469,15 @@ export class AudioProcessor {
           status: sttResult.status,
           executionDurationMs: sttResult.executionDurationMs,
           limitations: sttResult.limitations,
-          failureReason: sttResult.failureReason
+          failureReason: sttResult.failureReason,
+          details: {
+            ...(sttResult.modelName ? { modelName: sttResult.modelName } : {}),
+            ...(sttResult.modelType ? { modelType: sttResult.modelType } : {}),
+            supportedLanguages: sttResult.supportedLanguages || [],
+            thaiSpeechSupported: Boolean(sttResult.thaiSpeechSupported),
+            ...(sttResult.transcriptionLanguage ? { transcriptionLanguage: sttResult.transcriptionLanguage } : {}),
+            ...(sttResult.languageLimitation ? { languageLimitation: sttResult.languageLimitation } : {}),
+          }
         },
         audio_music_detection: {
           detectorName: 'music_classification_analyzer',
@@ -4127,6 +4514,11 @@ export class AudioProcessor {
         }
       };
 
+      const thaiLimitationSuffix =
+        sttResult.status === 'DETECTED' && sttResult.modelType === 'english-only' && !sttResult.thaiSpeechSupported
+          ? ` (English-only model '${sttResult.modelName || 'base.en'}': Thai speech is not supported.)`
+          : '';
+
       return {
         hasVoiceover,
         hasTimestampedVoiceover,
@@ -4143,14 +4535,14 @@ export class AudioProcessor {
           ? `Audio stream inspected. Acoustic energy present across ${Math.round(activeRatio * 100)}% of the timeline (mean volume ${meanVol} dB). ${
               sttResult.status === 'DETECTED' 
                 ? (hasTimestampedVoiceover 
-                    ? 'Speech transcription completed via local STT.' 
-                    : 'Speech transcription completed via local STT (plain-text transcript without segment timestamps; voiceover timeline ratio is unestimated).') 
+                    ? `Speech transcription completed via local STT.${thaiLimitationSuffix}`
+                    : `Speech transcription completed via local STT (plain-text transcript without segment timestamps; voiceover timeline ratio is unestimated).${thaiLimitationSuffix}`)
                 : 'Speech and voice narration are unverified without transcript analysis.'
             }`
           : (sttResult.status === 'DETECTED'
               ? (hasTimestampedVoiceover
-                  ? 'Low volume or quiet audio track. Speech transcription completed via local STT.'
-                  : 'Low volume or quiet audio track. Speech transcription completed via local STT (plain-text transcript without segment timestamps; voiceover timeline ratio is unestimated).')
+                  ? `Low volume or quiet audio track. Speech transcription completed via local STT.${thaiLimitationSuffix}`
+                  : `Low volume or quiet audio track. Speech transcription completed via local STT (plain-text transcript without segment timestamps; voiceover timeline ratio is unestimated).${thaiLimitationSuffix}`)
               : 'Low volume or quiet audio track.'),
         speechAnalysisStatus: sttResult.status,
         musicAnalysisStatus: musicResult.status,

@@ -74,6 +74,7 @@ export type StripeVerificationCategory =
 export type StripeStepStatus =
   | 'PASS'
   | 'SYNTHETIC TEST PASS'
+  | 'REAL CHECKOUT COMPLETED'
   | 'REAL STRIPE DELIVERY VERIFIED'
   | 'FAIL'
   | 'BLOCKED'
@@ -97,7 +98,7 @@ export interface StripeE2EStepResult {
 
 export interface StripeVerificationMatrix {
   checkoutSessionCreated: 'PASS' | 'NOT VERIFIED' | 'FAIL' | 'BLOCKED';
-  realCheckoutCompletion: 'REAL STRIPE DELIVERY VERIFIED' | 'NOT VERIFIED' | 'BLOCKED' | 'FAIL';
+  realCheckoutCompletion: 'REAL CHECKOUT COMPLETED' | 'REAL STRIPE DELIVERY VERIFIED' | 'NOT VERIFIED' | 'BLOCKED' | 'FAIL';
   realStripeWebhookDelivery: 'REAL STRIPE DELIVERY VERIFIED' | 'NOT VERIFIED' | 'BLOCKED' | 'FAIL';
   syntheticWebhookTests: 'SYNTHETIC TEST PASS' | 'NOT VERIFIED' | 'FAIL';
   customerSubscriptionCorrelation: 'PASS' | 'SYNTHETIC TEST PASS' | 'REAL STRIPE DELIVERY VERIFIED' | 'NOT VERIFIED' | 'FAIL';
@@ -313,6 +314,230 @@ function defaultMatrix(): StripeVerificationMatrix {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export interface ExpectedRealCheckoutWebhookTarget {
+  sessionId: string;
+  ownerUserId?: string;
+  customerId?: string;
+  subscriptionId?: string;
+}
+
+export interface WebhookCorrelationEvaluation {
+  valid: boolean;
+  claimsTargetSession: boolean;
+  reason?: string;
+}
+
+/**
+ * Validates that an event ID conforms to genuine Stripe event ID structure (`evt_<base62>`)
+ * and does not carry synthetic/test/mock/preflight markers.
+ */
+export function isGenuineStripeWebhookEventId(eventId: string): boolean {
+  const trimmed = (eventId || '').trim();
+  if (!/^evt_[A-Za-z0-9]{14,}$/.test(trimmed)) return false;
+  if (/^evt_(synth|test|mock|sim|fake|preflight)/i.test(trimmed)) return false;
+  return true;
+}
+
+/**
+ * Evaluates a persisted `webhook_events` row against a completed Stripe Test Mode Checkout Session.
+ * Fails closed unless ALL correlation, livemode=false, anti-synthetic, and signatureVerified=true
+ * invariants hold strictly.
+ */
+export function evaluateRealCheckoutWebhookRow(
+  row: any,
+  expected: ExpectedRealCheckoutWebhookTarget
+): WebhookCorrelationEvaluation {
+  const eventId = String(row?.event_id || '').trim();
+  const provider = String(row?.provider || 'stripe').trim();
+  const eventType = String(row?.event_type || '').trim();
+
+  if (provider !== 'stripe' || eventType !== 'checkout.session.completed') {
+    return {
+      valid: false,
+      claimsTargetSession: false,
+      reason: `Unexpected provider/eventType (${provider}/${eventType})`,
+    };
+  }
+
+  let payload: any;
+  try {
+    payload = JSON.parse(row?.payload_json || '{}');
+  } catch {
+    return {
+      valid: false,
+      claimsTargetSession: false,
+      reason: `Malformed payload_json for webhook ${eventId || '(empty)'}`,
+    };
+  }
+
+  const rawDataObject = payload?.data?.object;
+  const dataObjectId =
+    (typeof payload?.dataObjectId === 'string' && payload.dataObjectId.trim()) ||
+    (typeof rawDataObject?.id === 'string' && rawDataObject.id.trim()) ||
+    (typeof payload?.sessionId === 'string' && payload.sessionId.trim()) ||
+    '';
+  const claimsTargetSession = Boolean(dataObjectId && dataObjectId === expected.sessionId);
+
+  // 1. Reject synthetic markers or synthetic event IDs even if evt_ prefixed
+  if (
+    payload?.isSynthetic === true ||
+    payload?.synthetic === true ||
+    rawDataObject?.metadata?.isSynthetic === 'true' ||
+    Boolean(payload?.__syntheticTestMarker) ||
+    /^evt_(synth|test|mock|sim|fake|preflight)/i.test(eventId)
+  ) {
+    return {
+      valid: false,
+      claimsTargetSession,
+      reason: `Synthetic webhook event '${eventId}' rejected for Real Stripe Delivery verification`,
+    };
+  }
+
+  // 2. Require genuine Stripe event ID format (evt_<alphanumeric >=14>)
+  if (!isGenuineStripeWebhookEventId(eventId)) {
+    return {
+      valid: false,
+      claimsTargetSession,
+      reason: `Event ID '${eventId}' does not match genuine Stripe event ID format (evt_<alphanumeric>)`,
+    };
+  }
+
+  // 3. Require exact Checkout Session data.object.id correlation
+  if (!dataObjectId) {
+    return {
+      valid: false,
+      claimsTargetSession: false,
+      reason: `Webhook ${eventId} missing data.object.id / sessionId correlation`,
+    };
+  }
+  if (dataObjectId !== expected.sessionId) {
+    return {
+      valid: false,
+      claimsTargetSession: false,
+      reason: `Webhook ${eventId} targets different Checkout Session '${dataObjectId}' (expected '${expected.sessionId}')`,
+    };
+  }
+
+  // 4. Owner user check when specified
+  if (expected.ownerUserId && String(row?.user_id || '').trim() !== expected.ownerUserId) {
+    return {
+      valid: false,
+      claimsTargetSession,
+      reason: `Webhook ${eventId} user_id '${row?.user_id || 'null'}' does not match session owner '${expected.ownerUserId}'`,
+    };
+  }
+
+  // 5. Require explicit livemode === false
+  const webhookLivemode =
+    typeof payload?.livemode === 'boolean'
+      ? payload.livemode
+      : rawDataObject?.livemode;
+  if (webhookLivemode === true) {
+    return {
+      valid: false,
+      claimsTargetSession,
+      reason: `Webhook ${eventId} reports livemode=true (strictly rejected in Test Mode verification)`,
+    };
+  }
+  if (webhookLivemode !== false) {
+    return {
+      valid: false,
+      claimsTargetSession,
+      reason: `Webhook ${eventId} missing strict livemode=false verification metadata`,
+    };
+  }
+
+  // 6. Require explicit cryptographic webhook signature verification proof
+  if (payload?.signatureVerified !== true) {
+    return {
+      valid: false,
+      claimsTargetSession,
+      reason: `Webhook ${eventId} lacks cryptographic signature verification proof (signatureVerified=true)`,
+    };
+  }
+
+  // 7. Strict Customer ID correlation
+  const webhookCustomerId =
+    (typeof payload?.customerId === 'string' && payload.customerId.trim()) ||
+    (typeof rawDataObject?.customer === 'string'
+      ? rawDataObject.customer.trim()
+      : typeof rawDataObject?.customer?.id === 'string'
+        ? rawDataObject.customer.id.trim()
+        : '');
+  if (expected.customerId) {
+    if (!webhookCustomerId || webhookCustomerId !== expected.customerId) {
+      return {
+        valid: false,
+        claimsTargetSession,
+        reason: `Webhook ${eventId} customerId '${webhookCustomerId || 'missing'}' mismatches session customer '${expected.customerId}'`,
+      };
+    }
+  } else if (webhookCustomerId) {
+    return {
+      valid: false,
+      claimsTargetSession,
+      reason: `Webhook ${eventId} unexpectedly carries customerId '${webhookCustomerId}'`,
+    };
+  }
+
+  // 8. Strict Subscription ID correlation
+  const webhookSubId =
+    (typeof payload?.subscriptionId === 'string' && payload.subscriptionId.trim()) ||
+    (typeof rawDataObject?.subscription === 'string'
+      ? rawDataObject.subscription.trim()
+      : typeof rawDataObject?.subscription?.id === 'string'
+        ? rawDataObject.subscription.id.trim()
+        : '');
+  if (expected.subscriptionId) {
+    if (!webhookSubId || webhookSubId !== expected.subscriptionId) {
+      return {
+        valid: false,
+        claimsTargetSession,
+        reason: `Webhook ${eventId} subscriptionId '${webhookSubId || 'missing'}' mismatches session subscription '${expected.subscriptionId}'`,
+      };
+    }
+  } else if (webhookSubId) {
+    return {
+      valid: false,
+      claimsTargetSession,
+      reason: `Webhook ${eventId} unexpectedly carries subscriptionId '${webhookSubId}' for non-subscription session`,
+    };
+  }
+
+  return { valid: true, claimsTargetSession: true };
+}
+
+/**
+ * Searches SQLite `webhook_events` for a genuine, signature-verified, non-synthetic
+ * `checkout.session.completed` event matching the exact Checkout Session, Customer, Subscription, and livemode=false.
+ */
+export function findVerifiedRealCheckoutWebhook(
+  db: any,
+  expected: ExpectedRealCheckoutWebhookTarget
+): {
+  matched: any | null;
+  rejections: Array<{ eventId: string; claimsTargetSession: boolean; reason: string }>;
+} {
+  const rows = db
+    .prepare("SELECT * FROM webhook_events WHERE event_type = 'checkout.session.completed'")
+    .all() as any[];
+
+  const rejections: Array<{ eventId: string; claimsTargetSession: boolean; reason: string }> = [];
+  for (const row of rows) {
+    const evalRes = evaluateRealCheckoutWebhookRow(row, expected);
+    if (evalRes.valid) {
+      return { matched: row, rejections };
+    }
+    rejections.push({
+      eventId: String(row?.event_id || ''),
+      claimsTargetSession: evalRes.claimsTargetSession,
+      reason: evalRes.reason || 'Webhook correlation check failed',
+    });
+  }
+
+  return { matched: null, rejections };
 }
 
 export async function runStripeTestModeE2E(options?: {
@@ -595,12 +820,12 @@ export async function runStripeTestModeE2E(options?: {
           };
         }
 
-        matrix.realCheckoutCompletion = 'REAL STRIPE DELIVERY VERIFIED';
+        matrix.realCheckoutCompletion = 'REAL CHECKOUT COMPLETED';
         addStep({
           step: '2. Real Stripe Checkout Session Completion Check',
           category: 'REAL_CHECKOUT_E2E',
           isSyntheticWebhook: false,
-          status: 'REAL STRIPE DELIVERY VERIFIED',
+          status: 'REAL CHECKOUT COMPLETED',
           details: `Verified real Stripe Checkout Session ${session.id} is status='complete', payment_status='${session.payment_status}', livemode=false.`,
         });
 
@@ -625,7 +850,7 @@ export async function runStripeTestModeE2E(options?: {
             timestamp: new Date().toISOString(),
             steps,
             createdStripeIds,
-            boundaryNote: 'BLOCKED — Real Checkout completion confirmed via Stripe API, but --db-path is required to verify genuine Stripe webhook delivery & SQLite correlation.',
+            boundaryNote: 'REAL CHECKOUT COMPLETED, but verification is BLOCKED because --db-path is required to verify genuine Stripe webhook delivery & SQLite correlation.',
           };
         }
 
@@ -634,26 +859,49 @@ export async function runStripeTestModeE2E(options?: {
         const ownerUserId = (session.client_reference_id || session.metadata?.userId || '').trim();
         const planId = (session.metadata?.planId || '').trim();
 
-        const webhookRows = (storage as any).db
-          .prepare("SELECT * FROM webhook_events WHERE event_type = 'checkout.session.completed' AND event_id LIKE 'evt_%'")
-          .all() as any[];
-        const matchedRealWebhook = webhookRows.find((w) => {
-          try {
-            const p = JSON.parse(w.payload_json || '{}');
-            return w.user_id === ownerUserId && (!p.isSynthetic);
-          } catch {
-            return w.user_id === ownerUserId;
-          }
+        const webhookSearch = findVerifiedRealCheckoutWebhook((storage as any).db, {
+          sessionId: session.id,
+          ownerUserId,
+          customerId: sessionCustomerId,
+          subscriptionId: sessionSubId,
         });
+        const matchedRealWebhook = webhookSearch.matched;
 
         if (!matchedRealWebhook) {
+          const targetSessionDefect = webhookSearch.rejections.find((r) => r.claimsTargetSession);
+          const failureReasons = webhookSearch.rejections.map((r) => `${r.eventId}: ${r.reason}`).join('; ');
+          if (targetSessionDefect) {
+            matrix.realStripeWebhookDelivery = 'FAIL';
+            addStep({
+              step: '3. Real Stripe Webhook Delivery Integrity & Correlation Check',
+              category: 'REAL_CHECKOUT_E2E',
+              isSyntheticWebhook: false,
+              status: 'FAIL',
+              details: `Rejected webhook record for Checkout Session ${session.id}: ${targetSessionDefect.reason}`,
+            });
+            return {
+              mode,
+              testCategory,
+              overallStatus: 'FAIL',
+              exitCode: 1,
+              realCheckoutCompletionVerified: true,
+              realStripeWebhookDeliveryVerified: false,
+              syntheticWebhookTestsStatus: 'NOT_RUN',
+              verificationMatrix: matrix,
+              timestamp: new Date().toISOString(),
+              steps,
+              createdStripeIds,
+              boundaryNote: `REAL CHECKOUT COMPLETED, but webhook delivery integrity/correlation FAILED for ${session.id}: ${targetSessionDefect.reason}`,
+            };
+          }
+
           matrix.realStripeWebhookDelivery = 'BLOCKED';
           addStep({
             step: '3. Real Stripe Webhook Delivery Check',
             category: 'REAL_CHECKOUT_E2E',
             isSyntheticWebhook: false,
             status: 'BLOCKED',
-            details: `No genuine Stripe-delivered checkout.session.completed event (evt_...) found in webhook_events for user '${ownerUserId}'.`,
+            details: `No genuine signature-verified Stripe checkout.session.completed event matching session '${session.id}' found in webhook_events.${failureReasons ? ` Rejected non-matching rows: ${failureReasons}` : ''}`,
           });
           return {
             mode,
@@ -667,7 +915,7 @@ export async function runStripeTestModeE2E(options?: {
             timestamp: new Date().toISOString(),
             steps,
             createdStripeIds,
-            boundaryNote: 'BLOCKED — Real Checkout Session is complete, but real Stripe webhook delivery (evt_... in webhook_events) was not observed.',
+            boundaryNote: `REAL CHECKOUT COMPLETED for ${session.id}, but genuine Stripe webhook delivery & session correlation was not observed (BLOCKED).`,
           };
         }
 
@@ -812,6 +1060,7 @@ export async function runStripeTestModeE2E(options?: {
       const deadlineMs = Date.now() + waitSeconds * 1000;
       let completedSession: Stripe.Checkout.Session | null = null;
       let deliveredWebhookRow: any = null;
+      let lastRejections: Array<{ eventId: string; claimsTargetSession: boolean; reason: string }> = [];
 
       while (Date.now() < deadlineMs) {
         const s = await stripeClient.checkout.sessions.retrieve(checkoutData.sessionId, {
@@ -819,18 +1068,53 @@ export async function runStripeTestModeE2E(options?: {
         });
         const isPaid = s.status === 'complete' && (s.payment_status === 'paid' || s.payment_status === 'no_payment_required');
         if (isPaid) {
+          assert.strictEqual(s.livemode, false, 'Completed Checkout Session must be livemode=false (Test Mode)');
           completedSession = s;
-          const webhookRows = (storage as any).db
-            .prepare("SELECT * FROM webhook_events WHERE event_type = 'checkout.session.completed' AND event_id LIKE 'evt_%'")
-            .all() as any[];
-          deliveredWebhookRow = webhookRows.find((w) => w.user_id === userAData.user.id);
+          const expectedCustomerId = typeof s.customer === 'string' ? s.customer : s.customer?.id;
+          const expectedSubId = typeof s.subscription === 'string' ? s.subscription : s.subscription?.id;
+          const webhookSearch = findVerifiedRealCheckoutWebhook((storage as any).db, {
+            sessionId: checkoutData.sessionId,
+            ownerUserId: userAData.user.id,
+            customerId: expectedCustomerId,
+            subscriptionId: expectedSubId,
+          });
+          lastRejections = webhookSearch.rejections;
+          deliveredWebhookRow = webhookSearch.matched;
           if (deliveredWebhookRow) break;
         }
         await sleep(2000);
       }
 
       if (!completedSession || !deliveredWebhookRow) {
-        matrix.realCheckoutCompletion = completedSession ? 'REAL STRIPE DELIVERY VERIFIED' : 'BLOCKED';
+        const targetSessionDefect = lastRejections.find((r) => r.claimsTargetSession);
+        if (completedSession && targetSessionDefect) {
+          matrix.realCheckoutCompletion = 'REAL CHECKOUT COMPLETED';
+          matrix.realStripeWebhookDelivery = 'FAIL';
+          addStep({
+            step: '3. Real Stripe Webhook Delivery Integrity & Correlation Check',
+            category: 'REAL_CHECKOUT_E2E',
+            isSyntheticWebhook: false,
+            status: 'FAIL',
+            details: `Checkout ${checkoutData.sessionId} completed (REAL CHECKOUT COMPLETED), but webhook delivery failed integrity check: ${targetSessionDefect.reason}`,
+          });
+          return {
+            mode,
+            testCategory,
+            overallStatus: 'FAIL',
+            exitCode: 1,
+            realCheckoutCompletionVerified: true,
+            realStripeWebhookDeliveryVerified: false,
+            syntheticWebhookTestsStatus: 'NOT_RUN',
+            verificationMatrix: matrix,
+            timestamp: new Date().toISOString(),
+            steps,
+            createdStripeIds,
+            checkoutUrl,
+            boundaryNote: `REAL CHECKOUT COMPLETED, but genuine Stripe webhook correlation FAILED: ${targetSessionDefect.reason}`,
+          };
+        }
+
+        matrix.realCheckoutCompletion = completedSession ? 'REAL CHECKOUT COMPLETED' : 'BLOCKED';
         matrix.realStripeWebhookDelivery = 'BLOCKED';
         addStep({
           step: '3. Real Stripe Checkout Completion & Real Webhook Delivery Wait',
@@ -839,7 +1123,7 @@ export async function runStripeTestModeE2E(options?: {
           status: 'BLOCKED',
           details: !completedSession
             ? `Timed out after ${waitSeconds}s awaiting real Checkout payment completion for ${checkoutData.sessionId}.`
-            : `Checkout ${checkoutData.sessionId} completed, but timed out awaiting genuine Stripe webhook delivery to /api/billing/webhook.`,
+            : `Checkout ${checkoutData.sessionId} status='REAL CHECKOUT COMPLETED', but timed out awaiting genuine signature-verified Stripe webhook delivery to /api/billing/webhook.`,
         });
         return {
           mode,
@@ -854,11 +1138,13 @@ export async function runStripeTestModeE2E(options?: {
           steps,
           createdStripeIds,
           checkoutUrl,
-          boundaryNote: 'BLOCKED — Timed out awaiting real Checkout payment completion and/or real Stripe webhook delivery.',
+          boundaryNote: completedSession
+            ? 'REAL CHECKOUT COMPLETED, but BLOCKED awaiting genuine Stripe webhook delivery to /api/billing/webhook.'
+            : 'BLOCKED — Timed out awaiting real Checkout payment completion and real Stripe webhook delivery.',
         };
       }
 
-      matrix.realCheckoutCompletion = 'REAL STRIPE DELIVERY VERIFIED';
+      matrix.realCheckoutCompletion = 'REAL CHECKOUT COMPLETED';
       matrix.realStripeWebhookDelivery = 'REAL STRIPE DELIVERY VERIFIED';
 
       const sessionCustomerId = typeof completedSession.customer === 'string' ? completedSession.customer : completedSession.customer?.id;
