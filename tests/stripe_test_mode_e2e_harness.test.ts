@@ -2,6 +2,7 @@ import assert from 'assert';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import {
+  parseStripeHarnessCliArgs,
   runStripeTestModeE2E,
   validateStripeE2ESafetyGuards,
 } from '../scripts/verify-stripe-test-mode-e2e';
@@ -107,13 +108,113 @@ export async function runStripeTestModeE2EHarnessTests() {
     }
   );
   const rawOut = preflightExec.stdout.trim();
-  const jsonStart = rawOut.indexOf('{');
+  const jsonStart = rawOut.startsWith('{')
+    ? 0
+    : (rawOut.lastIndexOf('\n{') >= 0 ? rawOut.lastIndexOf('\n{') + 1 : rawOut.indexOf('{'));
   assert.ok(jsonStart >= 0, `Expected JSON object in --json output, got: ${rawOut}`);
   const preflightReport = JSON.parse(rawOut.slice(jsonStart));
   assert.strictEqual(preflightReport.overallStatus, 'PASS', `3.1 Preflight PASS (got ${preflightReport.overallStatus}: ${preflightReport.boundaryNote})`);
   assert.strictEqual(preflightReport.exitCode, 0, '3.2 Preflight exitCode=0');
-  assert.ok(preflightReport.steps.some((s: any) => s.step.includes('Preflight Route') && s.status === 'PASS'), '3.3 SQLite schema & route step passed');
+  assert.strictEqual(preflightReport.testCategory, 'PREFLIGHT_ONLY', '3.3 Preflight category explicitly labeled');
+  assert.strictEqual(preflightReport.realCheckoutCompletionVerified, false, '3.4 Preflight never claims real checkout');
+  assert.strictEqual(preflightReport.realStripeWebhookDeliveryVerified, false, '3.5 Preflight never claims real webhook delivery');
+  assert.strictEqual(preflightReport.syntheticWebhookTestsStatus, 'NOT_RUN', '3.6 Preflight does not run synthetic webhook tests');
+  assert.ok(preflightReport.steps.some((s: any) => s.step.includes('Preflight Route') && s.status === 'PASS'), '3.7 SQLite schema & route step passed');
   console.log('  ✅ PASS: --preflight-only verified isolated DB schema, rawBody server & readiness');
+
+  // 4. Category 1 (synthetic-api) vs Category 2 (real-checkout) separation & fail-closed contracts
+  console.log('\n[4. Category 1 (Synthetic API) vs Category 2 (Real Checkout-to-Webhook) Boundaries]');
+  const parsedDefault = parseStripeHarnessCliArgs([]);
+  assert.strictEqual(parsedDefault.mode, 'synthetic-api', '4.1 Default mode is Category 1 synthetic-api');
+
+  const parsedReal = parseStripeHarnessCliArgs([
+    '--mode=real-checkout',
+    '--session-id=cs_test_123',
+    '--listen-port=3000',
+    '--wait-seconds=60',
+    '--db-path=/tmp/vr_test.db',
+    '--json',
+  ]);
+  assert.strictEqual(parsedReal.mode, 'real-checkout', '4.2 Parses --mode=real-checkout');
+  assert.strictEqual(parsedReal.sessionId, 'cs_test_123', '4.3 Parses --session-id');
+  assert.strictEqual(parsedReal.listenPort, 3000, '4.4 Parses --listen-port');
+  assert.strictEqual(parsedReal.waitSeconds, 60, '4.5 Parses --wait-seconds');
+  assert.strictEqual(parsedReal.dbPath, '/tmp/vr_test.db', '4.6 Parses --db-path');
+  assert.strictEqual(parsedReal.json, true, '4.7 Parses --json');
+
+  const cat1Blocked = await runStripeTestModeE2E({
+    mode: 'synthetic-api',
+    env: { NODE_ENV: 'test', DEPLOYMENT_ENV: 'test' },
+  });
+  assert.strictEqual(cat1Blocked.overallStatus, 'BLOCKED', '4.8 Category 1 blocked without Stripe ENV');
+  assert.strictEqual(cat1Blocked.exitCode, 2, '4.9 Category 1 exitCode=2 when blocked');
+  assert.strictEqual(cat1Blocked.testCategory, 'CATEGORY_1_AUTOMATED_API_AND_SYNTHETIC_WEBHOOK', '4.10 Category 1 label enforced');
+  assert.strictEqual(cat1Blocked.realCheckoutCompletionVerified, false, '4.11 Category 1 cannot verify real checkout');
+  assert.strictEqual(cat1Blocked.realStripeWebhookDeliveryVerified, false, '4.12 Category 1 cannot verify real webhook');
+
+  const cat2Blocked = await runStripeTestModeE2E({
+    mode: 'real-checkout',
+    env: { NODE_ENV: 'test', DEPLOYMENT_ENV: 'test' },
+  });
+  assert.strictEqual(cat2Blocked.overallStatus, 'BLOCKED', '4.13 Category 2 blocked without Stripe ENV');
+  assert.strictEqual(cat2Blocked.exitCode, 2, '4.14 Category 2 exitCode=2 when blocked');
+  assert.strictEqual(cat2Blocked.testCategory, 'CATEGORY_2_REAL_CHECKOUT_TO_WEBHOOK', '4.15 Category 2 label enforced');
+  assert.strictEqual(cat2Blocked.realCheckoutCompletionVerified, false, '4.16 Category 2 never falsifies real checkout');
+  assert.strictEqual(cat2Blocked.realStripeWebhookDeliveryVerified, false, '4.17 Category 2 never falsifies real webhook');
+  assert.strictEqual(cat2Blocked.syntheticWebhookTestsStatus, 'NOT_RUN', '4.18 Category 2 never substitutes synthetic webhook tests');
+
+  const invalidSessionReport = await runStripeTestModeE2E({
+    mode: 'real-checkout',
+    sessionId: 'cs_live_fake_invalid_prefix',
+    env: {
+      NODE_ENV: 'test',
+      DEPLOYMENT_ENV: 'test',
+      PAYMENT_MODE: 'test',
+      STRIPE_SECRET_KEY: 'sk_test_1234567890abcdefghij',
+      STRIPE_WEBHOOK_SECRET: 'whsec_testsecret1234567890abcdef',
+    },
+  });
+  assert.strictEqual(invalidSessionReport.overallStatus, 'FAIL', '4.19 Category 2 rejects non-cs_test_ session ID');
+  assert.strictEqual(invalidSessionReport.exitCode, 1, '4.20 Invalid session ID exits with code 1');
+  assert.strictEqual(invalidSessionReport.realCheckoutCompletionVerified, false, '4.21 Rejected session leaves real checkout unverified');
+  assert.strictEqual(invalidSessionReport.realStripeWebhookDeliveryVerified, false, '4.22 Rejected session leaves real webhook unverified');
+  assert.strictEqual(invalidSessionReport.verificationMatrix.realCheckoutCompletion, 'FAIL', '4.23 Matrix marks realCheckoutCompletion FAIL');
+  assert.ok(
+    invalidSessionReport.steps.some((s) => s.step.includes('Prefix Validation') && s.status === 'FAIL'),
+    '4.23b Executed session prefix validation step'
+  );
+
+  const cat2ProdDbGuard = await runStripeTestModeE2E({
+    mode: 'real-checkout',
+    dbPath: 'data/videorisk.db',
+    env: {
+      NODE_ENV: 'test',
+      DEPLOYMENT_ENV: 'test',
+      PAYMENT_MODE: 'test',
+      STRIPE_SECRET_KEY: 'sk_test_1234567890abcdefghij',
+      STRIPE_WEBHOOK_SECRET: 'whsec_testsecret1234567890abcdef',
+    },
+  });
+  assert.strictEqual(cat2ProdDbGuard.overallStatus, 'FAIL', '4.24 Category 2 refuses production videorisk.db target');
+  assert.strictEqual(cat2ProdDbGuard.exitCode, 1, '4.25 Category 2 prod DB guard exits 1');
+  assert.ok(cat2ProdDbGuard.steps.some((s) => s.details.includes('SAFETY VIOLATION')), '4.26 Reports SAFETY VIOLATION');
+
+  let realSubprocessExitCode = 0;
+  let realSubprocessStdout = '';
+  try {
+    const res = await execFileAsync('npx', ['tsx', 'scripts/verify-stripe-test-mode-e2e.ts', '--mode=real-checkout'], {
+      cwd: process.cwd(),
+      env: cleanChildEnv,
+      timeout: 20000,
+    });
+    realSubprocessStdout = res.stdout;
+  } catch (err: any) {
+    realSubprocessExitCode = err?.code ?? 1;
+    realSubprocessStdout = `${err?.stdout || ''}\n${err?.stderr || ''}`;
+  }
+  assert.strictEqual(realSubprocessExitCode, 2, `4.27 Category 2 CLI exited with code 2 when creds absent (got ${realSubprocessExitCode})`);
+  assert.ok(realSubprocessStdout.includes('BLOCKED — AWAITING ENV'), '4.28 Category 2 CLI outputs BLOCKED — AWAITING ENV');
+  console.log('  ✅ PASS: Category 1 vs Category 2 boundaries and fail-closed guards enforced');
 
   console.log('\n======================================================');
   console.log('🎉 ALL STRIPE TEST MODE E2E HARNESS TESTS PASSED!');

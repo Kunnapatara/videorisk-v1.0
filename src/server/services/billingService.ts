@@ -2315,16 +2315,25 @@ export class BillingService {
                   user.creditsRemaining += creditAllocation;
                 }
 
+                const existingInitialPayment = !isRenewal
+                  ? this.findPaymentRecord(state, {
+                      invoiceId: invoice.id,
+                      paymentIntentId: invoicePaymentIntentId,
+                      chargeId: invoiceChargeId,
+                    })
+                  : null;
+
                 const invPayment = this.upsertStripePayment(state, {
-                  id: `pay_inv_${invoice.id || event.id}`,
+                  id: existingInitialPayment?.id || `pay_inv_${invoice.id || event.id}`,
                   userId: sub.userId,
+                  sessionId: existingInitialPayment?.sessionId,
                   paymentIntentId: invoicePaymentIntentId,
                   chargeId: invoiceChargeId,
                   invoiceId: invoice.id,
                   subscriptionId: subId,
                   customerId: invoiceCustomerId || user.stripeCustomerId,
                   planId: sub.planId,
-                  creditsGranted: isRenewal ? this.getPlanCreditAllocation(sub.planId) : this.getPlanCreditAllocation(sub.planId),
+                  creditsGranted: existingInitialPayment?.creditsGranted ?? this.getPlanCreditAllocation(sub.planId),
                   amountTotal: typeof invoice.amount_paid === 'number' ? invoice.amount_paid : undefined,
                   currency: invoice.currency || undefined,
                   status: 'paid',

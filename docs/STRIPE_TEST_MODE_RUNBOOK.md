@@ -1,8 +1,14 @@
 # VideoRisk v1.0 — Stripe Test Mode End-to-End Verification Runbook (Staging WS4)
 
-> **Verification Boundary Statement:**
-> The automated test suite (`npm run test:billing`) exercises real Stripe HMAC webhook signature verification (`Stripe.webhooks.generateTestHeaderString` / `webhooks.constructEvent`) and real SQLite database transactions against **mocked Stripe SDK responses**. Live Stripe Test Mode API calls (`sk_test_...`) and Stripe CLI webhooks are **NOT VERIFIED** in isolated environments without Stripe Test credentials.
-> You MUST complete this runbook in an authorized staging environment before claiming real Stripe Test Mode E2E verification.
+> **Verification Boundary & Status Taxonomy:**
+> This project strictly enforces the following verification status labels and prohibits claiming `SYNTHETIC TEST PASS` as `REAL STRIPE DELIVERY VERIFIED`:
+> - **`PASS`** — Deterministic offline/CI safety guard, schema, route, or API session-creation check passed.
+> - **`SYNTHETIC TEST PASS`** — Category 1 test passed using Stripe Test APIs + locally crafted HMAC events (`stripe.webhooks.generateTestHeaderString()`). **Does NOT prove real Stripe Checkout completion or genuine Stripe webhook delivery.**
+> - **`REAL STRIPE DELIVERY VERIFIED`** — Category 2 end-to-end verification completed: actual Stripe Test Mode Checkout payment (`status=complete`, `payment_status=paid`, `livemode=false`) + genuine Stripe-delivered webhook (`evt_...` via `stripe listen` or staging endpoint) + full SQLite correlation (`users`, `subscriptions`, `stripe_payments`, `credit_transactions`).
+> - **`BLOCKED`** — Real external credentials (`STRIPE_SECRET_KEY=sk_test_...`, `STRIPE_WEBHOOK_SECRET=whsec_...`), browser Checkout completion, or `stripe listen` delivery unavailable in the current environment (`exitCode=2`).
+> - **`NOT VERIFIED`** — Not executed yet in the specified category.
+>
+> In isolated CI/container environments without `sk_test_...`, `whsec_...`, browser checkout, and Stripe CLI, **Real Checkout Completion** and **Real Stripe Webhook Delivery** remain **`BLOCKED` / `NOT VERIFIED`**.
 
 ---
 
@@ -30,12 +36,14 @@ MEDIA_TOKEN_SECRET=replace_with_at_least_32_char_random_hex_secret
 STRIPE_SECRET_KEY=sk_test_...
 STRIPE_WEBHOOK_SECRET=whsec_...
 
-# Optional pre-created Stripe Test Mode Price IDs (if omitted in staging, dynamic test line items are used)
+# Recommended for staging so customer.subscription.created/updated webhooks map prices cleanly without rejected_unmapped_price
 STRIPE_PRICE_AUDIT_ONCE=price_...
 STRIPE_PRICE_CREATOR=price_...
 STRIPE_PRICE_PRO=price_...
 STRIPE_PRICE_AGENCY=price_...
 ```
+
+> **Note on `STRIPE_PRICE_*`:** `POST /api/billing/checkout` falls back to inline `price_data` if `STRIPE_PRICE_*` vars are omitted in staging, which works for `checkout.session.completed` (via `session.metadata.planId`). However, configuring pre-created Stripe Test Mode `STRIPE_PRICE_CREATOR`, `STRIPE_PRICE_PRO`, and `STRIPE_PRICE_AGENCY` IDs is strongly recommended so subsequent `customer.subscription.created` / `updated` webhooks resolve the exact plan without `rejected_unmapped_price`.
 
 Validate staging configuration fail-closed before building or starting the server:
 
@@ -73,7 +81,7 @@ Copy the temporary webhook signing secret (`whsec_...`) output by `stripe listen
 
 ---
 
-## 3. End-to-End Verification Checklist (Stripe Test Mode)
+## 3. End-to-End Verification Checklist (Category 2: Real Stripe Test Mode)
 
 ### Case 1: Invalid / Tampered Webhook Signature (Must Reject 400)
 ```bash
@@ -136,23 +144,39 @@ Record before signing off staging Stripe verification:
 
 ---
 
-## 5. Automated Stripe Test Mode E2E Verification Harness
+## 5. Automated Verification Harness (`scripts/verify-stripe-test-mode-e2e.ts`)
 
-Repository includes an isolated, non-destructive verification harness (`scripts/verify-stripe-test-mode-e2e.ts`) covering `Checkout -> Invalid Signature 400 -> Paid Subscription Webhook -> Subscription Update (incl. omitted current_period_end) -> Unknown Price Guard -> Idempotency Replay -> Partial/Full Refund Clawback -> Cancellation -> Cleanup`:
+The repository includes an isolated, non-destructive verification harness (`scripts/verify-stripe-test-mode-e2e.ts`) that strictly separates **Category 1 (Synthetic Webhook + API)** from **Category 2 (Real Checkout-to-Webhook)**:
 
 ```bash
-# Offline preflight only (verifies safety guards, rawBody server middleware, auth & SQLite billing schema; exit 0)
-npm run verify:stripe:e2e -- --preflight-only
+# Offline preflight only (verifies safety guards, rawBody server middleware, auth & SQLite billing schema; exit 0 PASS)
+npm run verify:stripe:e2e -- --preflight-only --json
 
-# Full real Stripe Test Mode API E2E (requires sk_test_... + whsec_...; exits 2 BLOCKED if unset)
-STRIPE_SECRET_KEY=sk_test_... STRIPE_WEBHOOK_SECRET=whsec_... npm run verify:stripe:e2e
+# Category 1: Automated Stripe Test API + Explicitly Labeled Synthetic Webhook Tests (SYNTHETIC TEST PASS)
+# - Creates Checkout Session via POST /api/billing/checkout, checks open/unpaid state & User B 403 isolation
+# - Exercises Stripe Test API Customer/PaymentMethod/Subscription/Refund/Cancel calls
+# - Signs synthetic events locally with generateTestHeaderString()
+# - Always reports realCheckoutCompletionVerified=false and realStripeWebhookDeliveryVerified=false
+STRIPE_SECRET_KEY=sk_test_... STRIPE_WEBHOOK_SECRET=whsec_... \
+  npm run verify:stripe:e2e -- --mode=synthetic-api
 
-# Non-ENV safety-guard & harness contract test suite
+# Category 2A: Real Stripe Checkout-to-Webhook Verification with interactive wait window (REAL STRIPE DELIVERY VERIFIED)
+# Terminal 1: stripe listen --forward-to http://127.0.0.1:3000/api/billing/webhook
+# Terminal 2:
+STRIPE_SECRET_KEY=sk_test_... STRIPE_WEBHOOK_SECRET=whsec_... \
+  npm run verify:stripe:e2e -- --mode=real-checkout --listen-port=3000 --wait-seconds=180
+# Complete the printed Checkout URL with Stripe test card 4242 4242 4242 4242.
+
+# Category 2B: Verify an already-completed staging Checkout Session + SQLite DB correlation
+STRIPE_SECRET_KEY=sk_test_... STRIPE_WEBHOOK_SECRET=whsec_... \
+  npm run verify:stripe:e2e -- --mode=real-checkout --session-id=cs_test_... --db-path=/tmp/staging_verify.db
+
+# CI-safe safety-guard & harness contract test suite (enforced in .github/workflows/ci.yml)
 npm run test:stripe:harness
 ```
 
 Safety guarantees enforced before any execution:
 - Refuses `sk_live_...` / `rk_live_...`, `PAYMENT_MODE=live`, `PAYMENT_MODE=production`, and `DEPLOYMENT_ENV=production` (exit `1`).
-- Always runs against a dedicated ephemeral SQLite database inside `os.tmpdir()` (refuses `videorisk.db`, exit `1`).
-- Exits cleanly with code `2` (`BLOCKED — AWAITING ENV`) when `STRIPE_SECRET_KEY` or `STRIPE_WEBHOOK_SECRET` are absent — never claims mocked behavior as live Stripe API verification.
-
+- Always runs against a dedicated ephemeral SQLite database inside `os.tmpdir()` (refuses `data/videorisk.db`, exit `1`).
+- Exits cleanly with code `2` (`BLOCKED — AWAITING ENV`) when `STRIPE_SECRET_KEY` or `STRIPE_WEBHOOK_SECRET` are absent — never claims mocked or synthetic behavior as `REAL STRIPE DELIVERY VERIFIED`.
+- In `--mode=real-checkout`, exits with code `2` (`BLOCKED`) if real Checkout has not completed (`status=complete`, `payment_status=paid`) or if genuine `evt_...` webhook delivery has not arrived — never fabricates synthetic webhooks.

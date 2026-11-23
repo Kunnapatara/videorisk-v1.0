@@ -21,7 +21,7 @@ import {
   validateMediaTokenSecret,
 } from '../src/server/config/environment';
 
-dotenv.config();
+dotenv.config({ quiet: true });
 
 export interface ValidationIssue {
   type: 'ERROR' | 'WARNING' | 'INFO';

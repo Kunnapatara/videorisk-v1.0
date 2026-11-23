@@ -383,6 +383,7 @@ export class SpeechTranscriptionAdapter {
       safeStatKey(validation.modelPath),
       `modelSha:${validation.modelSha256 || 'none'}`,
       `modelExp:${validation.expectedModelSha256 || 'none'}`,
+      `modelSrc:${validation.modelSha256Source || 'none'}`,
       `modelInt:${validation.modelIntegrityStatus || 'none'}`,
       safeStatKey(fixturePath),
       `sha:${fixtureSha256}`,
@@ -417,8 +418,111 @@ export class SpeechTranscriptionAdapter {
     expectedSha256?: string;
     validFormat: boolean;
     error?: string;
+    conflictingOverrideSha256?: string;
   } {
     const sha256HexRegex = /^[a-f0-9]{64}$/;
+    const modelBase = path.basename(modelPath);
+    const defaultManifestPath = path.resolve(process.cwd(), 'src', 'server', 'config', 'whisperModels.json');
+    const explicitManifestOverride = options?.trustedModelManifestPath || process.env.WHISPER_MODEL_MANIFEST_PATH;
+
+    const readManifestEntry = (
+      manifestPath: string,
+      requiredIfMissing: boolean
+    ): {
+      found: boolean;
+      expectedSha256?: string;
+      validFormat: boolean;
+      error?: string;
+    } => {
+      if (!fs.existsSync(manifestPath)) {
+        if (requiredIfMissing) {
+          return {
+            found: false,
+            validFormat: false,
+            error: `Configured Whisper model manifest not found at ${manifestPath}.`
+          };
+        }
+        return { found: false, validFormat: true };
+      }
+
+      let parsed: any;
+      try {
+        parsed = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      } catch (err: any) {
+        return {
+          found: false,
+          validFormat: false,
+          error: `Malformed Whisper model manifest JSON at ${manifestPath}: ${err?.message || err}`
+        };
+      }
+
+      const models = Array.isArray(parsed?.models) ? parsed.models : null;
+      if (!models) {
+        return {
+          found: false,
+          validFormat: false,
+          error: `Invalid Whisper model manifest schema at ${manifestPath}: missing 'models' array.`
+        };
+      }
+
+      const entry = models.find((m: any) => m && typeof m.filename === 'string' && m.filename === modelBase);
+      if (!entry) {
+        return { found: false, validFormat: true };
+      }
+
+      const normalizedManifestHash = typeof entry.expectedSha256 === 'string' ? entry.expectedSha256.trim().toLowerCase() : '';
+      if (!sha256HexRegex.test(normalizedManifestHash)) {
+        return {
+          found: true,
+          expectedSha256: normalizedManifestHash || undefined,
+          validFormat: false,
+          error: `Invalid expectedSha256 in Whisper model manifest for '${modelBase}'.`
+        };
+      }
+
+      return {
+        found: true,
+        expectedSha256: normalizedManifestHash,
+        validFormat: true
+      };
+    };
+
+    // Always inspect the built-in trusted manifest first so ENV/manifest overrides cannot silently downgrade pinned models
+    const builtInEntry = readManifestEntry(defaultManifestPath, false);
+    if (!builtInEntry.validFormat) {
+      return {
+        source: 'manifest',
+        expectedSha256: builtInEntry.expectedSha256,
+        validFormat: false,
+        error: builtInEntry.error
+      };
+    }
+
+    let manifestEntry = builtInEntry;
+    if (explicitManifestOverride) {
+      const overrideEntry = readManifestEntry(explicitManifestOverride, true);
+      if (!overrideEntry.validFormat) {
+        return {
+          source: 'manifest',
+          expectedSha256: overrideEntry.expectedSha256,
+          validFormat: false,
+          error: overrideEntry.error
+        };
+      }
+      if (builtInEntry.found && overrideEntry.found && overrideEntry.expectedSha256 !== builtInEntry.expectedSha256) {
+        return {
+          source: 'manifest',
+          expectedSha256: builtInEntry.expectedSha256,
+          validFormat: true,
+          conflictingOverrideSha256: overrideEntry.expectedSha256,
+          error: `Manifest override at ${explicitManifestOverride} conflicts with trusted built-in registry for '${modelBase}'.`
+        };
+      }
+      if (overrideEntry.found) {
+        manifestEntry = overrideEntry;
+      }
+    }
+
     if (options?.expectedModelSha256 !== undefined) {
       const normalized = String(options.expectedModelSha256).trim().toLowerCase();
       if (!sha256HexRegex.test(normalized)) {
@@ -427,6 +531,15 @@ export class SpeechTranscriptionAdapter {
           expectedSha256: normalized,
           validFormat: false,
           error: 'Explicit expectedModelSha256 must be a valid 64-character lowercase/uppercase SHA-256 hex digest.'
+        };
+      }
+      if (manifestEntry.found && manifestEntry.expectedSha256 && normalized !== manifestEntry.expectedSha256) {
+        return {
+          source: 'manifest',
+          expectedSha256: manifestEntry.expectedSha256,
+          validFormat: true,
+          conflictingOverrideSha256: normalized,
+          error: `Explicit expectedModelSha256 conflicts with trusted manifest checksum for '${modelBase}'.`
         };
       }
       return { source: 'env', expectedSha256: normalized, validFormat: true };
@@ -443,65 +556,27 @@ export class SpeechTranscriptionAdapter {
           error: 'Configured WHISPER_MODEL_SHA256 must be a valid 64-character SHA-256 hex digest.'
         };
       }
+      if (manifestEntry.found && manifestEntry.expectedSha256 && normalized !== manifestEntry.expectedSha256) {
+        return {
+          source: 'manifest',
+          expectedSha256: manifestEntry.expectedSha256,
+          validFormat: true,
+          conflictingOverrideSha256: normalized,
+          error: `WHISPER_MODEL_SHA256 conflicts with trusted manifest checksum for '${modelBase}'.`
+        };
+      }
       return { source: 'env', expectedSha256: normalized, validFormat: true };
     }
 
-    const explicitManifestOverride = options?.trustedModelManifestPath || process.env.WHISPER_MODEL_MANIFEST_PATH;
-    const defaultManifestPath = path.resolve(process.cwd(), 'src', 'server', 'config', 'whisperModels.json');
-    const manifestPath = explicitManifestOverride || defaultManifestPath;
-
-    if (!fs.existsSync(manifestPath)) {
-      if (explicitManifestOverride) {
-        return {
-          source: 'manifest',
-          validFormat: false,
-          error: `Configured Whisper model manifest not found at ${manifestPath}.`
-        };
-      }
-      return { source: 'none', validFormat: true };
-    }
-
-    let parsed: any;
-    try {
-      parsed = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-    } catch (err: any) {
+    if (manifestEntry.found && manifestEntry.expectedSha256) {
       return {
         source: 'manifest',
-        validFormat: false,
-        error: `Malformed Whisper model manifest JSON at ${manifestPath}: ${err?.message || err}`
+        expectedSha256: manifestEntry.expectedSha256,
+        validFormat: true
       };
     }
 
-    const models = Array.isArray(parsed?.models) ? parsed.models : null;
-    if (!models) {
-      return {
-        source: 'manifest',
-        validFormat: false,
-        error: `Invalid Whisper model manifest schema at ${manifestPath}: missing 'models' array.`
-      };
-    }
-
-    const modelBase = path.basename(modelPath);
-    const entry = models.find((m: any) => m && typeof m.filename === 'string' && m.filename === modelBase);
-    if (!entry) {
-      return { source: 'none', validFormat: true };
-    }
-
-    const normalizedManifestHash = typeof entry.expectedSha256 === 'string' ? entry.expectedSha256.trim().toLowerCase() : '';
-    if (!sha256HexRegex.test(normalizedManifestHash)) {
-      return {
-        source: 'manifest',
-        expectedSha256: normalizedManifestHash || undefined,
-        validFormat: false,
-        error: `Invalid expectedSha256 in Whisper model manifest for '${modelBase}'.`
-      };
-    }
-
-    return {
-      source: 'manifest',
-      expectedSha256: normalizedManifestHash,
-      validFormat: true
-    };
+    return { source: 'none', validFormat: true };
   }
 
   private normalizeTranscriptTokens(txt: string): string[] {
@@ -1475,6 +1550,20 @@ export class SpeechTranscriptionAdapter {
         };
       }
 
+      if (expected.conflictingOverrideSha256) {
+        return {
+          ok: false,
+          status: 'ERROR',
+          diagnosticCode: 'MODEL_SHA256_MISMATCH',
+          reason: expected.error || `Whisper model SHA-256 override conflicts with trusted manifest for '${path.basename(p)}'.`,
+          actualSha256,
+          expectedSha256: expected.expectedSha256,
+          source: expected.source,
+          verified: false,
+          integrityStatus: 'MISMATCH',
+        };
+      }
+
       if (!expected.expectedSha256) {
         if (requireHash) {
           return {
@@ -1951,13 +2040,14 @@ export class SpeechTranscriptionAdapter {
     }
 
     const strictEnvFlag = Boolean(options?.strictAttestationMode || (process.env.WHISPER_STRICT_PROVENANCE || '').trim().toLowerCase() === 'true');
+    const requireModelShaFlag = Boolean(options?.requireModelSha256 || (process.env.WHISPER_REQUIRE_MODEL_SHA256 || '').trim().toLowerCase() === 'true');
     const keysHash = crypto.createHash('sha256').update(JSON.stringify(this.parseTrustedPublicKeys(options?.trustedPublicKeys).keys)).digest('hex').slice(0, 12);
     const fingerprint = this.getRuntimeFingerprint(
       validation,
       canonicalFixturePath,
       preSha256,
       expectedTranscript,
-      `${provenanceResult.manifestDigest}:${provenance.humanSpeechProvenanceStatus}:${provenance.provenanceTrustTier}:${strictEnvFlag}:${keysHash}`
+      `${provenanceResult.manifestDigest}:${provenance.humanSpeechProvenanceStatus}:${provenance.provenanceTrustTier}:${strictEnvFlag}:${requireModelShaFlag}:${keysHash}`
     );
 
     if (options?.useCache) {

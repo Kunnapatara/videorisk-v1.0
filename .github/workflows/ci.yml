@@ -69,6 +69,12 @@ jobs:
       - name: Run checkout origin security and Stripe refund lifecycle suite (test HMAC signatures, mocked SDK)
         run: npm run test:billing
 
+      - name: Run Whisper GGML model SHA-256 integrity contract suite
+        run: npm run test:whisper:sha256
+
+      - name: Run Stripe Test Mode E2E harness and safety guard suite
+        run: npm run test:stripe:harness
+
       - name: Run production build (client + Node 22 backend bundle)
         run: |
           npm run build

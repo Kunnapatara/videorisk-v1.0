@@ -175,13 +175,16 @@ curl -s http://localhost:3000/api/health/readiness | jq '.checks.whisperStt'
 ## 7. Automated Model SHA-256 & Production Host Verification
 
 ### Automated GGML Model SHA-256 Verification
-- Trusted checksum manifest: `src/server/config/whisperModels.json` (`ggml-base.en.bin` -> `a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002`).
-- Env overrides:
-  - `WHISPER_MODEL_SHA256=<64-hex>` (explicit expected SHA-256 override)
-  - `WHISPER_REQUIRE_MODEL_SHA256=true` (fail closed with `MODEL_EXPECTED_HASH_MISSING` if model is not in manifest and env hash is unset)
-  - `WHISPER_MODEL_MANIFEST_PATH=<path>` (override manifest file)
+- Trusted built-in checksum manifest: `src/server/config/whisperModels.json` (`ggml-base.en.bin` -> `a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002`).
+- Anti-downgrade rule: `resolveExpectedModelSha256()` always inspects the built-in trusted manifest first. Conflicting `WHISPER_MODEL_SHA256`, `WHISPER_MODEL_MANIFEST_PATH`, or runtime hash overrides against a built-in manifest entry fail closed with `MODEL_SHA256_MISMATCH` (`modelIntegrityStatus: 'MISMATCH'`, `modelSha256Verified: false`).
+- Env controls:
+  - `WHISPER_MODEL_SHA256=<64-hex>` (must agree with built-in manifest when model filename is present in manifest; supplies hash for additional models)
+  - `WHISPER_REQUIRE_MODEL_SHA256=true` (fail closed with `MODEL_EXPECTED_HASH_MISSING` if model is not in manifest and env hash is unset; invalidates cached runtime compatibility checks via runtime fingerprint)
+  - `WHISPER_MODEL_MANIFEST_PATH=<path>` (supplemental manifest; cannot downgrade built-in checksums)
 - Any SHA-256 mismatch or post-provisioning byte mutation fails closed immediately with `MODEL_SHA256_MISMATCH` (`ANALYSIS_UNAVAILABLE` on `transcribe()` and `degraded` on `/api/health/readiness`), bypassing cached compatibility results.
-- CI-safe SHA-256 contract suite: `npm run test:whisper:sha256`
+- CI-enforced contract suites (`.github/workflows/ci.yml`):
+  - `npm run test:whisper:sha256` (`PASS` without downloading 142 MiB GGML weights)
+  - `npm run test:stripe:harness` (`PASS` without requiring Stripe secrets or prod DB)
 
 ### Production Deployment Verification Script (`scripts/verify-whisper-prod.ts`)
 Read-only, non-destructive host verification checking Binary + `ldd` + `ffmpeg`/`ffprobe`, Model SHA-256, Offline Ed25519 key hygiene & rotation (`WHISPER_TRUSTED_PUBLIC_KEYS` / `WHISPER_STRICT_PROVENANCE=true`), and Persistent vs Temporary storage paths:
@@ -194,10 +197,10 @@ npm run verify:whisper:prod -- --mode=production
 npm run verify:whisper:prod -- --mode=local
 ```
 
-Exit codes:
-- `0` = **PASS** (all checks passed)
-- `1` = **FAIL** (hard failure: checksum mismatch, missing library, tmpfs persistent volume in prod, leaked private key, etc.)
-- `2` = **BLOCKED** (missing required ENV / Ed25519 public keys / host provisioning, zero hard failures)
+Exit codes & Status Taxonomy:
+- `0` = **`PASS`** (all host checks passed)
+- `1` = **`FAIL`** (hard failure: checksum mismatch, missing library, tmpfs persistent volume in prod, leaked private key, etc.)
+- `2` = **`BLOCKED`** (missing required ENV / Ed25519 public keys / host provisioning, zero hard failures; external host verification remains **`NOT VERIFIED`** until provisioned)
 
 | Storage Path | Classification | Purpose & Verification Requirement |
 | :--- | :--- | :--- |

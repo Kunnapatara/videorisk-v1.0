@@ -244,6 +244,69 @@ export async function runWhisperModelSha256Tests() {
     }
     console.log('  ✅ PASS: Case 5 (Post-provisioning tamper fails closed & surfaces in readiness)');
 
+    // Case 6: Anti-downgrade — ENV/manifest overrides cannot silently bypass or downgrade trusted manifest checksums
+    console.log('\n[Case 6] Anti-downgrade protection against conflicting WHISPER_MODEL_SHA256 & manifest overrides');
+    const swappedModelA = path.join(workDir, 'ggml-mock-verified.bin');
+    const roguePayload = Buffer.concat([Buffer.from('lmgg', 'ascii'), Buffer.alloc(2048, 0x7b)]);
+    fs.writeFileSync(swappedModelA, roguePayload);
+    const rogueSha256 = crypto.createHash('sha256').update(roguePayload).digest('hex');
+
+    // Attacker replaces file AND tries to pass matching WHISPER_MODEL_SHA256 -> must STILL reject against manifest!
+    process.env.WHISPER_MODEL_MANIFEST_PATH = manifestPath;
+    process.env.WHISPER_MODEL_PATH = swappedModelA;
+    process.env.WHISPER_MODEL_SHA256 = rogueSha256;
+    process.env.WHISPER_REQUIRE_MODEL_SHA256 = 'true';
+    const overrideConflict = await speechTranscriptionAdapter.validateRuntime();
+    assert.strictEqual(overrideConflict.status, 'ERROR', '6.1 Conflicting WHISPER_MODEL_SHA256 rejected even if it matches rogue binary');
+    assert.strictEqual(overrideConflict.diagnosticCode, 'MODEL_SHA256_MISMATCH', '6.2 diagnosticCode=MODEL_SHA256_MISMATCH');
+    assert.strictEqual(overrideConflict.modelSha256Verified, false, '6.3 modelSha256Verified=false');
+
+    // Attacker tries to override built-in trusted ggml-base.en.bin via custom WHISPER_MODEL_MANIFEST_PATH
+    const spoofedBaseModel = path.join(workDir, 'ggml-base.en.bin');
+    fs.writeFileSync(spoofedBaseModel, roguePayload);
+    const spoofedManifest = path.join(workDir, 'spoofed_models.json');
+    fs.writeFileSync(
+      spoofedManifest,
+      JSON.stringify({
+        manifestVersion: '1.0.0',
+        models: [
+          {
+            filename: 'ggml-base.en.bin',
+            modelName: 'base.en',
+            format: 'ggml',
+            sizeBytes: roguePayload.length,
+            expectedSha256: rogueSha256,
+          },
+        ],
+      })
+    );
+    delete process.env.WHISPER_MODEL_SHA256;
+    process.env.WHISPER_MODEL_PATH = spoofedBaseModel;
+    process.env.WHISPER_MODEL_MANIFEST_PATH = spoofedManifest;
+    const builtInConflict = await speechTranscriptionAdapter.validateRuntime();
+    assert.strictEqual(builtInConflict.status, 'ERROR', '6.4 Custom manifest cannot spoof built-in ggml-base.en.bin checksum');
+    assert.strictEqual(builtInConflict.diagnosticCode, 'MODEL_SHA256_MISMATCH', '6.5 diagnosticCode=MODEL_SHA256_MISMATCH');
+    assert.strictEqual(builtInConflict.modelSha256Verified, false, '6.6 modelSha256Verified=false');
+
+    // Compatibility cache cannot bypass requirement toggle on unmanifested model
+    const customModel = path.join(workDir, 'custom_cache_model.bin');
+    fs.writeFileSync(customModel, roguePayload);
+    delete process.env.WHISPER_MODEL_MANIFEST_PATH;
+    delete process.env.WHISPER_MODEL_SHA256;
+    delete process.env.WHISPER_REQUIRE_MODEL_SHA256;
+    process.env.WHISPER_MODEL_PATH = customModel;
+    speechTranscriptionAdapter.clearCompatibilityCache();
+
+    const optCompat = await speechTranscriptionAdapter.verifyRuntimeCompatibility({ useCache: true });
+    assert.strictEqual(optCompat.compatible, true, '6.7 Optional mode without hash runs compat probe');
+    assert.strictEqual(optCompat.validation.modelSha256Verified, false, '6.8 Still never marks verified without expected hash');
+
+    process.env.WHISPER_REQUIRE_MODEL_SHA256 = 'true';
+    const reqCompat = await speechTranscriptionAdapter.verifyRuntimeCompatibility({ useCache: true });
+    assert.strictEqual(reqCompat.compatible, false, '6.9 Enabling WHISPER_REQUIRE_MODEL_SHA256 bypasses warm compat cache and fails closed');
+    assert.strictEqual(reqCompat.diagnosticCode, 'MODEL_EXPECTED_HASH_MISSING', '6.10 diagnosticCode=MODEL_EXPECTED_HASH_MISSING');
+    console.log('  ✅ PASS: Case 6 (Anti-downgrade ENV/manifest protection & cache invalidation)');
+
     console.log('\n======================================================');
     console.log('🎉 ALL WHISPER MODEL SHA-256 CONTRACT TESTS PASSED!');
     console.log('======================================================\n');
