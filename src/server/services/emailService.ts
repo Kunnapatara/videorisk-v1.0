@@ -76,12 +76,18 @@ export function resolveSmtpConfiguration(
   env: NodeJS.ProcessEnv = process.env
 ): SmtpResolvedConfig {
   const host = (env.SMTP_HOST || '').trim();
-  if (!host) {
-    return { configured: false, reason: 'SMTP_NOT_CONFIGURED' };
-  }
-
   const rawUser = env.SMTP_USER !== undefined ? env.SMTP_USER.trim() : '';
   const rawPass = env.SMTP_PASS !== undefined ? env.SMTP_PASS.trim() : '';
+
+  if (!host) {
+    if (rawUser || rawPass) {
+      return {
+        configured: false,
+        reason: 'SMTP_HOST_MISSING',
+      };
+    }
+    return { configured: false, reason: 'SMTP_NOT_CONFIGURED' };
+  }
 
   // Reject half-configured auth credentials fail-closed
   if ((rawUser && !rawPass) || (!rawUser && rawPass)) {

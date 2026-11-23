@@ -64,7 +64,7 @@ export async function runProductionReadinessTests(): Promise<void> {
   const initialEnv = snapshotEnv(trackedKeys);
 
   const { resolveEnvironmentSecurity, isProductionEnvironment } = await import('../src/server/config/environment');
-  const { validateBillingConfiguration } = await import('../scripts/validate-env');
+  const { validateBillingConfiguration, runValidatorCli } = await import('../scripts/validate-env');
   const { emailService, resolveSmtpConfiguration } = await import('../src/server/services/emailService');
   const { billingService } = await import('../src/server/services/billingService');
   const { apiRouter } = await import('../src/server/routes/api');
@@ -308,23 +308,210 @@ export async function runProductionReadinessTests(): Promise<void> {
     assert.strictEqual(validateBillingConfiguration('staging', validStagingEnv).valid, true, 'C.1e validateBillingConfiguration(--mode=staging) passes');
     assert.strictEqual(validateBillingConfiguration('production', validStagingEnv).valid, false, 'C.1f Staging config is rejected when evaluated as --mode=production');
 
-    // SMTP consistency in validateBillingConfiguration: unset -> warning only (non-blocking), invalid -> error, zero secret leakage
+    // SMTP consistency in validateBillingConfiguration & resolveSmtpConfiguration across staging, prod, dev & test
+    const validProdEnv: NodeJS.ProcessEnv = {
+      NODE_ENV: 'production',
+      DEPLOYMENT_ENV: 'production',
+      PAYMENT_MODE: 'live',
+      PAYMENT_PROVIDER: 'stripe',
+      STRIPE_SECRET_KEY: 'sk_live_prodKey1234567890abcdef',
+      STRIPE_WEBHOOK_SECRET: 'whsec_prodSecret1234567890abcdef',
+      STRIPE_PRICE_CREATOR: 'price_creator_123',
+      STRIPE_PRICE_PRO: 'price_pro_123',
+      STRIPE_PRICE_AGENCY: 'price_agency_123',
+      STRIPE_PRICE_AUDIT_ONCE: 'price_audit_123',
+      APP_BASE_URL: 'https://videorisk.com',
+      MEDIA_TOKEN_SECRET: 'vr_prod_media_secret_0123456789abcdef_strong',
+    };
+    const validDevEnv: NodeJS.ProcessEnv = {
+      NODE_ENV: 'development',
+      DEPLOYMENT_ENV: 'development',
+      PAYMENT_MODE: 'test',
+      STRIPE_SECRET_KEY: 'sk_test_devKey1234567890abcdef',
+    };
+    const validTestEnv: NodeJS.ProcessEnv = {
+      NODE_ENV: 'test',
+      PAYMENT_MODE: 'test',
+      STRIPE_SECRET_KEY: 'sk_test_testKey1234567890abcdef',
+    };
+
+    // Case A: Completely unset SMTP (and with .env.example defaults) -> WARNING in staging/prod, INFO in dev/test, valid: true
+    assert.strictEqual(
+      resolveSmtpConfiguration({
+        SMTP_HOST: '',
+        SMTP_PORT: '587',
+        SMTP_SECURE: 'false',
+        SMTP_USER: '',
+        SMTP_PASS: '',
+        SMTP_FROM: 'VideoRisk <no-reply@videorisk.com>',
+      }).reason,
+      'SMTP_NOT_CONFIGURED',
+      'C.1g.1 Empty SMTP_HOST/USER/PASS with .env.example defaults returns SMTP_NOT_CONFIGURED'
+    );
+
     const stagingNoSmtp = validateBillingConfiguration('staging', validStagingEnv);
+    assert.strictEqual(stagingNoSmtp.valid, true, 'C.1g.2 Unset SMTP in staging stays valid');
     assert.ok(
       stagingNoSmtp.issues.some((i) => i.variable === 'SMTP_HOST' && i.type === 'WARNING'),
-      'C.1g Unset SMTP_HOST in staging emits non-blocking WARNING'
+      'C.1g.3 Unset SMTP_HOST in staging emits non-blocking WARNING'
     );
+
+    const stagingDefaultSmtp = validateBillingConfiguration('staging', {
+      ...validStagingEnv,
+      SMTP_HOST: '',
+      SMTP_PORT: '587',
+      SMTP_SECURE: 'false',
+      SMTP_USER: '',
+      SMTP_PASS: '',
+      SMTP_FROM: 'VideoRisk <no-reply@videorisk.com>',
+      EMAIL_FROM: '',
+    });
+    assert.strictEqual(stagingDefaultSmtp.valid, true, 'C.1g.4 .env.example SMTP defaults without host do NOT fail staging');
+    assert.ok(
+      !stagingDefaultSmtp.issues.some((i) => i.type === 'ERROR'),
+      'C.1g.5 .env.example SMTP defaults produce zero errors'
+    );
+    assert.ok(
+      stagingDefaultSmtp.issues.some((i) => i.variable === 'SMTP_HOST' && i.type === 'WARNING'),
+      'C.1g.6 .env.example SMTP defaults emit WARNING in staging'
+    );
+
+    const prodDefaultSmtp = validateBillingConfiguration('production', {
+      ...validProdEnv,
+      SMTP_HOST: '',
+      SMTP_PORT: '587',
+      SMTP_SECURE: 'false',
+      SMTP_USER: '',
+      SMTP_PASS: '',
+      SMTP_FROM: 'VideoRisk <no-reply@videorisk.com>',
+    });
+    assert.strictEqual(prodDefaultSmtp.valid, true, 'C.1g.7 .env.example SMTP defaults without host stay valid in production');
+    assert.ok(
+      prodDefaultSmtp.issues.some((i) => i.variable === 'SMTP_HOST' && i.type === 'WARNING'),
+      'C.1g.8 Unset SMTP with .env.example defaults emits WARNING in production'
+    );
+
+    const devDefaultSmtp = validateBillingConfiguration('development', {
+      ...validDevEnv,
+      SMTP_PORT: '587',
+      SMTP_SECURE: 'false',
+      SMTP_FROM: 'VideoRisk <no-reply@videorisk.com>',
+    });
+    assert.strictEqual(devDefaultSmtp.valid, true, 'C.1g.9 Unset SMTP with .env.example defaults stays valid in development');
+    assert.ok(
+      devDefaultSmtp.issues.some((i) => i.variable === 'SMTP_HOST' && i.type === 'INFO'),
+      'C.1g.10 Unset SMTP emits INFO in development'
+    );
+
+    const testNoSmtp = validateBillingConfiguration('test', validTestEnv);
+    assert.strictEqual(testNoSmtp.valid, true, 'C.1g.11 Unset SMTP stays valid in test mode');
+    assert.ok(
+      testNoSmtp.issues.some((i) => i.variable === 'SMTP_HOST' && i.type === 'INFO'),
+      'C.1g.12 Unset SMTP emits INFO in test mode'
+    );
+
+    // Case B: Orphan credentials (SMTP_HOST empty + SMTP_USER and/or SMTP_PASS set) -> ERROR in all modes, zero secret leak
+    const orphanSecretUser = 'orphan_smtp_user_confidential_111';
+    const orphanSecretPass = 'orphan_smtp_pass_confidential_222';
+    const orphanVariants: Array<{ label: string; extra: NodeJS.ProcessEnv }> = [
+      { label: 'user_only', extra: { SMTP_HOST: '', SMTP_USER: orphanSecretUser, SMTP_PASS: '' } },
+      { label: 'pass_only', extra: { SMTP_HOST: '   ', SMTP_USER: '', SMTP_PASS: orphanSecretPass } },
+      { label: 'user_and_pass', extra: { SMTP_HOST: '', SMTP_USER: orphanSecretUser, SMTP_PASS: orphanSecretPass } },
+    ];
+    for (const variant of orphanVariants) {
+      const resolved = resolveSmtpConfiguration({
+        ...variant.extra,
+        SMTP_PORT: '587',
+        SMTP_SECURE: 'false',
+        SMTP_FROM: 'VideoRisk <no-reply@videorisk.com>',
+      });
+      assert.strictEqual(resolved.configured, false, `C.1h.1 (${variant.label}) marked unconfigured`);
+      assert.strictEqual(resolved.reason, 'SMTP_HOST_MISSING', `C.1h.2 (${variant.label}) reports SMTP_HOST_MISSING`);
+
+      for (const [modeName, baseEnv] of [
+        ['staging', validStagingEnv],
+        ['production', validProdEnv],
+        ['development', validDevEnv],
+        ['test', validTestEnv],
+      ] as Array<['staging' | 'production' | 'development' | 'test', NodeJS.ProcessEnv]>) {
+        const res = validateBillingConfiguration(modeName, {
+          ...baseEnv,
+          ...variant.extra,
+          SMTP_PORT: '587',
+          SMTP_SECURE: 'false',
+          SMTP_FROM: 'VideoRisk <no-reply@videorisk.com>',
+        });
+        assert.strictEqual(res.valid, false, `C.1h.3 (${variant.label} in ${modeName}) fails validation`);
+        assert.ok(
+          res.issues.some(
+            (i) => i.type === 'ERROR' && i.variable === 'SMTP_HOST' && /SMTP_HOST/i.test(i.message)
+          ),
+          `C.1h.4 (${variant.label} in ${modeName}) emits SMTP_HOST ERROR`
+        );
+        const serialized = JSON.stringify(res.issues);
+        assert.ok(!serialized.includes(orphanSecretUser), `C.1h.5 (${variant.label} in ${modeName}) never leaks SMTP_USER`);
+        assert.ok(!serialized.includes(orphanSecretPass), `C.1h.6 (${variant.label} in ${modeName}) never leaks SMTP_PASS`);
+      }
+    }
+
+    // Verify CLI output also emits ERROR, returns exit code 1, and never prints SMTP_USER / SMTP_PASS
+    const cliLines: string[] = [];
+    const cliOrigLog = console.log;
+    const cliOrigErr = console.error;
+    console.log = (...args: any[]) => cliLines.push(args.map(String).join(' '));
+    console.error = (...args: any[]) => cliLines.push(args.map(String).join(' '));
+    let cliExitCode = 0;
+    try {
+      cliExitCode = await runValidatorCli(['--mode=staging'], {
+        ...validStagingEnv,
+        SMTP_HOST: '',
+        SMTP_USER: orphanSecretUser,
+        SMTP_PASS: orphanSecretPass,
+      });
+    } finally {
+      console.log = cliOrigLog;
+      console.error = cliOrigErr;
+    }
+    assert.strictEqual(cliExitCode, 1, 'C.1h.7 CLI validator exits 1 on orphan SMTP credentials');
+    const cliOutput = cliLines.join('\n');
+    assert.ok(cliOutput.includes('[ERROR] SMTP_HOST:'), 'C.1h.8 CLI output flags [ERROR] SMTP_HOST');
+    assert.ok(!cliOutput.includes(orphanSecretUser), 'C.1h.9 CLI output never leaks SMTP_USER');
+    assert.ok(!cliOutput.includes(orphanSecretPass), 'C.1h.10 CLI output never leaks SMTP_PASS');
+
+    // Case C: SMTP_HOST set + incomplete auth -> ERROR preserving SMTP_AUTH_INCOMPLETE
     const stagingBadSmtpAuth = validateBillingConfiguration('staging', {
       ...validStagingEnv,
       SMTP_HOST: 'smtp.example.org',
       SMTP_USER: 'secret_smtp_user_leak_guard',
       SMTP_FROM: 'VideoRisk <no-reply@videorisk.com>',
     });
-    assert.strictEqual(stagingBadSmtpAuth.valid, false, 'C.1h Incomplete SMTP auth in staging fails validation');
+    assert.strictEqual(stagingBadSmtpAuth.valid, false, 'C.1i.1 Incomplete SMTP auth (user only) in staging fails validation');
+    assert.ok(
+      stagingBadSmtpAuth.issues.some((i) => i.type === 'ERROR' && i.variable === 'SMTP_PASS'),
+      'C.1i.2 Incomplete SMTP auth (user only) reports SMTP_PASS ERROR'
+    );
     assert.ok(
       !JSON.stringify(stagingBadSmtpAuth.issues).includes('secret_smtp_user_leak_guard'),
-      'C.1i SMTP validation errors never disclose credential values'
+      'C.1i.3 SMTP validation errors never disclose SMTP_USER value'
     );
+
+    const stagingBadSmtpPassOnly = validateBillingConfiguration('staging', {
+      ...validStagingEnv,
+      SMTP_HOST: 'smtp.example.org',
+      SMTP_PASS: 'secret_smtp_pass_leak_guard',
+      SMTP_FROM: 'VideoRisk <no-reply@videorisk.com>',
+    });
+    assert.strictEqual(stagingBadSmtpPassOnly.valid, false, 'C.1i.4 Incomplete SMTP auth (pass only) in staging fails validation');
+    assert.ok(
+      stagingBadSmtpPassOnly.issues.some((i) => i.type === 'ERROR' && i.variable === 'SMTP_USER'),
+      'C.1i.5 Incomplete SMTP auth (pass only) reports SMTP_USER ERROR'
+    );
+    assert.ok(
+      !JSON.stringify(stagingBadSmtpPassOnly.issues).includes('secret_smtp_pass_leak_guard'),
+      'C.1i.6 SMTP validation errors never disclose SMTP_PASS value'
+    );
+
+    // Case D: Valid SMTP configuration passes without errors or warnings
     const stagingValidSmtp = validateBillingConfiguration('staging', {
       ...validStagingEnv,
       SMTP_HOST: 'smtp.example.org',
@@ -334,7 +521,22 @@ export async function runProductionReadinessTests(): Promise<void> {
       SMTP_PASS: 'smtp_pass',
       SMTP_FROM: 'VideoRisk <no-reply@videorisk.com>',
     });
-    assert.strictEqual(stagingValidSmtp.valid, true, 'C.1j Valid SMTP settings pass staging configuration validation');
+    assert.strictEqual(stagingValidSmtp.valid, true, 'C.1j.1 Valid SMTP settings pass staging configuration validation');
+    assert.ok(
+      !stagingValidSmtp.issues.some(
+        (i) => i.variable.startsWith('SMTP_') && (i.type === 'ERROR' || i.type === 'WARNING')
+      ),
+      'C.1j.2 Valid SMTP settings produce zero SMTP errors or warnings'
+    );
+
+    const stagingValidSmtpNoAuth = validateBillingConfiguration('staging', {
+      ...validStagingEnv,
+      SMTP_HOST: 'smtp-relay.internal',
+      SMTP_PORT: '25',
+      SMTP_SECURE: 'false',
+      SMTP_FROM: 'VideoRisk <no-reply@videorisk.com>',
+    });
+    assert.strictEqual(stagingValidSmtpNoAuth.valid, true, 'C.1j.3 Valid unauthenticated SMTP relay passes configuration validation');
 
     // Staging rejects live Stripe key & PAYMENT_MODE=live & platform production flags
     const stagingWithLiveKey = resolveEnvironmentSecurity({
