@@ -334,8 +334,11 @@ export async function runProductionReadinessTests(): Promise<void> {
       PAYMENT_MODE: 'test',
       STRIPE_SECRET_KEY: 'sk_test_testKey1234567890abcdef',
     };
+    const validCiEnv: NodeJS.ProcessEnv = {
+      CI: 'true',
+    };
 
-    // Case A: Completely unset SMTP (and with .env.example defaults) -> WARNING in staging/prod, INFO in dev/test, valid: true
+    // Case A: Completely unset SMTP (and with .env.example defaults) -> WARNING in staging/prod, INFO in dev/test/ci, valid: true
     assert.strictEqual(
       resolveSmtpConfiguration({
         SMTP_HOST: '',
@@ -410,7 +413,22 @@ export async function runProductionReadinessTests(): Promise<void> {
       'C.1g.12 Unset SMTP emits INFO in test mode'
     );
 
-    // Case B: Orphan credentials (SMTP_HOST empty + SMTP_USER and/or SMTP_PASS set) -> ERROR in all modes, zero secret leak
+    const ciNoSmtp = validateBillingConfiguration('ci', {
+      ...validCiEnv,
+      SMTP_HOST: '',
+      SMTP_PORT: '587',
+      SMTP_SECURE: 'false',
+      SMTP_USER: '',
+      SMTP_PASS: '',
+      SMTP_FROM: 'VideoRisk <no-reply@videorisk.com>',
+    });
+    assert.strictEqual(ciNoSmtp.valid, true, 'C.1g.13 Unset SMTP with .env.example defaults stays valid in ci mode');
+    assert.ok(
+      ciNoSmtp.issues.some((i) => i.variable === 'SMTP_HOST' && i.type === 'INFO'),
+      'C.1g.14 Unset SMTP emits INFO in ci mode'
+    );
+
+    // Case B: Orphan credentials (SMTP_HOST empty + SMTP_USER and/or SMTP_PASS set) -> ERROR in all modes (including ci), zero secret leak
     const orphanSecretUser = 'orphan_smtp_user_confidential_111';
     const orphanSecretPass = 'orphan_smtp_pass_confidential_222';
     const orphanVariants: Array<{ label: string; extra: NodeJS.ProcessEnv }> = [
@@ -433,7 +451,8 @@ export async function runProductionReadinessTests(): Promise<void> {
         ['production', validProdEnv],
         ['development', validDevEnv],
         ['test', validTestEnv],
-      ] as Array<['staging' | 'production' | 'development' | 'test', NodeJS.ProcessEnv]>) {
+        ['ci', validCiEnv],
+      ] as Array<['staging' | 'production' | 'development' | 'test' | 'ci', NodeJS.ProcessEnv]>) {
         const res = validateBillingConfiguration(modeName, {
           ...baseEnv,
           ...variant.extra,
@@ -454,29 +473,34 @@ export async function runProductionReadinessTests(): Promise<void> {
       }
     }
 
-    // Verify CLI output also emits ERROR, returns exit code 1, and never prints SMTP_USER / SMTP_PASS
-    const cliLines: string[] = [];
-    const cliOrigLog = console.log;
-    const cliOrigErr = console.error;
-    console.log = (...args: any[]) => cliLines.push(args.map(String).join(' '));
-    console.error = (...args: any[]) => cliLines.push(args.map(String).join(' '));
-    let cliExitCode = 0;
-    try {
-      cliExitCode = await runValidatorCli(['--mode=staging'], {
-        ...validStagingEnv,
-        SMTP_HOST: '',
-        SMTP_USER: orphanSecretUser,
-        SMTP_PASS: orphanSecretPass,
-      });
-    } finally {
-      console.log = cliOrigLog;
-      console.error = cliOrigErr;
+    // Verify CLI output also emits ERROR, returns exit code 1, and never prints SMTP_USER / SMTP_PASS (staging & ci)
+    for (const [cliMode, cliEnv] of [
+      ['--mode=staging', validStagingEnv],
+      ['--mode=ci', validCiEnv],
+    ] as Array<[string, NodeJS.ProcessEnv]>) {
+      const cliLines: string[] = [];
+      const cliOrigLog = console.log;
+      const cliOrigErr = console.error;
+      console.log = (...args: any[]) => cliLines.push(args.map(String).join(' '));
+      console.error = (...args: any[]) => cliLines.push(args.map(String).join(' '));
+      let cliExitCode = 0;
+      try {
+        cliExitCode = await runValidatorCli([cliMode], {
+          ...cliEnv,
+          SMTP_HOST: '',
+          SMTP_USER: orphanSecretUser,
+          SMTP_PASS: orphanSecretPass,
+        });
+      } finally {
+        console.log = cliOrigLog;
+        console.error = cliOrigErr;
+      }
+      assert.strictEqual(cliExitCode, 1, `C.1h.7 CLI validator (${cliMode}) exits 1 on orphan SMTP credentials`);
+      const cliOutput = cliLines.join('\n');
+      assert.ok(cliOutput.includes('[ERROR] SMTP_HOST:'), `C.1h.8 CLI output (${cliMode}) flags [ERROR] SMTP_HOST`);
+      assert.ok(!cliOutput.includes(orphanSecretUser), `C.1h.9 CLI output (${cliMode}) never leaks SMTP_USER`);
+      assert.ok(!cliOutput.includes(orphanSecretPass), `C.1h.10 CLI output (${cliMode}) never leaks SMTP_PASS`);
     }
-    assert.strictEqual(cliExitCode, 1, 'C.1h.7 CLI validator exits 1 on orphan SMTP credentials');
-    const cliOutput = cliLines.join('\n');
-    assert.ok(cliOutput.includes('[ERROR] SMTP_HOST:'), 'C.1h.8 CLI output flags [ERROR] SMTP_HOST');
-    assert.ok(!cliOutput.includes(orphanSecretUser), 'C.1h.9 CLI output never leaks SMTP_USER');
-    assert.ok(!cliOutput.includes(orphanSecretPass), 'C.1h.10 CLI output never leaks SMTP_PASS');
 
     // Case C: SMTP_HOST set + incomplete auth -> ERROR preserving SMTP_AUTH_INCOMPLETE
     const stagingBadSmtpAuth = validateBillingConfiguration('staging', {
@@ -511,7 +535,74 @@ export async function runProductionReadinessTests(): Promise<void> {
       'C.1i.6 SMTP validation errors never disclose SMTP_PASS value'
     );
 
+    // Case C2: Invalid SMTP_PORT and INVALID_SMTP_SECURE -> ERROR across resolveSmtpConfiguration & validateBillingConfiguration
+    for (const badPort of ['0', '65536', 'abc', '-5']) {
+      const badPortResolved = resolveSmtpConfiguration({
+        SMTP_HOST: 'smtp.example.org',
+        SMTP_PORT: badPort,
+        SMTP_USER: 'smtp_user',
+        SMTP_PASS: 'smtp_pass',
+        SMTP_FROM: 'VideoRisk <no-reply@videorisk.com>',
+      });
+      assert.strictEqual(badPortResolved.configured, false, `C.1i.7 (${badPort}) marked unconfigured`);
+      assert.strictEqual(badPortResolved.reason, 'INVALID_SMTP_PORT', `C.1i.8 (${badPort}) reports INVALID_SMTP_PORT`);
+
+      const badPortVal = validateBillingConfiguration('ci', {
+        ...validCiEnv,
+        SMTP_HOST: 'smtp.example.org',
+        SMTP_PORT: badPort,
+        SMTP_USER: 'smtp_user',
+        SMTP_PASS: 'smtp_pass',
+        SMTP_FROM: 'VideoRisk <no-reply@videorisk.com>',
+      });
+      assert.strictEqual(badPortVal.valid, false, `C.1i.9 (${badPort}) fails CI validation`);
+      assert.ok(
+        badPortVal.issues.some((i) => i.type === 'ERROR' && i.variable === 'SMTP_PORT'),
+        `C.1i.10 (${badPort}) reports SMTP_PORT ERROR`
+      );
+    }
+
+    for (const badSecure of ['yes', '1', 'tls']) {
+      const badSecureResolved = resolveSmtpConfiguration({
+        SMTP_HOST: 'smtp.example.org',
+        SMTP_PORT: '587',
+        SMTP_SECURE: badSecure,
+        SMTP_USER: 'smtp_user',
+        SMTP_PASS: 'smtp_pass',
+        SMTP_FROM: 'VideoRisk <no-reply@videorisk.com>',
+      });
+      assert.strictEqual(badSecureResolved.configured, false, `C.1i.11 (${badSecure}) marked unconfigured`);
+      assert.strictEqual(badSecureResolved.reason, 'INVALID_SMTP_SECURE', `C.1i.12 (${badSecure}) reports INVALID_SMTP_SECURE`);
+
+      const badSecureVal = validateBillingConfiguration('ci', {
+        ...validCiEnv,
+        SMTP_HOST: 'smtp.example.org',
+        SMTP_PORT: '587',
+        SMTP_SECURE: badSecure,
+        SMTP_USER: 'smtp_user',
+        SMTP_PASS: 'smtp_pass',
+        SMTP_FROM: 'VideoRisk <no-reply@videorisk.com>',
+      });
+      assert.strictEqual(badSecureVal.valid, false, `C.1i.13 (${badSecure}) fails CI validation`);
+      assert.ok(
+        badSecureVal.issues.some((i) => i.type === 'ERROR' && i.variable === 'SMTP_SECURE'),
+        `C.1i.14 (${badSecure}) reports SMTP_SECURE ERROR`
+      );
+    }
+
     // Case D: Valid SMTP configuration passes without errors or warnings
+    const validSmtpResolved = resolveSmtpConfiguration({
+      SMTP_HOST: 'smtp.example.org',
+      SMTP_PORT: '465',
+      SMTP_SECURE: 'true',
+      SMTP_USER: 'smtp_user',
+      SMTP_PASS: 'smtp_pass',
+      SMTP_FROM: 'VideoRisk <no-reply@videorisk.com>',
+    });
+    assert.strictEqual(validSmtpResolved.configured, true, 'C.1j.0 Valid SMTP configuration resolves configured=true');
+    assert.strictEqual(validSmtpResolved.port, 465, 'C.1j.0b Valid SMTP port preserved');
+    assert.strictEqual(validSmtpResolved.secure, true, 'C.1j.0c Valid SMTP secure preserved');
+
     const stagingValidSmtp = validateBillingConfiguration('staging', {
       ...validStagingEnv,
       SMTP_HOST: 'smtp.example.org',
