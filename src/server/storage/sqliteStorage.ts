@@ -22,7 +22,13 @@ import {
   ChannelIntelligenceRecord,
   PlanDetails,
   StripePaymentRecord,
-  StripeRefundRecord
+  StripeRefundRecord,
+  AnalyticsEventName,
+  AnalyticsEventRecord,
+  AnalyticsQueryOptions,
+  AnalyticsEventsPage,
+  AnalyticsFunnelSummary,
+  AnalyticsFunnelDailyEntry
 } from '../../types';
 import { OFFICIAL_PRICING_PLANS } from './pricingCatalogue';
 import {
@@ -38,12 +44,22 @@ import {
   IPasswordResetRepository,
   IJobQueueRepository,
   IRateLimitRepository,
+  IAnalyticsRepository,
+  AnalyticsEventInput,
   RateLimitStatus,
   RateLimitSpec,
   MultiRateLimitStatus,
   LeaseFencingToken,
   UploadRecord
 } from './index';
+import {
+  ANALYTICS_EVENT_NAMES,
+  buildFunnelConversionRates,
+  createEmptyDailyEntry,
+  createEmptyFunnelStages,
+  isValidAnalyticsEventName,
+  sanitizeAnalyticsProperties
+} from '../services/analyticsSanitizer';
 import { validateTestDatabaseTarget } from './testIsolation';
 import { isProductionEnvironment } from '../config/environment';
 
@@ -855,6 +871,37 @@ export class SqliteStorageRepository implements IStorageRepository {
       } catch (err) {
         this.db.exec('ROLLBACK;');
         throw new Error(`Failed to apply migration 9: ${err}`);
+      }
+    }
+
+    // Migration 10: Product Analytics Events Foundation
+    if (!appliedVersions.has(10)) {
+      this.db.exec('BEGIN IMMEDIATE;');
+      try {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS analytics_events (
+            id TEXT PRIMARY KEY,
+            event_name TEXT NOT NULL,
+            user_id TEXT,
+            anonymous_id TEXT,
+            event_version INTEGER NOT NULL DEFAULT 1,
+            occurred_at TEXT NOT NULL,
+            properties TEXT NOT NULL DEFAULT '{}',
+            idempotency_key TEXT,
+            created_at TEXT NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_analytics_events_name_occurred ON analytics_events(event_name, occurred_at);
+          CREATE INDEX IF NOT EXISTS idx_analytics_events_user_occurred ON analytics_events(user_id, occurred_at);
+          CREATE INDEX IF NOT EXISTS idx_analytics_events_anon_occurred ON analytics_events(anonymous_id, occurred_at);
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_analytics_events_idempotency ON analytics_events(idempotency_key) WHERE idempotency_key IS NOT NULL;
+
+          INSERT INTO schema_migrations (version, name, applied_at)
+          VALUES (10, '010_analytics_events', datetime('now'));
+        `);
+        this.db.exec('COMMIT;');
+      } catch (err) {
+        this.db.exec('ROLLBACK;');
+        throw new Error(`Failed to apply migration 10: ${err}`);
       }
     }
   }
@@ -2473,6 +2520,17 @@ export class SqliteStorageRepository implements IStorageRepository {
       const subscriptionsCount = (restoredDb.prepare('SELECT COUNT(*) as c FROM subscriptions;').get() as any)?.c || 0;
       const webhookEventsCount = (restoredDb.prepare('SELECT COUNT(*) as c FROM webhook_events;').get() as any)?.c || 0;
       const creditTransactionsCount = (restoredDb.prepare('SELECT COUNT(*) as c FROM credit_transactions;').get() as any)?.c || 0;
+      let analyticsEventsCount = 0;
+      try {
+        const hasAnalyticsTable = restoredDb
+          .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'analytics_events';")
+          .get() as any;
+        if (hasAnalyticsTable) {
+          analyticsEventsCount = (restoredDb.prepare('SELECT COUNT(*) as c FROM analytics_events;').get() as any)?.c || 0;
+        }
+      } catch {
+        analyticsEventsCount = 0;
+      }
 
       return {
         restored: true,
@@ -2482,13 +2540,226 @@ export class SqliteStorageRepository implements IStorageRepository {
           reports: reportsCount,
           subscriptions: subscriptionsCount,
           webhookEvents: webhookEventsCount,
-          creditTransactions: creditTransactionsCount
+          creditTransactions: creditTransactionsCount,
+          analyticsEvents: analyticsEventsCount
         }
       };
     } finally {
       restoredDb.close();
     }
   }
+
+  // -------------------------------------------------------------
+  // PRODUCT ANALYTICS REPOSITORY (MIGRATION 010)
+  // -------------------------------------------------------------
+  public analytics: IAnalyticsRepository = {
+    recordEvent: async (input: AnalyticsEventInput) => {
+      const sanitizedProps = sanitizeAnalyticsProperties(input.properties, input.eventName);
+      const propertiesJson = JSON.stringify(sanitizedProps);
+      const createdAt = new Date().toISOString();
+      const idempotencyKey = input.idempotencyKey && input.idempotencyKey.trim()
+        ? input.idempotencyKey.trim()
+        : null;
+
+      const stmt = this.db.prepare(`
+        INSERT INTO analytics_events (
+          id, event_name, user_id, anonymous_id, event_version,
+          occurred_at, properties, idempotency_key, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT DO NOTHING
+      `);
+
+      const result = stmt.run(
+        input.id,
+        input.eventName,
+        input.userId || null,
+        input.anonymousId || null,
+        input.eventVersion,
+        input.occurredAt,
+        propertiesJson,
+        idempotencyKey,
+        createdAt
+      );
+
+      if (Number(result.changes || 0) === 0) {
+        return { recorded: false, deduplicated: true, event: null };
+      }
+
+      return {
+        recorded: true,
+        deduplicated: false,
+        event: {
+          id: input.id,
+          eventName: input.eventName,
+          userId: input.userId || null,
+          anonymousId: input.anonymousId || null,
+          eventVersion: input.eventVersion,
+          occurredAt: input.occurredAt,
+          properties: sanitizedProps,
+          idempotencyKey,
+          createdAt,
+        },
+      };
+    },
+
+    queryEvents: async (options: AnalyticsQueryOptions = {}): Promise<AnalyticsEventsPage> => {
+      const limit = Math.min(100, Math.max(1, Math.trunc(options.limit ?? 50)));
+      const offset = Math.max(0, Math.trunc(options.offset ?? 0));
+      const orderDir = options.order === 'asc' ? 'ASC' : 'DESC';
+
+      const conditions: string[] = [];
+      const params: Array<string | number> = [];
+
+      if (options.eventName) {
+        conditions.push('event_name = ?');
+        params.push(options.eventName);
+      }
+      if (options.userId) {
+        conditions.push('user_id = ?');
+        params.push(options.userId);
+      }
+      if (options.anonymousId) {
+        conditions.push('anonymous_id = ?');
+        params.push(options.anonymousId);
+      }
+      if (options.startDate) {
+        conditions.push('occurred_at >= ?');
+        params.push(options.startDate);
+      }
+      if (options.endDate) {
+        conditions.push('occurred_at <= ?');
+        params.push(options.endDate);
+      }
+
+      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+      const totalRow = this.db
+        .prepare(`SELECT COUNT(*) as total FROM analytics_events ${whereClause}`)
+        .get(...params) as { total: number };
+      const total = Number(totalRow?.total || 0);
+
+      const rows = this.db
+        .prepare(`
+          SELECT id, event_name, user_id, anonymous_id, event_version, occurred_at, properties, idempotency_key, created_at
+          FROM analytics_events
+          ${whereClause}
+          ORDER BY occurred_at ${orderDir}, created_at ${orderDir}, id ${orderDir}
+          LIMIT ? OFFSET ?
+        `)
+        .all(...params, limit, offset) as Array<{
+          id: string;
+          event_name: string;
+          user_id: string | null;
+          anonymous_id: string | null;
+          event_version: number;
+          occurred_at: string;
+          properties: string;
+          idempotency_key: string | null;
+          created_at: string;
+        }>;
+
+      const events: AnalyticsEventRecord[] = rows.map(row => {
+        let parsedProps: Record<string, unknown> = {};
+        try {
+          parsedProps = JSON.parse(row.properties || '{}');
+        } catch {
+          parsedProps = {};
+        }
+        const safeEventName = isValidAnalyticsEventName(row.event_name) ? row.event_name : undefined;
+        return {
+          id: row.id,
+          eventName: row.event_name as AnalyticsEventName,
+          userId: row.user_id || null,
+          anonymousId: row.anonymous_id || null,
+          eventVersion: Number(row.event_version || 1),
+          occurredAt: row.occurred_at,
+          properties: sanitizeAnalyticsProperties(parsedProps, safeEventName),
+          idempotencyKey: row.idempotency_key || null,
+          createdAt: row.created_at,
+        };
+      });
+
+      return {
+        events,
+        total,
+        limit,
+        offset,
+        hasMore: offset + events.length < total,
+      };
+    },
+
+    getFunnelSummary: async (options: { startDate?: string; endDate?: string } = {}): Promise<AnalyticsFunnelSummary> => {
+      const conditions: string[] = [];
+      const params: Array<string> = [];
+
+      if (options.startDate) {
+        conditions.push('occurred_at >= ?');
+        params.push(options.startDate);
+      }
+      if (options.endDate) {
+        conditions.push('occurred_at <= ?');
+        params.push(options.endDate);
+      }
+
+      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+      const stages = createEmptyFunnelStages();
+
+      const stageRows = this.db
+        .prepare(`
+          SELECT event_name, COUNT(*) as event_count, COUNT(DISTINCT user_id) as unique_users
+          FROM analytics_events
+          ${whereClause}
+          GROUP BY event_name
+        `)
+        .all(...params) as Array<{ event_name: string; event_count: number; unique_users: number }>;
+
+      for (const row of stageRows) {
+        if (!isValidAnalyticsEventName(row.event_name)) continue;
+        stages[row.event_name] = {
+          eventCount: Number(row.event_count || 0),
+          uniqueUsers: Number(row.unique_users || 0),
+        };
+      }
+
+      const dailyRows = this.db
+        .prepare(`
+          SELECT substr(occurred_at, 1, 10) as day, event_name, COUNT(*) as event_count, COUNT(DISTINCT user_id) as unique_users
+          FROM analytics_events
+          ${whereClause}
+          GROUP BY day, event_name
+          ORDER BY day ASC
+        `)
+        .all(...params) as Array<{ day: string; event_name: string; event_count: number; unique_users: number }>;
+
+      const dailyMap = new Map<string, AnalyticsFunnelDailyEntry>();
+      for (const row of dailyRows) {
+        if (!row.day || !isValidAnalyticsEventName(row.event_name)) continue;
+        let entry = dailyMap.get(row.day);
+        if (!entry) {
+          entry = createEmptyDailyEntry(row.day);
+          dailyMap.set(row.day, entry);
+        }
+        entry[row.event_name] = {
+          eventCount: Number(row.event_count || 0),
+          uniqueUsers: Number(row.unique_users || 0),
+        };
+      }
+
+      const daily = Array.from(dailyMap.values()).sort((a, b) => a.date.localeCompare(b.date));
+
+      return {
+        stages,
+        conversionRates: buildFunnelConversionRates(stages),
+        daily,
+        metadata: {
+          dataSource: 'analytics_events',
+          historicalReconstruction: false,
+          startDate: options.startDate || null,
+          endDate: options.endDate || null,
+          generatedAt: new Date().toISOString(),
+        },
+      };
+    },
+  };
 }
 
 /**

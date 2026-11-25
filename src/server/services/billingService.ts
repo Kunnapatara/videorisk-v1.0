@@ -14,6 +14,7 @@ import {
   StripeRefundRecord,
   StripeRefundStatus
 } from '../../types';
+import { analyticsService, TrackAnalyticsInput } from './analyticsService';
 
 export const ALLOWED_PAID_PLANS = ['creator', 'pro', 'agency', 'audit_once'] as const;
 export const RECURRING_SUBSCRIPTION_PLANS = ['creator', 'pro', 'agency'] as const;
@@ -1943,7 +1944,8 @@ export class BillingService {
     verificationContext?: { signatureVerified: boolean }
   ): Promise<{ alreadyProcessed: boolean }> {
     const signatureVerified = Boolean(verificationContext?.signatureVerified);
-    return await this.getActiveStorage().runTransaction(async (state) => {
+    const pendingAnalytics: TrackAnalyticsInput[] = [];
+    const txResult = await this.getActiveStorage().runTransaction(async (state) => {
       // Idempotency check inside transaction
       if (state.webhookEvents[event.id]) {
         console.log(`[BillingService] Idempotency hit: Event ${event.id} already processed.`);
@@ -2213,6 +2215,20 @@ export class BillingService {
           // Reconcile any partial/out-of-order refunds that arrived before checkout.session.completed
           this.reconcilePendingRefundsForPayment(state, createdPayment, user, new Date().toISOString());
 
+          pendingAnalytics.push({
+            eventName: 'purchase_completed',
+            userId: user.id,
+            idempotencyKey: `purchase_completed:checkout:${session.id}`,
+            properties: {
+              purchaseType: planId === 'audit_once' ? 'credit_purchase' : 'subscription_purchase',
+              planId,
+              currency: session.currency ? String(session.currency).toLowerCase() : undefined,
+              amountMinorUnits: typeof session.amount_total === 'number' ? session.amount_total : undefined,
+              paymentProvider: 'stripe',
+              purchaseRef: session.id,
+            },
+          });
+
           console.log(`[BillingService] checkout.session.completed: Allocated ${creditAllocation} credits to ${userId} for plan ${planId}`);
           break;
         }
@@ -2364,6 +2380,21 @@ export class BillingService {
                         chargeId: invoiceChargeId || null,
                       })
                     });
+                    if (creditAllocation > 0) {
+                      pendingAnalytics.push({
+                        eventName: 'purchase_completed',
+                        userId: sub.userId,
+                        idempotencyKey: `purchase_completed:invoice:${invoice.id || event.id}`,
+                        properties: {
+                          purchaseType: 'subscription_renewal',
+                          planId: sub.planId,
+                          currency: invoice.currency ? String(invoice.currency).toLowerCase() : undefined,
+                          amountMinorUnits: typeof invoice.amount_paid === 'number' ? invoice.amount_paid : undefined,
+                          paymentProvider: 'stripe',
+                          purchaseRef: invoice.id || event.id,
+                        },
+                      });
+                    }
                   }
                   this.reconcilePendingRefundsForPayment(state, invPayment, user, new Date().toISOString());
                   return { alreadyProcessed: false };
@@ -2533,6 +2564,24 @@ export class BillingService {
               };
 
               this.applyUserSubscriptionEntitlement(state, user, subId, status, mappedPlanId, effectiveCurrentPeriodEnd);
+
+              if (event.type === 'customer.subscription.updated' && sub && sub.planId !== mappedPlanId && status === 'active') {
+                const planRank: Record<string, number> = { free: 0, creator: 1, pro: 2, agency: 3 };
+                if ((planRank[mappedPlanId] || 0) > (planRank[sub.planId] || 0)) {
+                  pendingAnalytics.push({
+                    eventName: 'purchase_completed',
+                    userId: user.id,
+                    idempotencyKey: `purchase_completed:upgrade:${subId}:${event.id}`,
+                    properties: {
+                      purchaseType: 'plan_upgrade',
+                      planId: mappedPlanId,
+                      previousPlanId: sub.planId,
+                      paymentProvider: 'stripe',
+                      purchaseRef: subId,
+                    },
+                  });
+                }
+              }
             }
           }
 
@@ -2770,6 +2819,15 @@ export class BillingService {
 
       return { alreadyProcessed: false };
     });
+
+    if (!txResult.alreadyProcessed && pendingAnalytics.length > 0) {
+      const activeRepo = this.getActiveStorage();
+      for (const evt of pendingAnalytics) {
+        await analyticsService.trackSafe(evt, activeRepo);
+      }
+    }
+
+    return txResult;
   }
 
   /**
@@ -2930,6 +2988,7 @@ export class BillingService {
     // Payment verified: Synchronize user entitlement idempotently inside database transaction
     const syncEventId = `sync_${session.id}`;
     const targetUserId = sessionUserId;
+    let pendingSyncPurchase: TrackAnalyticsInput | null = null;
 
     const updatedUser = await this.getActiveStorage().runTransaction(async (state) => {
       const user = state.users[targetUserId];
@@ -3080,10 +3139,28 @@ export class BillingService {
         });
 
         this.reconcilePendingRefundsForPayment(state, syncedPayment, user, new Date().toISOString());
+
+        pendingSyncPurchase = {
+          eventName: 'purchase_completed',
+          userId: user.id,
+          idempotencyKey: `purchase_completed:checkout:${session.id}`,
+          properties: {
+            purchaseType: planId === 'audit_once' ? 'credit_purchase' : 'subscription_purchase',
+            planId,
+            currency: session.currency ? String(session.currency).toLowerCase() : undefined,
+            amountMinorUnits: typeof session.amount_total === 'number' ? session.amount_total : undefined,
+            paymentProvider: 'stripe',
+            purchaseRef: session.id,
+          },
+        };
       }
 
       return user;
     });
+
+    if (pendingSyncPurchase) {
+      await analyticsService.trackSafe(pendingSyncPurchase, this.getActiveStorage());
+    }
 
     return {
       status: 'complete',
@@ -3156,8 +3233,9 @@ export class BillingService {
     }
 
     const syntheticEventId = `sim_evt_${sessionId}`;
+    let pendingSimPurchase: TrackAnalyticsInput | null = null;
 
-    return await storage.runTransaction(async (state) => {
+    const updatedUser = await this.getActiveStorage().runTransaction(async (state) => {
       const alreadyProcessed = !!state.webhookEvents[syntheticEventId];
       const user = state.users[userId];
       if (!user) {
@@ -3195,8 +3273,26 @@ export class BillingService {
         metadataJson: JSON.stringify({ planId })
       });
 
+      pendingSimPurchase = {
+        eventName: 'purchase_completed',
+        userId: user.id,
+        idempotencyKey: `purchase_completed:sim:${sessionId}`,
+        properties: {
+          purchaseType: planId === 'audit_once' ? 'credit_purchase' : 'subscription_purchase',
+          planId,
+          paymentProvider: 'stripe_simulation',
+          purchaseRef: sessionId,
+        },
+      };
+
       return user;
     });
+
+    if (pendingSimPurchase) {
+      await analyticsService.trackSafe(pendingSimPurchase, this.getActiveStorage());
+    }
+
+    return updatedUser;
   }
 }
 

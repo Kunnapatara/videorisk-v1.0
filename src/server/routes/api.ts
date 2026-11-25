@@ -15,6 +15,8 @@ import { billingService, ALLOWED_PAID_PLANS } from '../services/billingService';
 import { emailService } from '../services/emailService';
 import { ensureDemoFixtures, getDemoFixture } from '../fixtures/demoMedia';
 import { channelIntelligenceEngine } from '../intelligence/channelIntelligence';
+import { analyticsService, ANALYTICS_EVENT_NAMES } from '../services/analyticsService';
+import { isValidAnalyticsEventName } from '../services/analyticsSanitizer';
 import { validateStripeWebhookSecret } from '../../../scripts/validate-env';
 import {
   isForbiddenProductionOriginHostname,
@@ -22,7 +24,7 @@ import {
   resolveEnvironmentSecurity,
   validateMediaTokenSecret,
 } from '../config/environment';
-import { ScanJob, ScanMode, UserAccount, CrossVideoPattern, ChannelCoverageReport, ChannelCoverageDetail, ChannelPatternsResponse, CrossVideoComparisonStatus } from '../../types';
+import { AnalyticsEventName, ScanJob, ScanMode, UserAccount, CrossVideoPattern, ChannelCoverageReport, ChannelCoverageDetail, ChannelPatternsResponse, CrossVideoComparisonStatus } from '../../types';
 
 export const apiRouter = Router();
 export const MIN_PASSWORD_LENGTH = 8;
@@ -260,6 +262,80 @@ export async function requireAuth(req: Request, res: Response): Promise<UserAcco
   }
   (req as any).user = user;
   return user;
+}
+
+function parseAdminAllowlist(raw: string | undefined, normalizeEmail: boolean): Set<string> {
+  if (!raw || typeof raw !== 'string') {
+    return new Set();
+  }
+  return new Set(
+    raw
+      .split(',')
+      .map(entry => (normalizeEmail ? entry.trim().toLowerCase() : entry.trim()))
+      .filter(Boolean)
+  );
+}
+
+export function isAdminUser(user: UserAccount, env: NodeJS.ProcessEnv = process.env): boolean {
+  const adminUserIds = parseAdminAllowlist(env.ADMIN_USER_IDS, false);
+  const adminEmails = parseAdminAllowlist(env.ADMIN_EMAILS, true);
+  if (adminUserIds.size === 0 && adminEmails.size === 0) {
+    return false;
+  }
+  if (adminUserIds.has(user.id)) {
+    return true;
+  }
+  if (user.email && adminEmails.has(user.email.toLowerCase().trim())) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Enforces both active authentication (401) and explicit administrator authorization (403).
+ * Fails closed when ADMIN_EMAILS and ADMIN_USER_IDS are unset.
+ */
+export async function requireAdmin(req: Request, res: Response): Promise<UserAccount | null> {
+  const user = await requireAuth(req, res);
+  if (!user) return null;
+
+  if (!isAdminUser(user)) {
+    res.status(403).json({ error: 'Forbidden: Administrator access is required.' });
+    return null;
+  }
+
+  return user;
+}
+
+const ANALYTICS_DATE_ONLY_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+
+function parseAnalyticsDateParam(
+  raw: unknown,
+  boundary: 'start' | 'end'
+): { ok: true; value?: string } | { ok: false; error: string } {
+  if (raw === undefined || raw === null || raw === '') {
+    return { ok: true, value: undefined };
+  }
+  if (typeof raw !== 'string') {
+    return { ok: false, error: 'Date parameter must be a valid ISO-8601 date or timestamp string.' };
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return { ok: true, value: undefined };
+  }
+  if (ANALYTICS_DATE_ONLY_REGEX.test(trimmed)) {
+    const iso = boundary === 'start' ? `${trimmed}T00:00:00.000Z` : `${trimmed}T23:59:59.999Z`;
+    const ms = Date.parse(iso);
+    if (!Number.isFinite(ms) || new Date(ms).toISOString().slice(0, 10) !== trimmed) {
+      return { ok: false, error: `Invalid calendar date: ${trimmed}` };
+    }
+    return { ok: true, value: iso };
+  }
+  const ms = Date.parse(trimmed);
+  if (!Number.isFinite(ms)) {
+    return { ok: false, error: `Invalid ISO-8601 date timestamp: ${trimmed}` };
+  }
+  return { ok: true, value: new Date(ms).toISOString() };
 }
 
 // ==============================================================================
@@ -1798,6 +1874,27 @@ apiRouter.post('/auth/register', async (req: Request, res: Response) => {
 
     const sessionToken = await storage.users.createSession(newUser.id);
 
+    await analyticsService.trackSafe({
+      eventName: 'user_registered',
+      userId: newUser.id,
+      idempotencyKey: `user_registered:${newUser.id}`,
+      properties: {
+        registrationMethod: 'email_password',
+      },
+    });
+
+    if (newUser.plan === 'free' && newUser.freeTrialClaimed === true && newUser.creditsRemaining > 0) {
+      await analyticsService.trackSafe({
+        eventName: 'trial_activated',
+        userId: newUser.id,
+        idempotencyKey: `trial_activated:${newUser.id}`,
+        properties: {
+          trialType: 'free_starter',
+          grantedCredits: newUser.creditsRemaining,
+        },
+      });
+    }
+
     res.status(201).json({
       user: sanitizeUser(newUser),
       token: sessionToken,
@@ -2141,6 +2238,15 @@ apiRouter.post('/user/plan', async (req: Request, res: Response) => {
           user: sanitizeUser(result.user),
         });
       }
+      await analyticsService.trackSafe({
+        eventName: 'trial_activated',
+        userId: user.id,
+        idempotencyKey: `trial_activated:${user.id}`,
+        properties: {
+          trialType: 'free_plan_claim',
+          grantedCredits: 10,
+        },
+      });
       return res.json(sanitizeUser(result.user));
     }
 
@@ -3567,5 +3673,134 @@ apiRouter.get('/operational/metrics', async (req: Request, res: Response) => {
     });
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to retrieve operational metrics.' });
+  }
+});
+
+// 18. Admin-Restricted Product Analytics Funnel & Event Queries
+apiRouter.get('/analytics/funnel', async (req: Request, res: Response) => {
+  try {
+    const admin = await requireAdmin(req, res);
+    if (!admin) return;
+
+    const startParsed = parseAnalyticsDateParam(req.query.startDate, 'start');
+    if (!startParsed.ok) {
+      return res.status(400).json({ error: `Invalid startDate: ${startParsed.error}` });
+    }
+    const endParsed = parseAnalyticsDateParam(req.query.endDate, 'end');
+    if (!endParsed.ok) {
+      return res.status(400).json({ error: `Invalid endDate: ${endParsed.error}` });
+    }
+
+    if (startParsed.value && endParsed.value && startParsed.value > endParsed.value) {
+      return res.status(400).json({ error: 'Invalid date range: startDate must be earlier than or equal to endDate.' });
+    }
+
+    const summary = await analyticsService.getFunnelSummary({
+      startDate: startParsed.value,
+      endDate: endParsed.value,
+    });
+    res.json(summary);
+  } catch (err: any) {
+    console.error('[Analytics Funnel Error]:', err?.message || err);
+    res.status(500).json({ error: 'Failed to retrieve analytics funnel summary.' });
+  }
+});
+
+apiRouter.get('/analytics/events', async (req: Request, res: Response) => {
+  try {
+    const admin = await requireAdmin(req, res);
+    if (!admin) return;
+
+    let eventName: AnalyticsEventName | undefined;
+    if (req.query.eventName !== undefined && req.query.eventName !== '') {
+      if (typeof req.query.eventName !== 'string' || !isValidAnalyticsEventName(req.query.eventName)) {
+        return res.status(400).json({
+          error: `Invalid eventName. Allowed values: ${ANALYTICS_EVENT_NAMES.join(', ')}`,
+        });
+      }
+      eventName = req.query.eventName;
+    }
+
+    let userId: string | undefined;
+    if (req.query.userId !== undefined && req.query.userId !== '') {
+      if (typeof req.query.userId !== 'string') {
+        return res.status(400).json({ error: 'userId filter must be a string.' });
+      }
+      const trimmed = req.query.userId.trim();
+      if (trimmed) {
+        userId = trimmed.slice(0, 128);
+      }
+    }
+
+    let anonymousId: string | undefined;
+    if (req.query.anonymousId !== undefined && req.query.anonymousId !== '') {
+      if (typeof req.query.anonymousId !== 'string') {
+        return res.status(400).json({ error: 'anonymousId filter must be a string.' });
+      }
+      const trimmed = req.query.anonymousId.trim();
+      if (trimmed) {
+        anonymousId = trimmed.slice(0, 128);
+      }
+    }
+
+    const startParsed = parseAnalyticsDateParam(req.query.startDate, 'start');
+    if (!startParsed.ok) {
+      return res.status(400).json({ error: `Invalid startDate: ${startParsed.error}` });
+    }
+    const endParsed = parseAnalyticsDateParam(req.query.endDate, 'end');
+    if (!endParsed.ok) {
+      return res.status(400).json({ error: `Invalid endDate: ${endParsed.error}` });
+    }
+
+    if (startParsed.value && endParsed.value && startParsed.value > endParsed.value) {
+      return res.status(400).json({ error: 'Invalid date range: startDate must be earlier than or equal to endDate.' });
+    }
+
+    let order: 'asc' | 'desc' = 'desc';
+    if (req.query.order !== undefined && req.query.order !== '') {
+      if (req.query.order !== 'asc' && req.query.order !== 'desc') {
+        return res.status(400).json({ error: 'Invalid order parameter. Allowed values: asc, desc.' });
+      }
+      order = req.query.order;
+    }
+
+    let limit = 50;
+    if (req.query.limit !== undefined && req.query.limit !== '') {
+      if (typeof req.query.limit !== 'string' || !/^[1-9]\d*$/.test(req.query.limit.trim())) {
+        return res.status(400).json({ error: 'Invalid limit parameter: must be a positive integer between 1 and 100.' });
+      }
+      const parsedLimit = Number(req.query.limit.trim());
+      if (!Number.isInteger(parsedLimit) || parsedLimit < 1 || parsedLimit > 100) {
+        return res.status(400).json({ error: 'Invalid limit parameter: must be between 1 and 100.' });
+      }
+      limit = parsedLimit;
+    }
+
+    let offset = 0;
+    if (req.query.offset !== undefined && req.query.offset !== '') {
+      if (typeof req.query.offset !== 'string' || !/^\d+$/.test(req.query.offset.trim())) {
+        return res.status(400).json({ error: 'Invalid offset parameter: must be a non-negative integer.' });
+      }
+      const parsedOffset = Number(req.query.offset.trim());
+      if (!Number.isInteger(parsedOffset) || parsedOffset < 0 || parsedOffset > 1_000_000) {
+        return res.status(400).json({ error: 'Invalid offset parameter: out of allowed bounds.' });
+      }
+      offset = parsedOffset;
+    }
+
+    const page = await analyticsService.queryEvents({
+      eventName,
+      userId,
+      anonymousId,
+      startDate: startParsed.value,
+      endDate: endParsed.value,
+      order,
+      limit,
+      offset,
+    });
+    res.json(page);
+  } catch (err: any) {
+    console.error('[Analytics Events Error]:', err?.message || err);
+    res.status(500).json({ error: 'Failed to retrieve analytics events.' });
   }
 });

@@ -19,10 +19,24 @@ import {
   ChannelIntelligenceRecord,
   PlanDetails,
   StripePaymentRecord,
-  StripeRefundRecord
+  StripeRefundRecord,
+  AnalyticsEventName,
+  AnalyticsEventRecord,
+  AnalyticsQueryOptions,
+  AnalyticsEventsPage,
+  AnalyticsFunnelSummary,
+  AnalyticsFunnelDailyEntry
 } from '../../types';
 import { OFFICIAL_PRICING_PLANS } from './pricingCatalogue';
 import { isProductionEnvironment } from '../config/environment';
+import {
+  ANALYTICS_EVENT_NAMES,
+  buildFunnelConversionRates,
+  createEmptyDailyEntry,
+  createEmptyFunnelStages,
+  isValidAnalyticsEventName,
+  sanitizeAnalyticsProperties
+} from '../services/analyticsSanitizer';
 
 export interface RateLimitStatus {
   allowed: boolean;
@@ -157,6 +171,23 @@ export interface IBillingRepository {
   getCreditTransactions(userId: string): Promise<CreditTransactionRecord[]>;
 }
 
+export interface AnalyticsEventInput {
+  id: string;
+  eventName: AnalyticsEventName;
+  userId: string | null;
+  anonymousId: string | null;
+  eventVersion: number;
+  occurredAt: string;
+  properties: Record<string, unknown>;
+  idempotencyKey?: string | null;
+}
+
+export interface IAnalyticsRepository {
+  recordEvent(event: AnalyticsEventInput): Promise<{ recorded: boolean; deduplicated: boolean; event: AnalyticsEventRecord | null }>;
+  queryEvents(options?: AnalyticsQueryOptions): Promise<AnalyticsEventsPage>;
+  getFunnelSummary(options?: { startDate?: string; endDate?: string }): Promise<AnalyticsFunnelSummary>;
+}
+
 export interface IStorageRepository {
   users: IUserRepository;
   uploads: IUploadRepository;
@@ -169,6 +200,7 @@ export interface IStorageRepository {
   passwordReset: IPasswordResetRepository;
   rateLimits: IRateLimitRepository;
   queue: IJobQueueRepository;
+  analytics: IAnalyticsRepository;
   checkRateLimit(key: string, action: string, limit: number, windowSeconds: number): Promise<boolean>;
   consumeRateLimit(key: string, action: string, limit: number, windowSeconds: number): Promise<RateLimitStatus>;
   consumeRateLimits(specs: RateLimitSpec[]): Promise<MultiRateLimitStatus>;
@@ -203,6 +235,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
     creditTransactions: CreditTransactionRecord[];
     stripePayments: Record<string, StripePaymentRecord>;
     stripeRefunds: Record<string, StripeRefundRecord>;
+    analyticsEvents: AnalyticsEventRecord[];
   };
 
   constructor(customDataFile?: string, env: NodeJS.ProcessEnv = process.env) {
@@ -236,6 +269,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
       creditTransactions: [],
       stripePayments: {},
       stripeRefunds: {},
+      analyticsEvents: [],
     };
     this.load();
     this.seedDefaultUserIfNeeded();
@@ -365,6 +399,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
       creditTransactions: Array.isArray(parsed.creditTransactions) ? parsed.creditTransactions : [],
       stripePayments: parsed.stripePayments || {},
       stripeRefunds: parsed.stripeRefunds || {},
+      analyticsEvents: Array.isArray(parsed.analyticsEvents) ? parsed.analyticsEvents : [],
     };
 
     let migratedLegacyFreeTrialFlags = false;
@@ -1358,10 +1393,148 @@ export class InMemoryStorageRepository implements IStorageRepository {
         reports: Object.keys(data.reports || {}).length,
         subscriptions: Object.keys(data.subscriptions || {}).length,
         webhookEvents: Object.keys(data.webhookEvents || {}).length,
-        creditTransactions: Array.isArray(data.creditTransactions) ? data.creditTransactions.length : 0
+        creditTransactions: Array.isArray(data.creditTransactions) ? data.creditTransactions.length : 0,
+        analyticsEvents: Array.isArray(data.analyticsEvents) ? data.analyticsEvents.length : 0
       }
     };
   }
+
+  public analytics: IAnalyticsRepository = {
+    recordEvent: async (input: AnalyticsEventInput) => {
+      if (input.idempotencyKey) {
+        const dup = this.state.analyticsEvents.find(e => e.idempotencyKey === input.idempotencyKey);
+        if (dup) {
+          return { recorded: false, deduplicated: true, event: null };
+        }
+      }
+      if (this.state.analyticsEvents.some(e => e.id === input.id)) {
+        return { recorded: false, deduplicated: true, event: null };
+      }
+
+      const record: AnalyticsEventRecord = {
+        id: input.id,
+        eventName: input.eventName,
+        userId: input.userId || null,
+        anonymousId: input.anonymousId || null,
+        eventVersion: input.eventVersion,
+        occurredAt: input.occurredAt,
+        properties: sanitizeAnalyticsProperties(input.properties, input.eventName),
+        idempotencyKey: input.idempotencyKey || null,
+        createdAt: new Date().toISOString(),
+      };
+      this.state.analyticsEvents.push(record);
+      this.save();
+      return { recorded: true, deduplicated: false, event: record };
+    },
+
+    queryEvents: async (options: AnalyticsQueryOptions = {}): Promise<AnalyticsEventsPage> => {
+      const limit = Math.min(100, Math.max(1, Math.trunc(options.limit ?? 50)));
+      const offset = Math.max(0, Math.trunc(options.offset ?? 0));
+      const order = options.order === 'asc' ? 'asc' : 'desc';
+
+      const filtered = this.state.analyticsEvents.filter(e => {
+        if (options.eventName && e.eventName !== options.eventName) return false;
+        if (options.userId && e.userId !== options.userId) return false;
+        if (options.anonymousId && e.anonymousId !== options.anonymousId) return false;
+        if (options.startDate && e.occurredAt < options.startDate) return false;
+        if (options.endDate && e.occurredAt > options.endDate) return false;
+        return true;
+      });
+
+      filtered.sort((a, b) => {
+        const cmp = a.occurredAt.localeCompare(b.occurredAt) || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id);
+        return order === 'asc' ? cmp : -cmp;
+      });
+
+      const page = filtered.slice(offset, offset + limit).map(e => ({
+        ...e,
+        properties: sanitizeAnalyticsProperties(e.properties, e.eventName),
+      }));
+
+      return {
+        events: page,
+        total: filtered.length,
+        limit,
+        offset,
+        hasMore: offset + page.length < filtered.length,
+      };
+    },
+
+    getFunnelSummary: async (options: { startDate?: string; endDate?: string } = {}): Promise<AnalyticsFunnelSummary> => {
+      const filtered = this.state.analyticsEvents.filter(e => {
+        if (options.startDate && e.occurredAt < options.startDate) return false;
+        if (options.endDate && e.occurredAt > options.endDate) return false;
+        return true;
+      });
+
+      const stages = createEmptyFunnelStages();
+      const stageUsers: Record<AnalyticsEventName, Set<string>> = {
+        user_registered: new Set(),
+        trial_activated: new Set(),
+        purchase_completed: new Set(),
+        analysis_started: new Set(),
+        analysis_completed: new Set(),
+        analysis_failed: new Set(),
+      };
+
+      const dailyMap = new Map<string, { entry: AnalyticsFunnelDailyEntry; users: Record<AnalyticsEventName, Set<string>> }>();
+
+      for (const e of filtered) {
+        if (!isValidAnalyticsEventName(e.eventName)) continue;
+        stages[e.eventName].eventCount += 1;
+        if (e.userId) {
+          stageUsers[e.eventName].add(e.userId);
+        }
+
+        const day = e.occurredAt.slice(0, 10);
+        let bucket = dailyMap.get(day);
+        if (!bucket) {
+          bucket = {
+            entry: createEmptyDailyEntry(day),
+            users: {
+              user_registered: new Set(),
+              trial_activated: new Set(),
+              purchase_completed: new Set(),
+              analysis_started: new Set(),
+              analysis_completed: new Set(),
+              analysis_failed: new Set(),
+            },
+          };
+          dailyMap.set(day, bucket);
+        }
+        bucket.entry[e.eventName].eventCount += 1;
+        if (e.userId) {
+          bucket.users[e.eventName].add(e.userId);
+        }
+      }
+
+      for (const name of ANALYTICS_EVENT_NAMES) {
+        stages[name].uniqueUsers = stageUsers[name].size;
+      }
+
+      const daily = Array.from(dailyMap.values())
+        .sort((a, b) => a.entry.date.localeCompare(b.entry.date))
+        .map(bucket => {
+          for (const name of ANALYTICS_EVENT_NAMES) {
+            bucket.entry[name].uniqueUsers = bucket.users[name].size;
+          }
+          return bucket.entry;
+        });
+
+      return {
+        stages,
+        conversionRates: buildFunnelConversionRates(stages),
+        daily,
+        metadata: {
+          dataSource: 'analytics_events',
+          historicalReconstruction: false,
+          startDate: options.startDate || null,
+          endDate: options.endDate || null,
+          generatedAt: new Date().toISOString(),
+        },
+      };
+    },
+  };
 }
 
 export { SqliteStorageRepository, migrateJsonToSqlite } from './sqliteStorage';

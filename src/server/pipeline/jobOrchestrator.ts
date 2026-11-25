@@ -7,6 +7,7 @@ import { videoProcessor, VideoProcessingError } from './videoProcessor';
 import { thumbnailInspector } from './thumbnailInspector';
 import { policyIntelligenceEngine } from '../intelligence/policyIntelligence';
 import { creditService } from '../services/creditService';
+import { analyticsService } from '../services/analyticsService';
 import { ScanJob, ScanStage, JobStatus, ThumbnailMetadata, JobQueueRecord, FencingError } from '../../types';
 
 export interface JobOrchestratorPipelineDeps {
@@ -181,8 +182,9 @@ export class JobOrchestrator {
     }, heartbeatInterval);
     if (heartbeatTimer.unref) heartbeatTimer.unref();
 
+    const jobStartedAt = Date.now();
     try {
-      await this.processJob(scanId, leaseToken, abortController.signal, () => leaseLost);
+      const summary = await this.processJob(scanId, leaseToken, abortController.signal, () => leaseLost);
 
       if (leaseLost || abortController.signal.aborted) {
         console.warn(`[JobOrchestrator] Stale worker lease lost during processing for job ${job.id}. Skipping completion.`);
@@ -190,6 +192,22 @@ export class JobOrchestrator {
       }
 
       await this.storageRepo.queue.completeJob(job.id, this.workerId, leaseToken);
+
+      await analyticsService.trackSafe(
+        {
+          eventName: 'analysis_completed',
+          userId: summary.userId,
+          idempotencyKey: `analysis_completed:${scanId}`,
+          properties: {
+            analysisId: scanId,
+            analysisMode: summary.scanMode,
+            processingStatus: 'COMPLETED',
+            processingDurationMs: Math.max(0, Date.now() - summary.startTime),
+            isRescan: summary.isRescan,
+          },
+        },
+        this.storageRepo
+      );
     } catch (err: any) {
       // If lease was lost or this was a fencing violation, suppress state mutations and credit refunds
       if (leaseLost || abortController.signal.aborted || err instanceof FencingError || err.name === 'FencingError') {
@@ -236,6 +254,37 @@ export class JobOrchestrator {
           }, leaseToken);
 
           await this.storageRepo.queue.failJob(job.id, err.message, false, 0, this.workerId, leaseToken);
+
+          const failedScan = await this.storageRepo.scans.getScan(scanId).catch(() => null);
+          const failureCategory =
+            err instanceof MediaInspectionError
+              ? 'MEDIA_INSPECTION_ERROR'
+              : err?.message?.includes('Insufficient credits')
+                ? 'INSUFFICIENT_CREDITS'
+                : err instanceof VideoProcessingError
+                  ? 'VIDEO_PROCESSING_ERROR'
+                  : err instanceof AudioProcessingError
+                    ? 'AUDIO_PROCESSING_ERROR'
+                    : err instanceof ProxyGenerationError
+                      ? 'PROXY_GENERATION_ERROR'
+                      : 'PIPELINE_ERROR';
+
+          await analyticsService.trackSafe(
+            {
+              eventName: 'analysis_failed',
+              userId: failedScan?.userId || null,
+              idempotencyKey: `analysis_failed:${scanId}`,
+              properties: {
+                analysisId: scanId,
+                analysisMode: failedScan?.scanMode === 'deep' ? 'deep' : 'standard',
+                processingStatus: 'FAILED',
+                processingDurationMs: Math.max(0, Date.now() - jobStartedAt),
+                failureCategory,
+                isRescan: Boolean(failedScan?.isRescan),
+              },
+            },
+            this.storageRepo
+          );
         } catch (fencingErr) {
           console.warn(`[JobOrchestrator] Stale worker fenced during terminal failure update for job ${job.id}`);
         }
@@ -258,7 +307,7 @@ export class JobOrchestrator {
     leaseToken?: string, 
     abortSignal?: AbortSignal, 
     isLeaseLost?: () => boolean
-  ): Promise<void> {
+  ): Promise<{ userId: string; scanMode: 'standard' | 'deep'; isRescan: boolean; startTime: number }> {
     const checkLease = () => {
       if (abortSignal?.aborted || isLeaseLost?.()) {
         throw new FencingError(`Worker lease lost or superseded during processing of scan ${scanId}`);
@@ -281,6 +330,20 @@ export class JobOrchestrator {
         currentStage: 'Media inspection',
         completedStages: ['Upload']
       }, leaseToken);
+
+      await analyticsService.trackSafe(
+        {
+          eventName: 'analysis_started',
+          userId: scan.userId,
+          idempotencyKey: `analysis_started:${scanId}`,
+          properties: {
+            analysisId: scanId,
+            analysisMode: scan.scanMode,
+            isRescan: Boolean(scan.isRescan),
+          },
+        },
+        this.storageRepo
+      );
 
       const inspectionStart = Date.now();
       const metadata = await this.deps.mediaInspector.inspect(scan.videoPath, scan.videoFilename);
@@ -492,6 +555,13 @@ export class JobOrchestrator {
         ],
         completedAt: new Date().toISOString()
       }, leaseToken);
+
+      return {
+        userId: scan.userId,
+        scanMode: scan.scanMode,
+        isRescan: Boolean(scan.isRescan),
+        startTime,
+      };
     } finally {
       // Clean up temporary extracted frames to prevent disk exhaustion
       if (tempFramesDirToClean) {

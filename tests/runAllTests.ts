@@ -130,6 +130,10 @@ async function main() {
     const { runProductionReadinessTests } = await import('./production_readiness_remediation.test');
     await runProductionReadinessTests();
 
+    // Run Suite 26: Analytics Foundation Completion (Migration 010, Event Service, Funnel & Security)
+    const { runAnalyticsFoundationTests } = await import('./analytics_foundation.test');
+    await runAnalyticsFoundationTests();
+
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log(`\n🎉 ALL AUTOMATED VERIFICATION SUITES COMPLETED SUCCESSFULLY in ${elapsed}s!`);
     process.exit(0);

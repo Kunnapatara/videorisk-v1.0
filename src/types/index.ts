@@ -829,3 +829,90 @@ export interface PlanDetails {
   description?: string;
   targetAudience?: string;
 }
+
+export type AnalyticsEventName =
+  | 'user_registered'
+  | 'trial_activated'
+  | 'purchase_completed'
+  | 'analysis_started'
+  | 'analysis_completed'
+  | 'analysis_failed';
+
+export interface AnalyticsEventRecord {
+  id: string;
+  eventName: AnalyticsEventName;
+  userId: string | null;
+  anonymousId: string | null;
+  eventVersion: number;
+  occurredAt: string;
+  properties: Record<string, unknown>;
+  idempotencyKey?: string | null;
+  createdAt: string;
+}
+
+export interface AnalyticsQueryOptions {
+  eventName?: AnalyticsEventName;
+  userId?: string;
+  anonymousId?: string;
+  startDate?: string;
+  endDate?: string;
+  limit?: number;
+  offset?: number;
+  order?: 'asc' | 'desc';
+}
+
+export interface AnalyticsEventsPage {
+  events: AnalyticsEventRecord[];
+  total: number;
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+}
+
+export interface AnalyticsFunnelStageMetrics {
+  eventCount: number;
+  uniqueUsers: number;
+}
+
+export interface AnalyticsConversionRate {
+  ratePercent: number;
+  numerator: number;
+  denominator: number;
+}
+
+export interface AnalyticsFunnelDailyEntry {
+  date: string;
+  user_registered: AnalyticsFunnelStageMetrics;
+  trial_activated: AnalyticsFunnelStageMetrics;
+  purchase_completed: AnalyticsFunnelStageMetrics;
+  analysis_started: AnalyticsFunnelStageMetrics;
+  analysis_completed: AnalyticsFunnelStageMetrics;
+  analysis_failed: AnalyticsFunnelStageMetrics;
+}
+
+export interface AnalyticsFunnelSummary {
+  stages: {
+    user_registered: AnalyticsFunnelStageMetrics;
+    trial_activated: AnalyticsFunnelStageMetrics;
+    purchase_completed: AnalyticsFunnelStageMetrics;
+    analysis_started: AnalyticsFunnelStageMetrics;
+    analysis_completed: AnalyticsFunnelStageMetrics;
+    analysis_failed: AnalyticsFunnelStageMetrics;
+  };
+  conversionRates: {
+    registrationToTrial: AnalyticsConversionRate;
+    trialToPurchase: AnalyticsConversionRate;
+    purchaseToAnalysisStarted: AnalyticsConversionRate;
+    analysisStartedToCompleted: AnalyticsConversionRate;
+    registrationToPurchase: AnalyticsConversionRate;
+    registrationToAnalysisCompleted: AnalyticsConversionRate;
+  };
+  daily: AnalyticsFunnelDailyEntry[];
+  metadata: {
+    dataSource: 'analytics_events';
+    historicalReconstruction: false;
+    startDate: string | null;
+    endDate: string | null;
+    generatedAt: string;
+  };
+}
