@@ -15,7 +15,7 @@ import {
   ShieldCheck
 } from 'lucide-react';
 import { ScanMode, UserAccount } from '../types';
-import { authFetch } from '../utils/api';
+import { authFetch, parseApiResponse } from '../utils/api';
 
 interface UploadModalProps {
   user: UserAccount | null;
@@ -132,12 +132,11 @@ export const UploadModal: React.FC<UploadModalProps> = ({
         body: formData,
       });
 
-      if (!uploadRes.ok) {
-        const errData = await uploadRes.json();
-        throw new Error(errData.error || 'Failed to upload video.');
-      }
-
-      const uploadData = await uploadRes.json();
+      const uploadData = await parseApiResponse<{
+        fileId: string;
+        filePath: string;
+        filename: string;
+      }>(uploadRes, 'Failed to upload video.');
 
       // 2. Upload Thumbnail if provided
       let uploadedThumbPath: string | undefined;
@@ -152,12 +151,19 @@ export const UploadModal: React.FC<UploadModalProps> = ({
           body: thumbFormData,
         });
 
-        if (thumbRes.ok) {
-          const thumbData = await thumbRes.json();
+        try {
+          const thumbData = await parseApiResponse<{
+            filePath: string;
+            filename: string;
+          }>(thumbRes, 'Thumbnail upload failed.');
           uploadedThumbPath = thumbData.filePath;
           uploadedThumbFilename = thumbData.filename;
-        } else {
-          console.warn('Thumbnail upload had non-critical issue; proceeding with video-only scan.');
+        } catch (thumbErr: any) {
+          if (import.meta.env?.DEV) {
+            console.warn('Thumbnail upload had non-critical issue; proceeding with video-only scan:', thumbErr?.message || 'Unknown error');
+          } else {
+            console.warn('Thumbnail upload had non-critical issue; proceeding with video-only scan.');
+          }
         }
       }
 
@@ -185,12 +191,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
         }),
       });
 
-      if (!scanRes.ok) {
-        const errData = await scanRes.json();
-        throw new Error(errData.error || 'Failed to start scan.');
-      }
-
-      const scanJob = await scanRes.json();
+      const scanJob = await parseApiResponse<{ id: string }>(scanRes, 'Failed to start scan.');
       onScanCreated(scanJob.id);
     } catch (err: any) {
       setUploadError(err.message || 'Error occurred while processing video.');
@@ -220,11 +221,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
         }),
       });
 
-      if (!scanRes.ok) {
-        throw new Error('Failed to start demo scan.');
-      }
-
-      const scanJob = await scanRes.json();
+      const scanJob = await parseApiResponse<{ id: string }>(scanRes, 'Failed to start demo scan.');
       onScanCreated(scanJob.id);
     } catch (err: any) {
       setUploadError(err.message || 'Failed to launch demo scan.');

@@ -138,6 +138,10 @@ async function main() {
     const { runOwnerTestingAndAdminAuthTests } = await import('./owner_testing_and_admin_auth.test');
     await runOwnerTestingAndAdminAuthTests();
 
+    // Run Suite 28: Upload Response Handling, Backend JSON Consistency & Media Resilience
+    const { runUploadResponseAndMediaResilienceTests } = await import('./upload_response_and_media_resilience.test');
+    await runUploadResponseAndMediaResilienceTests();
+
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log(`\n🎉 ALL AUTOMATED VERIFICATION SUITES COMPLETED SUCCESSFULLY in ${elapsed}s!`);
     process.exit(0);

@@ -1,4 +1,4 @@
-import express, { Router, Request, Response, RequestHandler } from 'express';
+import express, { Router, Request, Response, NextFunction, RequestHandler } from 'express';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
@@ -2524,7 +2524,11 @@ apiRouter.post(
     if (req.file && fs.existsSync(req.file.path)) {
       try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
     }
-    res.status(400).json({ error: err.message || 'Failed to inspect uploaded video.' });
+    const rawMsg = typeof err?.message === 'string' ? err.message : '';
+    const safeMsg = rawMsg && !rawMsg.includes(uploadDir)
+      ? rawMsg
+      : 'Failed to inspect uploaded video.';
+    res.status(400).json({ error: safeMsg });
   }
 });
 
@@ -2968,7 +2972,12 @@ apiRouter.post('/scans', async (req: Request, res: Response) => {
 
     res.status(201).json(scanJob);
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to create scan.' });
+    const status = err?.name === 'MediaInspectionError' ? 400 : 500;
+    const rawMsg = typeof err?.message === 'string' ? err.message : '';
+    const safeMsg = status === 400 && rawMsg && !rawMsg.includes(uploadDir)
+      ? rawMsg
+      : 'Failed to create scan.';
+    res.status(status).json({ error: safeMsg });
   }
 });
 
@@ -3798,4 +3807,43 @@ apiRouter.get('/analytics/events', async (req: Request, res: Response) => {
     console.error('[Analytics Events Error]:', err?.message || err);
     res.status(500).json({ error: 'Failed to retrieve analytics events.' });
   }
+});
+
+// Unmatched /api/* routes must always return structured JSON 404 instead of falling through
+// to Vite SPA HTML middleware (dev) or Express's default HTML 404 handler (production).
+apiRouter.use((_req: Request, res: Response) => {
+  res.status(404).json({
+    error: 'API endpoint not found.',
+    code: 'API_NOT_FOUND',
+  });
+});
+
+// Router-scoped JSON error middleware for unexpected /api/* middleware or Multer errors
+apiRouter.use((err: any, _req: Request, res: Response, next: NextFunction) => {
+  if (res.headersSent) {
+    return next(err);
+  }
+
+  console.error('[API Router Error]', err?.message || err);
+
+  if (err instanceof multer.MulterError) {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ error: 'Uploaded file exceeds the allowed size limit.', code: err.code });
+    }
+    return res.status(400).json({ error: `Upload error: ${err.message}`, code: err.code });
+  }
+
+  const rawStatus = Number(err?.status ?? err?.statusCode);
+  const status = Number.isInteger(rawStatus) && rawStatus >= 400 && rawStatus < 600 ? rawStatus : 500;
+  if (status < 500 && typeof err?.message === 'string' && err.message.trim()) {
+    return res.status(status).json({
+      error: err.message,
+      code: typeof err.code === 'string' ? err.code : 'BAD_REQUEST',
+    });
+  }
+
+  return res.status(500).json({
+    error: 'We couldn’t complete this request. Please try again.',
+    code: typeof err?.code === 'string' ? err.code : 'INTERNAL_ERROR',
+  });
 });

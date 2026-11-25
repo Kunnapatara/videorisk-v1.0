@@ -87,11 +87,32 @@ export async function createServerApp(options?: ServerAppOptions) {
   }
 
   // Global error handler
-  app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-    console.error('[VideoRisk Error]', err);
-    res.status(500).json({
-      error: 'We couldn’t complete this request. Please try again.',
-      code: err.code || 'INTERNAL_ERROR'
+  app.use((err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (res.headersSent) {
+      return next(err);
+    }
+    console.error('[VideoRisk Error]', err?.message || err);
+
+    if (err?.type === 'entity.parse.failed') {
+      return res.status(400).json({
+        error: 'Invalid JSON request body.',
+        code: 'INVALID_JSON'
+      });
+    }
+    if (err?.type === 'entity.too.large' || err?.status === 413 || err?.statusCode === 413) {
+      return res.status(413).json({
+        error: 'Request payload exceeds the allowed size limit.',
+        code: 'PAYLOAD_TOO_LARGE'
+      });
+    }
+
+    const rawStatus = Number(err?.status ?? err?.statusCode);
+    const status = Number.isInteger(rawStatus) && rawStatus >= 400 && rawStatus < 500 ? rawStatus : 500;
+    return res.status(status).json({
+      error: status < 500 && typeof err?.message === 'string' && err.message.trim()
+        ? err.message
+        : 'We couldn’t complete this request. Please try again.',
+      code: err?.code || (status < 500 ? 'BAD_REQUEST' : 'INTERNAL_ERROR')
     });
   });
 
