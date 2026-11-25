@@ -8,6 +8,7 @@ import { thumbnailInspector } from './thumbnailInspector';
 import { policyIntelligenceEngine } from '../intelligence/policyIntelligence';
 import { creditService } from '../services/creditService';
 import { analyticsService } from '../services/analyticsService';
+import { isVerifiedOwnerUser } from '../services/ownerAuth';
 import { ScanJob, ScanStage, JobStatus, ThumbnailMetadata, JobQueueRecord, FencingError } from '../../types';
 
 export interface JobOrchestratorPipelineDeps {
@@ -29,13 +30,16 @@ export class JobOrchestrator {
   private currentRunningCount = 0;
   private storageRepo: IStorageRepository;
   private deps: Required<JobOrchestratorPipelineDeps>;
+  private customEnv?: NodeJS.ProcessEnv;
 
   constructor(
     customStorage?: IStorageRepository,
     autoStart: boolean = true,
-    pipelineDeps?: JobOrchestratorPipelineDeps
+    pipelineDeps?: JobOrchestratorPipelineDeps,
+    customEnv?: NodeJS.ProcessEnv
   ) {
     this.storageRepo = customStorage || storage;
+    this.customEnv = customEnv;
     this.deps = {
       mediaInspector: pipelineDeps?.mediaInspector || mediaInspector,
       proxyGenerator: pipelineDeps?.proxyGenerator || proxyGenerator,
@@ -47,6 +51,10 @@ export class JobOrchestrator {
     if (autoStart) {
       this.startWorker();
     }
+  }
+
+  private getEnv(): NodeJS.ProcessEnv {
+    return this.customEnv || process.env;
   }
 
   public startWorker(): void {
@@ -236,21 +244,31 @@ export class JobOrchestrator {
         }
       } else {
         // Terminal failure: refund credits idempotently and mark scan failed
+        let terminalRefundResult = { refunded: false, amount: 0 };
         try {
-          const refundResult = await this.storageRepo.scans.refundScanCredits(scanId, undefined, leaseToken);
-          if (refundResult.refunded) {
-            console.log(`[JobOrchestrator] Refunded ${refundResult.amount} credits for failed job ${scanId}`);
+          terminalRefundResult = await this.storageRepo.scans.refundScanCredits(scanId, undefined, leaseToken);
+          if (terminalRefundResult.refunded) {
+            console.log(`[JobOrchestrator] Refunded ${terminalRefundResult.amount} credits for failed job ${scanId}`);
           }
         } catch (refundErr) {
           console.error(`[JobOrchestrator] Failed to execute credit refund for job ${scanId}:`, refundErr);
         }
+
+        const preUpdateScan = await this.storageRepo.scans.getScan(scanId).catch(() => null);
+        const isOwnerTestingScan = Boolean(
+          preUpdateScan &&
+          isVerifiedOwnerUser({ id: preUpdateScan.userId }, this.getEnv()) &&
+          !terminalRefundResult.refunded
+        );
 
         try {
           await this.storageRepo.scans.updateScan(scanId, {
             status: 'FAILED',
             error: (err instanceof MediaInspectionError || err instanceof VideoProcessingError || err instanceof AudioProcessingError || err instanceof ProxyGenerationError)
               ? err.message
-              : 'We couldn’t complete this scan. Your video was not published or shared. Credits have been refunded. Please try again.'
+              : isOwnerTestingScan
+                ? 'We couldn’t complete this scan. Your video was not published or shared. No credits were deducted. Please try again.'
+                : 'We couldn’t complete this scan. Your video was not published or shared. Credits have been refunded. Please try again.'
           }, leaseToken);
 
           await this.storageRepo.queue.failJob(job.id, err.message, false, 0, this.workerId, leaseToken);
@@ -356,29 +374,45 @@ export class JobOrchestrator {
       }
 
       checkLease();
-      // Deduct credits based on real duration
-      const requiredCredits = creditService.calculateRequiredCredits(metadata.durationSeconds, scan.scanMode);
-      const deducted = await this.storageRepo.scans.deductScanCredits(scanId, scan.userId, requiredCredits, leaseToken);
-      
-      if (!deducted) {
-        throw new Error(`Insufficient credits. Required: ${requiredCredits} minute(s), but available balance is lower.`);
-      }
+      const scanUser = await this.storageRepo.users.getUser(scan.userId);
+      const isOwnerTesting = Boolean(scanUser && isVerifiedOwnerUser(scanUser, this.getEnv()));
 
-      deductedCredits = requiredCredits;
-      await this.storageRepo.usage.recordUsage(
-        scan.userId, 
-        scan.id, 
-        creditService.formatMinutes(metadata.durationSeconds), 
-        requiredCredits, 
-        scan.scanMode,
-        leaseToken
-      );
+      let scanCreditsUsed = 0;
+      if (isOwnerTesting) {
+        await this.storageRepo.usage.recordUsage(
+          scan.userId,
+          scan.id,
+          creditService.formatMinutes(metadata.durationSeconds),
+          0,
+          scan.scanMode,
+          leaseToken
+        );
+      } else {
+        // Deduct credits based on real duration
+        const requiredCredits = creditService.calculateRequiredCredits(metadata.durationSeconds, scan.scanMode);
+        const deducted = await this.storageRepo.scans.deductScanCredits(scanId, scan.userId, requiredCredits, leaseToken);
+
+        if (!deducted) {
+          throw new Error(`Insufficient credits. Required: ${requiredCredits} minute(s), but available balance is lower.`);
+        }
+
+        scanCreditsUsed = requiredCredits;
+        deductedCredits = requiredCredits;
+        await this.storageRepo.usage.recordUsage(
+          scan.userId,
+          scan.id,
+          creditService.formatMinutes(metadata.durationSeconds),
+          requiredCredits,
+          scan.scanMode,
+          leaseToken
+        );
+      }
 
       checkLease();
       await this.storageRepo.scans.updateScan(scanId, {
         metadata,
         proxyPath,
-        creditsUsed: requiredCredits,
+        creditsUsed: scanCreditsUsed,
         completedStages: ['Upload', 'Media inspection']
       }, leaseToken);
 

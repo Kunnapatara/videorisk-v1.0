@@ -1120,11 +1120,20 @@ export async function runAnalyticsFoundationTests() {
     });
     assert.strictEqual(nonAdminUnsetFunnel.status, 403, 'Fail-closed 403 when admin allowlist unset');
 
-    // 5.3 Authenticated ordinary user when allowlist targets a different admin -> 403
+    // 5.3 Email-only ADMIN_EMAILS must NEVER grant admin privileges (403)
     const adminEmail = `admin_only_${uniqueSuffix}@videorisk.test`;
     const adminUser = await storage.users.createUser(adminEmail, 'hash', 'salt', 50, 'agency');
     const adminToken = await storage.users.createSession(adminUser.id);
     process.env.ADMIN_EMAILS = adminEmail;
+
+    const emailOnlyAdminAttempt = await fetch(`${baseUrl}/analytics/funnel`, {
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+    assert.strictEqual(emailOnlyAdminAttempt.status, 403, 'Email-only ADMIN_EMAILS matching must be rejected with 403');
+    delete process.env.ADMIN_EMAILS;
+
+    // 5.3b Authenticated ordinary user when allowlist targets a different admin User ID -> 403
+    process.env.ADMIN_USER_IDS = adminUser.id;
 
     const nonAdminFunnel = await fetch(`${baseUrl}/analytics/funnel`, {
       headers: { Authorization: `Bearer ${regToken}` },

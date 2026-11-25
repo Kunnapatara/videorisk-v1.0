@@ -134,6 +134,10 @@ async function main() {
     const { runAnalyticsFoundationTests } = await import('./analytics_foundation.test');
     await runAnalyticsFoundationTests();
 
+    // Run Suite 27: Owner Identity, Admin Authorization & Unlimited-Credit Owner Testing Mode
+    const { runOwnerTestingAndAdminAuthTests } = await import('./owner_testing_and_admin_auth.test');
+    await runOwnerTestingAndAdminAuthTests();
+
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log(`\n🎉 ALL AUTOMATED VERIFICATION SUITES COMPLETED SUCCESSFULLY in ${elapsed}s!`);
     process.exit(0);

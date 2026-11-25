@@ -549,6 +549,18 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                     </div>
                   </div>
 
+                  {currentUser.ownerTestingMode && (
+                    <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-300 text-xs text-amber-950 space-y-1">
+                      <div className="flex items-center gap-1.5 font-bold text-amber-900">
+                        <ShieldCheck className="w-4 h-4 text-amber-700 shrink-0" />
+                        <span>Owner Testing Mode — Credit-Free Testing</span>
+                      </div>
+                      <p className="text-[11px] text-amber-900 leading-relaxed">
+                        Verified owner testing runs without consuming credits. Your <span className="uppercase font-semibold">{currentUser.plan}</span> plan and actual balance ({currentUser.creditsRemaining} credits) remain untouched.
+                      </p>
+                    </div>
+                  )}
+
                   {/* Verified Subscription Info Card */}
                   <div className="p-4 rounded-xl bg-white border border-stone-200 space-y-3 text-xs shadow-2xs">
                     <div className="flex items-center justify-between">
@@ -708,7 +720,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   )}
 
                   <p className="text-[11px] text-stone-500 bg-stone-50 p-2.5 rounded-lg border border-stone-200 leading-normal">
-                    *Note: This ledger tracks internal credit deductions and grants. Formal payment invoices and receipts are issued through the Stripe Customer Portal.*
+                    *Note: This ledger tracks real internal credit deductions and grants. Formal payment invoices and receipts are issued through the Stripe Customer Portal.{currentUser.ownerTestingMode ? ' Owner Testing Mode scans do not consume credits or create artificial ledger entries.' : ''}*
                   </p>
                 </div>
               )}

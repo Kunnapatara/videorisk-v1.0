@@ -647,6 +647,11 @@ export interface UserAccount {
   passwordHash?: string;
   salt?: string;
   freeTrialClaimed?: boolean;
+  /**
+   * Server-computed indicator (never persisted or client-controlled):
+   * true ONLY when authenticated user ID matches configured OWNER_USER_ID.
+   */
+  ownerTestingMode?: boolean;
 }
 
 export interface AuthSessionRecord {

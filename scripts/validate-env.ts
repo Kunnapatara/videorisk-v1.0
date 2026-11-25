@@ -21,6 +21,7 @@ import {
   validateMediaTokenSecret,
 } from '../src/server/config/environment';
 import { resolveSmtpConfiguration } from '../src/server/services/emailService';
+import { isValidInternalUserId } from '../src/server/services/ownerAuth';
 
 dotenv.config({ quiet: true });
 
@@ -495,6 +496,36 @@ export function validateBillingConfiguration(
       type: 'INFO',
       variable: 'SMTP_HOST',
       message: 'SMTP settings syntax-validated (verify live password-reset email delivery before enabling Password Reset or Production).',
+    });
+  }
+
+  // 8. Owner & Admin User ID validation (only flags errors/warnings when misconfigured)
+  const rawOwnerId = env.OWNER_USER_ID?.trim() || '';
+  if (rawOwnerId && !isValidInternalUserId(rawOwnerId)) {
+    issues.push({
+      type: 'ERROR',
+      variable: 'OWNER_USER_ID',
+      message: 'OWNER_USER_ID must be a valid internal User ID (e.g. usr_...), never an email address or whitespace.',
+    });
+  }
+
+  const rawAdminUserIds = env.ADMIN_USER_IDS?.trim() || '';
+  if (rawAdminUserIds) {
+    const entries = rawAdminUserIds.split(',').map((s) => s.trim()).filter(Boolean);
+    if (entries.length === 0 || entries.some((entry) => !isValidInternalUserId(entry))) {
+      issues.push({
+        type: 'ERROR',
+        variable: 'ADMIN_USER_IDS',
+        message: 'ADMIN_USER_IDS must be a comma-separated list of valid internal User IDs, never email addresses.',
+      });
+    }
+  }
+
+  if (env.ADMIN_EMAILS && env.ADMIN_EMAILS.trim().length > 0) {
+    issues.push({
+      type: 'WARNING',
+      variable: 'ADMIN_EMAILS',
+      message: 'ADMIN_EMAILS is deprecated and ignored for authorization; configure OWNER_USER_ID and ADMIN_USER_IDS with internal User IDs.',
     });
   }
 

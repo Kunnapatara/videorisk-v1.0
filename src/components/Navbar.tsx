@@ -142,6 +142,16 @@ export const Navbar: React.FC<NavbarProps> = ({
             <ChevronDown className="w-3 h-3 text-stone-500" />
           </button>
 
+          {user?.ownerTestingMode && (
+            <div
+              className="hidden xl:flex items-center gap-1.5 px-2.5 py-1.5 bg-amber-950/70 border border-amber-600/50 rounded-lg text-[11px] font-bold text-amber-300"
+              title="Owner Testing Mode — Credit-Free Testing"
+            >
+              <ShieldCheck className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+              <span>Owner Testing Mode — Credit-Free Testing</span>
+            </div>
+          )}
+
           {/* Credits remaining counter */}
           <button 
             onClick={() => handleNavClick('pricing')}
@@ -225,6 +235,13 @@ export const Navbar: React.FC<NavbarProps> = ({
               Switch
             </button>
           </div>
+
+          {user?.ownerTestingMode && (
+            <div className="px-3 py-2 rounded-xl bg-amber-950/60 border border-amber-600/50 flex items-center gap-2 text-xs font-bold text-amber-300">
+              <ShieldCheck className="w-4 h-4 text-amber-400 shrink-0" />
+              <span>Owner Testing Mode — Credit-Free Testing</span>
+            </div>
+          )}
 
           {/* Mobile Navigation Links */}
           <nav className="flex flex-col space-y-1">

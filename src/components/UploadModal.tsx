@@ -11,7 +11,8 @@ import {
   Zap, 
   Tv, 
   X,
-  FileText
+  FileText,
+  ShieldCheck
 } from 'lucide-react';
 import { ScanMode, UserAccount } from '../types';
 import { authFetch } from '../utils/api';
@@ -290,8 +291,23 @@ export const UploadModal: React.FC<UploadModalProps> = ({
           </div>
         )}
 
+        {/* Owner Testing Mode Banner (Server-Verified Only) */}
+        {user?.ownerTestingMode && (
+          <div className="p-4 bg-amber-50 border border-amber-300 rounded-xl text-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 text-amber-950 shadow-2xs">
+            <div className="flex items-start gap-2.5">
+              <ShieldCheck className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-bold text-sm text-amber-950">Owner Testing Mode — Credit-Free Testing</p>
+                <p className="mt-0.5 text-amber-900 leading-relaxed">
+                  Verified owner scans (Standard, Deep, demo, and re-scan) run without consuming credits. Your <span className="uppercase font-bold">{user.plan}</span> plan and <strong className="font-mono">{user.creditsRemaining}</strong> credit balance remain unchanged.
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Insufficient Credit Guidance: Zero Balance */}
-        {user && user.creditsRemaining <= 0 && (
+        {user && !user.ownerTestingMode && user.creditsRemaining <= 0 && (
           <div className="p-4 bg-amber-50 border border-amber-200 rounded-xl text-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-amber-900 shadow-2xs">
             <div className="flex items-start gap-2.5">
               <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
@@ -324,7 +340,7 @@ export const UploadModal: React.FC<UploadModalProps> = ({
         )}
 
         {/* Insufficient Credit Guidance: Calculated Shortfall */}
-        {user && user.creditsRemaining > 0 && calculateRequiredCredits() !== null && user.creditsRemaining < (calculateRequiredCredits() || 0) && (
+        {user && !user.ownerTestingMode && user.creditsRemaining > 0 && calculateRequiredCredits() !== null && user.creditsRemaining < (calculateRequiredCredits() || 0) && (
           <div className="p-4 bg-amber-50 border border-amber-300 rounded-xl text-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-amber-950 shadow-2xs">
             <div className="flex items-start gap-2.5">
               <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
@@ -448,7 +464,11 @@ export const UploadModal: React.FC<UploadModalProps> = ({
               </div>
               <div>
                 <span className="text-stone-500 block text-[11px]">Credits Required</span>
-                {calculateRequiredCredits() !== null ? (
+                {user?.ownerTestingMode ? (
+                  <span className="font-extrabold text-amber-700 font-mono">
+                    0 credits (Owner Testing)
+                  </span>
+                ) : calculateRequiredCredits() !== null ? (
                   <span className="font-extrabold text-rose-600 font-mono">
                     {calculateRequiredCredits()} credit(s)
                   </span>
@@ -634,8 +654,9 @@ export const UploadModal: React.FC<UploadModalProps> = ({
             </button>
             {(() => {
               const reqCredits = calculateRequiredCredits();
-              const hasShortfall = user !== null && reqCredits !== null && user.creditsRemaining < reqCredits;
-              const hasZeroCredits = user !== null && user.creditsRemaining <= 0;
+              const isOwnerTesting = Boolean(user?.ownerTestingMode);
+              const hasShortfall = !isOwnerTesting && user !== null && reqCredits !== null && user.creditsRemaining < reqCredits;
+              const hasZeroCredits = !isOwnerTesting && user !== null && user.creditsRemaining <= 0;
               const isBlocked = isUploading || !file || hasShortfall || hasZeroCredits;
 
               return (
@@ -685,7 +706,9 @@ export const UploadModal: React.FC<UploadModalProps> = ({
               <span>Test the intelligence engine with sample creator profiles:</span>
             </div>
             <p className="text-[11px] text-stone-500 pl-5.5">
-              Sample scans run in your account, require an available credit balance, and consume 2 evaluation credits.
+              {user?.ownerTestingMode
+                ? 'Sample scans run credit-free in your account under Owner Testing Mode (normally 2 evaluation credits).'
+                : 'Sample scans run in your account, require an available credit balance, and consume 2 evaluation credits.'}
             </p>
           </div>
 
@@ -699,7 +722,9 @@ export const UploadModal: React.FC<UploadModalProps> = ({
               <div className="font-bold text-stone-900 group-hover:text-rose-600 flex flex-wrap items-center justify-between gap-1.5">
                 <span>Sample A: Raw Montage Clip</span>
                 <div className="flex items-center gap-1">
-                  <span className="text-[10px] text-stone-600 bg-stone-100 border border-stone-200 px-1.5 py-0.5 rounded font-mono font-semibold">2 credits</span>
+                  <span className="text-[10px] text-stone-600 bg-stone-100 border border-stone-200 px-1.5 py-0.5 rounded font-mono font-semibold">
+                    {user?.ownerTestingMode ? '0 credits (Owner)' : '2 credits'}
+                  </span>
                   <span className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded font-semibold">Reused Signals</span>
                 </div>
               </div>
@@ -717,7 +742,9 @@ export const UploadModal: React.FC<UploadModalProps> = ({
               <div className="font-bold text-stone-900 group-hover:text-emerald-600 flex flex-wrap items-center justify-between gap-1.5">
                 <span>Sample B: Clean Commentary Cut</span>
                 <div className="flex items-center gap-1">
-                  <span className="text-[10px] text-stone-600 bg-stone-100 border border-stone-200 px-1.5 py-0.5 rounded font-mono font-semibold">2 credits</span>
+                  <span className="text-[10px] text-stone-600 bg-stone-100 border border-stone-200 px-1.5 py-0.5 rounded font-mono font-semibold">
+                    {user?.ownerTestingMode ? '0 credits (Owner)' : '2 credits'}
+                  </span>
                   <span className="text-[10px] text-emerald-700 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded font-semibold">Transformative</span>
                 </div>
               </div>

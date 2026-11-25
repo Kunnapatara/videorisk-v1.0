@@ -352,6 +352,17 @@ export const PricingView: React.FC<PricingViewProps> = ({
       {/* Authenticated Account Overview Banner */}
       {user && (
         <div className="bg-stone-900 text-stone-100 rounded-2xl p-5 sm:p-6 max-w-4xl mx-auto shadow-lg space-y-4">
+          {user.ownerTestingMode && (
+            <div className="px-4 py-3 rounded-xl bg-amber-950/60 border border-amber-500/40 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+              <div className="flex items-center gap-2 font-bold text-amber-300">
+                <Shield className="w-4 h-4 text-amber-400 shrink-0" />
+                <span>Owner Testing Mode — Credit-Free Testing</span>
+              </div>
+              <span className="text-amber-200/90 text-[11px]">
+                All analysis workflows run without deducting your {user.creditsRemaining} {user.plan} plan credit(s).
+              </span>
+            </div>
+          )}
           <div className="grid grid-cols-1 sm:grid-cols-4 gap-4 text-center text-xs">
             <div className="p-3 border-b sm:border-b-0 sm:border-r border-stone-800 space-y-1">
               <span className="text-stone-400 block text-[11px] font-semibold uppercase tracking-wider">CURRENT PLAN</span>

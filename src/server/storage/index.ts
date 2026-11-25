@@ -37,6 +37,7 @@ import {
   isValidAnalyticsEventName,
   sanitizeAnalyticsProperties
 } from '../services/analyticsSanitizer';
+import { isVerifiedOwnerUser } from '../services/ownerAuth';
 
 export interface RateLimitStatus {
   allowed: boolean;
@@ -696,6 +697,10 @@ export class InMemoryStorageRepository implements IStorageRepository {
           return true;
         }
 
+        if (isVerifiedOwnerUser({ id: userId }, this.env)) {
+          return true;
+        }
+
         if (user.creditsRemaining < cleanAmount) return false;
 
         user.creditsRemaining -= cleanAmount;
@@ -716,6 +721,10 @@ export class InMemoryStorageRepository implements IStorageRepository {
 
         // Prevent double refunds
         if (scan.creditsRefunded) {
+          return { refunded: false, amount: 0 };
+        }
+
+        if (isVerifiedOwnerUser({ id: scan.userId }, this.env) && !(scan.creditsDeducted && scan.creditsDeducted > 0)) {
           return { refunded: false, amount: 0 };
         }
 

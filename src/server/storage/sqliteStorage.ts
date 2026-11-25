@@ -62,6 +62,7 @@ import {
 } from '../services/analyticsSanitizer';
 import { validateTestDatabaseTarget } from './testIsolation';
 import { isProductionEnvironment } from '../config/environment';
+import { isVerifiedOwnerUser } from '../services/ownerAuth';
 
 export interface MigrationRecord {
   version: number;
@@ -1552,6 +1553,12 @@ export class SqliteStorageRepository implements IStorageRepository {
           return;
         }
 
+        if (isVerifiedOwnerUser({ id: userId }, this.env)) {
+          // Verified Owner Testing Mode: credit-free execution without altering balance or ledger
+          success = true;
+          return;
+        }
+
         const user = db.prepare('SELECT credits_remaining, credits_used_total FROM users WHERE id = ?').get(userId) as any;
         if (!user || user.credits_remaining < amount) {
           success = false;
@@ -1597,6 +1604,12 @@ export class SqliteStorageRepository implements IStorageRepository {
         if (!scan) return;
 
         if (scan.credits_refunded === 1) {
+          result = { refunded: false, amount: 0 };
+          return;
+        }
+
+        if (isVerifiedOwnerUser({ id: scan.user_id }, this.env) && Number(scan.credits_deducted) <= 0) {
+          // Owner Testing Mode scans did not deduct credits; never issue artificial refund grants
           result = { refunded: false, amount: 0 };
           return;
         }

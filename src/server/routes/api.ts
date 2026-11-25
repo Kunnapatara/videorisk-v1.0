@@ -19,6 +19,10 @@ import { analyticsService, ANALYTICS_EVENT_NAMES } from '../services/analyticsSe
 import { isValidAnalyticsEventName } from '../services/analyticsSanitizer';
 import { validateStripeWebhookSecret } from '../../../scripts/validate-env';
 import {
+  isAuthorizedAdminUser,
+  isVerifiedOwnerUser,
+} from '../services/ownerAuth';
+import {
   isForbiddenProductionOriginHostname,
   isProductionEnvironment,
   resolveEnvironmentSecurity,
@@ -208,10 +212,15 @@ function isTestSwitchingAllowed(): boolean {
 
 /**
  * Omit sensitive credentials (passwordHash, salt) from public user representation
+ * and compute authoritative server-verified owner testing flag from OWNER_USER_ID.
  */
-export function sanitizeUser(user: UserAccount) {
+export function sanitizeUser(user: UserAccount, env: NodeJS.ProcessEnv = process.env) {
   const { passwordHash, salt, ...safeUser } = user;
-  return safeUser;
+  const ownerTestingMode = isVerifiedOwnerUser(user, env);
+  return {
+    ...safeUser,
+    ownerTestingMode,
+  };
 }
 
 /**
@@ -264,36 +273,18 @@ export async function requireAuth(req: Request, res: Response): Promise<UserAcco
   return user;
 }
 
-function parseAdminAllowlist(raw: string | undefined, normalizeEmail: boolean): Set<string> {
-  if (!raw || typeof raw !== 'string') {
-    return new Set();
-  }
-  return new Set(
-    raw
-      .split(',')
-      .map(entry => (normalizeEmail ? entry.trim().toLowerCase() : entry.trim()))
-      .filter(Boolean)
-  );
-}
-
+/**
+ * Authorizes Admin privileges strictly by verified internal User ID comparison
+ * (OWNER_USER_ID or ADMIN_USER_IDS).
+ * Email-only matching (ADMIN_EMAILS) never grants Admin privileges.
+ */
 export function isAdminUser(user: UserAccount, env: NodeJS.ProcessEnv = process.env): boolean {
-  const adminUserIds = parseAdminAllowlist(env.ADMIN_USER_IDS, false);
-  const adminEmails = parseAdminAllowlist(env.ADMIN_EMAILS, true);
-  if (adminUserIds.size === 0 && adminEmails.size === 0) {
-    return false;
-  }
-  if (adminUserIds.has(user.id)) {
-    return true;
-  }
-  if (user.email && adminEmails.has(user.email.toLowerCase().trim())) {
-    return true;
-  }
-  return false;
+  return isAuthorizedAdminUser(user, env);
 }
 
 /**
  * Enforces both active authentication (401) and explicit administrator authorization (403).
- * Fails closed when ADMIN_EMAILS and ADMIN_USER_IDS are unset.
+ * Fails closed when OWNER_USER_ID and ADMIN_USER_IDS are unset or invalid.
  */
 export async function requireAdmin(req: Request, res: Response): Promise<UserAccount | null> {
   const user = await requireAuth(req, res);
@@ -1238,7 +1229,8 @@ export const validateRescanAuthorization: RequestHandler = async (req, res, next
       return;
     }
 
-    if (user.creditsRemaining <= 0) {
+    const isOwnerTesting = isVerifiedOwnerUser(user, process.env);
+    if (!isOwnerTesting && user.creditsRemaining <= 0) {
       res.status(402).json({ 
         error: 'Insufficient credits for re-scan. Please top up your balance.',
         creditsRemaining: user.creditsRemaining 
@@ -2937,8 +2929,9 @@ apiRouter.post('/scans', async (req: Request, res: Response) => {
     const effectiveScanMode = (scanMode === 'deep' ? 'deep' : 'standard') as ScanMode;
     const metadata = await mediaInspector.inspect(canonicalVideoPath, videoFilename || path.basename(canonicalVideoPath));
     const requiredCredits = creditService.calculateRequiredCredits(metadata.durationSeconds, effectiveScanMode);
+    const isOwnerTesting = isVerifiedOwnerUser(user, process.env);
 
-    if (user.creditsRemaining < requiredCredits) {
+    if (!isOwnerTesting && user.creditsRemaining < requiredCredits) {
       return res.status(402).json({
         error: `Insufficient credits. Required: ${requiredCredits} credit(s), but available balance is ${user.creditsRemaining}.`,
         requiredCredits,
@@ -2962,7 +2955,7 @@ apiRouter.post('/scans', async (req: Request, res: Response) => {
       status: 'QUEUED',
       currentStage: 'Upload',
       completedStages: ['Upload'],
-      creditsUsed: requiredCredits,
+      creditsUsed: isOwnerTesting ? 0 : requiredCredits,
       createdAt: new Date().toISOString(),
       parentScanId: parentScan?.id,
       isRescan: !!isRescan
@@ -3054,8 +3047,9 @@ apiRouter.post('/scans/demo', async (req: Request, res: Response) => {
     const metadata = await mediaInspector.inspect(demoPath, demoFilename);
     const effectiveScanMode = (scanMode === 'deep' ? 'deep' : 'standard') as ScanMode;
     const requiredCredits = creditService.calculateRequiredCredits(metadata.durationSeconds, effectiveScanMode);
+    const isOwnerTesting = isVerifiedOwnerUser(user, process.env);
 
-    if (user.creditsRemaining < requiredCredits) {
+    if (!isOwnerTesting && user.creditsRemaining < requiredCredits) {
       // Clean up copied files on preflight rejection
       try { fs.unlinkSync(demoPath); } catch { /* ignore */ }
       if (demoThumbPath) { try { fs.unlinkSync(demoThumbPath); } catch { /* ignore */ } }
@@ -3084,7 +3078,7 @@ apiRouter.post('/scans/demo', async (req: Request, res: Response) => {
       status: 'QUEUED',
       currentStage: 'Upload',
       completedStages: ['Upload'],
-      creditsUsed: requiredCredits,
+      creditsUsed: isOwnerTesting ? 0 : requiredCredits,
       createdAt: new Date().toISOString(),
       isRescan: demoType === 'revised' || !!validatedParentScanId,
       parentScanId: validatedParentScanId
@@ -3291,8 +3285,9 @@ apiRouter.post('/scans/:id/rescan', requireAuthMiddleware, validateRescanAuthori
     }
 
     const requiredCredits = creditService.calculateRequiredCredits(metadata.durationSeconds, parentScan.scanMode);
+    const isOwnerTesting = isVerifiedOwnerUser(user, process.env);
 
-    if (user.creditsRemaining < requiredCredits) {
+    if (!isOwnerTesting && user.creditsRemaining < requiredCredits) {
       if (req.file && fs.existsSync(req.file.path)) {
         try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
       }
@@ -3318,7 +3313,7 @@ apiRouter.post('/scans/:id/rescan', requireAuthMiddleware, validateRescanAuthori
       status: 'QUEUED',
       currentStage: 'Upload',
       completedStages: ['Upload'],
-      creditsUsed: requiredCredits,
+      creditsUsed: isOwnerTesting ? 0 : requiredCredits,
       createdAt: new Date().toISOString(),
       parentScanId: parentScan.id,
       isRescan: true
