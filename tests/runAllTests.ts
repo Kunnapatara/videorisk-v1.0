@@ -142,6 +142,10 @@ async function main() {
     const { runUploadResponseAndMediaResilienceTests } = await import('./upload_response_and_media_resilience.test');
     await runUploadResponseAndMediaResilienceTests();
 
+    // Run Suite 29: Purchase Analytics Payment Evidence & Subscription Separation
+    const { runPurchaseAnalyticsPaymentEvidenceTests } = await import('./purchase_analytics_payment_evidence.test');
+    await runPurchaseAnalyticsPaymentEvidenceTests();
+
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log(`\n🎉 ALL AUTOMATED VERIFICATION SUITES COMPLETED SUCCESSFULLY in ${elapsed}s!`);
     process.exit(0);

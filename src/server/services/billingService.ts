@@ -1937,6 +1937,156 @@ export class BillingService {
   }
 
   /**
+   * Verifies that a Stripe Checkout Session reflects completed payment evidence
+   * (rejects open/expired/incomplete sessions, unpaid statuses, and un-succeeded expanded PaymentIntents).
+   */
+  private isCheckoutSessionPaymentVerified(session: any): boolean {
+    if (!session || typeof session !== 'object') return false;
+    if (typeof session.status === 'string' && session.status.trim().toLowerCase() !== 'complete') {
+      return false;
+    }
+    const isPaidStatus = session.payment_status === 'paid' || session.payment_status === 'no_payment_required';
+    if (!isPaidStatus) {
+      return false;
+    }
+    if (session.payment_intent && typeof session.payment_intent === 'object') {
+      const piStatus = session.payment_intent.status;
+      if (typeof piStatus === 'string' && piStatus.trim().toLowerCase() !== 'succeeded') {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Verifies that a Stripe Invoice payload carries authoritative paid evidence
+   * (rejects paid=false, non-'paid' status such as open/draft/void/uncollectible,
+   * un-succeeded expanded PaymentIntent/Charge, or unpaid amount_due > 0 with amount_paid <= 0).
+   */
+  private isInvoicePaymentVerified(invoice: any): boolean {
+    if (!invoice || typeof invoice !== 'object') return false;
+    if (typeof invoice.paid === 'boolean' && invoice.paid !== true) {
+      return false;
+    }
+    if (typeof invoice.status === 'string' && invoice.status.trim().toLowerCase() !== 'paid') {
+      return false;
+    }
+    if (invoice.payment_intent && typeof invoice.payment_intent === 'object') {
+      const piStatus = invoice.payment_intent.status;
+      if (typeof piStatus === 'string' && piStatus.trim().toLowerCase() !== 'succeeded') {
+        return false;
+      }
+    }
+    if (invoice.charge && typeof invoice.charge === 'object') {
+      const chStatus = invoice.charge.status;
+      if (typeof chStatus === 'string' && chStatus.trim().toLowerCase() !== 'succeeded') {
+        return false;
+      }
+    }
+    if (typeof invoice.amount_paid === 'number' && typeof invoice.amount_due === 'number') {
+      if (invoice.amount_due > 0 && invoice.amount_paid <= 0) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Extracts target and prior recurring plan IDs from Stripe invoice line items (including proration lines).
+   */
+  private extractInvoiceLinePlanInfo(invoice: any): {
+    targetPlanId: AllowedPaidPlan | null;
+    priorLinePlanId: AllowedPaidPlan | null;
+  } {
+    const lines = Array.isArray(invoice?.lines?.data) ? invoice.lines.data : [];
+    const planRank: Record<string, number> = { free: 0, creator: 1, pro: 2, agency: 3 };
+    let targetPlanId: AllowedPaidPlan | null = null;
+    let positiveBestRank = -1;
+    let fallbackBestRank = -1;
+    let fallbackPlan: AllowedPaidPlan | null = null;
+    let priorLinePlanId: AllowedPaidPlan | null = null;
+
+    for (const line of lines) {
+      const rawPriceId = line?.price?.id || line?.plan?.id;
+      if (typeof rawPriceId !== 'string' || !rawPriceId.trim()) continue;
+      const mapped = this.getPlanFromPriceId(rawPriceId.trim());
+      if (!mapped || !RECURRING_SUBSCRIPTION_PLANS.includes(mapped as any)) continue;
+
+      const rank = planRank[mapped] || 0;
+      const lineAmount = typeof line?.amount === 'number' ? line.amount : undefined;
+
+      if (lineAmount !== undefined && lineAmount < 0) {
+        priorLinePlanId = mapped;
+        continue;
+      }
+
+      if (lineAmount === undefined || lineAmount > 0) {
+        if (rank >= positiveBestRank) {
+          positiveBestRank = rank;
+          targetPlanId = mapped;
+        }
+      } else if (rank >= fallbackBestRank) {
+        fallbackBestRank = rank;
+        fallbackPlan = mapped;
+      }
+    }
+
+    if (!targetPlanId) {
+      targetPlanId = fallbackPlan;
+    }
+
+    return {
+      targetPlanId,
+      priorLinePlanId: priorLinePlanId && priorLinePlanId !== targetPlanId ? priorLinePlanId : null,
+    };
+  }
+
+  /**
+   * Resolves the most recent previously paid recurring plan ID for a subscription
+   * from authoritative stripe_payments records (excluding the current invoice).
+   */
+  private findPriorPaidPlanForSubscription(
+    state: any,
+    subscriptionId: string,
+    excludeInvoiceId?: string
+  ): AllowedPaidPlan | null {
+    if (!subscriptionId) return null;
+
+    if (state.prepare && typeof state.prepare === 'function') {
+      const rows = state.prepare(`
+        SELECT plan_id, invoice_id
+        FROM stripe_payments
+        WHERE subscription_id = ?
+          AND status IN ('paid', 'partially_refunded')
+        ORDER BY created_at DESC, rowid DESC
+      `).all(subscriptionId) as Array<{ plan_id?: string | null; invoice_id?: string | null }>;
+
+      for (const row of rows) {
+        if (excludeInvoiceId && row.invoice_id === excludeInvoiceId) continue;
+        if (row.plan_id && RECURRING_SUBSCRIPTION_PLANS.includes(row.plan_id as any)) {
+          return row.plan_id as AllowedPaidPlan;
+        }
+      }
+      return null;
+    }
+
+    const records = Object.values(state.stripePayments || {}) as StripePaymentRecord[];
+    const matching = records
+      .filter(
+        (r) =>
+          r &&
+          r.subscriptionId === subscriptionId &&
+          (!excludeInvoiceId || r.invoiceId !== excludeInvoiceId) &&
+          (r.status === 'paid' || r.status === 'partially_refunded') &&
+          r.planId &&
+          RECURRING_SUBSCRIPTION_PLANS.includes(r.planId as any)
+      )
+      .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+
+    return (matching[0]?.planId as AllowedPaidPlan) || null;
+  }
+
+  /**
    * Executes transactional state updates for verified webhook events
    */
   private async processVerifiedEvent(
@@ -2047,9 +2197,9 @@ export class BillingService {
           });
 
           // Payment status verification
-          const isPaid = session.payment_status === 'paid' || session.payment_status === 'no_payment_required';
+          const isPaid = this.isCheckoutSessionPaymentVerified(session);
           if (!isPaid) {
-            console.warn(`[BillingService] Checkout session ${session.id} payment status is '${session.payment_status}'. Entitlements withheld.`);
+            console.warn(`[BillingService] Checkout session ${session.id} payment not verified (status='${session.status}', payment_status='${session.payment_status}'). Entitlements withheld.`);
             state.webhookEvents[event.id] = buildCheckoutWebhookRecord(undefined);
             return { alreadyProcessed: false };
           }
@@ -2240,6 +2390,21 @@ export class BillingService {
           const invoiceChargeId = typeof invoice.charge === 'string' ? invoice.charge : invoice.charge?.id;
           const invoiceCustomerId = typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id;
 
+          if (!this.isInvoicePaymentVerified(invoice)) {
+            console.warn(
+              `[BillingService] invoice.paid event ${event.id} (invoice=${invoice?.id || 'unknown'}) lacks authoritative paid verification (paid=${invoice?.paid}, status=${invoice?.status}). Purchase and entitlements withheld.`
+            );
+            state.webhookEvents[event.id] = {
+              eventId: event.id,
+              provider: 'stripe',
+              eventType: event.type,
+              processedAt: new Date().toISOString(),
+              creditsGranted: 0,
+              outcome: 'rejected_unpaid_invoice',
+            };
+            return { alreadyProcessed: false };
+          }
+
           if (subId) {
             const sub = state.subscriptions[subId];
             if (sub) {
@@ -2255,13 +2420,23 @@ export class BillingService {
                 return { alreadyProcessed: false };
               }
 
+              const { targetPlanId: invoiceLinePlanId, priorLinePlanId } = this.extractInvoiceLinePlanInfo(invoice);
+              const effectivePlanId = (invoiceLinePlanId || sub.planId) as AllowedPaidPlan;
+              const priorPaidPlanId = this.findPriorPaidPlanForSubscription(state, subId, invoice.id);
+              const priorKnownPlanId =
+                priorPaidPlanId ||
+                priorLinePlanId ||
+                (sub.planId !== effectivePlanId ? (sub.planId as AllowedPaidPlan) : null);
+
               sub.status = 'active';
+              sub.planId = effectivePlanId;
               sub.lastEventCreated = mergeLastCreated(sub.lastEventCreated);
               sub.updatedAt = new Date(Math.max(Date.now(), eventCreatedMs)).toISOString();
 
               const user = state.users[sub.userId];
               if (user) {
                 const isRenewal = invoice.billing_reason === 'subscription_cycle';
+                const isSubscriptionUpdate = invoice.billing_reason === 'subscription_update';
                 const hasPriorFullRefund = this.hasSucceededFullRefund(state, {
                   paymentIntentId: invoicePaymentIntentId,
                   chargeId: invoiceChargeId,
@@ -2320,6 +2495,8 @@ export class BillingService {
                   }
                 }
 
+                const invoiceAlreadyProcessed = Boolean(invDedupKey && state.webhookEvents[invDedupKey]);
+
                 const creditAllocation = isRenewal && !invoiceRenewalAlreadyCredited
                   ? this.getPlanCreditAllocation(sub.planId)
                   : 0;
@@ -2328,7 +2505,7 @@ export class BillingService {
                   user.creditsRemaining += creditAllocation;
                 }
 
-                const existingInitialPayment = !isRenewal
+                const existingInitialPayment = !isRenewal && !isSubscriptionUpdate
                   ? this.findPaymentRecord(state, {
                       invoiceId: invoice.id,
                       paymentIntentId: invoicePaymentIntentId,
@@ -2351,6 +2528,9 @@ export class BillingService {
                   currency: invoice.currency || undefined,
                   status: 'paid',
                 });
+
+                const hasPositivePaidAmount =
+                  typeof invoice.amount_paid === 'number' ? invoice.amount_paid > 0 : true;
 
                 if (isRenewal) {
                   state.webhookEvents[event.id] = {
@@ -2380,7 +2560,7 @@ export class BillingService {
                         chargeId: invoiceChargeId || null,
                       })
                     });
-                    if (creditAllocation > 0) {
+                    if (creditAllocation > 0 && hasPositivePaidAmount) {
                       pendingAnalytics.push({
                         eventName: 'purchase_completed',
                         userId: sub.userId,
@@ -2399,6 +2579,48 @@ export class BillingService {
                   this.reconcilePendingRefundsForPayment(state, invPayment, user, new Date().toISOString());
                   return { alreadyProcessed: false };
                 }
+
+                if (isSubscriptionUpdate) {
+                  const planRank: Record<string, number> = { free: 0, creator: 1, pro: 2, agency: 3 };
+                  const isPaidPlanUpgrade =
+                    Boolean(priorKnownPlanId) &&
+                    (planRank[sub.planId] || 0) > (planRank[priorKnownPlanId!] || 0) &&
+                    hasPositivePaidAmount;
+
+                  state.webhookEvents[event.id] = {
+                    eventId: event.id,
+                    provider: 'stripe',
+                    eventType: event.type,
+                    processedAt: new Date().toISOString(),
+                    userId: sub.userId,
+                    creditsGranted: 0,
+                    planGranted: sub.planId,
+                  };
+                  if (invDedupKey) {
+                    state.webhookEvents[invDedupKey] = state.webhookEvents[event.id];
+                  }
+
+                  if (isPaidPlanUpgrade && !invoiceAlreadyProcessed) {
+                    pendingAnalytics.push({
+                      eventName: 'purchase_completed',
+                      userId: sub.userId,
+                      idempotencyKey: `purchase_completed:invoice:${invoice.id || event.id}`,
+                      properties: {
+                        purchaseType: 'plan_upgrade',
+                        planId: sub.planId,
+                        previousPlanId: priorKnownPlanId!,
+                        currency: invoice.currency ? String(invoice.currency).toLowerCase() : undefined,
+                        amountMinorUnits: typeof invoice.amount_paid === 'number' ? invoice.amount_paid : undefined,
+                        paymentProvider: 'stripe',
+                        purchaseRef: invoice.id || event.id,
+                      },
+                    });
+                  }
+
+                  this.reconcilePendingRefundsForPayment(state, invPayment, user, new Date().toISOString());
+                  return { alreadyProcessed: false };
+                }
+
                 this.reconcilePendingRefundsForPayment(state, invPayment, user, new Date().toISOString());
               } else {
                 state.subscriptions[subId] = sub;
@@ -2564,24 +2786,9 @@ export class BillingService {
               };
 
               this.applyUserSubscriptionEntitlement(state, user, subId, status, mappedPlanId, effectiveCurrentPeriodEnd);
-
-              if (event.type === 'customer.subscription.updated' && sub && sub.planId !== mappedPlanId && status === 'active') {
-                const planRank: Record<string, number> = { free: 0, creator: 1, pro: 2, agency: 3 };
-                if ((planRank[mappedPlanId] || 0) > (planRank[sub.planId] || 0)) {
-                  pendingAnalytics.push({
-                    eventName: 'purchase_completed',
-                    userId: user.id,
-                    idempotencyKey: `purchase_completed:upgrade:${subId}:${event.id}`,
-                    properties: {
-                      purchaseType: 'plan_upgrade',
-                      planId: mappedPlanId,
-                      previousPlanId: sub.planId,
-                      paymentProvider: 'stripe',
-                      purchaseRef: subId,
-                    },
-                  });
-                }
-              }
+              // Note: customer.subscription.created and customer.subscription.updated synchronize subscription
+              // state and entitlements only. Authoritative purchase_completed events for upgrades and renewals
+              // are emitted strictly from verified paid invoice.paid events.
             }
           }
 
@@ -2961,7 +3168,7 @@ export class BillingService {
       throw err;
     }
 
-    const isPaid = session.payment_status === 'paid' || session.payment_status === 'no_payment_required';
+    const isPaid = this.isCheckoutSessionPaymentVerified(session);
 
     if (!isPaid) {
       let status: 'complete' | 'pending' | 'unpaid' | 'expired' | 'canceled' | 'unknown' = 'pending';

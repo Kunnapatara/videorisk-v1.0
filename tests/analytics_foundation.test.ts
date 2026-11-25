@@ -765,8 +765,8 @@ export async function runAnalyticsFoundationTests() {
     });
     assert.strictEqual(renewRes.status, 200);
 
-    // Upgrade pro -> agency emits plan_upgrade; cancellation/failed payment/refund do NOT emit purchase_completed
-    const upgradeWh = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+    // Subscription update (pro -> agency, status='active') synchronizes state ONLY and must NOT emit purchase_completed without paid invoice evidence
+    const upgradeSubWh = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
       id: `evt_upgrade_${uniqueSuffix}`,
       created: Math.floor(Date.now() / 1000) + 20,
       type: 'customer.subscription.updated',
@@ -784,8 +784,48 @@ export async function runAnalyticsFoundationTests() {
       (
         await fetch(`${baseUrl}/billing/webhook`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'stripe-signature': upgradeWh.signature },
-          body: upgradeWh.payloadStr,
+          headers: { 'Content-Type': 'application/json', 'stripe-signature': upgradeSubWh.signature },
+          body: upgradeSubWh.payloadStr,
+        })
+      ).status,
+      200
+    );
+    const purchasesAfterSubUpdateOnly = await analyticsService.queryEvents({
+      userId: regUserId,
+      eventName: 'purchase_completed',
+    });
+    assert.strictEqual(
+      purchasesAfterSubUpdateOnly.total,
+      3,
+      'customer.subscription.updated alone must NOT emit purchase_completed'
+    );
+
+    // Authoritative paid upgrade invoice.paid (billing_reason='subscription_update') emits plan_upgrade once
+    const upgradeInvoiceId = `in_upgrade_${uniqueSuffix}`;
+    const upgradeInvWh = buildSignedWebhookRequest(realStripeHmac, webhookSecret, {
+      id: `evt_upgrade_inv_${uniqueSuffix}`,
+      created: Math.floor(Date.now() / 1000) + 22,
+      type: 'invoice.paid',
+      data: {
+        object: {
+          id: upgradeInvoiceId,
+          customer: cusId,
+          subscription: subId,
+          billing_reason: 'subscription_update',
+          paid: true,
+          status: 'paid',
+          amount_paid: 7000,
+          currency: 'usd',
+          lines: { data: [{ price: { id: 'price_agency' }, amount: 7000 }] },
+        },
+      },
+    });
+    assert.strictEqual(
+      (
+        await fetch(`${baseUrl}/billing/webhook`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'stripe-signature': upgradeInvWh.signature },
+          body: upgradeInvWh.payloadStr,
         })
       ).status,
       200
