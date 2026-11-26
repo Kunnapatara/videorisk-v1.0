@@ -3,6 +3,7 @@ import { promisify } from 'util';
 import path from 'path';
 import fs from 'fs';
 import { MediaMetadata } from '../../types';
+import { resolveExecutable } from './binaryResolver';
 
 const execFileAsync = promisify(execFile);
 
@@ -33,7 +34,13 @@ export class ProxyGenerator {
         filePath
       ];
 
-      const { stdout } = await execFileAsync('ffprobe', args, { timeout: 10000 });
+      const ffprobeResolution = resolveExecutable('ffprobe', 'FFPROBE_PATH', process.env);
+      if (ffprobeResolution.status !== 'READY' || !ffprobeResolution.resolvedPath) {
+        console.warn('[ProxyGenerator] FFprobe executable unavailable for proxy validation (%s).', ffprobeResolution.status);
+        return false;
+      }
+
+      const { stdout } = await execFileAsync(ffprobeResolution.resolvedPath, args, { timeout: 10000 });
       const parsed = JSON.parse(stdout);
       const stream = parsed.streams?.[0];
       return stream?.codec_type === 'video' && Number(stream.width) > 0 && Number(stream.height) > 0;
@@ -86,7 +93,19 @@ export class ProxyGenerator {
         proxyPath
       ];
 
-      await execFileAsync('ffmpeg', args, { timeout: 60000 });
+      const ffmpegResolution = resolveExecutable('ffmpeg', 'FFMPEG_PATH', process.env);
+      if (ffmpegResolution.status === 'MISSING_EXECUTABLE' || ffmpegResolution.status === 'NOT_CONFIGURED') {
+        throw new ProxyGenerationError(
+          `Failed to generate required 1080p proxy for high-resolution (${metadata.resolutionLabel}) video: FFmpeg executable not found.`
+        );
+      }
+      if (ffmpegResolution.status === 'NON_EXECUTABLE' || !ffmpegResolution.resolvedPath) {
+        throw new ProxyGenerationError(
+          `Failed to generate required 1080p proxy for high-resolution (${metadata.resolutionLabel}) video: FFmpeg binary is not executable.`
+        );
+      }
+
+      await execFileAsync(ffmpegResolution.resolvedPath, args, { timeout: 60000 });
 
       // Verify that the generated file exists and is valid readable video media
       const isValidGenerated = await this.isValidMediaProxy(proxyPath);

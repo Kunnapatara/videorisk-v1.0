@@ -13,6 +13,7 @@ import {
   OcrErrorClassification,
   PngValidationErrorClass
 } from '../../types';
+import { resolveExecutable } from './binaryResolver';
 
 const execFileAsync = promisify(execFile);
 
@@ -1786,7 +1787,23 @@ export class VideoProcessor {
       : Math.max(1, parseFloat((dur / Math.min(targetSamples, Math.ceil(dur / 2))).toFixed(2)));
     const expectedSamples = Math.min(targetSamples, Math.max(1, Math.ceil(dur / sampleInterval)));
 
-    const ffmpegBin = process.env.FFMPEG_PATH || 'ffmpeg';
+    const ffmpegResolution = resolveExecutable('ffmpeg', 'FFMPEG_PATH', process.env);
+    if (ffmpegResolution.status === 'MISSING_EXECUTABLE' || ffmpegResolution.status === 'NOT_CONFIGURED') {
+      if (fs.existsSync(tempDir)) {
+        try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+      throw new VideoProcessingError(
+        `FFmpeg executable not found (${ffmpegResolution.configuredPath || 'ffmpeg'}) during frame extraction.`,
+        'MISSING_EXECUTABLE'
+      );
+    }
+    if (ffmpegResolution.status === 'NON_EXECUTABLE' || !ffmpegResolution.resolvedPath) {
+      if (fs.existsSync(tempDir)) {
+        try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+      throw new VideoProcessingError('FFmpeg path is not executable during frame extraction.', 'NON_EXECUTABLE');
+    }
+    const ffmpegBin = ffmpegResolution.resolvedPath;
 
     const classifyFfmpegError = (err: any, stage: string): VideoProcessingError => {
       if (err instanceof VideoProcessingError) {
@@ -2536,9 +2553,16 @@ export class VideoProcessor {
         continue;
       }
 
+      const adaptiveFfmpegResolution = resolveExecutable('ffmpeg', 'FFMPEG_PATH', process.env);
+      const adaptiveFfmpegBin = adaptiveFfmpegResolution.resolvedPath;
+      if (!adaptiveFfmpegBin) {
+        console.warn('[VideoProcessor] Skipping adaptive candidate extraction: FFmpeg unavailable (%s).', adaptiveFfmpegResolution.status);
+        continue;
+      }
+
       const frameFile = path.join(targetDir, `adaptive_cut_${String(i).padStart(3, '0')}.jpg`);
       try {
-        await execFileAsync('ffmpeg', [
+        await execFileAsync(adaptiveFfmpegBin, [
           '-y',
           '-ss', String(t),
           '-i', videoPath,
@@ -2559,7 +2583,7 @@ export class VideoProcessor {
           } else if (Array.isArray(options.simulateCorruptRgbBytes) && options.simulateCorruptRgbBytes.includes(i)) {
             isReadable = false;
           } else {
-            const rawResult = await execFileAsync('ffmpeg', [
+            const rawResult = await execFileAsync(adaptiveFfmpegBin, [
               '-y',
               '-ss', String(t),
               '-i', videoPath,
@@ -2693,12 +2717,13 @@ export class VideoProcessor {
       };
     }
 
-    // Determine tesseract binary
-    const tesseractPath = process.env.TESSERACT_PATH;
+    // Determine tesseract binary (explicit TESSERACT_PATH > PATH fallback)
+    const tesseractResolution = resolveExecutable('tesseract', 'TESSERACT_PATH', process.env);
     let executable: string | null = null;
-    if (tesseractPath && fs.existsSync(tesseractPath)) {
-      executable = tesseractPath;
-    } else if (tesseractPath) {
+    if (tesseractResolution.status === 'READY' && tesseractResolution.resolvedPath) {
+      executable = tesseractResolution.resolvedPath;
+    } else if (tesseractResolution.configured) {
+      const isNonExec = tesseractResolution.status === 'NON_EXECUTABLE';
       return {
         status: 'ANALYSIS_UNAVAILABLE',
         framesInspected: 0,
@@ -2711,8 +2736,14 @@ export class VideoProcessor {
         plannedTimestamps: [],
         extractedTimestamps: [],
         succeededTimestamps: [],
-        limitations: 'OCR engine path configured but executable is missing on disk.',
-        failureReason: sanitizeOcrDiagnostic(`Configured TESSERACT_PATH not found at ${tesseractPath}`),
+        limitations: isNonExec
+          ? 'OCR engine path configured but binary is not executable.'
+          : 'OCR engine path configured but executable is missing on disk.',
+        failureReason: sanitizeOcrDiagnostic(
+          isNonExec
+            ? `Configured TESSERACT_PATH is not executable at ${tesseractResolution.configuredPath || ''}`
+            : `Configured TESSERACT_PATH not found at ${tesseractResolution.configuredPath || ''}`
+        ),
         failureClassification: 'OCR_ENGINE_FAILURE',
         executionDurationMs: getElapsedMs(),
         detectedFrames: [],
@@ -2751,7 +2782,8 @@ export class VideoProcessor {
     const deadlineMonoMs = startMonoMs + timeoutMs;
     const getRemainingOverallMs = (): number => Math.floor(deadlineMonoMs - getNowMs());
     const langs = options?.languages || 'eng+tha';
-    const ffmpegBin = process.env.FFMPEG_PATH || 'ffmpeg';
+    const ffmpegResolution = resolveExecutable('ffmpeg', 'FFMPEG_PATH', process.env);
+    const ffmpegBin = ffmpegResolution.resolvedPath || ffmpegResolution.configuredPath || 'ffmpeg';
 
     // Calculate candidate timestamps distributed deterministically across the entire duration [0, dur]
     const candidateTimestamps = (options?.timestamps && options.timestamps.length > 0)

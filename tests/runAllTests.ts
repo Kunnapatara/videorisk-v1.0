@@ -146,6 +146,10 @@ async function main() {
     const { runPurchaseAnalyticsPaymentEvidenceTests } = await import('./purchase_analytics_payment_evidence.test');
     await runPurchaseAnalyticsPaymentEvidenceTests();
 
+    // Run Suite 30: Configuration Integrity Remediation (Workstreams 1-8)
+    const { runConfigIntegrityRemediationTests } = await import('./config_integrity_remediation.test');
+    await runConfigIntegrityRemediationTests();
+
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log(`\n🎉 ALL AUTOMATED VERIFICATION SUITES COMPLETED SUCCESSFULLY in ${elapsed}s!`);
     process.exit(0);

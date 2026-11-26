@@ -4,7 +4,10 @@ import {
   isForbiddenProductionOriginHostname,
   isLoopbackHostname,
   isProductionEnvironment,
+  resolveConfiguredAppOrigin,
   resolveEnvironmentSecurity,
+  validateAppOriginUrl,
+  validateStripeSecretKeyFormat,
 } from '../config/environment';
 import {
   UserAccount,
@@ -71,6 +74,7 @@ export class BillingService {
 
   private hasExplicitTestClient: boolean = false;
   private storageOverride: IStorageRepository | null = null;
+  private stripeConfigError: string | null = null;
 
   constructor() {
     this.reconfigure();
@@ -86,13 +90,20 @@ export class BillingService {
 
   public reconfigure(): void {
     this.hasExplicitTestClient = false;
-    const apiKey = process.env.STRIPE_SECRET_KEY;
-    if (apiKey) {
-      this.stripe = new Stripe(apiKey, {
+    this.stripeConfigError = null;
+    const rawKey = process.env.STRIPE_SECRET_KEY;
+    const keyValidation = validateStripeSecretKeyFormat(rawKey);
+    if (keyValidation.validFormat && rawKey) {
+      this.stripe = new Stripe(rawKey.trim(), {
         apiVersion: '2025-02-24.acacia' as any,
         typescript: true,
       });
       this.isConfigured = true;
+    } else if (keyValidation.present && !keyValidation.validFormat) {
+      this.stripe = null;
+      this.isConfigured = false;
+      this.stripeConfigError = keyValidation.message;
+      console.error(`[BillingService] ${keyValidation.message}`);
     } else {
       this.stripe = null;
       this.isConfigured = false;
@@ -106,11 +117,21 @@ export class BillingService {
     this.stripe = client;
     this.isConfigured = !!client;
     this.hasExplicitTestClient = true;
+    this.stripeConfigError = null;
   }
 
   public getStripeClient(): Stripe | null {
-    if (!this.hasExplicitTestClient && !this.stripe && process.env.STRIPE_SECRET_KEY) {
-      this.reconfigure();
+    if (!this.hasExplicitTestClient) {
+      const keyValidation = validateStripeSecretKeyFormat(process.env.STRIPE_SECRET_KEY);
+      if (!keyValidation.validFormat) {
+        this.stripe = null;
+        this.isConfigured = false;
+        this.stripeConfigError = keyValidation.present ? keyValidation.message : null;
+        return null;
+      }
+      if (!this.stripe && keyValidation.validFormat) {
+        this.reconfigure();
+      }
     }
     return this.stripe;
   }
@@ -119,16 +140,20 @@ export class BillingService {
     return !!this.getStripeClient();
   }
 
+  public getStripeConfigurationError(): string | null {
+    if (this.hasExplicitTestClient) return null;
+    const keyValidation = validateStripeSecretKeyFormat(process.env.STRIPE_SECRET_KEY);
+    return keyValidation.present && !keyValidation.validFormat ? keyValidation.message : null;
+  }
+
   /**
-   * Identifies the current Stripe environment mode based on the secret key prefix
+   * Identifies the current Stripe environment mode based on canonical format-validated secret key
    */
   public getStripeMode(): 'live' | 'test' | 'unconfigured' {
     const stripe = this.getStripeClient();
-    if (!stripe || !process.env.STRIPE_SECRET_KEY) return 'unconfigured';
-    const key = process.env.STRIPE_SECRET_KEY;
-    if (key.startsWith('sk_live_') || key.startsWith('rk_live_')) return 'live';
-    if (key.startsWith('sk_test_') || key.startsWith('rk_test_')) return 'test';
-    return 'test';
+    const keyValidation = validateStripeSecretKeyFormat(process.env.STRIPE_SECRET_KEY);
+    if (!stripe || !keyValidation.validFormat) return 'unconfigured';
+    return keyValidation.mode === 'live' ? 'live' : 'test';
   }
 
   /**
@@ -136,11 +161,11 @@ export class BillingService {
    * Priority: APP_BASE_URL > APP_URL > PUBLIC_APP_URL
    */
   public getConfiguredAppBaseUrl(): string | null {
-    const raw = process.env.APP_BASE_URL || process.env.APP_URL || process.env.PUBLIC_APP_URL;
-    if (!raw || typeof raw !== 'string' || !raw.trim()) {
+    const originConfig = resolveConfiguredAppOrigin(process.env);
+    if (!originConfig.rawOrigin) {
       return null;
     }
-    return raw.trim().replace(/\/+$/, '');
+    return originConfig.rawOrigin.replace(/\/+$/, '');
   }
 
   /**
@@ -240,7 +265,8 @@ export class BillingService {
 
     const isProd = envSec.isProduction;
     const isDevOrTest = !isProd;
-    const configuredBase = this.getConfiguredAppBaseUrl();
+    const originConfig = resolveConfiguredAppOrigin(process.env);
+    const configuredBase = originConfig.rawOrigin ? originConfig.rawOrigin.replace(/\/+$/, '') : null;
 
     if (isProd) {
       if (!configuredBase) {
@@ -248,19 +274,9 @@ export class BillingService {
         err.statusCode = 500;
         throw err;
       }
-      let parsedBase: URL;
-      try {
-        if (configuredBase.startsWith('//') || configuredBase.includes('@') || /\s/.test(configuredBase) || configuredBase.includes('\\')) {
-          throw new Error('Invalid characters');
-        }
-        parsedBase = new URL(configuredBase);
-      } catch {
-        const err: any = new Error('Server checkout origin misconfiguration: APP_BASE_URL is malformed.');
-        err.statusCode = 500;
-        throw err;
-      }
-      if (parsedBase.protocol !== 'https:' || parsedBase.username || parsedBase.password || isForbiddenProductionOriginHostname(parsedBase.hostname)) {
-        const err: any = new Error('Server checkout origin misconfiguration: APP_BASE_URL must be a valid non-localhost HTTPS origin without credentials.');
+      const baseValidation = validateAppOriginUrl(configuredBase, true, originConfig.variable || 'APP_BASE_URL');
+      if (!baseValidation.valid) {
+        const err: any = new Error(`Server checkout origin misconfiguration: ${baseValidation.message}`);
         err.statusCode = 500;
         throw err;
       }
@@ -392,7 +408,8 @@ export class BillingService {
   public validatePortalReturnUrl(inputUrl?: string | null): string {
     const isProd = this.isProduction;
     const isDevOrTest = !isProd;
-    const configuredBase = this.getConfiguredAppBaseUrl();
+    const originConfig = resolveConfiguredAppOrigin(process.env);
+    const configuredBase = originConfig.rawOrigin ? originConfig.rawOrigin.replace(/\/+$/, '') : null;
 
     if (isProd) {
       if (!configuredBase) {
@@ -400,13 +417,9 @@ export class BillingService {
         err.statusCode = 500;
         throw err;
       }
-      try {
-        const parsedBase = new URL(configuredBase);
-        if (parsedBase.protocol !== 'https:' || parsedBase.username || parsedBase.password || isForbiddenProductionOriginHostname(parsedBase.hostname)) {
-          throw new Error('Insecure base URL');
-        }
-      } catch {
-        const err: any = new Error('Server portal return URL misconfiguration: APP_BASE_URL must be a valid non-localhost HTTPS origin.');
+      const baseValidation = validateAppOriginUrl(configuredBase, true, originConfig.variable || 'APP_BASE_URL');
+      if (!baseValidation.valid) {
+        const err: any = new Error(`Server portal return URL misconfiguration: ${baseValidation.message}`);
         err.statusCode = 500;
         throw err;
       }
@@ -629,10 +642,20 @@ export class BillingService {
     const requireStrictStripe = envSec.isProduction;
     const requireLive = envSec.requiresLivePayments;
     const isStaging = envSec.isStaging;
+    const keyValidation = validateStripeSecretKeyFormat(process.env.STRIPE_SECRET_KEY);
+
+    // Reject malformed non-empty Stripe secret keys across ALL modes (never fall back to simulation on malformed key)
+    if (!this.hasExplicitTestClient && keyValidation.present && !keyValidation.validFormat) {
+      const err: any = new Error(keyValidation.message);
+      err.statusCode = 500;
+      throw err;
+    }
+
+    const activeStripe = this.getStripeClient();
 
     // Production & Staging guard: fail fast if credentials are missing or mismatched with environment tier
     if (requireStrictStripe) {
-      if (!this.stripe) {
+      if (!activeStripe) {
         const err: any = new Error(
           isStaging
             ? 'Payment gateway is not configured for staging. Please verify STRIPE_SECRET_KEY (sk_test_...).'
@@ -670,7 +693,7 @@ export class BillingService {
     }
 
     // Real Stripe Session Creation if Stripe SDK is configured
-    if (this.stripe) {
+    if (activeStripe) {
       const priceId = this.getPriceIdForPlan(planId);
       const isOneTime = (planId === 'audit_once');
 
@@ -693,7 +716,7 @@ export class BillingService {
             quantity: 1,
           }];
 
-      const session = await this.stripe.checkout.sessions.create({
+      const session = await activeStripe.checkout.sessions.create({
         mode: isOneTime ? 'payment' : 'subscription',
         line_items: lineItems,
         client_reference_id: user.id,

@@ -389,16 +389,305 @@ export function validateMediaTokenSecret(
   };
 }
 
+export const STRIPE_LIVE_SECRET_KEY_REGEX = /^(?:sk|rk)_live_[A-Za-z0-9][A-Za-z0-9_]{9,}$/;
+export const STRIPE_TEST_SECRET_KEY_REGEX = /^(?:sk|rk)_test_[A-Za-z0-9][A-Za-z0-9_]{9,}$/;
+
+export interface StripeSecretKeyValidationResult {
+  present: boolean;
+  validFormat: boolean;
+  mode: 'live' | 'test' | 'malformed' | 'missing';
+  code: 'VALID_LIVE' | 'VALID_TEST' | 'MISSING' | 'MALFORMED';
+  message: string;
+}
+
+/**
+ * Canonical Stripe secret key validator shared across runtime BillingService,
+ * readiness probe, environment security resolution, and static CLI validation.
+ * Never includes the raw secret value in diagnostic messages.
+ */
+export function validateStripeSecretKeyFormat(
+  key?: string | null
+): StripeSecretKeyValidationResult {
+  const trimmed = typeof key === 'string' ? key.trim() : '';
+  if (!trimmed) {
+    return {
+      present: false,
+      validFormat: false,
+      mode: 'missing',
+      code: 'MISSING',
+      message: 'STRIPE_SECRET_KEY is not configured.',
+    };
+  }
+  if (STRIPE_LIVE_SECRET_KEY_REGEX.test(trimmed)) {
+    return {
+      present: true,
+      validFormat: true,
+      mode: 'live',
+      code: 'VALID_LIVE',
+      message: 'Valid Stripe live secret key format.',
+    };
+  }
+  if (STRIPE_TEST_SECRET_KEY_REGEX.test(trimmed)) {
+    return {
+      present: true,
+      validFormat: true,
+      mode: 'test',
+      code: 'VALID_TEST',
+      message: 'Valid Stripe test secret key format.',
+    };
+  }
+  return {
+    present: true,
+    validFormat: false,
+    mode: 'malformed',
+    code: 'MALFORMED',
+    message:
+      "Malformed STRIPE_SECRET_KEY format (expected 'sk_live_...', 'rk_live_...', 'sk_test_...', or 'rk_test_...' with at least 10 token characters).",
+  };
+}
+
 export function isLiveStripeSecretKey(key?: string | null): boolean {
   if (!key || typeof key !== 'string') return false;
-  const trimmed = key.trim();
-  return trimmed.startsWith('sk_live_') || trimmed.startsWith('rk_live_');
+  return STRIPE_LIVE_SECRET_KEY_REGEX.test(key.trim());
 }
 
 export function isTestStripeSecretKey(key?: string | null): boolean {
   if (!key || typeof key !== 'string') return false;
-  const trimmed = key.trim();
-  return trimmed.startsWith('sk_test_') || trimmed.startsWith('rk_test_');
+  return STRIPE_TEST_SECRET_KEY_REGEX.test(key.trim());
+}
+
+export type AppOriginVariableName = 'APP_BASE_URL' | 'APP_URL' | 'PUBLIC_APP_URL';
+
+export interface ResolvedAppOriginConfig {
+  rawOrigin: string;
+  variable: AppOriginVariableName | null;
+  hasExplicitAppBaseUrl: boolean;
+  hasAppUrlFallback: boolean;
+  hasPublicAppUrlFallback: boolean;
+}
+
+/**
+ * Resolves configured application origin with explicit precedence and attribution:
+ * APP_BASE_URL > APP_URL > PUBLIC_APP_URL
+ */
+export function resolveConfiguredAppOrigin(
+  env: NodeJS.ProcessEnv = process.env
+): ResolvedAppOriginConfig {
+  const appBaseUrl = typeof env.APP_BASE_URL === 'string' ? env.APP_BASE_URL.trim() : '';
+  const appUrl = typeof env.APP_URL === 'string' ? env.APP_URL.trim() : '';
+  const publicAppUrl = typeof env.PUBLIC_APP_URL === 'string' ? env.PUBLIC_APP_URL.trim() : '';
+
+  if (appBaseUrl) {
+    return {
+      rawOrigin: appBaseUrl,
+      variable: 'APP_BASE_URL',
+      hasExplicitAppBaseUrl: true,
+      hasAppUrlFallback: Boolean(appUrl),
+      hasPublicAppUrlFallback: Boolean(publicAppUrl),
+    };
+  }
+  if (appUrl) {
+    return {
+      rawOrigin: appUrl,
+      variable: 'APP_URL',
+      hasExplicitAppBaseUrl: false,
+      hasAppUrlFallback: true,
+      hasPublicAppUrlFallback: Boolean(publicAppUrl),
+    };
+  }
+  if (publicAppUrl) {
+    return {
+      rawOrigin: publicAppUrl,
+      variable: 'PUBLIC_APP_URL',
+      hasExplicitAppBaseUrl: false,
+      hasAppUrlFallback: false,
+      hasPublicAppUrlFallback: true,
+    };
+  }
+  return {
+    rawOrigin: '',
+    variable: null,
+    hasExplicitAppBaseUrl: false,
+    hasAppUrlFallback: false,
+    hasPublicAppUrlFallback: false,
+  };
+}
+
+export interface AppOriginValidationResult {
+  valid: boolean;
+  origin?: string;
+  code:
+    | 'VALID'
+    | 'MISSING'
+    | 'UNSAFE_SYNTAX'
+    | 'MALFORMED_URL'
+    | 'INSECURE_SCHEME'
+    | 'FORBIDDEN_HOST'
+    | 'UNSUPPORTED_SCHEME';
+  message: string;
+}
+
+/**
+ * Authoritative origin URL validator shared across validate-env.ts, BillingService,
+ * EmailService, and /api/health/readiness.
+ */
+export function validateAppOriginUrl(
+  rawOrigin: string | undefined | null,
+  requireHttpsPublic: boolean,
+  variableName: string = 'APP_BASE_URL'
+): AppOriginValidationResult {
+  const trimmed = typeof rawOrigin === 'string' ? rawOrigin.trim() : '';
+  if (!trimmed) {
+    return {
+      valid: false,
+      code: 'MISSING',
+      message: `${variableName} is missing or empty.`,
+    };
+  }
+
+  if (
+    /\s/.test(trimmed) ||
+    trimmed.includes('\\') ||
+    trimmed.includes('@') ||
+    trimmed.startsWith('//')
+  ) {
+    return {
+      valid: false,
+      code: 'UNSAFE_SYNTAX',
+      message: `Unsafe or malformed origin in ${variableName}: userinfo (@), backslashes, whitespace, and protocol-relative URLs are forbidden.`,
+    };
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return {
+      valid: false,
+      code: 'MALFORMED_URL',
+      message: `Malformed URL syntax in ${variableName}. Expected e.g. 'https://videorisk.com'.`,
+    };
+  }
+
+  if (parsed.username || parsed.password) {
+    return {
+      valid: false,
+      code: 'UNSAFE_SYNTAX',
+      message: `Unsafe or malformed origin in ${variableName}: userinfo credentials are forbidden.`,
+    };
+  }
+
+  if (requireHttpsPublic) {
+    if (parsed.protocol !== 'https:') {
+      return {
+        valid: false,
+        code: 'INSECURE_SCHEME',
+        message: `Insecure scheme '${parsed.protocol}' in ${variableName}. Production and staging strictly require https:// origins.`,
+      };
+    }
+    if (isForbiddenProductionOriginHostname(parsed.hostname)) {
+      return {
+        valid: false,
+        code: 'FORBIDDEN_HOST',
+        message: `Loopback, localhost, or unspecified origin '${parsed.origin}' in ${variableName} is forbidden in production/staging/live payment mode.`,
+      };
+    }
+  } else if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    return {
+      valid: false,
+      code: 'UNSUPPORTED_SCHEME',
+      message: `Unsupported scheme '${parsed.protocol}' in ${variableName}. Only http:// and https:// origins are allowed.`,
+    };
+  }
+
+  return {
+    valid: true,
+    origin: parsed.origin,
+    code: 'VALID',
+    message: `${variableName} origin is valid.`,
+  };
+}
+
+/**
+ * Strictly validates an IP address (IPv4/IPv6) or CIDR block (IPv4/IPv6).
+ */
+export function isValidIpOrCidr(entry: string): boolean {
+  if (!entry || typeof entry !== 'string') return false;
+  const trimmed = entry.trim();
+  if (trimmed === '') return false;
+
+  if (trimmed.includes('/')) {
+    const parts = trimmed.split('/');
+    if (parts.length !== 2) return false;
+    const [ipPart, prefixPart] = parts;
+
+    const ipVer = net.isIP(ipPart);
+    if (ipVer === 0) return false;
+
+    if (!/^(0|[1-9]\d*)$/.test(prefixPart)) return false;
+    const prefix = Number(prefixPart);
+    if (!Number.isSafeInteger(prefix)) return false;
+
+    if (ipVer === 4) {
+      return prefix >= 0 && prefix <= 32;
+    }
+    if (ipVer === 6) {
+      return prefix >= 0 && prefix <= 128;
+    }
+    return false;
+  }
+
+  return net.isIP(trimmed) !== 0;
+}
+
+export interface TrustProxyValidationResult {
+  valid: boolean;
+  mode: 'disabled' | 'hops' | 'keyword' | 'unrestricted' | 'ip_list' | 'invalid';
+  normalizedValue: boolean | number | string;
+  warning?: string;
+  error?: string;
+}
+
+export function validateTrustProxyValue(rawVal: string | undefined | null): TrustProxyValidationResult {
+  if (rawVal === undefined || rawVal === null || typeof rawVal !== 'string' || rawVal.trim() === '' || rawVal.trim().toLowerCase() === 'false') {
+    return { valid: true, mode: 'disabled', normalizedValue: false };
+  }
+
+  const trimmed = rawVal.trim();
+
+  if (/^[1-9]\d*$/.test(trimmed)) {
+    const num = Number(trimmed);
+    if (Number.isSafeInteger(num) && num > 0) {
+      return { valid: true, mode: 'hops', normalizedValue: num };
+    }
+  }
+
+  const knownKeywords = ['loopback', 'linklocal', 'uniquelocal'];
+  if (knownKeywords.includes(trimmed.toLowerCase())) {
+    return { valid: true, mode: 'keyword', normalizedValue: trimmed.toLowerCase() };
+  }
+
+  if (trimmed.toLowerCase() === 'true') {
+    return {
+      valid: true,
+      mode: 'unrestricted',
+      normalizedValue: true,
+      warning:
+        'TRUST_PROXY is set to unrestricted "true". Prefer configuring an exact hop count (e.g. TRUST_PROXY=1) or trusted subnet CIDR range.',
+    };
+  }
+
+  const parts = trimmed.split(',').map((p) => p.trim());
+  if (parts.length > 0 && parts.every((part) => isValidIpOrCidr(part))) {
+    return { valid: true, mode: 'ip_list', normalizedValue: parts.join(', ') };
+  }
+
+  return {
+    valid: false,
+    mode: 'invalid',
+    normalizedValue: false,
+    error: `Invalid TRUST_PROXY syntax. Expected 'false', a positive integer hop count (e.g. '1'), 'loopback'/'linklocal'/'uniquelocal', comma-separated IP/CIDR list, or 'true'.`,
+  };
 }
 
 export function resolveEnvironmentSecurity(
@@ -587,3 +876,79 @@ export function resolveEnvironmentSecurity(
 export function isProductionEnvironment(env: NodeJS.ProcessEnv = process.env): boolean {
   return resolveEnvironmentSecurity(env).isProduction;
 }
+
+/**
+ * Strictly validates and parses a positive integer from a string value:
+ * 1. Trims surrounding whitespace.
+ * 2. Entire value must match digits only without leading zeroes: /^[1-9]\d*$/
+ * 3. Rejects decimal values (e.g. "1.5"), trailing characters (e.g. "10abc"), zero ("0"),
+ *    negative values ("-1"), non-numeric strings, and Infinity.
+ * 4. Rejects values outside JavaScript's safe-integer range (Number.MAX_SAFE_INTEGER).
+ * Returns null if invalid.
+ */
+export function parseStrictPositiveInt(val: string | undefined | null): number | null {
+  if (val === undefined || val === null || typeof val !== 'string') {
+    return null;
+  }
+  const trimmed = val.trim();
+  if (!/^[1-9]\d*$/.test(trimmed)) {
+    return null;
+  }
+  if (trimmed.length > 15) {
+    try {
+      if (BigInt(trimmed) > BigInt(Number.MAX_SAFE_INTEGER)) {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+  }
+  const num = Number(trimmed);
+  if (!Number.isSafeInteger(num) || num <= 0) {
+    return null;
+  }
+  return num;
+}
+
+/**
+ * Resolves a rate-limit integer setting with unambiguous precedence:
+ * 1. Primary (current/specific) environment variable if set to a valid positive integer.
+ * 2. Fallback (legacy/general) environment variable if set to a valid positive integer.
+ * 3. Default positive integer value.
+ */
+export function resolveRateLimitInt(
+  primaryVal: string | undefined,
+  fallbackVal: string | undefined,
+  defaultValue: number
+): number {
+  const primaryParsed = parseStrictPositiveInt(primaryVal);
+  if (primaryParsed !== null) {
+    return primaryParsed;
+  }
+  const fallbackParsed = parseStrictPositiveInt(fallbackVal);
+  if (fallbackParsed !== null) {
+    return fallbackParsed;
+  }
+  return defaultValue;
+}
+
+export interface RateLimitPolicySpec {
+  id: string;
+  primaryVar: string;
+  fallbackVar?: string;
+  defaultValue: number;
+}
+
+export const RATE_LIMIT_POLICY_SPECS: readonly RateLimitPolicySpec[] = [
+  { id: 'auth_login_ip_limit', primaryVar: 'AUTH_LOGIN_IP_RATE_LIMIT', fallbackVar: 'AUTH_LOGIN_RATE_LIMIT', defaultValue: 20 },
+  { id: 'auth_login_ip_window', primaryVar: 'AUTH_LOGIN_IP_RATE_WINDOW', fallbackVar: 'AUTH_LOGIN_RATE_WINDOW', defaultValue: 900 },
+  { id: 'auth_login_account_limit', primaryVar: 'AUTH_LOGIN_ACCOUNT_RATE_LIMIT', defaultValue: 5 },
+  { id: 'auth_login_account_window', primaryVar: 'AUTH_LOGIN_ACCOUNT_RATE_WINDOW', defaultValue: 900 },
+  { id: 'auth_register_limit', primaryVar: 'AUTH_REGISTER_RATE_LIMIT', fallbackVar: 'AUTH_REGISTRATION_RATE_LIMIT', defaultValue: 30 },
+  { id: 'auth_register_window', primaryVar: 'AUTH_REGISTER_RATE_WINDOW', fallbackVar: 'AUTH_REGISTRATION_RATE_WINDOW', defaultValue: 900 },
+  { id: 'upload_user_limit', primaryVar: 'UPLOAD_USER_RATE_LIMIT', fallbackVar: 'UPLOAD_RATE_LIMIT', defaultValue: 10 },
+  { id: 'upload_user_window', primaryVar: 'UPLOAD_USER_RATE_WINDOW', fallbackVar: 'UPLOAD_RATE_WINDOW', defaultValue: 600 },
+  { id: 'upload_ip_limit', primaryVar: 'UPLOAD_IP_RATE_LIMIT', defaultValue: 20 },
+  { id: 'upload_ip_window', primaryVar: 'UPLOAD_IP_RATE_WINDOW', defaultValue: 600 },
+];
+

@@ -13,20 +13,29 @@
  *   npx tsx scripts/validate-env.ts --live-check       # Optional live Stripe API check (requires ALLOW_LIVE_STRIPE_CHECK=true)
  */
 
+import fs from 'fs';
 import dotenv from 'dotenv';
 import Stripe from 'stripe';
 import {
-  isForbiddenProductionOriginHostname,
+  parseStrictPositiveInt,
+  RATE_LIMIT_POLICY_SPECS,
+  resolveConfiguredAppOrigin,
   resolveEnvironmentSecurity,
+  validateAppOriginUrl,
   validateMediaTokenSecret,
+  validateStripeSecretKeyFormat,
+  validateTrustProxyValue,
 } from '../src/server/config/environment';
+import { resolveExecutable } from '../src/server/pipeline/binaryResolver';
 import { resolveSmtpConfiguration } from '../src/server/services/emailService';
 import { isValidInternalUserId } from '../src/server/services/ownerAuth';
 
 dotenv.config({ quiet: true });
 
+export type ValidationIssueType = 'ERROR' | 'WARNING' | 'INFO' | 'NOT CONFIGURED';
+
 export interface ValidationIssue {
-  type: 'ERROR' | 'WARNING' | 'INFO';
+  type: ValidationIssueType;
   variable: string;
   message: string;
 }
@@ -36,7 +45,12 @@ export interface ValidationSummary {
   valid: boolean;
   errorsCount: number;
   warningsCount: number;
+  notConfiguredCount: number;
   issues: ValidationIssue[];
+}
+
+export interface ValidateBillingOptions {
+  strictOrigin?: boolean;
 }
 
 export const INTENDED_PLANS = [
@@ -85,7 +99,8 @@ export function validateStripeWebhookSecret(secret?: string | null): {
  */
 export function validateBillingConfiguration(
   mode: 'production' | 'staging' | 'test' | 'development' | 'ci' = 'production',
-  env: NodeJS.ProcessEnv = process.env
+  env: NodeJS.ProcessEnv = process.env,
+  options: ValidateBillingOptions = {}
 ): ValidationSummary {
   const issues: ValidationIssue[] = [];
 
@@ -172,8 +187,9 @@ export function validateBillingConfiguration(
     });
   }
 
-  // 1. Stripe Secret Key Validation
-  if (!secretKey) {
+  // 1. Stripe Secret Key Validation (canonical format validation across all modes)
+  const keyValidation = validateStripeSecretKeyFormat(secretKey);
+  if (!keyValidation.present) {
     if (effectiveProduction) {
       issues.push({
         type: 'ERROR',
@@ -205,9 +221,15 @@ export function validateBillingConfiguration(
         message: 'STRIPE_SECRET_KEY not set. Development server will operate in simulation mode.',
       });
     }
+  } else if (!keyValidation.validFormat) {
+    issues.push({
+      type: 'ERROR',
+      variable: 'STRIPE_SECRET_KEY',
+      message: `Malformed Stripe secret key (${maskSecret(secretKey)}): expected 'sk_live_...', 'rk_live_...', 'sk_test_...', or 'rk_test_...' with at least 10 token characters.`,
+    });
   } else {
-    const isLiveKey = secretKey.startsWith('sk_live_') || secretKey.startsWith('rk_live_');
-    const isTestKey = secretKey.startsWith('sk_test_') || secretKey.startsWith('rk_test_');
+    const isLiveKey = keyValidation.mode === 'live';
+    const isTestKey = keyValidation.mode === 'test';
 
     const isNonProdContext =
       mode === 'staging' ||
@@ -226,12 +248,6 @@ export function validateBillingConfiguration(
           variable: 'STRIPE_SECRET_KEY',
           message: `Accidental live key (${maskSecret(secretKey)}) in staging mode! Staging strictly requires sk_test_... or rk_test_... to prevent real charges.`,
         });
-      } else if (!isTestKey) {
-        issues.push({
-          type: 'ERROR',
-          variable: 'STRIPE_SECRET_KEY',
-          message: `Malformed staging Stripe key: must begin with 'sk_test_' or 'rk_test_'. Found: ${maskSecret(secretKey)}.`,
-        });
       }
     } else if (isNonProdContext) {
       if (isLiveKey) {
@@ -240,43 +256,19 @@ export function validateBillingConfiguration(
           variable: 'STRIPE_SECRET_KEY',
           message: `Accidental live key (${maskSecret(secretKey)}) in ${mode} mode! Non-production mode must use sk_test_... or rk_test_... to prevent real credit card charges.`,
         });
-      } else if (effectiveProduction) {
-        if (isTestKey) {
-          issues.push({
-            type: 'ERROR',
-            variable: 'STRIPE_SECRET_KEY',
-            message: `Contradictory environment configuration: Test key (${maskSecret(secretKey)}) found in production mode. Production strictly requires a live key (sk_live_... or rk_live_...).`,
-          });
-        } else {
-          issues.push({
-            type: 'ERROR',
-            variable: 'STRIPE_SECRET_KEY',
-            message: `Malformed Stripe secret key: must begin with 'sk_live_' or 'rk_live_'. Found: ${maskSecret(secretKey)}.`,
-          });
-        }
-      } else if (!isTestKey) {
+      } else if (effectiveProduction && isTestKey) {
         issues.push({
           type: 'ERROR',
           variable: 'STRIPE_SECRET_KEY',
-          message: `Malformed test key: must begin with 'sk_test_' or 'rk_test_'. Found: ${maskSecret(secretKey)}.`,
+          message: `Contradictory environment configuration: Test key (${maskSecret(secretKey)}) found in production mode. Production strictly requires a live key (sk_live_... or rk_live_...).`,
         });
       }
-    } else if (effectiveProduction) {
-      if (!isLiveKey) {
-        if (isTestKey) {
-          issues.push({
-            type: 'ERROR',
-            variable: 'STRIPE_SECRET_KEY',
-            message: `Contradictory environment configuration: Test key (${maskSecret(secretKey)}) found in production mode. Production strictly requires a live key (sk_live_... or rk_live_...).`,
-          });
-        } else {
-          issues.push({
-            type: 'ERROR',
-            variable: 'STRIPE_SECRET_KEY',
-            message: `Malformed Stripe secret key: must begin with 'sk_live_' or 'rk_live_'. Found: ${maskSecret(secretKey)}.`,
-          });
-        }
-      }
+    } else if (effectiveProduction && isTestKey) {
+      issues.push({
+        type: 'ERROR',
+        variable: 'STRIPE_SECRET_KEY',
+        message: `Contradictory environment configuration: Test key (${maskSecret(secretKey)}) found in production mode. Production strictly requires a live key (sk_live_... or rk_live_...).`,
+      });
     }
   }
 
@@ -328,11 +320,11 @@ export function validateBillingConfiguration(
         });
       }
     } else {
-      if (!priceId.startsWith('price_')) {
+      if (!/^price_[A-Za-z0-9_]+$/.test(priceId)) {
         issues.push({
           type: 'ERROR',
           variable: plan.envVar!,
-          message: `Malformed Price ID for ${plan.name}: expected 'price_...' prefix. Found: ${maskSecret(priceId)}.`,
+          message: `Malformed Price ID for ${plan.name}: expected 'price_...' format. Found: ${maskSecret(priceId)}.`,
         });
       }
     }
@@ -355,56 +347,16 @@ export function validateBillingConfiguration(
     });
   }
 
-  // 5. Application Origin & Redirect Security (APP_BASE_URL / ALLOWED_ORIGINS)
-  const appBaseUrl = (env.APP_BASE_URL || env.APP_URL || env.PUBLIC_APP_URL || '').trim();
-  const validateOriginString = (rawOrigin: string, varName: string) => {
-    if (!rawOrigin) return;
-    if (/\s/.test(rawOrigin) || rawOrigin.includes('\\') || rawOrigin.includes('@') || rawOrigin.startsWith('//')) {
-      issues.push({
-        type: 'ERROR',
-        variable: varName,
-        message: `Unsafe or malformed origin in ${varName}: userinfo (@), backslashes, whitespace, and protocol-relative URLs are forbidden.`,
-      });
-      return;
-    }
-    try {
-      const parsed = new URL(rawOrigin);
-      if (enforceRuntimeHardening && parsed.protocol !== 'https:') {
-        issues.push({
-          type: 'ERROR',
-          variable: varName,
-          message: `Insecure scheme '${parsed.protocol}' in ${varName}. Production and staging strictly require https:// origins.`,
-        });
-      } else if (enforceRuntimeHardening && isForbiddenProductionOriginHostname(parsed.hostname)) {
-        issues.push({
-          type: 'ERROR',
-          variable: varName,
-          message: `Loopback, localhost, or unspecified origin '${parsed.origin}' in ${varName} is forbidden in production/staging/live payment mode.`,
-        });
-      } else if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
-        issues.push({
-          type: 'ERROR',
-          variable: varName,
-          message: `Unsupported scheme '${parsed.protocol}' in ${varName}. Only http:// and https:// origins are allowed.`,
-        });
-      }
-    } catch {
-      issues.push({
-        type: 'ERROR',
-        variable: varName,
-        message: `Malformed URL syntax in ${varName}. Expected e.g. 'https://videorisk.com'.`,
-      });
-    }
-  };
-
-  if (!appBaseUrl) {
+  // 5. Application Origin & Redirect Security (APP_BASE_URL / APP_URL / PUBLIC_APP_URL / ALLOWED_ORIGINS)
+  const originCfg = resolveConfiguredAppOrigin(env);
+  if (!originCfg.rawOrigin) {
     if (enforceRuntimeHardening) {
       issues.push({
-        type: (envSec.isLivePaymentMode && !envSec.isNodeEnvProduction) || isStagingTarget ? 'ERROR' : 'WARNING',
+        type: 'ERROR',
         variable: 'APP_BASE_URL',
         message: isStagingTarget
-          ? 'APP_BASE_URL is not set. Staging checkout & portal redirect origin resolution requires an explicit HTTPS origin.'
-          : 'APP_BASE_URL is not set. Production checkout & portal redirect origin resolution will fail closed until APP_BASE_URL is configured.',
+          ? 'Missing required APP_BASE_URL (or valid HTTPS origin fallback) in staging environment. Checkout & portal redirects require an explicit non-localhost HTTPS origin.'
+          : 'Missing required APP_BASE_URL (or valid HTTPS origin fallback) in production environment. Checkout & portal redirects fail closed until an explicit non-localhost HTTPS origin is configured.',
       });
     } else if (mode === 'test') {
       issues.push({
@@ -416,17 +368,61 @@ export function validateBillingConfiguration(
       issues.push({
         type: 'INFO',
         variable: 'APP_BASE_URL',
-        message: 'APP_BASE_URL not set; non-production checkout origin defaults to https://videorisk.com unless overridden.',
+        message: 'APP_BASE_URL not set; local development preview fallback (http://localhost:3000 / https://videorisk.com) remains active.',
       });
     }
   } else {
-    validateOriginString(appBaseUrl, env.APP_BASE_URL ? 'APP_BASE_URL' : env.APP_URL ? 'APP_URL' : 'PUBLIC_APP_URL');
+    const activeOriginVar = originCfg.variable!;
+    const originCheck = validateAppOriginUrl(originCfg.rawOrigin, enforceRuntimeHardening, activeOriginVar);
+    if (!originCheck.valid) {
+      issues.push({
+        type: 'ERROR',
+        variable: activeOriginVar,
+        message: originCheck.message,
+      });
+    } else if (originCfg.hasExplicitAppBaseUrl) {
+      if (originCfg.hasAppUrlFallback || originCfg.hasPublicAppUrlFallback) {
+        issues.push({
+          type: 'INFO',
+          variable: 'APP_BASE_URL',
+          message: `Explicit APP_BASE_URL (${originCheck.origin}) overrides fallback origin variable(s).`,
+        });
+      }
+    } else {
+      // Origin satisfied via APP_URL or PUBLIC_APP_URL fallback while APP_BASE_URL itself is unset
+      if (options.strictOrigin) {
+        issues.push({
+          type: 'ERROR',
+          variable: 'APP_BASE_URL',
+          message: `Strict origin validation (--strict-origin) requires explicit APP_BASE_URL; only fallback ${activeOriginVar} (${originCheck.origin}) is currently configured.`,
+        });
+      } else if (enforceRuntimeHardening) {
+        issues.push({
+          type: 'WARNING',
+          variable: 'APP_BASE_URL',
+          message: `Application origin requirement satisfied via fallback ${activeOriginVar} (${originCheck.origin}); APP_BASE_URL itself is not explicitly set. Set explicit APP_BASE_URL before production deployment.`,
+        });
+      } else {
+        issues.push({
+          type: 'INFO',
+          variable: activeOriginVar,
+          message: `Development/preview origin satisfied via ${activeOriginVar} (${originCheck.origin}); APP_BASE_URL itself is unset.`,
+        });
+      }
+    }
   }
 
   const allowedOriginsRaw = env.ALLOWED_ORIGINS?.trim() || '';
   if (allowedOriginsRaw) {
     for (const entry of allowedOriginsRaw.split(',').map((s) => s.trim()).filter(Boolean)) {
-      validateOriginString(entry, 'ALLOWED_ORIGINS');
+      const allowedCheck = validateAppOriginUrl(entry, enforceRuntimeHardening, 'ALLOWED_ORIGINS');
+      if (!allowedCheck.valid) {
+        issues.push({
+          type: 'ERROR',
+          variable: 'ALLOWED_ORIGINS',
+          message: allowedCheck.message,
+        });
+      }
     }
   }
 
@@ -529,14 +525,287 @@ export function validateBillingConfiguration(
     });
   }
 
+  // 9. Rate Limit Configuration & Precedence Validation
+  for (const spec of RATE_LIMIT_POLICY_SPECS) {
+    const rawPrimary = env[spec.primaryVar];
+    const primarySet = typeof rawPrimary === 'string' && rawPrimary.trim().length > 0;
+    const primaryValid = primarySet ? parseStrictPositiveInt(rawPrimary) !== null : true;
+
+    if (primarySet && !primaryValid) {
+      issues.push({
+        type: 'WARNING',
+        variable: spec.primaryVar,
+        message: `Invalid positive integer in ${spec.primaryVar}; runtime rejects invalid value and falls back to ${spec.fallbackVar || `default (${spec.defaultValue})`}.`,
+      });
+    }
+
+    if (spec.fallbackVar) {
+      const rawFallback = env[spec.fallbackVar];
+      const fallbackSet = typeof rawFallback === 'string' && rawFallback.trim().length > 0;
+      const fallbackValid = fallbackSet ? parseStrictPositiveInt(rawFallback) !== null : true;
+      if (fallbackSet && !fallbackValid) {
+        issues.push({
+          type: 'WARNING',
+          variable: spec.fallbackVar,
+          message: `Invalid positive integer in ${spec.fallbackVar}; runtime ignores invalid legacy value and uses ${spec.primaryVar} or default (${spec.defaultValue}).`,
+        });
+      }
+      if (primarySet && primaryValid && fallbackSet && fallbackValid && rawPrimary!.trim() !== rawFallback!.trim()) {
+        issues.push({
+          type: 'INFO',
+          variable: spec.primaryVar,
+          message: `Both ${spec.primaryVar} and legacy ${spec.fallbackVar} are configured; ${spec.primaryVar} takes precedence.`,
+        });
+      }
+    }
+  }
+
+  // 10. Storage Engine, Reverse Proxy Trust, and Simulation Webhook Guardrails
+  const storageEngine = (env.STORAGE_ENGINE || '').trim().toLowerCase();
+  if (storageEngine && storageEngine !== 'sqlite' && storageEngine !== 'memory') {
+    issues.push({
+      type: 'ERROR',
+      variable: 'STORAGE_ENGINE',
+      message: `Unrecognized STORAGE_ENGINE='${storageEngine}'. Allowed values are 'sqlite' or 'memory'.`,
+    });
+  } else if (storageEngine === 'memory') {
+    if (enforceRuntimeHardening) {
+      issues.push({
+        type: 'ERROR',
+        variable: 'STORAGE_ENGINE',
+        message: "STORAGE_ENGINE='memory' is strictly forbidden in staging and production; durable 'sqlite' storage is required.",
+      });
+    } else {
+      issues.push({
+        type: 'INFO',
+        variable: 'STORAGE_ENGINE',
+        message: "STORAGE_ENGINE='memory' active (ephemeral non-persistent storage for dev/test).",
+      });
+    }
+  }
+
+  const trustProxyCheck = validateTrustProxyValue(env.TRUST_PROXY);
+  if (!trustProxyCheck.valid) {
+    issues.push({
+      type: 'ERROR',
+      variable: 'TRUST_PROXY',
+      message: trustProxyCheck.error || 'Invalid TRUST_PROXY syntax.',
+    });
+  } else if (trustProxyCheck.warning) {
+    issues.push({
+      type: 'WARNING',
+      variable: 'TRUST_PROXY',
+      message: trustProxyCheck.warning,
+    });
+  }
+
+  const rawSimWebhook = (env.ALLOW_SIMULATION_WEBHOOK || '').trim().toLowerCase();
+  if (rawSimWebhook && rawSimWebhook !== 'true' && rawSimWebhook !== 'false') {
+    issues.push({
+      type: 'ERROR',
+      variable: 'ALLOW_SIMULATION_WEBHOOK',
+      message: "Invalid ALLOW_SIMULATION_WEBHOOK value; expected 'true' or 'false'.",
+    });
+  } else if (rawSimWebhook === 'true') {
+    if (enforceRuntimeHardening) {
+      issues.push({
+        type: 'ERROR',
+        variable: 'ALLOW_SIMULATION_WEBHOOK',
+        message: "ALLOW_SIMULATION_WEBHOOK='true' is strictly forbidden in staging and production environments.",
+      });
+    } else {
+      issues.push({
+        type: 'WARNING',
+        variable: 'ALLOW_SIMULATION_WEBHOOK',
+        message: "ALLOW_SIMULATION_WEBHOOK='true' enables unsigned simulation webhooks in non-production.",
+      });
+    }
+  }
+
+  // 11. Local Media, OCR, and Speech-to-Text Executable / Model Checks
+  const checkBinaryTool = (binaryName: string, envVar: string, requiredForMedia: boolean) => {
+    const res = resolveExecutable(binaryName, envVar, env);
+    if (res.configured) {
+      if (res.status === 'READY') {
+        issues.push({
+          type: 'INFO',
+          variable: envVar,
+          message: `${envVar} is configured and executable.`,
+        });
+      } else if (res.status === 'NON_EXECUTABLE') {
+        issues.push({
+          type: 'ERROR',
+          variable: envVar,
+          message: `${envVar} points to a non-executable or non-file path.`,
+        });
+      } else {
+        issues.push({
+          type: 'ERROR',
+          variable: envVar,
+          message: `${envVar} points to a missing executable path.`,
+        });
+      }
+      return true;
+    }
+
+    if (res.status === 'READY') {
+      issues.push({
+        type: 'INFO',
+        variable: envVar,
+        message: `${envVar} is unset; resolved system '${binaryName}' from PATH.`,
+      });
+      return true;
+    }
+
+    if (requiredForMedia && enforceRuntimeHardening) {
+      issues.push({
+        type: 'WARNING',
+        variable: envVar,
+        message: `${envVar} is not configured and '${binaryName}' was not found on PATH; media inspection/processing requires ${binaryName}.`,
+      });
+    } else {
+      issues.push({
+        type: 'NOT CONFIGURED',
+        variable: envVar,
+        message: `${envVar} is not configured and '${binaryName}' was not found on PATH; dependent detector reports NOT_ASSESSED or unavailable.`,
+      });
+    }
+    return false;
+  };
+
+  checkBinaryTool('ffmpeg', 'FFMPEG_PATH', true);
+  checkBinaryTool('ffprobe', 'FFPROBE_PATH', true);
+  checkBinaryTool('tesseract', 'TESSERACT_PATH', false);
+
+  const rawWhisperPath = (env.WHISPER_PATH || '').trim();
+  const rawLocalSttPath = (env.LOCAL_STT_PATH || '').trim();
+  let hasConfiguredSttBinary = false;
+
+  if (rawWhisperPath) {
+    hasConfiguredSttBinary = true;
+    const whisperRes = resolveExecutable('whisper', 'WHISPER_PATH', env);
+    if (whisperRes.status === 'READY') {
+      issues.push({
+        type: 'INFO',
+        variable: 'WHISPER_PATH',
+        message: 'WHISPER_PATH is configured and executable.',
+      });
+    } else {
+      issues.push({
+        type: 'ERROR',
+        variable: 'WHISPER_PATH',
+        message:
+          whisperRes.status === 'NON_EXECUTABLE'
+            ? 'WHISPER_PATH points to a non-executable or non-file path.'
+            : 'WHISPER_PATH points to a missing executable path.',
+      });
+    }
+  }
+
+  if (rawLocalSttPath) {
+    hasConfiguredSttBinary = true;
+    const localSttRes = resolveExecutable('whisper', 'LOCAL_STT_PATH', env);
+    if (localSttRes.status === 'READY') {
+      issues.push({
+        type: 'INFO',
+        variable: 'LOCAL_STT_PATH',
+        message: 'LOCAL_STT_PATH is configured and executable.',
+      });
+    } else {
+      issues.push({
+        type: 'ERROR',
+        variable: 'LOCAL_STT_PATH',
+        message:
+          localSttRes.status === 'NON_EXECUTABLE'
+            ? 'LOCAL_STT_PATH points to a non-executable or non-file path.'
+            : 'LOCAL_STT_PATH points to a missing executable path.',
+      });
+    }
+  }
+
+  if (!hasConfiguredSttBinary) {
+    issues.push({
+      type: 'NOT CONFIGURED',
+      variable: 'WHISPER_PATH',
+      message: 'Optional local Whisper STT binary (WHISPER_PATH / LOCAL_STT_PATH) is not configured; speech transcription remains NOT_ASSESSED.',
+    });
+  }
+
+  const rawWhisperModelPath = (env.WHISPER_MODEL_PATH || '').trim();
+  if (rawWhisperModelPath) {
+    try {
+      const modelStat = fs.statSync(rawWhisperModelPath);
+      if (!modelStat.isFile() || modelStat.size <= 0) {
+        issues.push({
+          type: 'ERROR',
+          variable: 'WHISPER_MODEL_PATH',
+          message: 'WHISPER_MODEL_PATH must point to a readable non-empty model file.',
+        });
+      } else {
+        issues.push({
+          type: 'INFO',
+          variable: 'WHISPER_MODEL_PATH',
+          message: 'WHISPER_MODEL_PATH exists and is a non-empty file.',
+        });
+      }
+    } catch {
+      issues.push({
+        type: 'ERROR',
+        variable: 'WHISPER_MODEL_PATH',
+        message: 'WHISPER_MODEL_PATH points to a missing or inaccessible model file.',
+      });
+    }
+  } else if (hasConfiguredSttBinary) {
+    issues.push({
+      type: 'WARNING',
+      variable: 'WHISPER_MODEL_PATH',
+      message: 'WHISPER_MODEL_PATH is not configured alongside local Whisper STT binary.',
+    });
+  } else {
+    issues.push({
+      type: 'NOT CONFIGURED',
+      variable: 'WHISPER_MODEL_PATH',
+      message: 'Optional Whisper model file (WHISPER_MODEL_PATH) is not configured.',
+    });
+  }
+
+  const rawMusicClassifierPath = (env.MUSIC_CLASSIFIER_PATH || '').trim();
+  if (rawMusicClassifierPath) {
+    const musicRes = resolveExecutable('music-classifier', 'MUSIC_CLASSIFIER_PATH', env);
+    if (musicRes.status === 'READY') {
+      issues.push({
+        type: 'INFO',
+        variable: 'MUSIC_CLASSIFIER_PATH',
+        message: 'MUSIC_CLASSIFIER_PATH is configured and executable.',
+      });
+    } else {
+      issues.push({
+        type: 'ERROR',
+        variable: 'MUSIC_CLASSIFIER_PATH',
+        message:
+          musicRes.status === 'NON_EXECUTABLE'
+            ? 'MUSIC_CLASSIFIER_PATH points to a non-executable or non-file path.'
+            : 'MUSIC_CLASSIFIER_PATH points to a missing executable path.',
+      });
+    }
+  } else {
+    issues.push({
+      type: 'NOT CONFIGURED',
+      variable: 'MUSIC_CLASSIFIER_PATH',
+      message: 'Optional local music classifier (MUSIC_CLASSIFIER_PATH) is not configured.',
+    });
+  }
+
   const errorsCount = issues.filter((i) => i.type === 'ERROR').length;
   const warningsCount = issues.filter((i) => i.type === 'WARNING').length;
+  const notConfiguredCount = issues.filter((i) => i.type === 'NOT CONFIGURED').length;
 
   return {
     mode,
     valid: errorsCount === 0,
     errorsCount,
     warningsCount,
+    notConfiguredCount,
     issues,
   };
 }
@@ -616,9 +885,11 @@ export async function runValidatorCli(
     else mode = 'production';
   }
 
+  const strictOrigin = args.includes('--strict-origin');
+
   console.log('======================================================================');
   console.log('VIDEORISK.COM — BILLING & ENVIRONMENT CONFIGURATION VALIDATOR');
-  console.log(`Target Evaluation Mode: [${mode.toUpperCase()}]`);
+  console.log(`Target Evaluation Mode: [${mode.toUpperCase()}]${strictOrigin ? ' (STRICT ORIGIN)' : ''}`);
   console.log('======================================================================\n');
 
   console.log('Configured Plans & Entitlements:');
@@ -628,13 +899,20 @@ export async function runValidatorCli(
   }
   console.log();
 
-  const summary = validateBillingConfiguration(mode, env);
+  const summary = validateBillingConfiguration(mode, env, { strictOrigin });
 
   if (summary.issues.length === 0) {
     console.log(`✅ All ${mode} configuration checks PASSED with 0 errors and 0 warnings.\n`);
   } else {
     for (const issue of summary.issues) {
-      const icon = issue.type === 'ERROR' ? '❌' : issue.type === 'WARNING' ? '⚠️ ' : 'ℹ️ ';
+      const icon =
+        issue.type === 'ERROR'
+          ? '❌'
+          : issue.type === 'WARNING'
+            ? '⚠️ '
+            : issue.type === 'NOT CONFIGURED'
+              ? '⚪'
+              : 'ℹ️ ';
       console.log(`${icon} [${issue.type}] ${issue.variable}: ${issue.message}`);
     }
     console.log();
@@ -679,7 +957,7 @@ export async function runValidatorCli(
   console.log('----------------------------------------------------------------------');
 
   if (!summary.valid) {
-    console.error(`\n❌ Configuration validation FAILED with ${summary.errorsCount} error(s).\n`);
+    console.error(`\n❌ Configuration validation FAILED with ${summary.errorsCount} error(s), ${summary.warningsCount} warning(s), ${summary.notConfiguredCount} not configured.\n`);
     return 1;
   }
 
@@ -688,7 +966,7 @@ export async function runValidatorCli(
     return 1;
   }
 
-  console.log(`\n✅ Configuration validation SUCCESSFUL for ${mode} mode${isLiveCheckRequested ? ' (Live check passed)' : ''}.\n`);
+  console.log(`\n✅ Configuration validation SUCCESSFUL for ${mode} mode (${summary.warningsCount} warning(s), ${summary.notConfiguredCount} not configured)${isLiveCheckRequested ? ' (Live check passed)' : ''}.\n`);
   return 0;
 }
 

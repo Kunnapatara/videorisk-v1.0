@@ -1051,6 +1051,7 @@ export async function runScanDeletionAndMediaCleanupTests() {
       STRIPE_PRICE_PRO: 'price_pro_123',
       STRIPE_PRICE_AGENCY: 'price_agency_123',
       STRIPE_PRICE_AUDIT_ONCE: 'price_audit_123',
+      APP_BASE_URL: 'https://videorisk.com',
       MEDIA_TOKEN_SECRET: validMediaSecret,
     });
     assert.strictEqual(prodValidRes.valid, true, 'Valid production billing configuration passes');
@@ -1150,6 +1151,7 @@ export async function runScanDeletionAndMediaCleanupTests() {
       STRIPE_PRICE_PRO: 'price_pro_123',
       STRIPE_PRICE_AGENCY: 'price_agency_123',
       STRIPE_PRICE_AUDIT_ONCE: 'price_audit_123',
+      APP_BASE_URL: 'https://videorisk.com',
       MEDIA_TOKEN_SECRET: validMediaSecret,
     };
 

@@ -241,15 +241,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
 
   constructor(customDataFile?: string, env: NodeJS.ProcessEnv = process.env) {
     this.env = env;
-    if (customDataFile) {
-      this.dataFile = path.resolve(customDataFile);
-    } else if (env.STORE_PATH) {
-      this.dataFile = path.resolve(env.STORE_PATH);
-    } else if (env.DATA_DIR) {
-      this.dataFile = path.resolve(env.DATA_DIR, 'store.json');
-    } else {
-      this.dataFile = path.resolve(process.cwd(), 'data', 'store.json');
-    }
+    this.dataFile = resolveLegacyStorePath(customDataFile, env);
 
     this.state = {
       users: {},
@@ -1546,28 +1538,47 @@ export class InMemoryStorageRepository implements IStorageRepository {
   };
 }
 
-export { SqliteStorageRepository, migrateJsonToSqlite } from './sqliteStorage';
+export { SqliteStorageRepository, migrateJsonToSqlite, resolveSqliteDatabasePath } from './sqliteStorage';
 import { SqliteStorageRepository, migrateJsonToSqlite } from './sqliteStorage';
 
+export function resolveLegacyStorePath(
+  customDataFile?: string,
+  env: NodeJS.ProcessEnv = process.env
+): string {
+  const cleanCustom = typeof customDataFile === 'string' ? customDataFile.trim() : '';
+  if (cleanCustom) {
+    return path.resolve(cleanCustom);
+  }
+  const cleanStorePath = typeof env.STORE_PATH === 'string' ? env.STORE_PATH.trim() : '';
+  if (cleanStorePath) {
+    return path.resolve(cleanStorePath);
+  }
+  const cleanDataDir = typeof env.DATA_DIR === 'string' ? env.DATA_DIR.trim() : '';
+  if (cleanDataDir) {
+    return path.resolve(cleanDataDir, 'store.json');
+  }
+  return path.resolve(process.cwd(), 'data', 'store.json');
+}
+
 export function createStorage(customPath?: string, env: NodeJS.ProcessEnv = process.env): IStorageRepository {
-  if (env.STORAGE_ENGINE === 'memory') {
+  if (env.STORAGE_ENGINE?.trim().toLowerCase() === 'memory') {
     return new InMemoryStorageRepository(customPath, env);
   }
   return new SqliteStorageRepository(customPath, env);
 }
 
 // Default system-of-record storage instance:
-// Uses durable SQLite in production, with seamless migration from legacy store.json if present.
-function initializeDefaultStorage(): IStorageRepository {
-  if (process.env.STORAGE_ENGINE === 'memory') {
-    return new InMemoryStorageRepository();
+// Uses durable SQLite in production, preserving DATABASE_PATH > DATA_DIR > default precedence,
+// with seamless migration from legacy store.json if present.
+export function initializeDefaultStorage(env: NodeJS.ProcessEnv = process.env): IStorageRepository {
+  if (env.STORAGE_ENGINE?.trim().toLowerCase() === 'memory') {
+    return new InMemoryStorageRepository(undefined, env);
   }
 
-  const dbPath = process.env.DATABASE_PATH || path.resolve(process.cwd(), 'data', 'videorisk.db');
-  const sqliteRepo = new SqliteStorageRepository(dbPath);
+  const sqliteRepo = new SqliteStorageRepository(undefined, env);
 
   // Auto-migrate legacy JSON storage if present and SQLite has 0 users
-  const legacyJsonPath = process.env.STORE_PATH || path.resolve(process.cwd(), 'data', 'store.json');
+  const legacyJsonPath = resolveLegacyStorePath(undefined, env);
   if (fs.existsSync(legacyJsonPath)) {
     try {
       const userCount = (sqliteRepo.db.prepare('SELECT COUNT(*) as c FROM users').get() as any).c;

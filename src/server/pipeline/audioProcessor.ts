@@ -11,6 +11,7 @@ import {
   DetectorReport 
 } from '../../types';
 import { isProductionEnvironment } from '../config/environment';
+import { resolveExecutable } from './binaryResolver';
 
 const execFileAsync = promisify(execFile);
 
@@ -3070,20 +3071,23 @@ export class SpeechTranscriptionAdapter {
         if (inputExt !== '.wav' && fs.existsSync(videoPath)) {
           let containerHasAudio = false;
           try {
-            const ffprobeBin = process.env.FFPROBE_PATH || 'ffprobe';
-            const { stdout: probeOut } = await execFileAsync(
-              ffprobeBin,
-              ['-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', videoPath],
-              { timeout: 15000 }
-            );
-            containerHasAudio = String(probeOut || '').trim().length > 0;
+            const ffprobeRes = resolveExecutable('ffprobe', 'FFPROBE_PATH', process.env);
+            if (ffprobeRes.status === 'READY' && ffprobeRes.resolvedPath) {
+              const { stdout: probeOut } = await execFileAsync(
+                ffprobeRes.resolvedPath,
+                ['-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', videoPath],
+                { timeout: 15000 }
+              );
+              containerHasAudio = String(probeOut || '').trim().length > 0;
+            }
           } catch {
             containerHasAudio = false;
           }
 
           if (containerHasAudio) {
             const wavInputPath = path.join(tmpDir, 'whisper_input_16k.wav');
-            const ffmpegBin = process.env.FFMPEG_PATH || 'ffmpeg';
+            const ffmpegRes = resolveExecutable('ffmpeg', 'FFMPEG_PATH', process.env);
+            const ffmpegBin = ffmpegRes.resolvedPath || ffmpegRes.configuredPath || 'ffmpeg';
             try {
               await execFileAsync(
                 ffmpegBin,
@@ -3999,7 +4003,22 @@ export class AudioProcessor {
       };
     }
 
-    const ffmpegBin = options?.ffmpegBinary || 'ffmpeg';
+    const ffmpegResolution = options?.ffmpegBinary
+      ? null
+      : resolveExecutable('ffmpeg', 'FFMPEG_PATH', process.env);
+    if (ffmpegResolution && ffmpegResolution.status !== 'READY') {
+      return {
+        status: 'ANALYSIS_UNAVAILABLE',
+        totalAudioSeconds: 0,
+        chunkSignatures: [],
+        failureReason:
+          ffmpegResolution.status === 'NON_EXECUTABLE'
+            ? 'Configured FFMPEG_PATH is not executable for PCM extraction'
+            : 'FFmpeg executable not found or inaccessible for PCM extraction',
+        limitations: 'PCM extraction unavailable because local FFmpeg executable is missing or not executable.'
+      };
+    }
+    const ffmpegBin = options?.ffmpegBinary || ffmpegResolution?.resolvedPath || 'ffmpeg';
     const timeoutMs = options?.timeoutMs || 45000;
     const tempPcmPath = path.resolve(os.tmpdir(), `vr_pcm_${Date.now()}_${crypto.randomBytes(6).toString('hex')}.raw`);
 
@@ -4263,10 +4282,19 @@ export class AudioProcessor {
         '-'
       ];
 
+      const ffmpegResolution = resolveExecutable('ffmpeg', 'FFMPEG_PATH', process.env);
+      if (ffmpegResolution.status !== 'READY' || !ffmpegResolution.resolvedPath) {
+        throw new AudioProcessingError(
+          ffmpegResolution.status === 'NON_EXECUTABLE'
+            ? 'FFmpeg audio analysis failed: configured FFMPEG_PATH is not executable.'
+            : 'FFmpeg audio analysis failed: FFmpeg executable not found.'
+        );
+      }
+
       // ffmpeg writes filter output and telemetry to stderr
       let output = '';
       try {
-        const { stdout, stderr } = await execFileAsync('ffmpeg', args, { timeout: 30000 });
+        const { stdout, stderr } = await execFileAsync(ffmpegResolution.resolvedPath, args, { timeout: 30000 });
         output = (stdout || '') + (stderr || '');
       } catch (procErr: any) {
         // Fail closed: Never treat partial output from a failed FFmpeg process as a successful measurement

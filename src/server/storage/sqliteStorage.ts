@@ -70,6 +70,25 @@ export interface MigrationRecord {
   appliedAt: string;
 }
 
+export function resolveSqliteDatabasePath(
+  customPath?: string,
+  env: NodeJS.ProcessEnv = process.env
+): string {
+  const cleanCustom = typeof customPath === 'string' ? customPath.trim() : '';
+  if (cleanCustom) {
+    return path.resolve(cleanCustom);
+  }
+  const cleanDatabasePath = typeof env.DATABASE_PATH === 'string' ? env.DATABASE_PATH.trim() : '';
+  if (cleanDatabasePath) {
+    return path.resolve(cleanDatabasePath);
+  }
+  const cleanDataDir = typeof env.DATA_DIR === 'string' ? env.DATA_DIR.trim() : '';
+  if (cleanDataDir) {
+    return path.resolve(cleanDataDir, 'videorisk.db');
+  }
+  return path.resolve(process.cwd(), 'data', 'videorisk.db');
+}
+
 export class SqliteStorageRepository implements IStorageRepository {
   public db: DatabaseSync;
   public dbPath: string;
@@ -79,15 +98,7 @@ export class SqliteStorageRepository implements IStorageRepository {
 
   constructor(customPath?: string, env: NodeJS.ProcessEnv = process.env) {
     this.env = env;
-    if (customPath) {
-      this.dbPath = path.resolve(customPath);
-    } else if (env.DATABASE_PATH) {
-      this.dbPath = path.resolve(env.DATABASE_PATH);
-    } else if (env.DATA_DIR) {
-      this.dbPath = path.resolve(env.DATA_DIR, 'videorisk.db');
-    } else {
-      this.dbPath = path.resolve(process.cwd(), 'data', 'videorisk.db');
-    }
+    this.dbPath = resolveSqliteDatabasePath(customPath, env);
 
     // Pre-open validation: Ensure no SQLite connection opens or writes to a production database during test runs
     if (env.VIDEORISK_TEST_RUN === 'true' || env.TEST_DATABASE_PATH || env.NODE_ENV === 'test' || process.env.VIDEORISK_TEST_RUN === 'true' || process.env.TEST_DATABASE_PATH || process.env.NODE_ENV === 'test') {

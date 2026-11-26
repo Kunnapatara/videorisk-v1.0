@@ -3,6 +3,7 @@ import { promisify } from 'util';
 import fs from 'fs';
 import crypto from 'crypto';
 import { MediaMetadata } from '../../types';
+import { resolveExecutable } from './binaryResolver';
 
 const execFileAsync = promisify(execFile);
 
@@ -47,7 +48,17 @@ export class MediaInspector {
       throw new MediaInspectionError('Uploaded video file is empty (0 bytes).', 'INVALID_MEDIA_METADATA');
     }
 
-    const ffprobeBin = process.env.FFPROBE_PATH || 'ffprobe';
+    const ffprobeResolution = resolveExecutable('ffprobe', 'FFPROBE_PATH', process.env);
+    if (ffprobeResolution.status === 'MISSING_EXECUTABLE' || ffprobeResolution.status === 'NOT_CONFIGURED') {
+      throw new MediaInspectionError(
+        `FFprobe executable not found (${ffprobeResolution.configuredPath || 'ffprobe'}).`,
+        'MISSING_EXECUTABLE'
+      );
+    }
+    if (ffprobeResolution.status === 'NON_EXECUTABLE' || !ffprobeResolution.resolvedPath) {
+      throw new MediaInspectionError('FFprobe path is not executable.', 'NON_EXECUTABLE');
+    }
+    const ffprobeBin = ffprobeResolution.resolvedPath;
 
     // Arguments passed directly to ffprobe binary without shell expansion
     const args = [

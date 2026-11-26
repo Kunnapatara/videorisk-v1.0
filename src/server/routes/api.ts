@@ -4,7 +4,6 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import crypto from 'crypto';
-import net from 'net';
 import { storage } from '../storage';
 import { jobOrchestrator } from '../pipeline/jobOrchestrator';
 import { mediaInspector } from '../pipeline/mediaInspector';
@@ -23,10 +22,16 @@ import {
   isVerifiedOwnerUser,
 } from '../services/ownerAuth';
 import {
-  isForbiddenProductionOriginHostname,
   isProductionEnvironment,
+  isValidIpOrCidr,
+  parseStrictPositiveInt,
+  resolveConfiguredAppOrigin,
   resolveEnvironmentSecurity,
+  resolveRateLimitInt,
+  validateAppOriginUrl,
   validateMediaTokenSecret,
+  validateStripeSecretKeyFormat,
+  validateTrustProxyValue,
 } from '../config/environment';
 import { AnalyticsEventName, ScanJob, ScanMode, UserAccount, CrossVideoPattern, ChannelCoverageReport, ChannelCoverageDetail, ChannelPatternsResponse, CrossVideoComparisonStatus } from '../../types';
 
@@ -954,67 +959,7 @@ export const secureUploadsHandler: RequestHandler = async (req: Request, res: Re
   }
 };
 
-/**
- * Strictly validates and parses a positive integer from a string value:
- * 1. Trims surrounding whitespace.
- * 2. Entire value must match digits only without leading zeroes: /^[1-9]\d*$/
- * 3. Rejects decimal values (e.g. "1.5"), trailing characters (e.g. "10abc"), zero ("0"),
- *    negative values ("-1"), non-numeric strings, and Infinity.
- * 4. Rejects values outside JavaScript's safe-integer range (Number.MAX_SAFE_INTEGER).
- * Returns null if invalid.
- */
-export function parseStrictPositiveInt(val: string | undefined | null): number | null {
-  if (val === undefined || val === null || typeof val !== 'string') {
-    return null;
-  }
-  const trimmed = val.trim();
-  if (!/^[1-9]\d*$/.test(trimmed)) {
-    return null;
-  }
-  // Check bounds using BigInt for values longer than 15 digits to avoid float precision coercion
-  if (trimmed.length > 15) {
-    try {
-      if (BigInt(trimmed) > BigInt(Number.MAX_SAFE_INTEGER)) {
-        return null;
-      }
-    } catch {
-      return null;
-    }
-  }
-  const num = Number(trimmed);
-  if (!Number.isSafeInteger(num) || num <= 0) {
-    return null;
-  }
-  return num;
-}
-
-/**
- * Resolves a rate-limit integer setting with unambiguous precedence:
- * 1. Primary (current/specific) environment variable if set to a valid positive integer.
- * 2. Fallback (legacy/general) environment variable if set to a valid positive integer.
- * 3. Default positive integer value.
- *
- * Security Guarantee:
- * Invalid strings, empty strings, zero ('0'), negative numbers ('-1'), decimals ('1.5'),
- * trailing letters ('10abc'), NaN, Infinity, or overflow values are strictly rejected
- * and will never disable the rate limit. An invalid primary value never prevents a valid
- * legacy fallback from being applied.
- */
-export function resolveRateLimitInt(
-  primaryVal: string | undefined,
-  fallbackVal: string | undefined,
-  defaultValue: number
-): number {
-  const primaryParsed = parseStrictPositiveInt(primaryVal);
-  if (primaryParsed !== null) {
-    return primaryParsed;
-  }
-  const fallbackParsed = parseStrictPositiveInt(fallbackVal);
-  if (fallbackParsed !== null) {
-    return fallbackParsed;
-  }
-  return defaultValue;
-}
+export { parseStrictPositiveInt, resolveRateLimitInt, isValidIpOrCidr };
 
 /**
  * Safely parses positive integers from environment configuration with fallback to secure default.
@@ -1039,99 +984,25 @@ export function getClientIp(req: Request): string {
 }
 
 /**
- * Strictly validates an IP address (IPv4/IPv6) or CIDR block (IPv4/IPv6).
- * Uses Node's built-in net.isIP to validate octets and address formatting.
- * Strictly validates prefix lengths (0-32 for IPv4, 0-128 for IPv6).
- */
-export function isValidIpOrCidr(entry: string): boolean {
-  if (!entry || typeof entry !== 'string') return false;
-  const trimmed = entry.trim();
-  if (trimmed === '') return false;
-
-  // CIDR: IP/prefix
-  if (trimmed.includes('/')) {
-    const parts = trimmed.split('/');
-    if (parts.length !== 2) return false;
-    const [ipPart, prefixPart] = parts;
-
-    const ipVer = net.isIP(ipPart);
-    if (ipVer === 0) return false;
-
-    // Prefix must be a non-negative integer without signs, decimals, or letters
-    if (!/^(0|[1-9]\d*)$/.test(prefixPart)) return false;
-    const prefix = Number(prefixPart);
-    if (!Number.isSafeInteger(prefix)) return false;
-
-    if (ipVer === 4) {
-      return prefix >= 0 && prefix <= 32;
-    }
-    if (ipVer === 6) {
-      return prefix >= 0 && prefix <= 128;
-    }
-    return false;
-  }
-
-  // Standalone IP
-  return net.isIP(trimmed) !== 0;
-}
-
-/**
  * Validates and configures reverse proxy trust settings for Express.
- *
- * Security Requirements & Assumptions:
- * - Proxy trust is disabled by default (false) to prevent client IP spoofing via arbitrary X-Forwarded-For headers.
- * - In production, unrestricted "true" should NOT be used unless all inbound traffic is strictly constrained
- *   to traverse the front-end reverse proxy (e.g. AWS ALB, Cloud Run, Nginx).
- * - Deployment Note: The application must NOT be directly reachable through an untrusted path when proxy trust is enabled.
- * - Accepts hop counts (e.g. 1), CIDR/IP lists, or standard keywords ("loopback", "linklocal", "uniquelocal").
- * - Fails safely to false if an invalid or unparseable configuration is provided.
+ * Fails safely to false if an invalid or unparseable configuration is provided.
  */
 export function configureTrustProxy(app: express.Express, rawVal: string | undefined): void {
-  if (rawVal === undefined || rawVal === null || typeof rawVal !== 'string' || rawVal.trim() === '' || rawVal.trim().toLowerCase() === 'false') {
+  const result = validateTrustProxyValue(rawVal);
+  if (!result.valid) {
+    console.error(`[SECURITY ERROR] Invalid TRUST_PROXY configuration value "${rawVal}". Defaulting to trust proxy: false for security.`);
     app.set('trust proxy', false);
     return;
   }
-
-  const trimmed = rawVal.trim();
-
-  // 1. Exact numeric positive hop count (e.g. "1", "2")
-  if (/^[1-9]\d*$/.test(trimmed)) {
-    const num = Number(trimmed);
-    if (Number.isSafeInteger(num) && num > 0) {
-      app.set('trust proxy', num);
-      return;
-    }
-  }
-
-  // 2. Standard Express trust proxy keywords
-  const knownKeywords = ['loopback', 'linklocal', 'uniquelocal'];
-  if (knownKeywords.includes(trimmed.toLowerCase())) {
-    app.set('trust proxy', trimmed.toLowerCase());
-    return;
-  }
-
-  // 3. Boolean "true" (unrestricted trust proxy) - always logs explicit security warning
-  if (trimmed.toLowerCase() === 'true') {
+  if (result.mode === 'unrestricted') {
     console.warn(
       '[SECURITY WARNING] TRUST_PROXY is set to unrestricted "true". ' +
       'This trusts all X-Forwarded-For headers from any connecting client. ' +
       'Ensure the application is NOT directly accessible without passing through your edge proxy/load balancer. ' +
       'Prefer configuring an exact hop count (e.g. TRUST_PROXY=1) or trusted subnet CIDR range.'
     );
-    app.set('trust proxy', true);
-    return;
   }
-
-  // 4. Comma-separated list of IP addresses or CIDR subnets
-  const parts = trimmed.split(',').map(p => p.trim());
-  if (parts.length > 0 && parts.every(part => isValidIpOrCidr(part))) {
-    app.set('trust proxy', parts.join(', '));
-    return;
-  }
-
-  // 5. Invalid / unsupported configuration -> Fail safe to false
-  console.error(`[SECURITY ERROR] Invalid TRUST_PROXY configuration value "${rawVal}". Defaulting to trust proxy: false for security.`);
-  app.set('trust proxy', false);
+  app.set('trust proxy', result.normalizedValue);
 }
 
 /**
@@ -1346,35 +1217,31 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
     isCoreReady = false;
   }
 
-  // 3. Billing gateway readiness check (non-disclosing, format-validated)
+  // 3. Billing gateway readiness check (non-disclosing, canonical format-validated)
   const rawKey = process.env.STRIPE_SECRET_KEY ? process.env.STRIPE_SECRET_KEY.trim() : '';
   const rawWebhook = process.env.STRIPE_WEBHOOK_SECRET ? process.env.STRIPE_WEBHOOK_SECRET.trim() : '';
 
-  const hasSecretKey = rawKey.length > 0;
+  const keyValidation = validateStripeSecretKeyFormat(rawKey);
+  const hasSecretKey = keyValidation.present;
   const hasWebhookSecret = rawWebhook.length > 0;
-  const isKeyLive = /^sk_live_[a-zA-Z0-9]{20,}$/.test(rawKey) || /^rk_live_[a-zA-Z0-9]{20,}$/.test(rawKey);
-  const isKeyTest = /^sk_test_[a-zA-Z0-9]{20,}$/.test(rawKey) || /^rk_test_[a-zA-Z0-9]{20,}$/.test(rawKey);
+  const isKeyLive = keyValidation.mode === 'live';
+  const isKeyTest = keyValidation.mode === 'test';
   // Authoritative Stripe webhook secret format validation via shared validator
   const webhookValidation = validateStripeWebhookSecret(rawWebhook);
   const isWebhookFormatValid = hasWebhookSecret && webhookValidation.isValid;
-  const isKeyFormatValid = isKeyLive || isKeyTest;
+  const isKeyFormatValid = keyValidation.validFormat;
 
-  const configuredBaseUrl = billingService.getConfiguredAppBaseUrl();
+  const originConfig = resolveConfiguredAppOrigin(process.env);
   let isOriginHttpsValid = true;
   if (isProd) {
-    if (!configuredBaseUrl) {
+    if (!originConfig.rawOrigin) {
       isOriginHttpsValid = false;
     } else {
-      try {
-        const parsedBase = new URL(configuredBaseUrl);
-        isOriginHttpsValid =
-          parsedBase.protocol === 'https:' &&
-          !parsedBase.username &&
-          !parsedBase.password &&
-          !isForbiddenProductionOriginHostname(parsedBase.hostname);
-      } catch {
-        isOriginHttpsValid = false;
-      }
+      isOriginHttpsValid = validateAppOriginUrl(
+        originConfig.rawOrigin,
+        true,
+        originConfig.variable || 'APP_BASE_URL'
+      ).valid;
     }
   }
 
@@ -1394,15 +1261,15 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
       : isProd
         ? 'Stripe billing credentials unconfigured in production environment.'
         : 'Stripe credentials unconfigured; running in free/simulation billing mode.';
+  } else if (hasSecretKey && !isKeyFormatValid) {
+    billingStatus = 'degraded';
+    billingMessage = 'Malformed STRIPE_SECRET_KEY (expected sk_live_... or sk_test_...).';
+  } else if (hasWebhookSecret && !isWebhookFormatValid) {
+    billingStatus = 'degraded';
+    billingMessage = 'Malformed STRIPE_WEBHOOK_SECRET (expected whsec_... format).';
   } else if (!hasSecretKey || !hasWebhookSecret) {
     billingStatus = 'degraded';
     billingMessage = 'Partial billing configuration: both STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET are required for complete checkout & webhook processing.';
-  } else if (!isKeyFormatValid) {
-    billingStatus = 'degraded';
-    billingMessage = 'Malformed STRIPE_SECRET_KEY (expected sk_live_... or sk_test_...).';
-  } else if (!isWebhookFormatValid) {
-    billingStatus = 'degraded';
-    billingMessage = 'Malformed STRIPE_WEBHOOK_SECRET (expected whsec_... format).';
   } else if (isStagingBilling && isKeyLive) {
     billingStatus = 'degraded';
     billingMessage = 'Staging environment forbids Stripe live credentials (sk_live_...); configure sk_test_... keys instead.';
@@ -1827,8 +1694,8 @@ apiRouter.get('/health/readiness', async (req: Request, res: Response) => {
 apiRouter.post('/auth/register', async (req: Request, res: Response) => {
   try {
     const clientIp = getClientIp(req);
-    const registerLimit = resolveRateLimitInt(process.env.AUTH_REGISTER_RATE_LIMIT, undefined, 30);
-    const registerWindow = resolveRateLimitInt(process.env.AUTH_REGISTER_RATE_WINDOW, undefined, 900); // 15 minutes
+    const registerLimit = resolveRateLimitInt(process.env.AUTH_REGISTER_RATE_LIMIT, process.env.AUTH_REGISTRATION_RATE_LIMIT, 30);
+    const registerWindow = resolveRateLimitInt(process.env.AUTH_REGISTER_RATE_WINDOW, process.env.AUTH_REGISTRATION_RATE_WINDOW, 900); // 15 minutes
 
     const regStatus = await storage.rateLimits.consumeRateLimit(clientIp, 'auth_register', registerLimit, registerWindow);
     if (!regStatus.allowed) {

@@ -7,7 +7,8 @@ import {
   DetectorExecutionStatus, 
   DetectorReport 
 } from '../../types';
-import { validateTesseractTsv } from './videoProcessor';
+import { validateTesseractTsv, sanitizeOcrDiagnostic } from './videoProcessor';
+import { resolveExecutable } from './binaryResolver';
 
 const execFileAsync = promisify(execFile);
 
@@ -40,20 +41,24 @@ export interface ThumbnailOcrResult {
 export class ThumbnailOcrAdapter {
   public async extractText(imagePath: string, width: number, height: number): Promise<ThumbnailOcrResult> {
     const startTime = Date.now();
-    const tesseractPath = process.env.TESSERACT_PATH;
-
-    // Check explicit path or system tool
+    const tesseractResolution = resolveExecutable('tesseract', 'TESSERACT_PATH', process.env);
     let executable: string | null = null;
-    if (tesseractPath && fs.existsSync(tesseractPath)) {
-      executable = tesseractPath;
-    } else if (tesseractPath) {
+    if (tesseractResolution.status === 'READY' && tesseractResolution.resolvedPath) {
+      executable = tesseractResolution.resolvedPath;
+    } else if (tesseractResolution.configured) {
+      const reason = tesseractResolution.status === 'NON_EXECUTABLE'
+        ? sanitizeOcrDiagnostic(`Configured TESSERACT_PATH is not executable at ${tesseractResolution.configuredPath || ''}`)
+        : sanitizeOcrDiagnostic(`Configured TESSERACT_PATH not found at ${tesseractResolution.configuredPath || ''}`);
       return {
         status: 'ANALYSIS_UNAVAILABLE',
         extractedText: null,
         textDensityRatio: null,
         confidence: 0,
-        failureReason: `Configured TESSERACT_PATH not found at ${tesseractPath}`,
-        limitations: 'OCR engine path was configured but executable is missing.',
+        failureReason: reason,
+        limitations:
+          tesseractResolution.status === 'NON_EXECUTABLE'
+            ? 'OCR engine path was configured but binary is not executable.'
+            : 'OCR engine path was configured but executable is missing.',
         executionDurationMs: Date.now() - startTime
       };
     }
@@ -166,7 +171,15 @@ export class ThumbnailInspector {
         imagePath
       ];
 
-      const { stdout } = await execFileAsync('ffprobe', args, { timeout: 15000 });
+      const ffprobeResolution = resolveExecutable('ffprobe', 'FFPROBE_PATH', process.env);
+      if (ffprobeResolution.status === 'MISSING_EXECUTABLE') {
+        throw new ThumbnailInspectionError('FFprobe executable not found for thumbnail inspection.');
+      }
+      if (ffprobeResolution.status === 'NON_EXECUTABLE') {
+        throw new ThumbnailInspectionError('Configured FFPROBE_PATH is not executable.');
+      }
+      const ffprobeBin = ffprobeResolution.resolvedPath || 'ffprobe';
+      const { stdout } = await execFileAsync(ffprobeBin, args, { timeout: 15000 });
       const probeData = JSON.parse(stdout);
 
       const stream = probeData.streams?.[0];
@@ -324,7 +337,11 @@ export class ThumbnailInspector {
         '-f', 'null',
         '-'
       ];
-      const { stderr } = await execFileAsync('ffmpeg', statsArgs, { timeout: 15000 });
+      const ffmpegResolution = resolveExecutable('ffmpeg', 'FFMPEG_PATH', process.env);
+      if (ffmpegResolution.status !== 'READY' || !ffmpegResolution.resolvedPath) {
+        return null;
+      }
+      const { stderr } = await execFileAsync(ffmpegResolution.resolvedPath, statsArgs, { timeout: 15000 });
       return this.evaluateLuminanceExecution(String(stderr || ''), false);
     } catch {
       return null;

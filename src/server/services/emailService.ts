@@ -1,8 +1,9 @@
 import nodemailer from 'nodemailer';
 import type { Transporter } from 'nodemailer';
 import {
-  isForbiddenProductionOriginHostname,
+  resolveConfiguredAppOrigin,
   resolveEnvironmentSecurity,
+  validateAppOriginUrl,
 } from '../config/environment';
 
 export interface SmtpResolvedConfig {
@@ -160,9 +161,9 @@ export function resolvePasswordResetAppBaseUrl(
   env: NodeJS.ProcessEnv = process.env
 ): { valid: boolean; origin?: string; reason?: string } {
   const envSec = resolveEnvironmentSecurity(env);
-  const rawBase = (env.APP_BASE_URL || env.APP_URL || env.PUBLIC_APP_URL || '').trim();
+  const originConfig = resolveConfiguredAppOrigin(env);
 
-  if (!rawBase) {
+  if (!originConfig.rawOrigin) {
     if (envSec.isProduction) {
       return {
         valid: false,
@@ -175,47 +176,24 @@ export function resolvePasswordResetAppBaseUrl(
     };
   }
 
-  if (rawBase.startsWith('//') || rawBase.includes('@') || /\s/.test(rawBase) || rawBase.includes('\\')) {
+  const originCheck = validateAppOriginUrl(
+    originConfig.rawOrigin,
+    envSec.isProduction,
+    originConfig.variable || 'APP_BASE_URL'
+  );
+  if (!originCheck.valid || !originCheck.origin) {
     return {
       valid: false,
-      reason: 'INVALID_APP_BASE_URL',
-    };
-  }
-
-  let parsed: URL;
-  try {
-    parsed = new URL(rawBase);
-  } catch {
-    return {
-      valid: false,
-      reason: 'INVALID_APP_BASE_URL',
-    };
-  }
-
-  if (parsed.username || parsed.password) {
-    return {
-      valid: false,
-      reason: 'INVALID_APP_BASE_URL',
-    };
-  }
-
-  if (envSec.isProduction) {
-    if (parsed.protocol !== 'https:' || isForbiddenProductionOriginHostname(parsed.hostname)) {
-      return {
-        valid: false,
-        reason: 'INSECURE_OR_FORBIDDEN_APP_BASE_URL',
-      };
-    }
-  } else if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    return {
-      valid: false,
-      reason: 'INVALID_APP_BASE_URL',
+      reason:
+        originCheck.code === 'INSECURE_SCHEME' || originCheck.code === 'FORBIDDEN_HOST'
+          ? 'INSECURE_OR_FORBIDDEN_APP_BASE_URL'
+          : 'INVALID_APP_BASE_URL',
     };
   }
 
   return {
     valid: true,
-    origin: parsed.origin,
+    origin: originCheck.origin,
   };
 }
 
