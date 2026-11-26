@@ -2,6 +2,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import { mediaInspector } from '../src/server/pipeline/mediaInspector';
 import { thumbnailInspector, ThumbnailInspectionError, ThumbnailOcrAdapter } from '../src/server/pipeline/thumbnailInspector';
 import { audioProcessor, AudioProcessingError, SpeechTranscriptionAdapter } from '../src/server/pipeline/audioProcessor';
@@ -572,14 +573,39 @@ export async function runProductCapabilitiesTests() {
 
     // 8.6 Thumbnail OCR Adapter
     const ocrAdapter = new ThumbnailOcrAdapter();
-    const unconfiguredOcr = await ocrAdapter.extractText(validThumbPath, 1280, 720);
-    assert(unconfiguredOcr.status === 'NOT_ASSESSED', '8.6 Unconfigured OCR returns NOT_ASSESSED');
-    assert(unconfiguredOcr.limitations.includes('TESSERACT_PATH'), '8.6 Unconfigured OCR explicitly documents missing engine');
+    const prevTesseractPath = process.env.TESSERACT_PATH;
+    const prevPath = process.env.PATH;
+    const isolatedEmptyPathDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vr_no_tesseract_'));
+    try {
+      delete process.env.TESSERACT_PATH;
+      process.env.PATH = isolatedEmptyPathDir;
 
-    process.env.TESSERACT_PATH = '/path/to/nonexistent/tesseract_binary';
-    const missingOcr = await ocrAdapter.extractText(validThumbPath, 1280, 720);
-    assert(missingOcr.status === 'ANALYSIS_UNAVAILABLE', '8.6 Invalid OCR path returns ANALYSIS_UNAVAILABLE');
-    delete process.env.TESSERACT_PATH;
+      const unconfiguredOcr = await ocrAdapter.extractText(validThumbPath, 1280, 720);
+      assert(unconfiguredOcr.status === 'NOT_ASSESSED', '8.6 Unconfigured OCR returns NOT_ASSESSED');
+      assert(unconfiguredOcr.limitations.includes('TESSERACT_PATH'), '8.6 Unconfigured OCR explicitly documents missing engine');
+
+      process.env.TESSERACT_PATH = '/path/to/nonexistent/tesseract_binary';
+      const missingOcr = await ocrAdapter.extractText(validThumbPath, 1280, 720);
+      assert(missingOcr.status === 'ANALYSIS_UNAVAILABLE', '8.6 Invalid OCR path returns ANALYSIS_UNAVAILABLE');
+    } finally {
+      if (prevTesseractPath === undefined) {
+        delete process.env.TESSERACT_PATH;
+      } else {
+        process.env.TESSERACT_PATH = prevTesseractPath;
+      }
+      if (prevPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = prevPath;
+      }
+      try {
+        if (fs.existsSync(isolatedEmptyPathDir)) {
+          fs.rmSync(isolatedEmptyPathDir, { recursive: true, force: true });
+        }
+      } catch {
+        // ignore cleanup error
+      }
+    }
 
     // 8.7 Re-scan Comparison with Known Video Changes
     // Scenario A: Issue RESOLVED (Original has repeated footage, revised replaces it with distinct scenes)
