@@ -1,6 +1,7 @@
 import assert from 'assert';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import { promisify } from 'util';
 import { execFile } from 'child_process';
 import { thumbnailInspector, ThumbnailOcrAdapter } from '../src/server/pipeline/thumbnailInspector';
@@ -23,15 +24,20 @@ export async function runPhase456VerificationTests() {
     fs.mkdirSync(testDir, { recursive: true });
   }
 
+  const prevTesseractPath = process.env.TESSERACT_PATH;
+  const prevPath = process.env.PATH;
+  const prevWhisperPath = process.env.WHISPER_PATH;
+  const prevLocalSttPath = process.env.LOCAL_STT_PATH;
+
   const generatedFiles: string[] = [];
   const cleanup = () => {
     for (const f of generatedFiles) {
       try {
-        if (fs.existsSync(f)) fs.unlinkSync(f);
+        if (fs.existsSync(f)) fs.rmSync(f, { recursive: true, force: true });
       } catch {}
     }
     try {
-      if (fs.existsSync(testDir)) fs.rmdirSync(testDir);
+      if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
     } catch {}
   };
 
@@ -114,10 +120,32 @@ export async function runPhase456VerificationTests() {
       isProxyUsed: false
     };
 
-    // Unconfigured state returns NOT_ASSESSED
-    delete process.env.TESSERACT_PATH;
-    const unconfVideoOcr = await videoProcessor.performVideoOcr(textVideoPath, mockVideoMeta);
-    assert.strictEqual(unconfVideoOcr.status, 'NOT_ASSESSED', '2.1 Unconfigured Video OCR returns NOT_ASSESSED');
+    // Unconfigured state returns NOT_ASSESSED (isolate PATH so system tesseract is not picked up)
+    const casePrevTesseractPath = process.env.TESSERACT_PATH;
+    const casePrevPath = process.env.PATH;
+    const isolatedEmptyPathDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vr_phase456_no_tesseract_'));
+    try {
+      delete process.env.TESSERACT_PATH;
+      process.env.PATH = isolatedEmptyPathDir;
+      const unconfVideoOcr = await videoProcessor.performVideoOcr(textVideoPath, mockVideoMeta);
+      assert.strictEqual(unconfVideoOcr.status, 'NOT_ASSESSED', '2.1 Unconfigured Video OCR returns NOT_ASSESSED');
+    } finally {
+      if (casePrevTesseractPath === undefined) {
+        delete process.env.TESSERACT_PATH;
+      } else {
+        process.env.TESSERACT_PATH = casePrevTesseractPath;
+      }
+      if (casePrevPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = casePrevPath;
+      }
+      try {
+        if (fs.existsSync(isolatedEmptyPathDir)) {
+          fs.rmSync(isolatedEmptyPathDir, { recursive: true, force: true });
+        }
+      } catch {}
+    }
 
     // Configured execution returns DETECTED with frames and bounding boxes
     process.env.TESSERACT_PATH = '/usr/bin/tesseract';
@@ -291,6 +319,26 @@ EOF
     console.log('🎉 ALL PHASE 4–6 GAP CLOSURE VERIFICATIONS PASSED!');
     console.log('======================================================\n');
   } finally {
+    if (prevTesseractPath === undefined) {
+      delete process.env.TESSERACT_PATH;
+    } else {
+      process.env.TESSERACT_PATH = prevTesseractPath;
+    }
+    if (prevPath === undefined) {
+      delete process.env.PATH;
+    } else {
+      process.env.PATH = prevPath;
+    }
+    if (prevWhisperPath === undefined) {
+      delete process.env.WHISPER_PATH;
+    } else {
+      process.env.WHISPER_PATH = prevWhisperPath;
+    }
+    if (prevLocalSttPath === undefined) {
+      delete process.env.LOCAL_STT_PATH;
+    } else {
+      process.env.LOCAL_STT_PATH = prevLocalSttPath;
+    }
     cleanup();
   }
 }
