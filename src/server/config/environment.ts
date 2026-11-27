@@ -973,7 +973,7 @@ export function resolveRetentionConfiguration(
   env: NodeJS.ProcessEnv = process.env
 ): RetentionConfiguration {
   const rawEnabled = (env.RETENTION_CLEANUP_ENABLED || '').trim().toLowerCase();
-  const enabled = rawEnabled !== 'false' && rawEnabled !== '0';
+  const enabled = rawEnabled === 'true' || rawEnabled === '1';
 
   const mediaRetentionHours =
     parseStrictPositiveInt(env.MEDIA_RETENTION_HOURS) ?? DEFAULT_MEDIA_RETENTION_HOURS;

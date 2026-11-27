@@ -92,6 +92,23 @@ export class RetentionService {
     const startedAtMs = this.nowFn();
     const startedAt = new Date(startedAtMs).toISOString();
 
+    if (!config.enabled) {
+      return {
+        executed: false,
+        skippedOverlap: false,
+        startedAt,
+        completedAt: new Date(this.nowFn()).toISOString(),
+        config,
+        pendingScansReconciled: 0,
+        pendingScansPurged: 0,
+        expiredScansMediaCleaned: 0,
+        expiredFilesRemoved: 0,
+        expiredUploadsRemoved: 0,
+        tempArtifactsRemoved: 0,
+        errors: 0,
+      };
+    }
+
     if (this.sweepInProgress) {
       return {
         executed: false,
@@ -475,7 +492,7 @@ export class RetentionService {
   public startScheduler(options: { initialDelayMs?: number } = {}): void {
     const config = this.getConfiguration();
     if (!config.enabled) {
-      console.log('[Retention] Automated retention scheduler disabled via RETENTION_CLEANUP_ENABLED=false.');
+      console.log('[Retention] Automated retention scheduler disabled (RETENTION_CLEANUP_ENABLED must be explicitly true or 1 to activate).');
       return;
     }
     if (this.intervalTimer) {

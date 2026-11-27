@@ -622,9 +622,30 @@ export async function runLaunchBlockersPhase1Tests(): Promise<void> {
     console.log('\n[Task 5] Verifying automated retention cleanup, reconciliation, overlap lock, and restart safety...');
 
     const defaultRetentionCfg = resolveRetentionConfiguration({});
+    assert.strictEqual(defaultRetentionCfg.enabled, false, 'Retention MUST be disabled when RETENTION_CLEANUP_ENABLED is absent');
     assert.strictEqual(defaultRetentionCfg.mediaRetentionHours, 168);
     assert.strictEqual(defaultRetentionCfg.tempArtifactRetentionHours, 24);
+    assert.strictEqual(defaultRetentionCfg.cleanupIntervalMs, 3600000);
     assert.strictEqual(defaultRetentionCfg.approvalStatus, 'CONFIGURABLE_DEFAULT_REQUIRES_OWNER_APPROVAL');
+
+    assert.strictEqual(resolveRetentionConfiguration({ RETENTION_CLEANUP_ENABLED: '' }).enabled, false, 'Empty string stays disabled');
+    assert.strictEqual(resolveRetentionConfiguration({ RETENTION_CLEANUP_ENABLED: 'false' }).enabled, false, 'Explicit false stays disabled');
+    assert.strictEqual(resolveRetentionConfiguration({ RETENTION_CLEANUP_ENABLED: ' FALSE ' }).enabled, false, 'Case-insensitive false stays disabled');
+    assert.strictEqual(resolveRetentionConfiguration({ RETENTION_CLEANUP_ENABLED: '0' }).enabled, false, 'Explicit 0 stays disabled');
+    assert.strictEqual(resolveRetentionConfiguration({ RETENTION_CLEANUP_ENABLED: 'yes' }).enabled, false, 'Non-explicit value stays disabled');
+    assert.strictEqual(resolveRetentionConfiguration({ RETENTION_CLEANUP_ENABLED: 'true' }).enabled, true, 'Explicit true enables retention');
+    assert.strictEqual(resolveRetentionConfiguration({ RETENTION_CLEANUP_ENABLED: ' TRUE ' }).enabled, true, 'Case-insensitive true enables retention');
+    assert.strictEqual(resolveRetentionConfiguration({ RETENTION_CLEANUP_ENABLED: '1' }).enabled, true, 'Explicit 1 enables retention');
+    assert.strictEqual(resolveRetentionConfiguration({ RETENTION_CLEANUP_ENABLED: ' 1 ' }).enabled, true, 'Trimmed 1 enables retention');
+    const customWindowsDisabled = resolveRetentionConfiguration({
+      MEDIA_RETENTION_HOURS: '72',
+      TEMP_ARTIFACT_RETENTION_HOURS: '12',
+      RETENTION_CLEANUP_INTERVAL_MS: '60000',
+    });
+    assert.strictEqual(customWindowsDisabled.enabled, false);
+    assert.strictEqual(customWindowsDisabled.mediaRetentionHours, 72);
+    assert.strictEqual(customWindowsDisabled.tempArtifactRetentionHours, 12);
+    assert.strictEqual(customWindowsDisabled.cleanupIntervalMs, 60000);
 
     // Use isolated storage + uploadDir for clean deterministic retention test
     const retDbPath = path.join(tempDir, 'retention_test.db');
@@ -764,13 +785,40 @@ export async function runLaunchBlockersPhase1Tests(): Promise<void> {
       createdAt: oneHourAgo,
     });
 
-    const retentionEnv = {
-      ...process.env,
+    // Verify disabled retention (absent, false, 0) NEVER schedules timers or deletes media
+    const baseRetentionWindows = {
       MEDIA_RETENTION_HOURS: '168',
       TEMP_ARTIFACT_RETENTION_HOURS: '24',
     };
+    for (const disabledVal of [undefined, 'false', '0'] as Array<string | undefined>) {
+      const disabledEnv: NodeJS.ProcessEnv = { ...process.env, ...baseRetentionWindows };
+      if (disabledVal === undefined) delete disabledEnv.RETENTION_CLEANUP_ENABLED;
+      else disabledEnv.RETENTION_CLEANUP_ENABLED = disabledVal;
 
-    // First sweep: simulate unlink error on pendingVid so it stays CLEANUP_PENDING across restart
+      const disabledService = new RetentionService({
+        storage: retStorage,
+        uploadDir: retUploadDir,
+        env: disabledEnv,
+        nowFn: () => baseNow,
+      });
+      disabledService.startScheduler({ initialDelayMs: 1 });
+      assert.strictEqual((disabledService as any).intervalTimer, null, `Disabled scheduler (${String(disabledVal)}) does not arm interval timer`);
+      assert.strictEqual((disabledService as any).initialDelayTimer, null, `Disabled scheduler (${String(disabledVal)}) does not arm initial timer`);
+      const disabledSweep = await disabledService.runCleanupSweep();
+      assert.strictEqual(disabledSweep.executed, false, `Disabled sweep (${String(disabledVal)}) does not execute`);
+      assert.strictEqual(disabledSweep.expiredFilesRemoved, 0);
+      assert.strictEqual(fs.existsSync(expiredVid), true, `Expired video untouched while retention disabled (${String(disabledVal)})`);
+      assert.strictEqual(fs.existsSync(staleTmpFile), true, `Stale tmp file untouched while retention disabled (${String(disabledVal)})`);
+      assert.ok(await retStorage.scans.getScan('scan_ret_pending'), `Pending scan untouched while retention disabled (${String(disabledVal)})`);
+    }
+
+    const retentionEnv = {
+      ...process.env,
+      ...baseRetentionWindows,
+      RETENTION_CLEANUP_ENABLED: 'true',
+    };
+
+    // First sweep (explicitly enabled): simulate unlink error on pendingVid so it stays CLEANUP_PENDING across restart
     const failingRetService = new RetentionService({
       storage: retStorage,
       uploadDir: retUploadDir,
@@ -812,12 +860,22 @@ export async function runLaunchBlockersPhase1Tests(): Promise<void> {
       nowFn: () => baseNow,
     });
 
+    // Verify explicit '1' also enables CLEANUP_PENDING reconciliation after restart
     const sweep2 = await restartedRetService.runCleanupSweep();
     assert.strictEqual(sweep2.executed, true);
     assert.strictEqual(sweep2.errors, 0, 'Restarted recovery sweep succeeds cleanly');
     assert.strictEqual(sweep2.pendingScansPurged, 1, 'CLEANUP_PENDING scan reconciled and purged after restart');
     assert.strictEqual(fs.existsSync(pendingVid), false, 'Pending file removed on retry');
     assert.strictEqual(await restartedStorage.scans.getScan('scan_ret_pending'), null, 'Pending scan record removed after retry');
+
+    const numericEnabledService = new RetentionService({
+      storage: restartedStorage,
+      uploadDir: retUploadDir,
+      env: { ...baseRetentionWindows, RETENTION_CLEANUP_ENABLED: '1' },
+      nowFn: () => baseNow,
+    });
+    const sweepNumeric = await numericEnabledService.runCleanupSweep();
+    assert.strictEqual(sweepNumeric.executed, true, 'RETENTION_CLEANUP_ENABLED=1 enables cleanup sweeps');
 
     // Overlap guard verification
     let releaseBlocker!: () => void;
