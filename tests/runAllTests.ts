@@ -150,6 +150,10 @@ async function main() {
     const { runConfigIntegrityRemediationTests } = await import('./config_integrity_remediation.test');
     await runConfigIntegrityRemediationTests();
 
+    // Run Suite 31: Phase 1 Launch Blockers (Operational Metrics Admin, Security Headers, Legal Pages, Account Deletion, Retention)
+    const { runLaunchBlockersPhase1Tests } = await import('./launch_blockers_phase1.test');
+    await runLaunchBlockersPhase1Tests();
+
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log(`\n🎉 ALL AUTOMATED VERIFICATION SUITES COMPLETED SUCCESSFULLY in ${elapsed}s!`);
     process.exit(0);

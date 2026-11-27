@@ -16,7 +16,8 @@ import {
   History,
   Calendar,
   Sparkles,
-  ExternalLink
+  ExternalLink,
+  Trash2
 } from 'lucide-react';
 
 interface AuthModalProps {
@@ -30,6 +31,8 @@ interface AuthModalProps {
   intendedPlanId?: string | null;
   onIntendedPlanConfirmed?: (planId: string) => void;
   onExplorePricing?: () => void;
+  onOpenTerms?: () => void;
+  onOpenPrivacy?: () => void;
 }
 
 interface BillingSummaryData {
@@ -68,7 +71,9 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   onConsumeInitialResetToken,
   intendedPlanId,
   onIntendedPlanConfirmed,
-  onExplorePricing
+  onExplorePricing,
+  onOpenTerms,
+  onOpenPrivacy
 }) => {
   const [mode, setMode] = useState<'account' | 'login' | 'register' | 'switch' | 'forgot' | 'reset'>('account');
   const [accountSubTab, setAccountSubTab] = useState<'overview' | 'ledger'>('overview');
@@ -80,6 +85,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   const [portalLoading, setPortalLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [deleteConfirmationText, setDeleteConfirmationText] = useState('');
+  const [deleteAcknowledged, setDeleteAcknowledged] = useState(false);
+  const [deleteLoading, setDeleteLoading] = useState(false);
 
   // Billing summary & transactions for authenticated account
   const [billingSummary, setBillingSummary] = useState<BillingSummaryData | null>(null);
@@ -99,6 +108,9 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     if (isOpen) {
       setError(null);
       setSuccess(null);
+      setShowDeleteConfirm(false);
+      setDeleteConfirmationText('');
+      setDeleteAcknowledged(false);
       if (initialResetToken) {
         setResetToken(initialResetToken);
         setMode('reset');
@@ -360,6 +372,41 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       setError(err.message || 'Unable to open billing portal. Please contact support.');
     } finally {
       setPortalLoading(false);
+    }
+  };
+
+  const handleDeleteAccount = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setSuccess(null);
+
+    if (!deleteAcknowledged || deleteConfirmationText.trim().toUpperCase() !== 'DELETE') {
+      setError('Type DELETE and check the confirmation box to permanently delete your account.');
+      return;
+    }
+
+    setDeleteLoading(true);
+    try {
+      const res = await authFetch('/api/auth/account', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          confirm: true,
+          confirmation: deleteConfirmationText.trim().toUpperCase(),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to delete account.');
+      }
+
+      removeSessionToken();
+      onUserChanged(null);
+      onClose();
+    } catch (err: any) {
+      setError(err.message || 'Failed to permanently delete account.');
+    } finally {
+      setDeleteLoading(false);
     }
   };
 
@@ -650,6 +697,98 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                       <span>Sign Out</span>
                     </button>
                   </div>
+
+                  {/* Permanent Account Deletion Section */}
+                  <div className="pt-3 border-t border-stone-200 space-y-3">
+                    {currentUser.ownerTestingMode ? (
+                      <div className="p-3 rounded-xl bg-stone-50 border border-stone-200 text-[11px] text-stone-500">
+                        Protected owner/admin accounts cannot be deleted via self-service.
+                      </div>
+                    ) : !showDeleteConfirm ? (
+                      <div className="flex items-center justify-between gap-3">
+                        <p className="text-[11px] text-stone-500">
+                          Permanently delete your account, scans, reports, and uploaded media.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowDeleteConfirm(true);
+                            setError(null);
+                          }}
+                          className="px-3 py-1.5 text-[11px] font-semibold text-rose-700 hover:bg-rose-50 border border-rose-200 rounded-lg shrink-0 transition-colors flex items-center gap-1.5"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          <span>Delete Account</span>
+                        </button>
+                      </div>
+                    ) : (
+                      <form onSubmit={handleDeleteAccount} className="p-4 rounded-xl bg-rose-50/70 border border-rose-200 space-y-3 text-xs">
+                        <div className="flex items-start gap-2 text-rose-900">
+                          <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                          <div className="space-y-1">
+                            <p className="font-bold">Permanent Account Deletion</p>
+                            <p className="text-[11px] text-rose-800 leading-relaxed">
+                              This permanently deletes your profile, active sessions, scan history, reports, evidence, channel context, and unshared media files. Anonymized billing audit records are retained for financial compliance.
+                            </p>
+                          </div>
+                        </div>
+
+                        <div>
+                          <label className="block text-[11px] font-semibold text-rose-900 mb-1">
+                            Type <span className="font-mono font-bold">DELETE</span> to confirm
+                          </label>
+                          <input
+                            type="text"
+                            value={deleteConfirmationText}
+                            onChange={(e) => setDeleteConfirmationText(e.target.value)}
+                            placeholder="DELETE"
+                            className="w-full px-3 py-1.5 text-xs font-mono bg-white border border-rose-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-rose-500/20 focus:border-rose-500"
+                          />
+                        </div>
+
+                        <label className="flex items-start gap-2 text-[11px] text-rose-900 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={deleteAcknowledged}
+                            onChange={(e) => setDeleteAcknowledged(e.target.checked)}
+                            className="mt-0.5 accent-rose-600"
+                          />
+                          <span>I understand this action is irreversible and permanently erases my account data.</span>
+                        </label>
+
+                        <div className="flex items-center justify-end gap-2 pt-1">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setShowDeleteConfirm(false);
+                              setDeleteConfirmationText('');
+                              setDeleteAcknowledged(false);
+                            }}
+                            className="px-3 py-1.5 text-xs font-medium text-stone-600 hover:bg-white rounded-lg border border-stone-200 bg-white"
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            type="submit"
+                            disabled={deleteLoading || !deleteAcknowledged || deleteConfirmationText.trim().toUpperCase() !== 'DELETE'}
+                            className="px-3.5 py-1.5 text-xs font-bold text-white bg-rose-600 hover:bg-rose-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg flex items-center gap-1.5"
+                          >
+                            {deleteLoading ? (
+                              <>
+                                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                <span>Deleting...</span>
+                              </>
+                            ) : (
+                              <>
+                                <Trash2 className="w-3.5 h-3.5" />
+                                <span>Permanently Delete</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
+                      </form>
+                    )}
+                  </div>
                 </div>
               )}
 
@@ -853,6 +992,31 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 >
                   Create free account
                 </button>
+              </div>
+
+              <div className="text-center pt-1 text-[11px] text-stone-400">
+                By signing in, you agree to our{' '}
+                <a
+                  href="/terms"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    onOpenTerms?.();
+                  }}
+                  className="text-stone-600 hover:text-rose-600 underline"
+                >
+                  Terms of Service
+                </a>{' '}
+                and{' '}
+                <a
+                  href="/privacy"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    onOpenPrivacy?.();
+                  }}
+                  className="text-stone-600 hover:text-rose-600 underline"
+                >
+                  Privacy Policy
+                </a>.
               </div>
             </form>
           )}
@@ -1088,6 +1252,31 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 >
                   Sign In
                 </button>
+              </div>
+
+              <div className="text-center pt-1 text-[11px] text-stone-400">
+                By creating an account, you agree to our{' '}
+                <a
+                  href="/terms"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    onOpenTerms?.();
+                  }}
+                  className="text-stone-600 hover:text-rose-600 underline"
+                >
+                  Terms of Service
+                </a>{' '}
+                and{' '}
+                <a
+                  href="/privacy"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    onOpenPrivacy?.();
+                  }}
+                  className="text-stone-600 hover:text-rose-600 underline"
+                >
+                  Privacy Policy
+                </a>.
               </div>
             </form>
           )}

@@ -1,10 +1,12 @@
 import 'dotenv/config';
 import express from 'express';
+import helmet from 'helmet';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { apiRouter, configureTrustProxy, secureUploadsHandler, validateAndGetMediaTokenSecret } from './src/server/routes/api';
 import { isProductionEnvironment } from './src/server/config/environment';
+import { retentionService } from './src/server/services/retentionService';
 
 dotenv.config();
 
@@ -19,6 +21,21 @@ export interface ServerAppOptions {
   }) => Promise<{ middlewares: express.RequestHandler; close?: () => Promise<void> }>;
 }
 
+function isAiStudioPreviewHost(hostOrUrl?: string): boolean {
+  if (!hostOrUrl) return false;
+  let hostname = hostOrUrl.trim().toLowerCase();
+  if (hostname.includes('://')) {
+    try {
+      hostname = new URL(hostname).hostname.toLowerCase();
+    } catch {
+      return false;
+    }
+  } else {
+    hostname = hostname.split(':')[0];
+  }
+  return /^ais-(dev|pre)-[a-z0-9-]+(?:\.[a-z0-9-]+)*\.run\.app$/i.test(hostname);
+}
+
 export async function createServerApp(options?: ServerAppOptions) {
   const env = options?.env ?? process.env;
   const app = express();
@@ -29,6 +46,62 @@ export async function createServerApp(options?: ServerAppOptions) {
 
   // Configure and validate reverse proxy trust settings at startup
   configureTrustProxy(app, env.TRUST_PROXY);
+
+  // HTTP Security Headers (CSP, X-Content-Type-Options, Frame Protection, Referrer Policy)
+  // In development or AI Studio preview hosts, allow embedding from Google AI Studio without X-Frame-Options: SAMEORIGIN
+  // so the interactive preview iframe connects cleanly while restricting framing strictly to self + AI Studio.
+  // Standalone production deployments enforce X-Frame-Options: SAMEORIGIN and frame-ancestors 'self'.
+  const buildHelmetMiddleware = (allowAiStudioFrame: boolean) =>
+    helmet({
+      contentSecurityPolicy: {
+        directives: {
+          defaultSrc: ["'self'"],
+          scriptSrc: isProd ? ["'self'"] : ["'self'", "'unsafe-inline'"],
+          styleSrc: ["'self'", "'unsafe-inline'"],
+          imgSrc: ["'self'", 'data:', 'blob:'],
+          mediaSrc: ["'self'", 'blob:'],
+          connectSrc: isProd ? ["'self'"] : ["'self'", 'ws:', 'wss:'],
+          fontSrc: ["'self'", 'data:'],
+          objectSrc: ["'none'"],
+          baseUri: ["'self'"],
+          formAction: ["'self'", 'https://checkout.stripe.com', 'https://billing.stripe.com'],
+          frameAncestors: allowAiStudioFrame
+            ? ["'self'", 'https://aistudio.google.com', 'https://*.aistudio.google.com']
+            : ["'self'"],
+          upgradeInsecureRequests: null,
+        },
+      },
+      frameguard: allowAiStudioFrame ? false : { action: 'sameorigin' },
+      hsts: false, // Enabled conditionally below strictly for HTTPS requests
+      crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' },
+      crossOriginEmbedderPolicy: false,
+      referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+    });
+
+  const strictHelmet = buildHelmetMiddleware(false);
+  const aiStudioPreviewHelmet = buildHelmetMiddleware(true);
+  const envIsAiStudioPreview = isAiStudioPreviewHost(env.APP_URL) && !env.APP_BASE_URL;
+
+  app.use((req, res, next) => {
+    const allowAiStudioFrame =
+      !isProd ||
+      envIsAiStudioPreview ||
+      isAiStudioPreviewHost(req.get('host')) ||
+      isAiStudioPreviewHost(req.get('x-forwarded-host'));
+    return (allowAiStudioFrame ? aiStudioPreviewHelmet : strictHelmet)(req, res, next);
+  });
+
+  // Enforce Strict-Transport-Security only on HTTPS deployments/requests
+  const httpsHstsMiddleware = helmet.hsts({
+    maxAge: 31536000,
+    includeSubDomains: true,
+  });
+  app.use((req, res, next) => {
+    if (req.secure || req.protocol === 'https') {
+      return httpsHstsMiddleware(req, res, next);
+    }
+    next();
+  });
 
   app.use(express.json({
     verify: (req: any, _res, buf) => {
@@ -125,11 +198,13 @@ async function startServer() {
 
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`[VideoRisk Server] Running at http://0.0.0.0:${PORT}`);
+    retentionService.startScheduler();
   });
 
   // Graceful shutdown handling for operational restarts and deployments
   const gracefulShutdown = (signal: string) => {
     console.log(`[VideoRisk Server] Received ${signal}. Initiating graceful shutdown...`);
+    retentionService.stopScheduler();
     server.close(async () => {
       try {
         if (closeViteServer) {

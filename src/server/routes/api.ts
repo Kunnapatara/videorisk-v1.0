@@ -22,6 +22,14 @@ import {
   isVerifiedOwnerUser,
 } from '../services/ownerAuth';
 import {
+  validateSafeStoragePath as validateSafeStoragePathShared,
+  isSafeUploadPath as isSafeUploadPathShared,
+  collectScanMediaPaths,
+  cleanupScanFrameDirectories,
+  cleanupMediaPaths,
+} from '../services/mediaCleanupService';
+import { executePermanentAccountDeletion } from '../services/accountDeletionService';
+import {
   isProductionEnvironment,
   isValidIpOrCidr,
   parseStrictPositiveInt,
@@ -148,63 +156,15 @@ const uploadThumbnailMiddleware: RequestHandler = (req, res, next) => {
  * Prevents directory traversal, symlink jumping, prefix-collision attacks, and directory deletions.
  */
 function validateSafeStoragePath(candidatePath: string, options: { mustExist?: boolean } = {}): { isSafe: boolean; resolvedPath: string; error?: string } {
-  try {
-    if (!candidatePath || typeof candidatePath !== 'string') {
-      return { isSafe: false, resolvedPath: '', error: 'Candidate path is empty or invalid.' };
-    }
-    const resolved = path.resolve(candidatePath);
-
-    // Allowed storage roots: production permits uploadDir; non-production permits uploadDir and os.tmpdir()
-    const allowedRoots = [uploadDir];
-    if (!isProductionEnvironment(process.env)) {
-      allowedRoots.push(path.resolve(os.tmpdir()));
-    }
-
-    let matchedRoot: string | null = null;
-    let relToRoot = '';
-
-    for (const root of allowedRoots) {
-      const rel = path.relative(root, resolved);
-      if (!rel.startsWith('..') && !path.isAbsolute(rel) && rel !== '' && rel !== '.') {
-        matchedRoot = root;
-        relToRoot = rel;
-        break;
-      }
-    }
-
-    if (!matchedRoot) {
-      return { isSafe: false, resolvedPath: resolved, error: 'Path escapes allowed storage directories.' };
-    }
-
-    // Prevent targeting the root storage directory or protected root subdirectories themselves
-    if (!relToRoot || relToRoot === '.' || relToRoot === 'proxies' || relToRoot === 'frames') {
-      return { isSafe: false, resolvedPath: resolved, error: 'Target path cannot be the root storage directory.' };
-    }
-
-    // If file exists, check symlink resolution to prevent symlink-based escapes
-    if (fs.existsSync(resolved)) {
-      try {
-        const realRoot = fs.realpathSync(matchedRoot);
-        const realTarget = fs.realpathSync(resolved);
-        const realRel = path.relative(realRoot, realTarget);
-        if (realRel.startsWith('..') || path.isAbsolute(realRel)) {
-          return { isSafe: false, resolvedPath: resolved, error: 'Symlink escapes allowed storage directory.' };
-        }
-      } catch {
-        return { isSafe: false, resolvedPath: resolved, error: 'Symlink resolution failed.' };
-      }
-    } else if (options.mustExist) {
-      return { isSafe: false, resolvedPath: resolved, error: 'File does not exist.' };
-    }
-
-    return { isSafe: true, resolvedPath: resolved };
-  } catch (err: any) {
-    return { isSafe: false, resolvedPath: '', error: `Path resolution error for '${candidatePath}': ${err?.message || err}` };
-  }
+  return validateSafeStoragePathShared(candidatePath, {
+    mustExist: options.mustExist,
+    uploadDir,
+    env: process.env,
+  });
 }
 
 function isSafeUploadPath(candidatePath: string): boolean {
-  return validateSafeStoragePath(candidatePath, { mustExist: true }).isSafe;
+  return isSafeUploadPathShared(candidatePath, { uploadDir, env: process.env });
 }
 
 /**
@@ -1844,6 +1804,67 @@ apiRouter.post('/auth/logout', async (req: Request, res: Response) => {
   }
 });
 
+// Permanent Self-Service Account Deletion (Protected: Requires Auth + Explicit Confirmation)
+apiRouter.delete('/auth/account', async (req: Request, res: Response) => {
+  try {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+
+    const body = (req.body && typeof req.body === 'object') ? req.body : {};
+    const confirmFlag = body.confirm === true;
+    const rawConfirmation = typeof body.confirmation === 'string' ? body.confirmation.trim().toUpperCase() : '';
+    const isExplicitlyConfirmed =
+      confirmFlag && (rawConfirmation === 'DELETE' || rawConfirmation === 'DELETE MY ACCOUNT');
+
+    if (!isExplicitlyConfirmed) {
+      return res.status(400).json({
+        error: 'Explicit deletion confirmation is required. Provide confirm: true and confirmation: "DELETE".',
+        code: 'CONFIRMATION_REQUIRED',
+      });
+    }
+
+    if (body.password !== undefined && body.password !== null && String(body.password) !== '') {
+      if (typeof body.password !== 'string') {
+        return res.status(400).json({ error: 'Invalid password format.' });
+      }
+      if (!user.passwordHash || !user.salt) {
+        return res.status(401).json({ error: 'Password verification failed.' });
+      }
+      const computedHash = crypto.scryptSync(body.password, user.salt, 64).toString('hex');
+      if (!crypto.timingSafeEqual(Buffer.from(user.passwordHash, 'hex'), Buffer.from(computedHash, 'hex'))) {
+        return res.status(401).json({ error: 'Invalid account password.' });
+      }
+    }
+
+    const result = await executePermanentAccountDeletion(user, {
+      storage,
+      uploadDir,
+      env: process.env,
+      isTrustedPublicMediaFn: (p) => isTrustedPublicMedia(p),
+    });
+
+    if (!result.ok) {
+      return res.status(result.statusCode).json({
+        error: result.error,
+        ...(result.code ? { code: result.code } : {}),
+        ...(result.status ? { status: result.status } : {}),
+      });
+    }
+
+    res.json({
+      success: true,
+      deletedUserId: result.deletedUserId,
+      anonymizedSubjectId: result.anonymizedSubjectId,
+      filesRemoved: result.filesRemoved ?? 0,
+      archivedBillingRecords: result.archivedBillingRecords ?? 0,
+      message: 'Account and associated personal media and scan data permanently deleted.',
+    });
+  } catch (err: any) {
+    console.error('[Account Deletion Error]:', err?.message || err);
+    res.status(500).json({ error: 'Failed to permanently delete account.' });
+  }
+});
+
 // Password Recovery: Request Reset Token (Public, Non-enumerating, Rate-limited)
 apiRouter.post('/auth/forgot-password', async (req: Request, res: Response) => {
   try {
@@ -3258,60 +3279,23 @@ apiRouter.delete('/scans/:id', async (req: Request, res: Response) => {
     }
 
     // Identify candidate paths for scan-owned media files and artifacts
-    // Identify candidate paths for scan-owned media files and artifacts
-    const candidatePaths: string[] = [];
-    if (scan.videoPath && scan.videoPath.trim()) candidatePaths.push(scan.videoPath.trim());
-    if (scan.thumbnailPath && scan.thumbnailPath.trim()) candidatePaths.push(scan.thumbnailPath.trim());
-    if (scan.proxyPath && scan.proxyPath.trim()) candidatePaths.push(scan.proxyPath.trim());
+    const uniqueCandidates = collectScanMediaPaths(scan, { uploadDir });
 
-    // Also check for generated proxy artifact even if proxyPath was not stored on scan record
-    if (scan.videoPath && scan.videoPath.trim()) {
-      const baseName = path.basename(scan.videoPath, path.extname(scan.videoPath));
-      const potentialProxy = path.join(uploadDir, 'proxies', `proxy_${baseName}.mp4`);
-      if (fs.existsSync(potentialProxy) && !candidatePaths.includes(potentialProxy)) {
-        candidatePaths.push(potentialProxy);
-      }
+    const cleanupBatch = await cleanupMediaPaths(uniqueCandidates, {
+      storage,
+      excludeScanIds: new Set([scan.id]),
+      uploadDir,
+      env: process.env,
+      isTrustedPublicMediaFn: (p) => isTrustedPublicMedia(p),
+    });
+
+    if (cleanupBatch.unsafePath) {
+      console.error('[Storage Security] Unsafe file path rejected during scan deletion:', cleanupBatch.unsafeError);
+      return res.status(400).json({ error: 'Invalid or unsafe media path in scan record.' });
     }
 
-    // Validate path safety against directory traversal and symlink escapes for all candidates
-    for (const p of candidatePaths) {
-      const validation = validateSafeStoragePath(p);
-      if (!validation.isSafe) {
-        console.error('[Storage Security] Unsafe file path rejected during scan deletion:', validation.error);
-        return res.status(400).json({ error: 'Invalid or unsafe media path in scan record.' });
-      }
-    }
-
-    let filesRemoved = 0;
-    let cleanupFailed = false;
-
-    // Deduplicate candidate paths
-    const uniqueCandidates = Array.from(new Set(candidatePaths));
-
-    for (const p of uniqueCandidates) {
-      const resolved = path.resolve(p);
-
-      // Handle missing files idempotently
-      if (!fs.existsSync(resolved)) {
-        continue;
-      }
-
-      // Protection against deleting another scan's files:
-      // Verify if another scan shares this media file
-      const isShared = await storage.scans.isMediaShared(resolved, scan.id);
-      if (isShared) {
-        continue;
-      }
-
-      try {
-        fs.unlinkSync(resolved);
-        filesRemoved++;
-      } catch (err: any) {
-        // Log cleanup failure without exposing sensitive filesystem paths to the client
-        console.error('[Storage] Filesystem cleanup failed for scan asset:', err?.code || err?.message || 'Unknown error');
-        cleanupFailed = true;
-      }
-    }
+    const filesRemoved = cleanupBatch.filesRemoved;
+    const cleanupFailed = !cleanupBatch.ok;
 
     // Inconsistent state guard: If cleanup failed for files that remain on disk,
     // do NOT permanently purge DB records. Mark status as CLEANUP_PENDING and return 500.
@@ -3327,6 +3311,8 @@ apiRouter.delete('/scans/:id', async (req: Request, res: Response) => {
         status: 'CLEANUP_PENDING'
       });
     }
+
+    cleanupScanFrameDirectories(scan.id, { uploadDir, env: process.env });
 
     // Filesystem cleanup succeeded (or files were already absent / shared).
     // Attempt permanent database record purge.
@@ -3516,11 +3502,11 @@ apiRouter.post('/media/token', requireAuthMiddleware, async (req: Request, res: 
   }
 });
 
-// 17. Operational Metrics & Cost Telemetry (Workstream 12)
+// 17. Operational Metrics & Cost Telemetry (Admin-Restricted)
 apiRouter.get('/operational/metrics', async (req: Request, res: Response) => {
   try {
-    const user = await requireAuth(req, res);
-    if (!user) return;
+    const admin = await requireAdmin(req, res);
+    if (!admin) return;
 
     if (storage.getOperationalMetrics) {
       const metrics = await storage.getOperationalMetrics();

@@ -296,9 +296,10 @@ export async function runAnalyticsFoundationTests() {
     const migRows = upgradedRepo.db
       .prepare('SELECT version, name FROM schema_migrations ORDER BY version ASC')
       .all() as Array<{ version: number; name: string }>;
-    assert.strictEqual(migRows.length, 10, 'All 10 migrations applied');
-    assert.strictEqual(migRows[9].version, 10);
-    assert.strictEqual(migRows[9].name, '010_analytics_events');
+    assert(migRows.length >= 10, 'Migration 10 and all additive migrations applied');
+    const mig10 = migRows.find(r => r.version === 10);
+    assert(mig10, 'Migration 10 exists');
+    assert.strictEqual(mig10.name, '010_analytics_events');
 
     const idxRows = upgradedRepo.db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'analytics_events'")
@@ -334,7 +335,7 @@ export async function runAnalyticsFoundationTests() {
     const migRowsAfterReopen = reopenedRepo.db
       .prepare('SELECT version FROM schema_migrations ORDER BY version ASC')
       .all() as Array<{ version: number }>;
-    assert.strictEqual(migRowsAfterReopen.length, 10, 'Migration 10 is idempotent on re-open');
+    assert.strictEqual(migRowsAfterReopen.length, migRows.length, 'Migrations are idempotent on re-open');
     await reopenedRepo.close();
     console.log('  ✅ PASS: Migration 010 applies cleanly, preserves pre-010 data, and is idempotent');
 

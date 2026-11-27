@@ -15,7 +15,7 @@ import {
 import { UserAccount } from '../types';
 
 interface NavbarProps {
-  activeTab: 'home' | 'upload' | 'history' | 'pricing' | 'channel';
+  activeTab: 'home' | 'upload' | 'history' | 'pricing' | 'channel' | 'terms' | 'privacy';
   setActiveTab: (tab: 'home' | 'upload' | 'history' | 'pricing' | 'channel') => void;
   user: UserAccount | null;
   onNewScan: () => void;

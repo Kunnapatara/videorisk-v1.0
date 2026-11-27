@@ -45,6 +45,8 @@ import {
   IJobQueueRepository,
   IRateLimitRepository,
   IAnalyticsRepository,
+  AccountDeletionResult,
+  BillingAuditArchiveRecord,
   AnalyticsEventInput,
   RateLimitStatus,
   RateLimitSpec,
@@ -916,6 +918,32 @@ export class SqliteStorageRepository implements IStorageRepository {
         throw new Error(`Failed to apply migration 10: ${err}`);
       }
     }
+
+    // Migration 11: Anonymized Billing Audit Archive for Permanent Account Deletion
+    if (!appliedVersions.has(11)) {
+      this.db.exec('BEGIN IMMEDIATE;');
+      try {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS billing_audit_archive (
+            id TEXT PRIMARY KEY,
+            anonymized_subject_id TEXT NOT NULL,
+            record_type TEXT NOT NULL,
+            source_record_id TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            archived_at TEXT NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_billing_audit_archive_subject ON billing_audit_archive(anonymized_subject_id);
+          CREATE INDEX IF NOT EXISTS idx_billing_audit_archive_type ON billing_audit_archive(record_type);
+
+          INSERT INTO schema_migrations (version, name, applied_at)
+          VALUES (11, '011_billing_audit_archive', datetime('now'));
+        `);
+        this.db.exec('COMMIT;');
+      } catch (err) {
+        this.db.exec('ROLLBACK;');
+        throw new Error(`Failed to apply migration 11: ${err}`);
+      }
+    }
   }
 
   private seedDefaultUsersIfNeeded() {
@@ -1144,6 +1172,163 @@ export class SqliteStorageRepository implements IStorageRepository {
 
       this.db.prepare(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`).run(...values);
       return (await this.users.getUser(userId))!;
+    },
+
+    deleteAccount: async (userId: string): Promise<AccountDeletionResult> => {
+      let result: AccountDeletionResult = {
+        deleted: false,
+        anonymizedSubjectId: '',
+        archivedBillingRecords: 0,
+      };
+
+      await this.runTransaction(db => {
+        const userRow = db.prepare('SELECT id, email FROM users WHERE id = ?').get(userId) as { id: string; email: string } | undefined;
+        if (!userRow) {
+          return;
+        }
+
+        const anonymizedSubjectId = `deleted_${crypto.createHash('sha256').update(userId).digest('hex').slice(0, 24)}`;
+        const archivedAt = new Date().toISOString();
+        let archivedCount = 0;
+
+        const normalizedUserEmail = (userRow.email || '').trim();
+        const scrubArchivedValue = (val: unknown): unknown => {
+          if (typeof val === 'string') {
+            let next = val;
+            if (userId && next.includes(userId)) {
+              next = next.split(userId).join(anonymizedSubjectId);
+            }
+            if (normalizedUserEmail) {
+              const escapedEmail = normalizedUserEmail.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              next = next.replace(new RegExp(escapedEmail, 'gi'), '[REDACTED_EMAIL]');
+            }
+            return next;
+          }
+          if (Array.isArray(val)) {
+            return val.map(scrubArchivedValue);
+          }
+          if (val && typeof val === 'object') {
+            const out: Record<string, unknown> = {};
+            for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+              if (k === 'user_id' || k === 'userId' || k === 'email') continue;
+              out[k] = scrubArchivedValue(v);
+            }
+            return out;
+          }
+          return val;
+        };
+
+        const insertArchive = db.prepare(`
+          INSERT INTO billing_audit_archive (id, anonymized_subject_id, record_type, source_record_id, payload_json, archived_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `);
+
+        // 1. Archive stripe_payments (strip direct user_id & PII)
+        const paymentRows = db.prepare('SELECT * FROM stripe_payments WHERE user_id = ?').all(userId) as any[];
+        for (const p of paymentRows) {
+          const sanitized = scrubArchivedValue(p) as Record<string, unknown>;
+          insertArchive.run(
+            `ba_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+            anonymizedSubjectId,
+            'stripe_payment',
+            String(scrubArchivedValue(p.id)),
+            JSON.stringify({ ...sanitized, anonymizedSubjectId }),
+            archivedAt
+          );
+          archivedCount++;
+        }
+
+        // 2. Archive stripe_refunds & scrub user_id
+        const refundRows = db.prepare('SELECT * FROM stripe_refunds WHERE user_id = ?').all(userId) as any[];
+        for (const r of refundRows) {
+          const sanitized = scrubArchivedValue(r) as Record<string, unknown>;
+          insertArchive.run(
+            `ba_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+            anonymizedSubjectId,
+            'stripe_refund',
+            String(scrubArchivedValue(r.refund_id)),
+            JSON.stringify({ ...sanitized, anonymizedSubjectId }),
+            archivedAt
+          );
+          archivedCount++;
+        }
+        db.prepare('UPDATE stripe_refunds SET user_id = ? WHERE user_id = ?').run(anonymizedSubjectId, userId);
+
+        // 3. Archive credit_transactions (strip direct user_id & scrub reference_id/metadata containing userId/email)
+        const creditRows = db.prepare('SELECT * FROM credit_transactions WHERE user_id = ?').all(userId) as any[];
+        for (const tx of creditRows) {
+          const sanitized = scrubArchivedValue(tx) as Record<string, unknown>;
+          insertArchive.run(
+            `ba_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+            anonymizedSubjectId,
+            'credit_transaction',
+            String(scrubArchivedValue(tx.id)),
+            JSON.stringify({ ...sanitized, anonymizedSubjectId }),
+            archivedAt
+          );
+          archivedCount++;
+        }
+
+        // 4. Archive subscriptions (strip direct user_id & PII)
+        const subRows = db.prepare('SELECT * FROM subscriptions WHERE user_id = ?').all(userId) as any[];
+        for (const s of subRows) {
+          const sanitized = scrubArchivedValue(s) as Record<string, unknown>;
+          insertArchive.run(
+            `ba_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+            anonymizedSubjectId,
+            'subscription',
+            String(scrubArchivedValue(s.id)),
+            JSON.stringify({ ...sanitized, anonymizedSubjectId }),
+            archivedAt
+          );
+          archivedCount++;
+        }
+
+        // 5. Scrub user_id on webhook_events & analytics_events
+        const webhookRows = db.prepare('SELECT event_id, payload_json FROM webhook_events WHERE user_id = ?').all(userId) as any[];
+        for (const wh of webhookRows) {
+          let nextPayload = wh.payload_json;
+          try {
+            const parsed = JSON.parse(wh.payload_json);
+            if (parsed && parsed.userId === userId) {
+              parsed.userId = anonymizedSubjectId;
+              nextPayload = JSON.stringify(parsed);
+            }
+          } catch {
+            // keep raw payload_json if unparseable
+          }
+          db.prepare('UPDATE webhook_events SET user_id = ?, payload_json = ? WHERE event_id = ?').run(
+            anonymizedSubjectId,
+            nextPayload,
+            wh.event_id
+          );
+        }
+        db.prepare('UPDATE analytics_events SET user_id = ? WHERE user_id = ?').run(anonymizedSubjectId, userId);
+
+        // 6. Purge rate_limits scoped to this account
+        const normalizedEmail = (userRow.email || '').toLowerCase().trim().slice(0, 255);
+        const acctKey = `acct_${crypto.createHash('sha256').update(normalizedEmail).digest('hex').slice(0, 32)}`;
+        db.prepare('DELETE FROM rate_limits WHERE key = ? OR key = ?').run(`user_${userId}`, acctKey);
+
+        // 7. Purge comparisons referencing user scans as original_scan_id
+        db.prepare(`
+          DELETE FROM comparisons
+          WHERE original_scan_id IN (SELECT id FROM scans WHERE user_id = ?)
+             OR revised_scan_id IN (SELECT id FROM scans WHERE user_id = ?)
+        `).run(userId, userId);
+
+        // 8. Delete user row (cascades atomically to sessions, password_resets, uploads, channel_profiles,
+        //    channel_intelligence, scans -> job_queue/reports/evidence/comparisons, usage_ledger,
+        //    credit_transactions, subscriptions, stripe_payments)
+        const delRes = db.prepare('DELETE FROM users WHERE id = ?').run(userId);
+        result = {
+          deleted: Number(delRes.changes) > 0,
+          anonymizedSubjectId,
+          archivedBillingRecords: archivedCount,
+        };
+      });
+
+      return result;
     },
 
     createSession: async (userId: string): Promise<string> => {
@@ -2302,11 +2487,39 @@ export class SqliteStorageRepository implements IStorageRepository {
       };
     },
 
+    listUploads: async (): Promise<UploadRecord[]> => {
+      const rows = this.db.prepare('SELECT * FROM uploads ORDER BY created_at ASC').all() as any[];
+      return rows.map(r => ({
+        fileId: r.file_id,
+        userId: r.user_id,
+        filename: r.filename,
+        filePath: r.file_path,
+        fileSize: Number(r.file_size),
+        type: r.type,
+        createdAt: r.created_at
+      }));
+    },
+
     deleteUpload: async (fileId: string): Promise<boolean> => {
       const res = this.db.prepare('DELETE FROM uploads WHERE file_id = ?').run(fileId);
       return res.changes > 0;
     }
   };
+
+  public async getBillingAuditArchive(anonymizedSubjectId?: string): Promise<BillingAuditArchiveRecord[]> {
+    const rows = (anonymizedSubjectId
+      ? this.db.prepare('SELECT * FROM billing_audit_archive WHERE anonymized_subject_id = ? ORDER BY archived_at ASC').all(anonymizedSubjectId)
+      : this.db.prepare('SELECT * FROM billing_audit_archive ORDER BY archived_at ASC').all()) as any[];
+
+    return rows.map(r => ({
+      id: r.id,
+      anonymizedSubjectId: r.anonymized_subject_id,
+      recordType: r.record_type,
+      sourceRecordId: r.source_record_id,
+      payloadJson: r.payload_json,
+      archivedAt: r.archived_at,
+    }));
+  }
 
   // -------------------------------------------------------------
   // BILLING REPOSITORY

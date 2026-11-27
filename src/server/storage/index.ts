@@ -101,6 +101,21 @@ export interface IChannelIntelligenceRepository {
   removeScanReferences(scanId: string): Promise<void>;
 }
 
+export interface BillingAuditArchiveRecord {
+  id: string;
+  anonymizedSubjectId: string;
+  recordType: 'stripe_payment' | 'stripe_refund' | 'credit_transaction' | 'subscription';
+  sourceRecordId: string;
+  payloadJson: string;
+  archivedAt: string;
+}
+
+export interface AccountDeletionResult {
+  deleted: boolean;
+  anonymizedSubjectId: string;
+  archivedBillingRecords: number;
+}
+
 export interface IUserRepository {
   getUser(id: string): Promise<UserAccount | null>;
   getUserByEmail(email: string): Promise<UserAccount | null>;
@@ -112,6 +127,7 @@ export interface IUserRepository {
   updatePlan(userId: string, plan: 'free' | 'creator' | 'pro' | 'agency', credits: number): Promise<UserAccount>;
   claimFreeTrial(userId: string): Promise<{ user: UserAccount; alreadyClaimed: boolean }>;
   updateUser(userId: string, updates: Partial<UserAccount>): Promise<UserAccount | null>;
+  deleteAccount(userId: string): Promise<AccountDeletionResult>;
   createSession(userId: string): Promise<string>;
   getUserBySession(token: string): Promise<UserAccount | null>;
   deleteSession(token: string): Promise<void>;
@@ -158,6 +174,7 @@ export interface IUploadRepository {
   recordUpload(upload: UploadRecord): Promise<UploadRecord>;
   getUpload(fileId: string): Promise<UploadRecord | null>;
   getUploadByPath(filePath: string): Promise<UploadRecord | null>;
+  listUploads?(): Promise<UploadRecord[]>;
   deleteUpload(fileId: string): Promise<boolean>;
 }
 
@@ -206,6 +223,7 @@ export interface IStorageRepository {
   consumeRateLimit(key: string, action: string, limit: number, windowSeconds: number): Promise<RateLimitStatus>;
   consumeRateLimits(specs: RateLimitSpec[]): Promise<MultiRateLimitStatus>;
   getOperationalMetrics?: () => Promise<OperationalMetrics>;
+  getBillingAuditArchive?: (anonymizedSubjectId?: string) => Promise<BillingAuditArchiveRecord[]>;
   close?: () => Promise<void>;
   runTransaction<T>(operation: (state: any) => Promise<T> | T): Promise<T>;
   createBackup?(targetDir?: string): Promise<{ backupPath: string; timestamp: string; sizeBytes: number }>;
@@ -237,6 +255,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
     stripePayments: Record<string, StripePaymentRecord>;
     stripeRefunds: Record<string, StripeRefundRecord>;
     analyticsEvents: AnalyticsEventRecord[];
+    billingAuditArchive: BillingAuditArchiveRecord[];
   };
 
   constructor(customDataFile?: string, env: NodeJS.ProcessEnv = process.env) {
@@ -263,6 +282,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
       stripePayments: {},
       stripeRefunds: {},
       analyticsEvents: [],
+      billingAuditArchive: [],
     };
     this.load();
     this.seedDefaultUserIfNeeded();
@@ -393,6 +413,7 @@ export class InMemoryStorageRepository implements IStorageRepository {
       stripePayments: parsed.stripePayments || {},
       stripeRefunds: parsed.stripeRefunds || {},
       analyticsEvents: Array.isArray(parsed.analyticsEvents) ? parsed.analyticsEvents : [],
+      billingAuditArchive: Array.isArray(parsed.billingAuditArchive) ? parsed.billingAuditArchive : [],
     };
 
     let migratedLegacyFreeTrialFlags = false;
@@ -579,6 +600,189 @@ export class InMemoryStorageRepository implements IStorageRepository {
       Object.assign(user, updates);
       this.save();
       return user;
+    },
+    deleteAccount: async (userId: string): Promise<AccountDeletionResult> => {
+      return await this.runTransaction(async (state) => {
+        const user = state.users[userId];
+        if (!user) {
+          return { deleted: false, anonymizedSubjectId: '', archivedBillingRecords: 0 };
+        }
+
+        const anonymizedSubjectId = `deleted_${crypto.createHash('sha256').update(userId).digest('hex').slice(0, 24)}`;
+        const archivedAt = new Date().toISOString();
+        let archivedBillingRecords = 0;
+
+        if (!Array.isArray(state.billingAuditArchive)) {
+          state.billingAuditArchive = [];
+        }
+
+        const normalizedUserEmail = (user.email || '').trim();
+        const scrubArchivedValue = (val: unknown): unknown => {
+          if (typeof val === 'string') {
+            let next = val;
+            if (userId && next.includes(userId)) {
+              next = next.split(userId).join(anonymizedSubjectId);
+            }
+            if (normalizedUserEmail) {
+              const escapedEmail = normalizedUserEmail.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              next = next.replace(new RegExp(escapedEmail, 'gi'), '[REDACTED_EMAIL]');
+            }
+            return next;
+          }
+          if (Array.isArray(val)) {
+            return val.map(scrubArchivedValue);
+          }
+          if (val && typeof val === 'object') {
+            const out: Record<string, unknown> = {};
+            for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+              if (k === 'user_id' || k === 'userId' || k === 'email') continue;
+              out[k] = scrubArchivedValue(v);
+            }
+            return out;
+          }
+          return val;
+        };
+
+        // Archive billing/accounting records under irreversible pseudonym (strip userId & PII)
+        for (const [paymentId, payment] of Object.entries(state.stripePayments || {})) {
+          if (payment.userId === userId) {
+            const sanitized = scrubArchivedValue(payment) as Record<string, unknown>;
+            state.billingAuditArchive.push({
+              id: `ba_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+              anonymizedSubjectId,
+              recordType: 'stripe_payment',
+              sourceRecordId: String(scrubArchivedValue(paymentId)),
+              payloadJson: JSON.stringify({ ...sanitized, anonymizedSubjectId }),
+              archivedAt,
+            });
+            archivedBillingRecords++;
+            delete state.stripePayments[paymentId];
+          }
+        }
+
+        for (const [refundId, refund] of Object.entries(state.stripeRefunds || {})) {
+          if (refund.userId === userId) {
+            const sanitized = scrubArchivedValue(refund) as Record<string, unknown>;
+            state.billingAuditArchive.push({
+              id: `ba_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+              anonymizedSubjectId,
+              recordType: 'stripe_refund',
+              sourceRecordId: String(scrubArchivedValue(refundId)),
+              payloadJson: JSON.stringify({ ...sanitized, anonymizedSubjectId }),
+              archivedAt,
+            });
+            archivedBillingRecords++;
+            refund.userId = anonymizedSubjectId;
+          }
+        }
+
+        const remainingCredits: CreditTransactionRecord[] = [];
+        for (const tx of state.creditTransactions || []) {
+          if (tx.userId === userId) {
+            const sanitized = scrubArchivedValue(tx) as Record<string, unknown>;
+            state.billingAuditArchive.push({
+              id: `ba_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+              anonymizedSubjectId,
+              recordType: 'credit_transaction',
+              sourceRecordId: String(scrubArchivedValue(tx.id)),
+              payloadJson: JSON.stringify({ ...sanitized, anonymizedSubjectId }),
+              archivedAt,
+            });
+            archivedBillingRecords++;
+          } else {
+            remainingCredits.push(tx);
+          }
+        }
+        state.creditTransactions = remainingCredits;
+
+        for (const [subId, sub] of Object.entries(state.subscriptions || {})) {
+          if (sub.userId === userId) {
+            const sanitized = scrubArchivedValue(sub) as Record<string, unknown>;
+            state.billingAuditArchive.push({
+              id: `ba_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+              anonymizedSubjectId,
+              recordType: 'subscription',
+              sourceRecordId: String(scrubArchivedValue(subId)),
+              payloadJson: JSON.stringify({ ...sanitized, anonymizedSubjectId }),
+              archivedAt,
+            });
+            archivedBillingRecords++;
+            delete state.subscriptions[subId];
+          }
+        }
+
+        // Scrub nullable user references in webhook & analytics audit logs
+        for (const ev of Object.values(state.webhookEvents || {})) {
+          if (ev.userId === userId) {
+            ev.userId = anonymizedSubjectId;
+          }
+        }
+        for (const ev of state.analyticsEvents || []) {
+          if (ev.userId === userId) {
+            ev.userId = anonymizedSubjectId;
+          }
+        }
+
+        // Purge account-scoped rate limits (user ID and hashed email keys)
+        const normalizedEmail = (user.email || '').toLowerCase().trim().slice(0, 255);
+        const acctKey = `acct_${crypto.createHash('sha256').update(normalizedEmail).digest('hex').slice(0, 32)}`;
+        const userRateKey = `user_${userId}`;
+        state.rateLimits = (state.rateLimits || []).filter(
+          (r) => r.key !== userRateKey && r.key !== acctKey
+        );
+
+        // Revoke all sessions and password reset tokens
+        for (const [token, sess] of Object.entries(state.sessions || {})) {
+          if (sess.userId === userId) {
+            delete state.sessions[token];
+          }
+        }
+        for (const [hash, pr] of Object.entries(state.passwordResets || {})) {
+          if (pr.userId === userId) {
+            delete state.passwordResets[hash];
+          }
+        }
+
+        // Remove uploads, channel profiles, channel intelligence, scans, reports, evidence, comparisons, queue, usage
+        for (const [fileId, up] of Object.entries(state.uploads || {})) {
+          if (up.userId === userId) {
+            delete state.uploads[fileId];
+          }
+        }
+        delete state.channelProfiles[userId];
+        for (const [ciId, ci] of Object.entries(state.channelIntelligence || {})) {
+          if (ci.userId === userId) {
+            delete state.channelIntelligence[ciId];
+          }
+        }
+
+        const userScanIds = new Set<string>();
+        for (const [scanId, scan] of Object.entries(state.scans || {})) {
+          if (scan.userId === userId) {
+            userScanIds.add(scanId);
+            delete state.scans[scanId];
+            delete state.reports[scanId];
+            delete state.evidence[scanId];
+            delete state.comparisons[scanId];
+            delete state.jobQueue[scanId];
+          }
+        }
+        // Clean up any comparisons where deleted scans appeared as originalScanId
+        for (const [revId, comp] of Object.entries(state.comparisons || {})) {
+          if (userScanIds.has(comp.originalScanId) || userScanIds.has(comp.revisedScanId)) {
+            delete state.comparisons[revId];
+          }
+        }
+
+        state.usage = (state.usage || []).filter((u) => u.userId !== userId && !userScanIds.has(u.scanId));
+
+        delete state.users[userId];
+        return {
+          deleted: true,
+          anonymizedSubjectId,
+          archivedBillingRecords,
+        };
+      });
     }
   };
 
@@ -983,6 +1187,9 @@ export class InMemoryStorageRepository implements IStorageRepository {
       const resolved = path.resolve(filePath);
       return Object.values(this.state.uploads).find(u => path.resolve(u.filePath) === resolved) || null;
     },
+    listUploads: async () => {
+      return Object.values(this.state.uploads);
+    },
     deleteUpload: async (fileId: string) => {
       if (this.state.uploads[fileId]) {
         delete this.state.uploads[fileId];
@@ -1357,6 +1564,14 @@ export class InMemoryStorageRepository implements IStorageRepository {
         policy: reportCount > 0 ? Math.round(policyMs / reportCount) : 0
       }
     };
+  }
+
+  public async getBillingAuditArchive(anonymizedSubjectId?: string): Promise<BillingAuditArchiveRecord[]> {
+    const records = this.state.billingAuditArchive || [];
+    if (anonymizedSubjectId) {
+      return records.filter((r) => r.anonymizedSubjectId === anonymizedSubjectId);
+    }
+    return [...records];
   }
 
   public async close(): Promise<void> {

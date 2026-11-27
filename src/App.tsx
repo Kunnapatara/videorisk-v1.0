@@ -9,11 +9,15 @@ import { HistoryView } from './components/HistoryView';
 import { PricingView } from './components/PricingView';
 import { ChannelProfileView } from './components/ChannelProfileView';
 import { AuthModal } from './components/AuthModal';
+import { TermsOfServiceView } from './components/TermsOfServiceView';
+import { PrivacyPolicyView } from './components/PrivacyPolicyView';
 import { UserAccount, RiskReport, ScanJob, ReScanComparison } from './types';
 import { authFetch } from './utils/api';
 
+type AppTab = 'home' | 'upload' | 'processing' | 'report' | 'comparison' | 'history' | 'pricing' | 'channel' | 'terms' | 'privacy';
+
 export function App() {
-  const [activeTab, setActiveTab] = useState<'home' | 'upload' | 'processing' | 'report' | 'comparison' | 'history' | 'pricing' | 'channel'>('home');
+  const [activeTab, setActiveTab] = useState<AppTab>('home');
   const [user, setUser] = useState<UserAccount | null>(null);
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const [authModalInitialMode, setAuthModalInitialMode] = useState<'account' | 'login' | 'register' | 'switch' | 'forgot' | 'reset'>('login');
@@ -43,9 +47,27 @@ export function App() {
     }
   };
 
+  const navigateToLegalPage = (page: 'terms' | 'privacy') => {
+    setAuthModalOpen(false);
+    setActiveTab(page);
+    const targetPath = page === 'terms' ? '/terms' : '/privacy';
+    if (window.location.pathname !== targetPath) {
+      window.history.pushState({}, document.title, targetPath);
+    }
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
   useEffect(() => {
     fetchUser();
+    const pathname = window.location.pathname.toLowerCase();
     const params = new URLSearchParams(window.location.search);
+    const viewParam = (params.get('view') || '').toLowerCase();
+    if (pathname === '/terms' || viewParam === 'terms') {
+      setActiveTab('terms');
+    } else if (pathname === '/privacy' || viewParam === 'privacy') {
+      setActiveTab('privacy');
+    }
+
     const tokenFromUrl = params.get('resetToken');
     if (tokenFromUrl && tokenFromUrl.trim().length > 0) {
       setInitialResetToken(tokenFromUrl.trim());
@@ -56,6 +78,19 @@ export function App() {
       const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}${window.location.hash}`;
       window.history.replaceState({}, document.title, nextUrl);
     }
+
+    const handlePopState = () => {
+      const nextPath = window.location.pathname.toLowerCase();
+      if (nextPath === '/terms') {
+        setActiveTab('terms');
+      } else if (nextPath === '/privacy') {
+        setActiveTab('privacy');
+      } else {
+        setActiveTab(prev => (prev === 'terms' || prev === 'privacy' ? 'home' : prev));
+      }
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
   }, []);
 
   // When user switches or logs in
@@ -144,6 +179,9 @@ export function App() {
         }
         setActiveTab={(tab) => {
           setRescanParentId(undefined);
+          if (window.location.pathname === '/terms' || window.location.pathname === '/privacy') {
+            window.history.pushState({}, document.title, '/');
+          }
           setActiveTab(tab);
         }}
         user={user}
@@ -277,6 +315,29 @@ export function App() {
             />
           </div>
         )}
+        {activeTab === 'terms' && (
+          <TermsOfServiceView
+            onBack={() => {
+              if (window.location.pathname === '/terms') {
+                window.history.pushState({}, document.title, '/');
+              }
+              setActiveTab('home');
+            }}
+            onOpenPrivacy={() => navigateToLegalPage('privacy')}
+          />
+        )}
+
+        {activeTab === 'privacy' && (
+          <PrivacyPolicyView
+            onBack={() => {
+              if (window.location.pathname === '/privacy') {
+                window.history.pushState({}, document.title, '/');
+              }
+              setActiveTab('home');
+            }}
+            onOpenTerms={() => navigateToLegalPage('terms')}
+          />
+        )}
       </main>
 
       {/* Auth & Account Modal */}
@@ -295,6 +356,8 @@ export function App() {
           setAuthModalOpen(false);
           setActiveTab('pricing');
         }}
+        onOpenTerms={() => navigateToLegalPage('terms')}
+        onOpenPrivacy={() => navigateToLegalPage('privacy')}
         onClose={() => setAuthModalOpen(false)}
         onUserChanged={handleUserChanged}
       />
@@ -311,6 +374,29 @@ export function App() {
             <p className="font-bold text-stone-800">
               Know the risk before you publish.
             </p>
+            <div className="flex items-center justify-center sm:justify-start gap-3 pt-1 text-[11px]">
+              <a
+                href="/terms"
+                onClick={(e) => {
+                  e.preventDefault();
+                  navigateToLegalPage('terms');
+                }}
+                className="font-semibold text-stone-600 hover:text-rose-600 underline underline-offset-2"
+              >
+                Terms of Service
+              </a>
+              <span className="text-stone-300">·</span>
+              <a
+                href="/privacy"
+                onClick={(e) => {
+                  e.preventDefault();
+                  navigateToLegalPage('privacy');
+                }}
+                className="font-semibold text-stone-600 hover:text-rose-600 underline underline-offset-2"
+              >
+                Privacy Policy
+              </a>
+            </div>
           </div>
           <div className="text-[11px] text-stone-400 max-w-md sm:text-right space-y-1">
             <p className="font-medium text-stone-600">Evidence first. Context that matters. Better-informed decisions.</p>

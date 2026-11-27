@@ -952,3 +952,42 @@ export const RATE_LIMIT_POLICY_SPECS: readonly RateLimitPolicySpec[] = [
   { id: 'upload_ip_window', primaryVar: 'UPLOAD_IP_RATE_WINDOW', defaultValue: 600 },
 ];
 
+/**
+ * Configurable media and temporary artifact retention defaults.
+ * NOTE: These are operational defaults only and require explicit owner approval
+ * before production deployment and policy enforcement.
+ */
+export const DEFAULT_MEDIA_RETENTION_HOURS = 168; // 7 days (requires owner sign-off for prod)
+export const DEFAULT_TEMP_ARTIFACT_RETENTION_HOURS = 24; // 24 hours
+export const DEFAULT_RETENTION_CLEANUP_INTERVAL_MS = 3600000; // 1 hour
+
+export interface RetentionConfiguration {
+  enabled: boolean;
+  mediaRetentionHours: number;
+  tempArtifactRetentionHours: number;
+  cleanupIntervalMs: number;
+  approvalStatus: 'CONFIGURABLE_DEFAULT_REQUIRES_OWNER_APPROVAL';
+}
+
+export function resolveRetentionConfiguration(
+  env: NodeJS.ProcessEnv = process.env
+): RetentionConfiguration {
+  const rawEnabled = (env.RETENTION_CLEANUP_ENABLED || '').trim().toLowerCase();
+  const enabled = rawEnabled !== 'false' && rawEnabled !== '0';
+
+  const mediaRetentionHours =
+    parseStrictPositiveInt(env.MEDIA_RETENTION_HOURS) ?? DEFAULT_MEDIA_RETENTION_HOURS;
+  const tempArtifactRetentionHours =
+    parseStrictPositiveInt(env.TEMP_ARTIFACT_RETENTION_HOURS) ?? DEFAULT_TEMP_ARTIFACT_RETENTION_HOURS;
+  const cleanupIntervalMs =
+    parseStrictPositiveInt(env.RETENTION_CLEANUP_INTERVAL_MS) ?? DEFAULT_RETENTION_CLEANUP_INTERVAL_MS;
+
+  return {
+    enabled,
+    mediaRetentionHours,
+    tempArtifactRetentionHours,
+    cleanupIntervalMs,
+    approvalStatus: 'CONFIGURABLE_DEFAULT_REQUIRES_OWNER_APPROVAL',
+  };
+}
+
