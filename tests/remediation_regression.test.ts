@@ -249,6 +249,8 @@ printf "5\\t1\\t1\\t1\\t1\\t1\\t10abc\\t10\\t50\\t20\\t90xyz\\tSAMPLE\\n"
     const prevPathForOcr = process.env.PATH;
     const prevTessForOcr = process.env.TESSERACT_PATH;
     const prevFfmpegForOcr = process.env.FFMPEG_PATH;
+    const resolvedFfmpegForTest = resolveExecutable('ffmpeg', 'FFMPEG_PATH', process.env).resolvedPath;
+    assert.ok(resolvedFfmpegForTest, 'FFmpeg executable must be resolvable before PATH-isolated OCR failure tests');
     try {
       delete process.env.TESSERACT_PATH;
       const emptyPathDir = path.resolve(testDir, 'empty_tesseract_path');
@@ -260,13 +262,17 @@ printf "5\\t1\\t1\\t1\\t1\\t1\\t10abc\\t10\\t50\\t20\\t90xyz\\tSAMPLE\\n"
       assert.strictEqual(unconfiguredOcrRes.framesSucceeded, 0, '2.11i Unconfigured Tesseract records 0 succeeded frames');
       assert.notStrictEqual(unconfiguredOcrRes.status, 'NO_SIGNAL_DETECTED', '2.11j Unconfigured Tesseract never claims NO_SIGNAL_DETECTED');
 
-      // (c) Non-executable `tesseract` discovered via PATH (when TESSERACT_PATH is unset) must fail with FAILED / INSUFFICIENT_EVIDENCE
+      // (c) Non-executable `tesseract` discovered via isolated PATH (when TESSERACT_PATH is unset) must fail with FAILED / INSUFFICIENT_EVIDENCE
       const nonExecPathDir = path.resolve(testDir, 'non_exec_path_bin');
       fs.mkdirSync(nonExecPathDir, { recursive: true });
       const pathNonExecTess = path.join(nonExecPathDir, 'tesseract');
       fs.writeFileSync(pathNonExecTess, '#!/bin/sh\nexit 0\n', { mode: 0o644 });
       generatedFiles.push(pathNonExecTess);
-      process.env.PATH = `${nonExecPathDir}${path.delimiter}${prevPathForOcr || '/usr/bin:/bin'}`;
+      delete process.env.TESSERACT_PATH;
+      process.env.PATH = nonExecPathDir;
+      process.env.FFMPEG_PATH = resolvedFfmpegForTest;
+      const isolatedPathResolution = resolveExecutable('tesseract', 'TESSERACT_PATH', process.env);
+      assert.strictEqual(isolatedPathResolution.status, 'NON_EXECUTABLE', '2.11k0 Isolated PATH resolves only the non-executable tesseract fixture');
       const pathNonExecOcrRes = await videoProcessor.performVideoOcr(dummyVideoPath, meta3s, { maxFrames: 2 });
       assert.strictEqual(pathNonExecOcrRes.executionStatus, 'FAILED', '2.11k PATH non-executable Tesseract reports FAILED executionStatus');
       assert.strictEqual(pathNonExecOcrRes.status, 'INSUFFICIENT_EVIDENCE', '2.11l PATH non-executable Tesseract returns INSUFFICIENT_EVIDENCE');
@@ -275,14 +281,13 @@ printf "5\\t1\\t1\\t1\\t1\\t1\\t10abc\\t10\\t50\\t20\\t90xyz\\tSAMPLE\\n"
       assert.notStrictEqual(pathNonExecOcrRes.status, 'NO_SIGNAL_DETECTED', '2.11o PATH non-executable Tesseract never claims NO_SIGNAL_DETECTED');
 
       // (d) Runtime EACCES when binary becomes non-executable after initial resolution
-      const sysFfmpegPath = resolveExecutable('ffmpeg', 'FFMPEG_PATH', { PATH: prevPathForOcr || '/usr/bin:/bin' }).resolvedPath || 'ffmpeg';
       const runtimeEaccesTess = path.resolve(testDir, 'runtime_eacces_tess.sh');
       fs.writeFileSync(runtimeEaccesTess, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
       generatedFiles.push(runtimeEaccesTess);
       const chmodFfmpegWrapper = path.resolve(testDir, 'ffmpeg_chmod_wrapper.sh');
       fs.writeFileSync(
         chmodFfmpegWrapper,
-        `#!/bin/sh\nchmod 0644 "${runtimeEaccesTess}"\nexec "${sysFfmpegPath}" "$@"\n`,
+        `#!/bin/sh\nchmod 0644 "${runtimeEaccesTess}"\nexec "${resolvedFfmpegForTest}" "$@"\n`,
         { mode: 0o755 }
       );
       generatedFiles.push(chmodFfmpegWrapper);
