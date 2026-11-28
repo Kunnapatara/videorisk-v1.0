@@ -9,7 +9,14 @@ import { policyIntelligenceEngine } from '../intelligence/policyIntelligence';
 import { creditService } from '../services/creditService';
 import { analyticsService } from '../services/analyticsService';
 import { isVerifiedOwnerUser } from '../services/ownerAuth';
-import { ScanJob, ScanStage, JobStatus, ThumbnailMetadata, JobQueueRecord, FencingError } from '../../types';
+import {
+  buildDetectionHistoryEventsForScan,
+  buildFailedScanDetectionHistoryEvent,
+  extractAudioSpectralFingerprint,
+  extractMediaSha256Fingerprint,
+  extractVisualDhashFingerprint,
+} from '../services/intelligenceRepositoryService';
+import { ScanJob, ScanStage, JobStatus, ThumbnailMetadata, JobQueueRecord, FencingError, ReScanComparison, RiskReport } from '../../types';
 
 export interface JobOrchestratorPipelineDeps {
   mediaInspector?: Pick<typeof mediaInspector, 'inspect'>;
@@ -271,6 +278,21 @@ export class JobOrchestrator {
                 : 'We couldn’t complete this scan. Your video was not published or shared. Credits have been refunded. Please try again.'
           }, leaseToken);
 
+          if (preUpdateScan && this.storageRepo.detectionHistory) {
+            try {
+              const failedEvent = buildFailedScanDetectionHistoryEvent(
+                preUpdateScan,
+                err?.message || 'Scan processing failed'
+              );
+              await this.storageRepo.detectionHistory.appendEvents(scanId, [failedEvent], leaseToken);
+            } catch (histErr: any) {
+              if (histErr instanceof FencingError || histErr?.name === 'FencingError') {
+                throw histErr;
+              }
+              console.warn(`[JobOrchestrator] Non-fatal detection history failure write warning for ${scanId}:`, histErr?.message || histErr);
+            }
+          }
+
           await this.storageRepo.queue.failJob(job.id, err.message, false, 0, this.workerId, leaseToken);
 
           const failedScan = await this.storageRepo.scans.getScan(scanId).catch(() => null);
@@ -416,6 +438,12 @@ export class JobOrchestrator {
         completedStages: ['Upload', 'Media inspection']
       }, leaseToken);
 
+      const mediaShaFp = extractMediaSha256Fingerprint(scan, metadata);
+      if (mediaShaFp && this.storageRepo.fingerprints) {
+        checkLease();
+        await this.storageRepo.fingerprints.saveFingerprints(scanId, [mediaShaFp], leaseToken);
+      }
+
       await this.sleep(300);
 
       // 2. Stage: Audio & transcript
@@ -429,6 +457,12 @@ export class JobOrchestrator {
       const audioResult = await this.deps.audioProcessor.analyzeAudio(proxyPath, metadata);
       const audioMs = Date.now() - audioStart;
 
+      const audioFp = extractAudioSpectralFingerprint(scan, audioResult);
+      if (audioFp && this.storageRepo.fingerprints) {
+        checkLease();
+        await this.storageRepo.fingerprints.saveFingerprints(scanId, [audioFp], leaseToken);
+      }
+
       await this.sleep(300);
 
       // 3. Stage: Scene analysis
@@ -441,6 +475,12 @@ export class JobOrchestrator {
       const videoStart = Date.now();
       const videoResult = await this.deps.videoProcessor.analyzeVideo(proxyPath, metadata, scan.scanMode);
       tempFramesDirToClean = videoResult.tempFramesDir;
+
+      const visualFp = extractVisualDhashFingerprint(scan, videoResult);
+      if (visualFp && this.storageRepo.fingerprints) {
+        checkLease();
+        await this.storageRepo.fingerprints.saveFingerprints(scanId, [visualFp], leaseToken);
+      }
 
       // Execute Full-Video OCR (Phase 4.3) on sampled frames if video stream is present
       try {
@@ -559,17 +599,43 @@ export class JobOrchestrator {
         channelProfileSnapshot: channelProfile || undefined,
       }, leaseToken);
 
+      const completedAt = new Date().toISOString();
+
       // If this is a re-scan, generate and save the comparison with parent scan
+      let generatedComparison: ReScanComparison | null = null;
+      let parentReport: RiskReport | null = null;
+      let parentScan: ScanJob | null = null;
       if (scan.parentScanId) {
-        const parentReport = await this.storageRepo.scans.getReport(scan.parentScanId);
-        const parentScan = await this.storageRepo.scans.getScan(scan.parentScanId);
+        parentReport = await this.storageRepo.scans.getReport(scan.parentScanId);
+        parentScan = await this.storageRepo.scans.getScan(scan.parentScanId);
         if (parentReport) {
           const comparison = this.deps.policyIntelligenceEngine.generateComparison(parentReport, report, {
             originalScanRecord: parentScan || undefined,
-            revisedScanRecord: { ...scan, metadata },
+            revisedScanRecord: { ...scan, metadata, status: 'COMPLETED' },
           });
+          generatedComparison = comparison;
           checkLease();
           await this.storageRepo.scans.saveComparison(comparison, leaseToken);
+        }
+      }
+
+      // Persist structured detection history linked to scan, fingerprints, and evidence
+      if (this.storageRepo.detectionHistory) {
+        const persistedFingerprints = this.storageRepo.fingerprints
+          ? await this.storageRepo.fingerprints.getFingerprintsByScan(scanId, scan.userId)
+          : [];
+        const historyEvents = buildDetectionHistoryEventsForScan({
+          scan: { ...scan, metadata, status: 'COMPLETED', completedAt },
+          report,
+          evidence: timeline,
+          fingerprints: persistedFingerprints,
+          comparison: generatedComparison,
+          parentReport,
+          parentScan,
+        });
+        if (historyEvents.length > 0) {
+          checkLease();
+          await this.storageRepo.detectionHistory.appendEvents(scanId, historyEvents, leaseToken);
         }
       }
 
@@ -587,7 +653,7 @@ export class JobOrchestrator {
           'Policy analysis', 
           'Risk report'
         ],
-        completedAt: new Date().toISOString()
+        completedAt
       }, leaseToken);
 
       return {

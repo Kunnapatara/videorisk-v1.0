@@ -28,7 +28,15 @@ import {
   AnalyticsQueryOptions,
   AnalyticsEventsPage,
   AnalyticsFunnelSummary,
-  AnalyticsFunnelDailyEntry
+  AnalyticsFunnelDailyEntry,
+  FingerprintRecord,
+  FingerprintInput,
+  FingerprintQueryOptions,
+  PersistedEvidenceRecord,
+  EvidenceQueryOptions,
+  DetectionHistoryEvent,
+  DetectionHistoryInput,
+  DetectionHistoryQueryOptions
 } from '../../types';
 import { OFFICIAL_PRICING_PLANS } from './pricingCatalogue';
 import {
@@ -36,6 +44,8 @@ import {
   IUserRepository,
   IScanRepository,
   IEvidenceRepository,
+  IFingerprintRepository,
+  IDetectionHistoryRepository,
   IUsageRepository,
   IUploadRepository,
   IBillingRepository,
@@ -65,6 +75,10 @@ import {
 import { validateTestDatabaseTarget } from './testIsolation';
 import { isProductionEnvironment } from '../config/environment';
 import { isVerifiedOwnerUser } from '../services/ownerAuth';
+import {
+  computeEvidenceIntegritySha256,
+  deriveEvidenceStage
+} from '../services/intelligenceRepositoryService';
 
 export interface MigrationRecord {
   version: number;
@@ -942,6 +956,211 @@ export class SqliteStorageRepository implements IStorageRepository {
       } catch (err) {
         this.db.exec('ROLLBACK;');
         throw new Error(`Failed to apply migration 11: ${err}`);
+      }
+    }
+
+    // Migration 12: Indexed, tenant-scoped Video Fingerprint Repository
+    if (!appliedVersions.has(12)) {
+      this.db.exec('BEGIN IMMEDIATE;');
+      try {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS video_fingerprints (
+            id TEXT PRIMARY KEY,
+            scan_id TEXT NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            fingerprint_type TEXT NOT NULL,
+            algorithm TEXT NOT NULL,
+            algorithm_version TEXT NOT NULL,
+            fingerprint_hash TEXT NOT NULL,
+            signature_count INTEGER NOT NULL DEFAULT 0,
+            payload_json TEXT,
+            provenance TEXT NOT NULL,
+            source_stage TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_video_fingerprints_unique
+            ON video_fingerprints(scan_id, fingerprint_type, algorithm, algorithm_version);
+          CREATE INDEX IF NOT EXISTS idx_video_fingerprints_scan
+            ON video_fingerprints(scan_id);
+          CREATE INDEX IF NOT EXISTS idx_video_fingerprints_user_created
+            ON video_fingerprints(user_id, created_at);
+          CREATE INDEX IF NOT EXISTS idx_video_fingerprints_user_hash
+            ON video_fingerprints(user_id, fingerprint_hash);
+          CREATE INDEX IF NOT EXISTS idx_video_fingerprints_user_type_algo
+            ON video_fingerprints(user_id, fingerprint_type, algorithm);
+
+          INSERT INTO schema_migrations (version, name, applied_at)
+          VALUES (12, '012_fingerprint_repository', datetime('now'));
+        `);
+        this.db.exec('COMMIT;');
+      } catch (err) {
+        this.db.exec('ROLLBACK;');
+        throw new Error(`Failed to apply migration 12: ${err}`);
+      }
+    }
+
+    // Migration 13: Additive Evidence Repository structured metadata & tenant indexing
+    if (!appliedVersions.has(13)) {
+      this.db.exec('BEGIN IMMEDIATE;');
+      try {
+        const evCols = this.db.prepare('PRAGMA table_info(evidence)').all() as Array<{ name: string }>;
+        const existingCols = new Set(evCols.map(c => c.name));
+        const additiveColumns: Array<[string, string]> = [
+          ['user_id', 'TEXT'],
+          ['domain', 'TEXT'],
+          ['source', 'TEXT'],
+          ['stage', 'TEXT'],
+          ['evidence_status', 'TEXT'],
+          ['confidence_level', 'TEXT'],
+          ['timestamp_start', 'REAL'],
+          ['timestamp_end', 'REAL'],
+          ['provenance', 'TEXT'],
+          ['integrity_sha256', 'TEXT'],
+          ['metadata_json', 'TEXT'],
+          ['created_at', 'TEXT'],
+          ['updated_at', 'TEXT'],
+        ];
+        for (const [colName, colType] of additiveColumns) {
+          if (!existingCols.has(colName)) {
+            this.db.exec(`ALTER TABLE evidence ADD COLUMN ${colName} ${colType};`);
+          }
+        }
+
+        this.db.exec(`
+          CREATE INDEX IF NOT EXISTS idx_evidence_user_scan
+            ON evidence(user_id, scan_id, created_at);
+          CREATE INDEX IF NOT EXISTS idx_evidence_user_status
+            ON evidence(user_id, evidence_status, created_at);
+          CREATE INDEX IF NOT EXISTS idx_evidence_scan_status
+            ON evidence(scan_id, evidence_status);
+        `);
+
+        // Non-destructive backfill of existing evidence rows preserving all data_json payloads
+        const pkCol = existingCols.has('id') ? 'id' : (existingCols.has('item_id') ? 'item_id' : null);
+        if (pkCol) {
+          const legacyRows = this.db.prepare(`
+            SELECT e.${pkCol} as row_id, e.scan_id, e.data_json, e.created_at, s.user_id as scan_user_id
+            FROM evidence e
+            LEFT JOIN scans s ON s.id = e.scan_id
+            WHERE e.user_id IS NULL OR e.integrity_sha256 IS NULL
+          `).all() as Array<{ row_id: string; scan_id: string; data_json: string; created_at: string | null; scan_user_id: string | null }>;
+
+          if (legacyRows.length > 0) {
+            const backfillStmt = this.db.prepare(`
+              UPDATE evidence
+              SET user_id = ?,
+                  domain = ?,
+                  source = ?,
+                  stage = ?,
+                  evidence_status = ?,
+                  confidence_level = ?,
+                  timestamp_start = ?,
+                  timestamp_end = ?,
+                  provenance = ?,
+                  integrity_sha256 = ?,
+                  created_at = COALESCE(created_at, ?),
+                  updated_at = COALESCE(updated_at, ?)
+              WHERE ${pkCol} = ?
+            `);
+            for (const row of legacyRows) {
+              let parsed: EvidenceItem | null = null;
+              try {
+                parsed = JSON.parse(row.data_json) as EvidenceItem;
+              } catch {
+                parsed = null;
+              }
+              const itemForHash: EvidenceItem = parsed || {
+                id: row.row_id,
+                scanId: row.scan_id,
+                domain: 'video_audio',
+                timestampStart: 0,
+                timestampEnd: 0,
+                timestampLabel: '00:00',
+                type: 'unknown',
+                category: 'reused_content',
+                severity: 'info',
+                confidenceLevel: 'UNKNOWN',
+                provenance: 'legacy',
+                source: 'legacy',
+                label: '',
+                details: '',
+              };
+              const fallbackCreated = row.created_at || new Date().toISOString();
+              backfillStmt.run(
+                row.scan_user_id || null,
+                parsed?.domain || null,
+                parsed?.source || null,
+                parsed ? deriveEvidenceStage(parsed) : 'Visual evidence',
+                parsed?.evidenceStatus || 'OBSERVED',
+                parsed?.confidenceLevel || 'UNKNOWN',
+                typeof parsed?.timestampStart === 'number' ? parsed.timestampStart : null,
+                typeof parsed?.timestampEnd === 'number' ? parsed.timestampEnd : null,
+                parsed?.provenance || null,
+                computeEvidenceIntegritySha256(itemForHash),
+                fallbackCreated,
+                fallbackCreated,
+                row.row_id
+              );
+            }
+          }
+        }
+
+        this.db.exec(`
+          INSERT INTO schema_migrations (version, name, applied_at)
+          VALUES (13, '013_evidence_repository_enrichment', datetime('now'));
+        `);
+        this.db.exec('COMMIT;');
+      } catch (err) {
+        this.db.exec('ROLLBACK;');
+        throw new Error(`Failed to apply migration 13: ${err}`);
+      }
+    }
+
+    // Migration 14: Append-oriented, tenant-scoped Detection History repository
+    if (!appliedVersions.has(14)) {
+      this.db.exec('BEGIN IMMEDIATE;');
+      try {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS detection_history (
+            id TEXT PRIMARY KEY,
+            scan_id TEXT NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            parent_scan_id TEXT,
+            comparison_scan_id TEXT,
+            fingerprint_id TEXT REFERENCES video_fingerprints(id) ON DELETE SET NULL,
+            evidence_id TEXT,
+            evidence_ids_json TEXT,
+            detection_type TEXT NOT NULL,
+            detection_key TEXT NOT NULL,
+            detector_name TEXT,
+            detector_status TEXT,
+            result_status TEXT NOT NULL CHECK (result_status IN ('New', 'Still Present', 'Resolved', 'NOT VERIFIED')),
+            processing_version TEXT NOT NULL,
+            verification_reason TEXT,
+            idempotency_key TEXT NOT NULL,
+            details_json TEXT,
+            detected_at TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          );
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_detection_history_idempotency
+            ON detection_history(idempotency_key);
+          CREATE INDEX IF NOT EXISTS idx_detection_history_user_detected
+            ON detection_history(user_id, detected_at, created_at);
+          CREATE INDEX IF NOT EXISTS idx_detection_history_scan_detected
+            ON detection_history(scan_id, detected_at, created_at);
+          CREATE INDEX IF NOT EXISTS idx_detection_history_user_key
+            ON detection_history(user_id, detection_key, detected_at);
+          CREATE INDEX IF NOT EXISTS idx_detection_history_fingerprint
+            ON detection_history(fingerprint_id);
+
+          INSERT INTO schema_migrations (version, name, applied_at)
+          VALUES (14, '014_detection_history', datetime('now'));
+        `);
+        this.db.exec('COMMIT;');
+      } catch (err) {
+        this.db.exec('ROLLBACK;');
+        throw new Error(`Failed to apply migration 14: ${err}`);
       }
     }
   }
@@ -2177,15 +2396,66 @@ export class SqliteStorageRepository implements IStorageRepository {
     saveEvidence: async (scanId: string, items: EvidenceItem[], leaseToken?: LeaseFencingToken): Promise<void> => {
       await this.runTransaction(db => {
         this.validateLeaseFence(db, scanId, leaseToken);
+        const scanRow = db.prepare('SELECT user_id FROM scans WHERE id = ?').get(scanId) as { user_id: string } | undefined;
+        if (!scanRow) {
+          throw new Error(`Cannot save evidence: scan ${scanId} not found`);
+        }
+
         db.prepare('DELETE FROM evidence WHERE scan_id = ?').run(scanId);
         const stmt = db.prepare(`
-          INSERT INTO evidence (id, scan_id, data_json, created_at)
-          VALUES (?, ?, ?, ?)
-          ON CONFLICT(id) DO UPDATE SET scan_id = excluded.scan_id, data_json = excluded.data_json
+          INSERT INTO evidence (
+            id, scan_id, user_id, domain, source, stage,
+            evidence_status, confidence_level, timestamp_start, timestamp_end,
+            provenance, integrity_sha256, metadata_json, data_json, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            scan_id = excluded.scan_id,
+            user_id = excluded.user_id,
+            domain = excluded.domain,
+            source = excluded.source,
+            stage = excluded.stage,
+            evidence_status = excluded.evidence_status,
+            confidence_level = excluded.confidence_level,
+            timestamp_start = excluded.timestamp_start,
+            timestamp_end = excluded.timestamp_end,
+            provenance = excluded.provenance,
+            integrity_sha256 = excluded.integrity_sha256,
+            metadata_json = excluded.metadata_json,
+            data_json = excluded.data_json,
+            updated_at = excluded.updated_at
         `);
         const now = new Date().toISOString();
         for (const item of items) {
-          stmt.run(item.id, scanId, JSON.stringify(item), now);
+          if (item.scanId && item.scanId !== scanId) {
+            throw new Error(`Tenant/scan boundary violation: evidence item ${item.id} scanId ${item.scanId} does not match ${scanId}`);
+          }
+          const normalized: EvidenceItem = { ...item, scanId };
+          const stage = deriveEvidenceStage(normalized);
+          const integritySha256 = computeEvidenceIntegritySha256(normalized);
+          const metaJson = JSON.stringify({
+            uncertaintyReason: normalized.uncertaintyReason || 'NONE',
+            confidence: normalized.confidence === undefined ? null : normalized.confidence,
+            category: normalized.category || null,
+            severity: normalized.severity || null,
+          });
+          stmt.run(
+            normalized.id,
+            scanId,
+            scanRow.user_id,
+            normalized.domain || null,
+            normalized.source || null,
+            stage,
+            normalized.evidenceStatus || 'OBSERVED',
+            normalized.confidenceLevel || 'UNKNOWN',
+            Number.isFinite(normalized.timestampStart) ? normalized.timestampStart : null,
+            Number.isFinite(normalized.timestampEnd) ? normalized.timestampEnd : null,
+            normalized.provenance || null,
+            integritySha256,
+            metaJson,
+            JSON.stringify(normalized),
+            now,
+            now
+          );
         }
       });
     },
@@ -2193,8 +2463,443 @@ export class SqliteStorageRepository implements IStorageRepository {
     getEvidence: async (scanId: string): Promise<EvidenceItem[]> => {
       const rows = this.db.prepare('SELECT data_json FROM evidence WHERE scan_id = ? ORDER BY created_at ASC').all(scanId) as any[];
       return rows.map(r => JSON.parse(r.data_json));
+    },
+
+    getEvidenceForUser: async (scanId: string, userId: string): Promise<PersistedEvidenceRecord[]> => {
+      if (!userId || !userId.trim()) return [];
+      const rows = this.db.prepare(`
+        SELECT e.data_json, e.user_id, e.stage, e.integrity_sha256, e.metadata_json, e.created_at, e.updated_at
+        FROM evidence e
+        INNER JOIN scans s ON s.id = e.scan_id
+        WHERE e.scan_id = ? AND s.user_id = ?
+        ORDER BY e.timestamp_start ASC, e.created_at ASC
+      `).all(scanId, userId) as any[];
+      return rows.map(r => this.mapPersistedEvidenceRow(r));
+    },
+
+    queryEvidence: async (userId: string, options: EvidenceQueryOptions = {}): Promise<PersistedEvidenceRecord[]> => {
+      if (!userId || !userId.trim()) return [];
+      const limit = Math.min(200, Math.max(1, Math.trunc(options.limit ?? 100)));
+      const offset = Math.max(0, Math.trunc(options.offset ?? 0));
+
+      const conditions: string[] = ['s.user_id = ?'];
+      const params: Array<string | number> = [userId];
+
+      if (options.scanId) {
+        conditions.push('e.scan_id = ?');
+        params.push(options.scanId);
+      }
+      if (options.domain) {
+        conditions.push('e.domain = ?');
+        params.push(options.domain);
+      }
+      if (options.evidenceStatus) {
+        conditions.push('e.evidence_status = ?');
+        params.push(options.evidenceStatus);
+      }
+      if (options.stage) {
+        conditions.push('e.stage = ?');
+        params.push(options.stage);
+      }
+
+      const rows = this.db.prepare(`
+        SELECT e.data_json, COALESCE(e.user_id, s.user_id) as user_id, e.stage, e.integrity_sha256, e.metadata_json, e.created_at, e.updated_at
+        FROM evidence e
+        INNER JOIN scans s ON s.id = e.scan_id
+        WHERE ${conditions.join(' AND ')}
+        ORDER BY e.created_at ASC, e.timestamp_start ASC
+        LIMIT ? OFFSET ?
+      `).all(...params, limit, offset) as any[];
+
+      return rows.map(r => this.mapPersistedEvidenceRow(r));
     }
   };
+
+  private mapPersistedEvidenceRow(row: any): PersistedEvidenceRecord {
+    const parsed = JSON.parse(row.data_json) as EvidenceItem;
+    let metadataJson: Record<string, unknown> | undefined;
+    if (row.metadata_json) {
+      try {
+        metadataJson = JSON.parse(row.metadata_json);
+      } catch {
+        metadataJson = undefined;
+      }
+    }
+    return {
+      ...parsed,
+      userId: row.user_id,
+      stage: row.stage || deriveEvidenceStage(parsed),
+      integritySha256: row.integrity_sha256 || computeEvidenceIntegritySha256(parsed),
+      metadataJson,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at || row.created_at,
+    };
+  }
+
+  // -------------------------------------------------------------
+  // FINGERPRINT REPOSITORY (MIGRATION 012)
+  // -------------------------------------------------------------
+  public fingerprints: IFingerprintRepository = {
+    saveFingerprints: async (
+      scanId: string,
+      inputs: FingerprintInput[],
+      leaseToken?: LeaseFencingToken
+    ): Promise<FingerprintRecord[]> => {
+      let savedRecords: FingerprintRecord[] = [];
+      await this.runTransaction(db => {
+        this.validateLeaseFence(db, scanId, leaseToken);
+        const scanRow = db.prepare('SELECT user_id FROM scans WHERE id = ?').get(scanId) as { user_id: string } | undefined;
+        if (!scanRow) {
+          throw new Error(`Cannot save fingerprints: scan ${scanId} not found`);
+        }
+
+        const stmt = db.prepare(`
+          INSERT INTO video_fingerprints (
+            id, scan_id, user_id, fingerprint_type, algorithm, algorithm_version,
+            fingerprint_hash, signature_count, payload_json, provenance, source_stage,
+            created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(scan_id, fingerprint_type, algorithm, algorithm_version) DO UPDATE SET
+            fingerprint_hash = excluded.fingerprint_hash,
+            signature_count = excluded.signature_count,
+            payload_json = excluded.payload_json,
+            provenance = excluded.provenance,
+            source_stage = excluded.source_stage,
+            updated_at = excluded.updated_at
+        `);
+
+        const now = new Date().toISOString();
+        const selectExistingStmt = db.prepare(`
+          SELECT * FROM video_fingerprints
+          WHERE scan_id = ? AND fingerprint_type = ? AND algorithm = ? AND algorithm_version = ?
+        `);
+
+        for (const input of inputs) {
+          if (input.scanId !== scanId) {
+            throw new Error(`Scan boundary violation: fingerprint scanId ${input.scanId} does not match ${scanId}`);
+          }
+          if (input.userId !== scanRow.user_id) {
+            throw new Error(`Tenant boundary violation: fingerprint userId ${input.userId} does not match scan owner ${scanRow.user_id}`);
+          }
+          if (!input.fingerprintHash || !input.fingerprintHash.trim()) {
+            throw new Error(`Invalid fingerprint: empty fingerprintHash for ${input.fingerprintType}`);
+          }
+
+          const id = input.id || `fp_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+          const payloadJson = input.payload !== undefined ? JSON.stringify(input.payload) : null;
+          stmt.run(
+            id,
+            scanId,
+            scanRow.user_id,
+            input.fingerprintType,
+            input.algorithm,
+            input.algorithmVersion,
+            input.fingerprintHash.trim(),
+            Math.max(0, Math.trunc(input.signatureCount)),
+            payloadJson,
+            input.provenance,
+            input.sourceStage,
+            now,
+            now
+          );
+
+          const row = selectExistingStmt.get(
+            scanId,
+            input.fingerprintType,
+            input.algorithm,
+            input.algorithmVersion
+          ) as any;
+          if (row) {
+            savedRecords.push(this.mapFingerprintRow(row));
+          }
+        }
+      });
+      return savedRecords;
+    },
+
+    getFingerprintsByScan: async (scanId: string, userId: string): Promise<FingerprintRecord[]> => {
+      if (!userId || !userId.trim()) return [];
+      const rows = this.db.prepare(`
+        SELECT vf.*
+        FROM video_fingerprints vf
+        INNER JOIN scans s ON s.id = vf.scan_id
+        WHERE vf.scan_id = ? AND vf.user_id = ? AND s.user_id = ?
+        ORDER BY vf.created_at ASC
+      `).all(scanId, userId, userId) as any[];
+      return rows.map(r => this.mapFingerprintRow(r));
+    },
+
+    queryFingerprints: async (userId: string, options: FingerprintQueryOptions = {}): Promise<FingerprintRecord[]> => {
+      if (!userId || !userId.trim()) return [];
+      const limit = Math.min(200, Math.max(1, Math.trunc(options.limit ?? 50)));
+      const offset = Math.max(0, Math.trunc(options.offset ?? 0));
+
+      const conditions: string[] = ['user_id = ?'];
+      const params: Array<string | number> = [userId];
+
+      if (options.scanId) {
+        conditions.push('scan_id = ?');
+        params.push(options.scanId);
+      }
+      if (options.fingerprintType) {
+        conditions.push('fingerprint_type = ?');
+        params.push(options.fingerprintType);
+      }
+      if (options.algorithm) {
+        conditions.push('algorithm = ?');
+        params.push(options.algorithm);
+      }
+      if (options.fingerprintHash) {
+        conditions.push('fingerprint_hash = ?');
+        params.push(options.fingerprintHash);
+      }
+
+      const rows = this.db.prepare(`
+        SELECT * FROM video_fingerprints
+        WHERE ${conditions.join(' AND ')}
+        ORDER BY created_at DESC
+        LIMIT ? OFFSET ?
+      `).all(...params, limit, offset) as any[];
+      return rows.map(r => this.mapFingerprintRow(r));
+    },
+
+    deleteFingerprintsByScan: async (scanId: string, userId: string): Promise<number> => {
+      if (!userId || !userId.trim()) return 0;
+      const res = this.db.prepare('DELETE FROM video_fingerprints WHERE scan_id = ? AND user_id = ?').run(scanId, userId);
+      return Number(res.changes || 0);
+    }
+  };
+
+  private mapFingerprintRow(row: any): FingerprintRecord {
+    let payload: FingerprintRecord['payload'];
+    if (row.payload_json) {
+      try {
+        payload = JSON.parse(row.payload_json);
+      } catch {
+        payload = undefined;
+      }
+    }
+    return {
+      id: row.id,
+      scanId: row.scan_id,
+      userId: row.user_id,
+      fingerprintType: row.fingerprint_type,
+      algorithm: row.algorithm,
+      algorithmVersion: row.algorithm_version,
+      fingerprintHash: row.fingerprint_hash,
+      signatureCount: Number(row.signature_count || 0),
+      payload,
+      provenance: row.provenance,
+      sourceStage: row.source_stage,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  // -------------------------------------------------------------
+  // DETECTION HISTORY REPOSITORY (MIGRATION 014)
+  // -------------------------------------------------------------
+  public detectionHistory: IDetectionHistoryRepository = {
+    appendEvents: async (
+      scanId: string,
+      inputs: DetectionHistoryInput[],
+      leaseToken?: LeaseFencingToken
+    ) => {
+      let appended = 0;
+      let deduplicated = 0;
+      const addedEvents: DetectionHistoryEvent[] = [];
+
+      await this.runTransaction(db => {
+        this.validateLeaseFence(db, scanId, leaseToken);
+        const scanRow = db.prepare('SELECT user_id FROM scans WHERE id = ?').get(scanId) as { user_id: string } | undefined;
+        if (!scanRow) {
+          throw new Error(`Cannot append detection history: scan ${scanId} not found`);
+        }
+
+        const allowedStatuses = new Set(['New', 'Still Present', 'Resolved', 'NOT VERIFIED']);
+        const insertStmt = db.prepare(`
+          INSERT INTO detection_history (
+            id, scan_id, user_id, parent_scan_id, comparison_scan_id,
+            fingerprint_id, evidence_id, evidence_ids_json,
+            detection_type, detection_key, detector_name, detector_status,
+            result_status, processing_version, verification_reason,
+            idempotency_key, details_json, detected_at, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(idempotency_key) DO NOTHING
+        `);
+
+        const now = new Date().toISOString();
+
+        for (const input of inputs) {
+          if (input.scanId !== scanId) {
+            throw new Error(`Scan boundary violation: detection history scanId ${input.scanId} does not match ${scanId}`);
+          }
+          if (input.userId !== scanRow.user_id) {
+            throw new Error(`Tenant boundary violation: detection history userId ${input.userId} does not match scan owner ${scanRow.user_id}`);
+          }
+          if (!allowedStatuses.has(input.resultStatus)) {
+            throw new Error(`Invalid detection history resultStatus: ${input.resultStatus}`);
+          }
+          if (!input.idempotencyKey || !input.idempotencyKey.trim()) {
+            throw new Error('Detection history event requires non-empty idempotencyKey');
+          }
+
+          const id = input.id || `dh_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+          const detectedAt = input.detectedAt || now;
+          const cleanKey = input.idempotencyKey.trim();
+          const res = insertStmt.run(
+            id,
+            scanId,
+            scanRow.user_id,
+            input.parentScanId || null,
+            input.comparisonScanId || null,
+            input.fingerprintId || null,
+            input.evidenceId || null,
+            input.evidenceIds ? JSON.stringify(input.evidenceIds) : null,
+            input.detectionType,
+            input.detectionKey,
+            input.detectorName || null,
+            input.detectorStatus || null,
+            input.resultStatus,
+            input.processingVersion,
+            input.verificationReason || null,
+            cleanKey,
+            input.details !== undefined ? JSON.stringify(input.details) : null,
+            detectedAt,
+            now
+          );
+
+          if (Number(res.changes || 0) === 0) {
+            deduplicated++;
+          } else {
+            appended++;
+            addedEvents.push({
+              id,
+              scanId,
+              userId: scanRow.user_id,
+              parentScanId: input.parentScanId ?? null,
+              comparisonScanId: input.comparisonScanId ?? null,
+              fingerprintId: input.fingerprintId ?? null,
+              evidenceId: input.evidenceId ?? null,
+              evidenceIds: input.evidenceIds ? [...input.evidenceIds] : [],
+              detectionType: input.detectionType,
+              detectionKey: input.detectionKey,
+              detectorName: input.detectorName ?? null,
+              detectorStatus: input.detectorStatus ?? null,
+              resultStatus: input.resultStatus,
+              processingVersion: input.processingVersion,
+              verificationReason: input.verificationReason ?? null,
+              idempotencyKey: cleanKey,
+              details: input.details,
+              detectedAt,
+              createdAt: now,
+            });
+          }
+        }
+      });
+
+      return { appended, deduplicated, events: addedEvents };
+    },
+
+    getHistoryByScan: async (
+      scanId: string,
+      userId: string,
+      options: DetectionHistoryQueryOptions = {}
+    ): Promise<DetectionHistoryEvent[]> => {
+      if (!userId || !userId.trim()) return [];
+      const scanRow = this.db.prepare('SELECT user_id FROM scans WHERE id = ?').get(scanId) as { user_id: string } | undefined;
+      if (!scanRow || scanRow.user_id !== userId) return [];
+      return this.detectionHistory.getHistoryByUser(userId, { ...options, scanId });
+    },
+
+    getHistoryByUser: async (
+      userId: string,
+      options: DetectionHistoryQueryOptions = {}
+    ): Promise<DetectionHistoryEvent[]> => {
+      if (!userId || !userId.trim()) return [];
+      const limit = Math.min(500, Math.max(1, Math.trunc(options.limit ?? 100)));
+      const offset = Math.max(0, Math.trunc(options.offset ?? 0));
+      const orderDir = options.order === 'desc' ? 'DESC' : 'ASC';
+
+      const conditions: string[] = ['user_id = ?'];
+      const params: Array<string | number> = [userId];
+
+      if (options.scanId) {
+        conditions.push('scan_id = ?');
+        params.push(options.scanId);
+      }
+      if (options.detectionType) {
+        conditions.push('detection_type = ?');
+        params.push(options.detectionType);
+      }
+      if (options.detectionKey) {
+        conditions.push('detection_key = ?');
+        params.push(options.detectionKey);
+      }
+      if (options.resultStatus) {
+        conditions.push('result_status = ?');
+        params.push(options.resultStatus);
+      }
+      if (options.startDate) {
+        conditions.push('detected_at >= ?');
+        params.push(options.startDate);
+      }
+      if (options.endDate) {
+        conditions.push('detected_at <= ?');
+        params.push(options.endDate);
+      }
+
+      const rows = this.db.prepare(`
+        SELECT * FROM detection_history
+        WHERE ${conditions.join(' AND ')}
+        ORDER BY detected_at ${orderDir}, created_at ${orderDir}, id ${orderDir}
+        LIMIT ? OFFSET ?
+      `).all(...params, limit, offset) as any[];
+
+      return rows.map(r => this.mapDetectionHistoryRow(r));
+    }
+  };
+
+  private mapDetectionHistoryRow(row: any): DetectionHistoryEvent {
+    let evidenceIds: string[] = [];
+    if (row.evidence_ids_json) {
+      try {
+        const parsed = JSON.parse(row.evidence_ids_json);
+        if (Array.isArray(parsed)) evidenceIds = parsed;
+      } catch {
+        evidenceIds = [];
+      }
+    }
+    let details: Record<string, unknown> | undefined;
+    if (row.details_json) {
+      try {
+        details = JSON.parse(row.details_json);
+      } catch {
+        details = undefined;
+      }
+    }
+    return {
+      id: row.id,
+      scanId: row.scan_id,
+      userId: row.user_id,
+      parentScanId: row.parent_scan_id || null,
+      comparisonScanId: row.comparison_scan_id || null,
+      fingerprintId: row.fingerprint_id || null,
+      evidenceId: row.evidence_id || null,
+      evidenceIds,
+      detectionType: row.detection_type,
+      detectionKey: row.detection_key,
+      detectorName: row.detector_name || null,
+      detectorStatus: row.detector_status || null,
+      resultStatus: row.result_status,
+      processingVersion: row.processing_version,
+      verificationReason: row.verification_reason || null,
+      idempotencyKey: row.idempotency_key,
+      details,
+      detectedAt: row.detected_at,
+      createdAt: row.created_at,
+    };
+  }
 
   // -------------------------------------------------------------
   // USAGE REPOSITORY

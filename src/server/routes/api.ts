@@ -41,7 +41,21 @@ import {
   validateStripeSecretKeyFormat,
   validateTrustProxyValue,
 } from '../config/environment';
-import { AnalyticsEventName, ScanJob, ScanMode, UserAccount, CrossVideoPattern, ChannelCoverageReport, ChannelCoverageDetail, ChannelPatternsResponse, CrossVideoComparisonStatus } from '../../types';
+import {
+  AnalyticsEventName,
+  DetectionHistoryStatus,
+  EvidenceDomain,
+  EvidenceStatus,
+  FingerprintType,
+  ScanJob,
+  ScanMode,
+  UserAccount,
+  CrossVideoPattern,
+  ChannelCoverageReport,
+  ChannelCoverageDetail,
+  ChannelPatternsResponse,
+  CrossVideoComparisonStatus
+} from '../../types';
 
 export const apiRouter = Router();
 export const MIN_PASSWORD_LENGTH = 8;
@@ -3039,6 +3053,209 @@ apiRouter.get('/scans/:id/evidence', async (req: Request, res: Response) => {
     res.json(evidence);
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to retrieve evidence.' });
+  }
+});
+
+// 11b. Query Tenant-Scoped Structured Evidence (Strict Auth + IDOR protection)
+const ALLOWED_EVIDENCE_DOMAINS = new Set<EvidenceDomain>([
+  'video_audio',
+  'title',
+  'description_tags',
+  'thumbnail',
+  'channel_context',
+]);
+const ALLOWED_EVIDENCE_STATUSES = new Set<EvidenceStatus>([
+  'VERIFIED',
+  'OBSERVED',
+  'INSUFFICIENT_EVIDENCE',
+  'NOT_ASSESSED',
+]);
+const ALLOWED_FINGERPRINT_TYPES = new Set<FingerprintType>([
+  'media_sha256',
+  'visual_dhash_sequence',
+  'audio_spectral_sequence',
+]);
+const ALLOWED_DETECTION_STATUSES = new Set<DetectionHistoryStatus>([
+  'New',
+  'Still Present',
+  'Resolved',
+  'NOT VERIFIED',
+]);
+
+apiRouter.get('/evidence', async (req: Request, res: Response) => {
+  try {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+
+    let scanId: string | undefined;
+    if (typeof req.query.scanId === 'string' && req.query.scanId.trim()) {
+      scanId = req.query.scanId.trim().slice(0, 128);
+      const scan = await storage.scans.getScan(scanId);
+      if (scan && scan.userId !== user.id) {
+        return res.status(403).json({ error: 'Access denied: Evidence belongs to another user.' });
+      }
+    }
+
+    let domain: EvidenceDomain | undefined;
+    if (req.query.domain !== undefined && req.query.domain !== '') {
+      if (typeof req.query.domain !== 'string' || !ALLOWED_EVIDENCE_DOMAINS.has(req.query.domain as EvidenceDomain)) {
+        return res.status(400).json({ error: 'Invalid domain parameter.' });
+      }
+      domain = req.query.domain as EvidenceDomain;
+    }
+
+    let evidenceStatus: EvidenceStatus | undefined;
+    if (req.query.evidenceStatus !== undefined && req.query.evidenceStatus !== '') {
+      if (typeof req.query.evidenceStatus !== 'string' || !ALLOWED_EVIDENCE_STATUSES.has(req.query.evidenceStatus as EvidenceStatus)) {
+        return res.status(400).json({ error: 'Invalid evidenceStatus parameter.' });
+      }
+      evidenceStatus = req.query.evidenceStatus as EvidenceStatus;
+    }
+
+    const limit = typeof req.query.limit === 'string' && /^[1-9]\d*$/.test(req.query.limit.trim())
+      ? Math.min(200, Number(req.query.limit.trim()))
+      : 100;
+    const offset = typeof req.query.offset === 'string' && /^\d+$/.test(req.query.offset.trim())
+      ? Number(req.query.offset.trim())
+      : 0;
+
+    const evidence = await storage.evidence.queryEvidence(user.id, {
+      scanId,
+      domain,
+      evidenceStatus,
+      limit,
+      offset,
+    });
+    res.json({ count: evidence.length, evidence });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to retrieve evidence records.' });
+  }
+});
+
+// 11c. Get Scan Fingerprints (Strict Auth + IDOR protection)
+apiRouter.get('/scans/:id/fingerprints', async (req: Request, res: Response) => {
+  try {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+
+    const scan = await storage.scans.getScan(req.params.id);
+    if (!scan) {
+      return res.status(404).json({ error: 'Scan job not found.' });
+    }
+    if (scan.userId !== user.id) {
+      return res.status(403).json({ error: 'Access denied: Fingerprints belong to another user.' });
+    }
+
+    let fingerprintType: FingerprintType | undefined;
+    if (req.query.fingerprintType !== undefined && req.query.fingerprintType !== '') {
+      if (typeof req.query.fingerprintType !== 'string' || !ALLOWED_FINGERPRINT_TYPES.has(req.query.fingerprintType as FingerprintType)) {
+        return res.status(400).json({ error: 'Invalid fingerprintType parameter.' });
+      }
+      fingerprintType = req.query.fingerprintType as FingerprintType;
+    }
+
+    const fingerprints = fingerprintType
+      ? await storage.fingerprints.queryFingerprints(user.id, { scanId: scan.id, fingerprintType })
+      : await storage.fingerprints.getFingerprintsByScan(scan.id, user.id);
+
+    res.json({ scanId: scan.id, count: fingerprints.length, fingerprints });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to retrieve scan fingerprints.' });
+  }
+});
+
+// 11d. Get Scan Detection History (Strict Auth + IDOR protection)
+apiRouter.get('/scans/:id/detection-history', async (req: Request, res: Response) => {
+  try {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+
+    const scan = await storage.scans.getScan(req.params.id);
+    if (!scan) {
+      return res.status(404).json({ error: 'Scan job not found.' });
+    }
+    if (scan.userId !== user.id) {
+      return res.status(403).json({ error: 'Access denied: Detection history belongs to another user.' });
+    }
+
+    let resultStatus: DetectionHistoryStatus | undefined;
+    if (req.query.resultStatus !== undefined && req.query.resultStatus !== '') {
+      if (typeof req.query.resultStatus !== 'string' || !ALLOWED_DETECTION_STATUSES.has(req.query.resultStatus as DetectionHistoryStatus)) {
+        return res.status(400).json({ error: 'Invalid resultStatus parameter.' });
+      }
+      resultStatus = req.query.resultStatus as DetectionHistoryStatus;
+    }
+
+    const order: 'asc' | 'desc' = req.query.order === 'desc' ? 'desc' : 'asc';
+    const limit = typeof req.query.limit === 'string' && /^[1-9]\d*$/.test(req.query.limit.trim())
+      ? Math.min(500, Number(req.query.limit.trim()))
+      : 100;
+    const offset = typeof req.query.offset === 'string' && /^\d+$/.test(req.query.offset.trim())
+      ? Number(req.query.offset.trim())
+      : 0;
+
+    const events = await storage.detectionHistory.getHistoryByScan(scan.id, user.id, {
+      resultStatus,
+      detectionType: typeof req.query.detectionType === 'string' && req.query.detectionType.trim()
+        ? req.query.detectionType.trim().slice(0, 128)
+        : undefined,
+      order,
+      limit,
+      offset,
+    });
+    res.json({ scanId: scan.id, count: events.length, events });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to retrieve scan detection history.' });
+  }
+});
+
+// 11e. Get User Chronological Detection History (Strict Auth + Tenant Scope)
+apiRouter.get('/detection-history', async (req: Request, res: Response) => {
+  try {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+
+    let scanId: string | undefined;
+    if (typeof req.query.scanId === 'string' && req.query.scanId.trim()) {
+      scanId = req.query.scanId.trim().slice(0, 128);
+      const scan = await storage.scans.getScan(scanId);
+      if (scan && scan.userId !== user.id) {
+        return res.status(403).json({ error: 'Access denied: Detection history belongs to another user.' });
+      }
+    }
+
+    let resultStatus: DetectionHistoryStatus | undefined;
+    if (req.query.resultStatus !== undefined && req.query.resultStatus !== '') {
+      if (typeof req.query.resultStatus !== 'string' || !ALLOWED_DETECTION_STATUSES.has(req.query.resultStatus as DetectionHistoryStatus)) {
+        return res.status(400).json({ error: 'Invalid resultStatus parameter.' });
+      }
+      resultStatus = req.query.resultStatus as DetectionHistoryStatus;
+    }
+
+    const order: 'asc' | 'desc' = req.query.order === 'desc' ? 'desc' : 'asc';
+    const limit = typeof req.query.limit === 'string' && /^[1-9]\d*$/.test(req.query.limit.trim())
+      ? Math.min(500, Number(req.query.limit.trim()))
+      : 100;
+    const offset = typeof req.query.offset === 'string' && /^\d+$/.test(req.query.offset.trim())
+      ? Number(req.query.offset.trim())
+      : 0;
+
+    const events = await storage.detectionHistory.getHistoryByUser(user.id, {
+      scanId,
+      resultStatus,
+      detectionType: typeof req.query.detectionType === 'string' && req.query.detectionType.trim()
+        ? req.query.detectionType.trim().slice(0, 128)
+        : undefined,
+      detectionKey: typeof req.query.detectionKey === 'string' && req.query.detectionKey.trim()
+        ? req.query.detectionKey.trim().slice(0, 128)
+        : undefined,
+      order,
+      limit,
+      offset,
+    });
+    res.json({ count: events.length, events });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to retrieve detection history.' });
   }
 });
 

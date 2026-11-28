@@ -25,7 +25,15 @@ import {
   AnalyticsQueryOptions,
   AnalyticsEventsPage,
   AnalyticsFunnelSummary,
-  AnalyticsFunnelDailyEntry
+  AnalyticsFunnelDailyEntry,
+  FingerprintRecord,
+  FingerprintInput,
+  FingerprintQueryOptions,
+  PersistedEvidenceRecord,
+  EvidenceQueryOptions,
+  DetectionHistoryEvent,
+  DetectionHistoryInput,
+  DetectionHistoryQueryOptions
 } from '../../types';
 import { OFFICIAL_PRICING_PLANS } from './pricingCatalogue';
 import { isProductionEnvironment } from '../config/environment';
@@ -38,6 +46,10 @@ import {
   sanitizeAnalyticsProperties
 } from '../services/analyticsSanitizer';
 import { isVerifiedOwnerUser } from '../services/ownerAuth';
+import {
+  computeEvidenceIntegritySha256,
+  deriveEvidenceStage
+} from '../services/intelligenceRepositoryService';
 
 export interface RateLimitStatus {
   allowed: boolean;
@@ -150,9 +162,35 @@ export interface IScanRepository {
   isMediaShared(filePath: string, excludeScanId: string): Promise<boolean>;
 }
 
+export interface IFingerprintRepository {
+  saveFingerprints(scanId: string, inputs: FingerprintInput[], leaseToken?: LeaseFencingToken): Promise<FingerprintRecord[]>;
+  getFingerprintsByScan(scanId: string, userId: string): Promise<FingerprintRecord[]>;
+  queryFingerprints(userId: string, options?: FingerprintQueryOptions): Promise<FingerprintRecord[]>;
+  deleteFingerprintsByScan(scanId: string, userId: string): Promise<number>;
+}
+
 export interface IEvidenceRepository {
   saveEvidence(scanId: string, items: EvidenceItem[], leaseToken?: LeaseFencingToken): Promise<void>;
   getEvidence(scanId: string): Promise<EvidenceItem[]>;
+  getEvidenceForUser(scanId: string, userId: string): Promise<PersistedEvidenceRecord[]>;
+  queryEvidence(userId: string, options?: EvidenceQueryOptions): Promise<PersistedEvidenceRecord[]>;
+}
+
+export interface IDetectionHistoryRepository {
+  appendEvents(
+    scanId: string,
+    events: DetectionHistoryInput[],
+    leaseToken?: LeaseFencingToken
+  ): Promise<{ appended: number; deduplicated: number; events: DetectionHistoryEvent[] }>;
+  getHistoryByScan(
+    scanId: string,
+    userId: string,
+    options?: DetectionHistoryQueryOptions
+  ): Promise<DetectionHistoryEvent[]>;
+  getHistoryByUser(
+    userId: string,
+    options?: DetectionHistoryQueryOptions
+  ): Promise<DetectionHistoryEvent[]>;
 }
 
 export interface IUsageRepository {
@@ -213,6 +251,8 @@ export interface IStorageRepository {
   channelIntelligence: IChannelIntelligenceRepository;
   scans: IScanRepository;
   evidence: IEvidenceRepository;
+  fingerprints: IFingerprintRepository;
+  detectionHistory: IDetectionHistoryRepository;
   usage: IUsageRepository;
   billing: IBillingRepository;
   passwordReset: IPasswordResetRepository;
@@ -247,6 +287,9 @@ export class InMemoryStorageRepository implements IStorageRepository {
     jobQueue: Record<string, JobQueueRecord>;
     reports: Record<string, RiskReport>;
     evidence: Record<string, EvidenceItem[]>;
+    evidenceMeta: Record<string, { userId: string; stage: string; integritySha256: string; createdAt: string; updatedAt: string }>;
+    fingerprints: Record<string, FingerprintRecord>;
+    detectionHistory: DetectionHistoryEvent[];
     comparisons: Record<string, ReScanComparison>;
     usage: Array<{ userId: string; scanId: string; durationMinutes: number; creditsDeducted: number; mode: string; timestamp: string }>;
     webhookEvents: Record<string, WebhookEventRecord>;
@@ -274,6 +317,9 @@ export class InMemoryStorageRepository implements IStorageRepository {
       jobQueue: {},
       reports: {},
       evidence: {},
+      evidenceMeta: {},
+      fingerprints: {},
+      detectionHistory: [],
       comparisons: {},
       usage: [],
       webhookEvents: {},
@@ -405,6 +451,9 @@ export class InMemoryStorageRepository implements IStorageRepository {
       jobQueue: parsed.jobQueue || {},
       reports: parsed.reports || {},
       evidence: parsed.evidence || {},
+      evidenceMeta: parsed.evidenceMeta || {},
+      fingerprints: parsed.fingerprints || {},
+      detectionHistory: Array.isArray(parsed.detectionHistory) ? parsed.detectionHistory : [],
       comparisons: parsed.comparisons || {},
       usage: parsed.usage || [],
       webhookEvents: parsed.webhookEvents || {},
@@ -760,6 +809,12 @@ export class InMemoryStorageRepository implements IStorageRepository {
         for (const [scanId, scan] of Object.entries(state.scans || {})) {
           if (scan.userId === userId) {
             userScanIds.add(scanId);
+            const evItems = state.evidence[scanId] || [];
+            for (const evItem of evItems) {
+              if (state.evidenceMeta) {
+                delete state.evidenceMeta[evItem.id];
+              }
+            }
             delete state.scans[scanId];
             delete state.reports[scanId];
             delete state.evidence[scanId];
@@ -767,6 +822,15 @@ export class InMemoryStorageRepository implements IStorageRepository {
             delete state.jobQueue[scanId];
           }
         }
+        // Clean up fingerprints & detectionHistory belonging to user or user scans
+        for (const [fpId, fp] of Object.entries(state.fingerprints || {})) {
+          if (fp.userId === userId || userScanIds.has(fp.scanId)) {
+            delete state.fingerprints[fpId];
+          }
+        }
+        state.detectionHistory = (state.detectionHistory || []).filter(
+          (dh) => dh.userId !== userId && !userScanIds.has(dh.scanId)
+        );
         // Clean up any comparisons where deleted scans appeared as originalScanId
         for (const [revId, comp] of Object.entries(state.comparisons || {})) {
           if (userScanIds.has(comp.originalScanId) || userScanIds.has(comp.revisedScanId)) {
@@ -952,11 +1016,23 @@ export class InMemoryStorageRepository implements IStorageRepository {
     deleteScan: async (id: string): Promise<boolean> => {
       return await this.runTransaction(async (state) => {
         if (!state.scans[id]) return false;
+        const evItems = state.evidence[id] || [];
+        for (const evItem of evItems) {
+          if (state.evidenceMeta) {
+            delete state.evidenceMeta[evItem.id];
+          }
+        }
         delete state.scans[id];
         delete state.reports[id];
         delete state.evidence[id];
         delete state.comparisons[id];
         delete state.jobQueue[id];
+        for (const [fpId, fp] of Object.entries(state.fingerprints || {})) {
+          if (fp.scanId === id) {
+            delete state.fingerprints[fpId];
+          }
+        }
+        state.detectionHistory = (state.detectionHistory || []).filter((dh) => dh.scanId !== id);
         // Clean up or invalidate derived channel intelligence records
         for (const [recId, rec] of Object.entries(state.channelIntelligence || {})) {
           if (rec.sourceScanIds && rec.sourceScanIds.includes(id)) {
@@ -984,12 +1060,290 @@ export class InMemoryStorageRepository implements IStorageRepository {
 
   public evidence: IEvidenceRepository = {
     saveEvidence: async (scanId: string, items: EvidenceItem[], leaseToken?: LeaseFencingToken) => {
-      this.validateLeaseFence(scanId, leaseToken);
-      this.state.evidence[scanId] = items;
-      this.save();
+      await this.runTransaction(async (state) => {
+        this.validateLeaseFence(scanId, leaseToken);
+        const scan = state.scans[scanId];
+        if (!scan) {
+          throw new Error(`Cannot save evidence: scan ${scanId} not found`);
+        }
+        const prevItems = state.evidence[scanId] || [];
+        if (!state.evidenceMeta) state.evidenceMeta = {};
+        for (const prev of prevItems) {
+          delete state.evidenceMeta[prev.id];
+        }
+        const now = new Date().toISOString();
+        const normalizedItems: EvidenceItem[] = [];
+        for (const item of items) {
+          if (item.scanId && item.scanId !== scanId) {
+            throw new Error(`Tenant/scan boundary violation: evidence item ${item.id} scanId ${item.scanId} does not match ${scanId}`);
+          }
+          const normalized = { ...item, scanId };
+          normalizedItems.push(normalized);
+          state.evidenceMeta[normalized.id] = {
+            userId: scan.userId,
+            stage: deriveEvidenceStage(normalized),
+            integritySha256: computeEvidenceIntegritySha256(normalized),
+            createdAt: state.evidenceMeta[normalized.id]?.createdAt || now,
+            updatedAt: now,
+          };
+        }
+        state.evidence[scanId] = normalizedItems;
+      });
     },
     getEvidence: async (scanId: string) => {
       return this.state.evidence[scanId] || [];
+    },
+    getEvidenceForUser: async (scanId: string, userId: string): Promise<PersistedEvidenceRecord[]> => {
+      if (!userId || !userId.trim()) return [];
+      const scan = this.state.scans[scanId];
+      if (!scan || scan.userId !== userId) return [];
+      const items = this.state.evidence[scanId] || [];
+      return items.map((item) => {
+        const meta = this.state.evidenceMeta?.[item.id];
+        return {
+          ...item,
+          scanId,
+          userId: scan.userId,
+          stage: meta?.stage || deriveEvidenceStage(item),
+          integritySha256: meta?.integritySha256 || computeEvidenceIntegritySha256({ ...item, scanId }),
+          createdAt: meta?.createdAt || scan.createdAt,
+          updatedAt: meta?.updatedAt || scan.createdAt,
+        };
+      });
+    },
+    queryEvidence: async (userId: string, options: EvidenceQueryOptions = {}): Promise<PersistedEvidenceRecord[]> => {
+      if (!userId || !userId.trim()) return [];
+      const limit = Math.min(200, Math.max(1, Math.trunc(options.limit ?? 100)));
+      const offset = Math.max(0, Math.trunc(options.offset ?? 0));
+      const records: PersistedEvidenceRecord[] = [];
+      for (const scan of Object.values(this.state.scans)) {
+        if (scan.userId !== userId) continue;
+        if (options.scanId && scan.id !== options.scanId) continue;
+        const items = this.state.evidence[scan.id] || [];
+        for (const item of items) {
+          const meta = this.state.evidenceMeta?.[item.id];
+          const stage = meta?.stage || deriveEvidenceStage(item);
+          const status = item.evidenceStatus || 'OBSERVED';
+          if (options.domain && item.domain !== options.domain) continue;
+          if (options.evidenceStatus && status !== options.evidenceStatus) continue;
+          if (options.stage && stage !== options.stage) continue;
+          records.push({
+            ...item,
+            scanId: scan.id,
+            userId: scan.userId,
+            stage,
+            integritySha256: meta?.integritySha256 || computeEvidenceIntegritySha256({ ...item, scanId: scan.id }),
+            createdAt: meta?.createdAt || scan.createdAt,
+            updatedAt: meta?.updatedAt || scan.createdAt,
+          });
+        }
+      }
+      return records.slice(offset, offset + limit);
+    }
+  };
+
+  public fingerprints: IFingerprintRepository = {
+    saveFingerprints: async (
+      scanId: string,
+      inputs: FingerprintInput[],
+      leaseToken?: LeaseFencingToken
+    ): Promise<FingerprintRecord[]> => {
+      return await this.runTransaction(async (state) => {
+        this.validateLeaseFence(scanId, leaseToken);
+        const scan = state.scans[scanId];
+        if (!scan) {
+          throw new Error(`Cannot save fingerprints: scan ${scanId} not found`);
+        }
+        if (!state.fingerprints) state.fingerprints = {};
+        const now = new Date().toISOString();
+        const saved: FingerprintRecord[] = [];
+
+        for (const input of inputs) {
+          if (input.scanId !== scanId) {
+            throw new Error(`Scan boundary violation: fingerprint scanId ${input.scanId} does not match ${scanId}`);
+          }
+          if (input.userId !== scan.userId) {
+            throw new Error(`Tenant boundary violation: fingerprint userId ${input.userId} does not match scan owner ${scan.userId}`);
+          }
+          if (!input.fingerprintHash || !input.fingerprintHash.trim()) {
+            throw new Error(`Invalid fingerprint: empty fingerprintHash for ${input.fingerprintType}`);
+          }
+
+          const existing = Object.values(state.fingerprints).find(
+            (fp) =>
+              fp.scanId === scanId &&
+              fp.fingerprintType === input.fingerprintType &&
+              fp.algorithm === input.algorithm &&
+              fp.algorithmVersion === input.algorithmVersion
+          );
+
+          const id = existing?.id || input.id || `fp_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+          const record: FingerprintRecord = {
+            id,
+            scanId,
+            userId: scan.userId,
+            fingerprintType: input.fingerprintType,
+            algorithm: input.algorithm,
+            algorithmVersion: input.algorithmVersion,
+            fingerprintHash: input.fingerprintHash.trim(),
+            signatureCount: Math.max(0, Math.trunc(input.signatureCount)),
+            payload: input.payload,
+            provenance: input.provenance,
+            sourceStage: input.sourceStage,
+            createdAt: existing?.createdAt || now,
+            updatedAt: now,
+          };
+          state.fingerprints[id] = record;
+          saved.push(record);
+        }
+        return saved;
+      });
+    },
+    getFingerprintsByScan: async (scanId: string, userId: string): Promise<FingerprintRecord[]> => {
+      if (!userId || !userId.trim()) return [];
+      const scan = this.state.scans[scanId];
+      if (!scan || scan.userId !== userId) return [];
+      return Object.values(this.state.fingerprints || {})
+        .filter((fp) => fp.scanId === scanId && fp.userId === userId)
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    },
+    queryFingerprints: async (userId: string, options: FingerprintQueryOptions = {}): Promise<FingerprintRecord[]> => {
+      if (!userId || !userId.trim()) return [];
+      const limit = Math.min(200, Math.max(1, Math.trunc(options.limit ?? 50)));
+      const offset = Math.max(0, Math.trunc(options.offset ?? 0));
+      const matched = Object.values(this.state.fingerprints || {})
+        .filter((fp) => {
+          if (fp.userId !== userId) return false;
+          if (options.scanId && fp.scanId !== options.scanId) return false;
+          if (options.fingerprintType && fp.fingerprintType !== options.fingerprintType) return false;
+          if (options.algorithm && fp.algorithm !== options.algorithm) return false;
+          if (options.fingerprintHash && fp.fingerprintHash !== options.fingerprintHash) return false;
+          return true;
+        })
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+      return matched.slice(offset, offset + limit);
+    },
+    deleteFingerprintsByScan: async (scanId: string, userId: string): Promise<number> => {
+      if (!userId || !userId.trim()) return 0;
+      return await this.runTransaction(async (state) => {
+        let deleted = 0;
+        for (const [fpId, fp] of Object.entries(state.fingerprints || {})) {
+          if (fp.scanId === scanId && fp.userId === userId) {
+            delete state.fingerprints[fpId];
+            deleted++;
+          }
+        }
+        return deleted;
+      });
+    }
+  };
+
+  public detectionHistory: IDetectionHistoryRepository = {
+    appendEvents: async (
+      scanId: string,
+      inputs: DetectionHistoryInput[],
+      leaseToken?: LeaseFencingToken
+    ) => {
+      return await this.runTransaction(async (state) => {
+        this.validateLeaseFence(scanId, leaseToken);
+        const scan = state.scans[scanId];
+        if (!scan) {
+          throw new Error(`Cannot append detection history: scan ${scanId} not found`);
+        }
+        if (!Array.isArray(state.detectionHistory)) {
+          state.detectionHistory = [];
+        }
+        const allowedStatuses = new Set(['New', 'Still Present', 'Resolved', 'NOT VERIFIED']);
+        const now = new Date().toISOString();
+        let appended = 0;
+        let deduplicated = 0;
+        const addedEvents: DetectionHistoryEvent[] = [];
+
+        for (const input of inputs) {
+          if (input.scanId !== scanId) {
+            throw new Error(`Scan boundary violation: detection history scanId ${input.scanId} does not match ${scanId}`);
+          }
+          if (input.userId !== scan.userId) {
+            throw new Error(`Tenant boundary violation: detection history userId ${input.userId} does not match scan owner ${scan.userId}`);
+          }
+          if (!allowedStatuses.has(input.resultStatus)) {
+            throw new Error(`Invalid detection history resultStatus: ${input.resultStatus}`);
+          }
+          if (!input.idempotencyKey || !input.idempotencyKey.trim()) {
+            throw new Error('Detection history event requires non-empty idempotencyKey');
+          }
+
+          const dup = state.detectionHistory.find((e) => e.idempotencyKey === input.idempotencyKey);
+          if (dup) {
+            deduplicated++;
+            continue;
+          }
+
+          const event: DetectionHistoryEvent = {
+            id: input.id || `dh_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+            scanId,
+            userId: scan.userId,
+            parentScanId: input.parentScanId ?? null,
+            comparisonScanId: input.comparisonScanId ?? null,
+            fingerprintId: input.fingerprintId ?? null,
+            evidenceId: input.evidenceId ?? null,
+            evidenceIds: input.evidenceIds ? [...input.evidenceIds] : [],
+            detectionType: input.detectionType,
+            detectionKey: input.detectionKey,
+            detectorName: input.detectorName ?? null,
+            detectorStatus: input.detectorStatus ?? null,
+            resultStatus: input.resultStatus,
+            processingVersion: input.processingVersion,
+            verificationReason: input.verificationReason ?? null,
+            idempotencyKey: input.idempotencyKey.trim(),
+            details: input.details,
+            detectedAt: input.detectedAt || now,
+            createdAt: now,
+          };
+          state.detectionHistory.push(event);
+          addedEvents.push(event);
+          appended++;
+        }
+
+        return { appended, deduplicated, events: addedEvents };
+      });
+    },
+    getHistoryByScan: async (
+      scanId: string,
+      userId: string,
+      options: DetectionHistoryQueryOptions = {}
+    ): Promise<DetectionHistoryEvent[]> => {
+      if (!userId || !userId.trim()) return [];
+      const scan = this.state.scans[scanId];
+      if (!scan || scan.userId !== userId) return [];
+      return this.detectionHistory.getHistoryByUser(userId, { ...options, scanId });
+    },
+    getHistoryByUser: async (
+      userId: string,
+      options: DetectionHistoryQueryOptions = {}
+    ): Promise<DetectionHistoryEvent[]> => {
+      if (!userId || !userId.trim()) return [];
+      const limit = Math.min(500, Math.max(1, Math.trunc(options.limit ?? 100)));
+      const offset = Math.max(0, Math.trunc(options.offset ?? 0));
+      const order = options.order === 'desc' ? 'desc' : 'asc';
+
+      const filtered = (this.state.detectionHistory || []).filter((ev) => {
+        if (ev.userId !== userId) return false;
+        if (options.scanId && ev.scanId !== options.scanId) return false;
+        if (options.detectionType && ev.detectionType !== options.detectionType) return false;
+        if (options.detectionKey && ev.detectionKey !== options.detectionKey) return false;
+        if (options.resultStatus && ev.resultStatus !== options.resultStatus) return false;
+        if (options.startDate && ev.detectedAt < options.startDate) return false;
+        if (options.endDate && ev.detectedAt > options.endDate) return false;
+        return true;
+      });
+
+      filtered.sort((a, b) => {
+        const cmp = a.detectedAt.localeCompare(b.detectedAt) || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id);
+        return order === 'asc' ? cmp : -cmp;
+      });
+
+      return filtered.slice(offset, offset + limit);
     }
   };
 

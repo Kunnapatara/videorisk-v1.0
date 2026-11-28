@@ -154,6 +154,10 @@ async function main() {
     const { runLaunchBlockersPhase1Tests } = await import('./launch_blockers_phase1.test');
     await runLaunchBlockersPhase1Tests();
 
+    // Run Suite 32: Phase 2A Product Intelligence Foundation (Fingerprints, Evidence, Detection History, Additive Migrations)
+    const { runPhase2AIntelligenceFoundationTests } = await import('./phase2a_intelligence_foundation.test');
+    await runPhase2AIntelligenceFoundationTests();
+
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log(`\n🎉 ALL AUTOMATED VERIFICATION SUITES COMPLETED SUCCESSFULLY in ${elapsed}s!`);
     process.exit(0);

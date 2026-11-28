@@ -921,3 +921,134 @@ export interface AnalyticsFunnelSummary {
     generatedAt: string;
   };
 }
+
+// =============================================================================
+// Phase 2A: Product Intelligence Foundation Types
+// =============================================================================
+
+export type FingerprintType =
+  | 'media_sha256'
+  | 'visual_dhash_sequence'
+  | 'audio_spectral_sequence';
+
+export interface FingerprintRecord {
+  id: string;
+  scanId: string;
+  userId: string;
+  fingerprintType: FingerprintType;
+  algorithm: string;
+  algorithmVersion: string;
+  fingerprintHash: string;
+  signatureCount: number;
+  payload?:
+    | StoredVisualSignature[]
+    | StoredAudioSignature[]
+    | { sha256: string }
+    | Record<string, unknown>;
+  provenance: string;
+  sourceStage: ScanStage | string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface FingerprintInput {
+  id?: string;
+  scanId: string;
+  userId: string;
+  fingerprintType: FingerprintType;
+  algorithm: string;
+  algorithmVersion: string;
+  fingerprintHash: string;
+  signatureCount: number;
+  payload?: FingerprintRecord['payload'];
+  provenance: string;
+  sourceStage: ScanStage | string;
+}
+
+export interface FingerprintQueryOptions {
+  scanId?: string;
+  fingerprintType?: FingerprintType;
+  algorithm?: string;
+  fingerprintHash?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface PersistedEvidenceRecord extends EvidenceItem {
+  userId: string;
+  stage: string;
+  integritySha256: string;
+  metadataJson?: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface EvidenceQueryOptions {
+  scanId?: string;
+  domain?: EvidenceDomain;
+  evidenceStatus?: EvidenceStatus;
+  stage?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export type DetectionHistoryStatus =
+  | 'New'
+  | 'Still Present'
+  | 'Resolved'
+  | 'NOT VERIFIED';
+
+export interface DetectionHistoryEvent {
+  id: string;
+  scanId: string;
+  userId: string;
+  parentScanId?: string | null;
+  comparisonScanId?: string | null;
+  fingerprintId?: string | null;
+  evidenceId?: string | null;
+  evidenceIds?: string[];
+  detectionType: string;
+  detectionKey: string;
+  detectorName?: string | null;
+  detectorStatus?: DetectorExecutionStatus | DomainAssessmentStatus | string | null;
+  resultStatus: DetectionHistoryStatus;
+  processingVersion: string;
+  verificationReason?: string | null;
+  idempotencyKey: string;
+  details?: Record<string, unknown>;
+  detectedAt: string;
+  createdAt: string;
+}
+
+export interface DetectionHistoryInput {
+  id?: string;
+  scanId: string;
+  userId: string;
+  parentScanId?: string | null;
+  comparisonScanId?: string | null;
+  fingerprintId?: string | null;
+  evidenceId?: string | null;
+  evidenceIds?: string[];
+  detectionType: string;
+  detectionKey: string;
+  detectorName?: string | null;
+  detectorStatus?: DetectorExecutionStatus | DomainAssessmentStatus | string | null;
+  resultStatus: DetectionHistoryStatus;
+  processingVersion: string;
+  verificationReason?: string | null;
+  idempotencyKey: string;
+  details?: Record<string, unknown>;
+  detectedAt?: string;
+}
+
+export interface DetectionHistoryQueryOptions {
+  scanId?: string;
+  detectionType?: string;
+  detectionKey?: string;
+  resultStatus?: DetectionHistoryStatus;
+  startDate?: string;
+  endDate?: string;
+  limit?: number;
+  offset?: number;
+  order?: 'asc' | 'desc';
+}
