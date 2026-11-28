@@ -12,6 +12,7 @@ import {
 } from '../src/server/pipeline/videoProcessor';
 import { thumbnailInspector } from '../src/server/pipeline/thumbnailInspector';
 import { mediaInspector, MediaInspectionError } from '../src/server/pipeline/mediaInspector';
+import { resolveExecutable } from '../src/server/pipeline/binaryResolver';
 import os from 'os';
 import {
   SpeechTranscriptionAdapter,
@@ -237,6 +238,99 @@ printf "5\\t1\\t1\\t1\\t1\\t1\\t10abc\\t10\\t50\\t20\\t90xyz\\tSAMPLE\\n"
     assert.strictEqual(malformedTsvRes.framesOcrFailed, 3, '2.11a Malformed TSV counted as framesOcrFailed');
     assert.strictEqual(malformedTsvRes.framesSucceeded, 0, '2.11b Malformed TSV never counted as framesSucceeded');
     assert.notStrictEqual(malformedTsvRes.status, 'NO_SIGNAL_DETECTED', '2.11c Malformed TSV never falsely claims NO_SIGNAL_DETECTED');
+
+    // Test 2.3c: Comprehensive OCR failure & return-contract regression coverage
+    // (a) Missing configured executable reports explicit executionStatus='UNAVAILABLE' and 0 succeeded frames
+    assert.strictEqual(missingTessRes.executionStatus, 'UNAVAILABLE', '2.11d Missing configured Tesseract reports UNAVAILABLE executionStatus');
+    assert.strictEqual(missingTessRes.framesSucceeded, 0, '2.11e Missing configured Tesseract records 0 succeeded frames');
+    assert.strictEqual(missingTessRes.failureClassification, 'OCR_ENGINE_FAILURE', '2.11f Missing configured Tesseract classifies as OCR_ENGINE_FAILURE');
+
+    // (b) Missing everywhere (TESSERACT_PATH unset and empty PATH) reports NOT_ASSESSED
+    const prevPathForOcr = process.env.PATH;
+    const prevTessForOcr = process.env.TESSERACT_PATH;
+    const prevFfmpegForOcr = process.env.FFMPEG_PATH;
+    try {
+      delete process.env.TESSERACT_PATH;
+      const emptyPathDir = path.resolve(testDir, 'empty_tesseract_path');
+      fs.mkdirSync(emptyPathDir, { recursive: true });
+      process.env.PATH = emptyPathDir;
+      const unconfiguredOcrRes = await videoProcessor.performVideoOcr(dummyVideoPath, meta3s, { maxFrames: 2 });
+      assert.strictEqual(unconfiguredOcrRes.status, 'NOT_ASSESSED', '2.11g Unconfigured Tesseract returns NOT_ASSESSED');
+      assert.strictEqual(unconfiguredOcrRes.executionStatus, 'NOT_ASSESSED', '2.11h Unconfigured Tesseract reports NOT_ASSESSED executionStatus');
+      assert.strictEqual(unconfiguredOcrRes.framesSucceeded, 0, '2.11i Unconfigured Tesseract records 0 succeeded frames');
+      assert.notStrictEqual(unconfiguredOcrRes.status, 'NO_SIGNAL_DETECTED', '2.11j Unconfigured Tesseract never claims NO_SIGNAL_DETECTED');
+
+      // (c) Non-executable `tesseract` discovered via PATH (when TESSERACT_PATH is unset) must fail with FAILED / INSUFFICIENT_EVIDENCE
+      const nonExecPathDir = path.resolve(testDir, 'non_exec_path_bin');
+      fs.mkdirSync(nonExecPathDir, { recursive: true });
+      const pathNonExecTess = path.join(nonExecPathDir, 'tesseract');
+      fs.writeFileSync(pathNonExecTess, '#!/bin/sh\nexit 0\n', { mode: 0o644 });
+      generatedFiles.push(pathNonExecTess);
+      process.env.PATH = `${nonExecPathDir}${path.delimiter}${prevPathForOcr || '/usr/bin:/bin'}`;
+      const pathNonExecOcrRes = await videoProcessor.performVideoOcr(dummyVideoPath, meta3s, { maxFrames: 2 });
+      assert.strictEqual(pathNonExecOcrRes.executionStatus, 'FAILED', '2.11k PATH non-executable Tesseract reports FAILED executionStatus');
+      assert.strictEqual(pathNonExecOcrRes.status, 'INSUFFICIENT_EVIDENCE', '2.11l PATH non-executable Tesseract returns INSUFFICIENT_EVIDENCE');
+      assert.strictEqual(pathNonExecOcrRes.framesSucceeded, 0, '2.11m PATH non-executable Tesseract records 0 succeeded frames');
+      assert.strictEqual(pathNonExecOcrRes.failureClassification, 'OCR_ENGINE_FAILURE', '2.11n PATH non-executable Tesseract classifies as OCR_ENGINE_FAILURE');
+      assert.notStrictEqual(pathNonExecOcrRes.status, 'NO_SIGNAL_DETECTED', '2.11o PATH non-executable Tesseract never claims NO_SIGNAL_DETECTED');
+
+      // (d) Runtime EACCES when binary becomes non-executable after initial resolution
+      const sysFfmpegPath = resolveExecutable('ffmpeg', 'FFMPEG_PATH', { PATH: prevPathForOcr || '/usr/bin:/bin' }).resolvedPath || 'ffmpeg';
+      const runtimeEaccesTess = path.resolve(testDir, 'runtime_eacces_tess.sh');
+      fs.writeFileSync(runtimeEaccesTess, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      generatedFiles.push(runtimeEaccesTess);
+      const chmodFfmpegWrapper = path.resolve(testDir, 'ffmpeg_chmod_wrapper.sh');
+      fs.writeFileSync(
+        chmodFfmpegWrapper,
+        `#!/bin/sh\nchmod 0644 "${runtimeEaccesTess}"\nexec "${sysFfmpegPath}" "$@"\n`,
+        { mode: 0o755 }
+      );
+      generatedFiles.push(chmodFfmpegWrapper);
+      process.env.PATH = prevPathForOcr || '/usr/bin:/bin';
+      process.env.FFMPEG_PATH = chmodFfmpegWrapper;
+      process.env.TESSERACT_PATH = runtimeEaccesTess;
+      const runtimeEaccesRes = await videoProcessor.performVideoOcr(dummyVideoPath, meta3s, { maxFrames: 2 });
+      assert.strictEqual(runtimeEaccesRes.executionStatus, 'FAILED', '2.11p Runtime EACCES reports FAILED executionStatus');
+      assert.strictEqual(runtimeEaccesRes.status, 'INSUFFICIENT_EVIDENCE', '2.11q Runtime EACCES returns INSUFFICIENT_EVIDENCE');
+      assert.strictEqual(runtimeEaccesRes.framesSucceeded, 0, '2.11r Runtime EACCES records 0 succeeded frames');
+      assert.strictEqual(runtimeEaccesRes.failureClassification, 'OCR_ENGINE_FAILURE', '2.11s Runtime EACCES classifies as OCR_ENGINE_FAILURE');
+      assert.notStrictEqual(runtimeEaccesRes.status, 'NO_SIGNAL_DETECTED', '2.11t Runtime EACCES never claims NO_SIGNAL_DETECTED');
+
+      // (e) Per-frame timeout when overall timeout is ample still reports FAILED / INSUFFICIENT_EVIDENCE when all frames fail
+      if (prevFfmpegForOcr === undefined) delete process.env.FFMPEG_PATH;
+      else process.env.FFMPEG_PATH = prevFfmpegForOcr;
+      process.env.TESSERACT_PATH = timeoutOcrScript;
+      const perFrameTimeoutRes = await videoProcessor.performVideoOcr(dummyVideoPath, meta3s, {
+        timestamps: [0.5],
+        perFrameTimeoutMs: 500,
+        timeoutMs: 5000
+      });
+      assert.strictEqual(perFrameTimeoutRes.executionStatus, 'FAILED', '2.11u Per-frame timeout reports FAILED executionStatus');
+      assert.strictEqual(perFrameTimeoutRes.status, 'INSUFFICIENT_EVIDENCE', '2.11v Per-frame timeout returns INSUFFICIENT_EVIDENCE');
+      assert.strictEqual(perFrameTimeoutRes.framesSucceeded, 0, '2.11w Per-frame timeout records 0 succeeded frames');
+      assert.strictEqual(perFrameTimeoutRes.framesOcrFailed, 1, '2.11w2 Per-frame OCR timeout records 1 failed OCR frame');
+      assert.strictEqual(perFrameTimeoutRes.failureClassification, 'OCR_TIMEOUT', '2.11x Per-frame timeout classifies as OCR_TIMEOUT');
+      assert.notStrictEqual(perFrameTimeoutRes.status, 'NO_SIGNAL_DETECTED', '2.11y Per-frame timeout never claims NO_SIGNAL_DETECTED');
+
+      // (f) Missing video file input and audio-only metadata return explicit executionStatus
+      const missingVideoRes = await videoProcessor.performVideoOcr(path.resolve(testDir, 'missing_video.mp4'), meta3s);
+      assert.strictEqual(missingVideoRes.status, 'ANALYSIS_UNAVAILABLE', '2.11z Missing video file returns ANALYSIS_UNAVAILABLE');
+      assert.strictEqual(missingVideoRes.executionStatus, 'UNAVAILABLE', '2.11aa Missing video file sets executionStatus=UNAVAILABLE');
+      assert.strictEqual(missingVideoRes.framesSucceeded, 0, '2.11ab Missing video file records 0 succeeded frames');
+
+      const noVideoStreamMeta: MediaMetadata = { ...meta3s, videoCodec: undefined, width: 0, height: 0 };
+      const noVideoStreamRes = await videoProcessor.performVideoOcr(dummyVideoPath, noVideoStreamMeta);
+      assert.strictEqual(noVideoStreamRes.status, 'NOT_PROVIDED', '2.11ac No-video-stream returns NOT_PROVIDED');
+      assert.strictEqual(noVideoStreamRes.executionStatus, 'NOT_ASSESSED', '2.11ad No-video-stream sets executionStatus=NOT_ASSESSED');
+      assert.strictEqual(noVideoStreamRes.framesSucceeded, 0, '2.11ae No-video-stream records 0 succeeded frames');
+    } finally {
+      if (prevPathForOcr === undefined) delete process.env.PATH;
+      else process.env.PATH = prevPathForOcr;
+      if (prevTessForOcr === undefined) delete process.env.TESSERACT_PATH;
+      else process.env.TESSERACT_PATH = prevTessForOcr;
+      if (prevFfmpegForOcr === undefined) delete process.env.FFMPEG_PATH;
+      else process.env.FFMPEG_PATH = prevFfmpegForOcr;
+    }
 
     // Test 2.4: Strict Canonical 12-Column TSV Schema Validation
     const canonicalHeader = 'level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext';

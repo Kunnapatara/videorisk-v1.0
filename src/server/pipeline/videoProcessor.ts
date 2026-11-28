@@ -2678,6 +2678,7 @@ export class VideoProcessor {
     if (!fs.existsSync(videoPath)) {
       return {
         status: 'ANALYSIS_UNAVAILABLE',
+        executionStatus: 'UNAVAILABLE',
         framesInspected: 0,
         totalCandidateFrames: 0,
         coverageRatio: 0,
@@ -2688,6 +2689,15 @@ export class VideoProcessor {
         plannedTimestamps: [],
         extractedTimestamps: [],
         succeededTimestamps: [],
+        framesTargeted: 0,
+        framesExtracted: 0,
+        framesExtractionFailed: 0,
+        framesAttempted: 0,
+        framesSucceeded: 0,
+        framesFailed: 0,
+        framesOcrFailed: 0,
+        framesSkipped: 0,
+        isPartial: false,
         limitations: 'Video file does not exist on disk.',
         failureReason: `Video media file not found at ${path.basename(videoPath)}`,
         failureClassification: 'OCR_INPUT_FAILURE',
@@ -2700,6 +2710,7 @@ export class VideoProcessor {
     if (!metadata.videoCodec || metadata.width === 0) {
       return {
         status: 'NOT_PROVIDED',
+        executionStatus: 'NOT_ASSESSED',
         framesInspected: 0,
         totalCandidateFrames: 0,
         coverageRatio: 0,
@@ -2710,6 +2721,15 @@ export class VideoProcessor {
         plannedTimestamps: [],
         extractedTimestamps: [],
         succeededTimestamps: [],
+        framesTargeted: 0,
+        framesExtracted: 0,
+        framesExtractionFailed: 0,
+        framesAttempted: 0,
+        framesSucceeded: 0,
+        framesFailed: 0,
+        framesOcrFailed: 0,
+        framesSkipped: 0,
+        isPartial: false,
         limitations: 'Container does not contain an active visual video stream.',
         executionDurationMs: 0,
         detectedFrames: [],
@@ -2722,10 +2742,10 @@ export class VideoProcessor {
     let executable: string | null = null;
     if (tesseractResolution.status === 'READY' && tesseractResolution.resolvedPath) {
       executable = tesseractResolution.resolvedPath;
-    } else if (tesseractResolution.configured) {
-      const isNonExec = tesseractResolution.status === 'NON_EXECUTABLE';
+    } else if (tesseractResolution.status === 'NON_EXECUTABLE') {
       return {
-        status: 'ANALYSIS_UNAVAILABLE',
+        status: 'INSUFFICIENT_EVIDENCE',
+        executionStatus: 'FAILED',
         framesInspected: 0,
         totalCandidateFrames: 0,
         coverageRatio: 0,
@@ -2736,13 +2756,54 @@ export class VideoProcessor {
         plannedTimestamps: [],
         extractedTimestamps: [],
         succeededTimestamps: [],
-        limitations: isNonExec
-          ? 'OCR engine path configured but binary is not executable.'
-          : 'OCR engine path configured but executable is missing on disk.',
+        framesTargeted: 0,
+        framesExtracted: 0,
+        framesExtractionFailed: 0,
+        framesAttempted: 0,
+        framesSucceeded: 0,
+        framesFailed: 0,
+        framesOcrFailed: 0,
+        framesSkipped: 0,
+        isPartial: false,
+        limitations: tesseractResolution.configured
+          ? 'OCR engine path configured but binary is not executable. No visual text signals could be assessed; temporal timeline coverage not verified.'
+          : 'OCR engine binary on PATH is not executable. No visual text signals could be assessed; temporal timeline coverage not verified.',
         failureReason: sanitizeOcrDiagnostic(
-          isNonExec
+          tesseractResolution.configured
             ? `Configured TESSERACT_PATH is not executable at ${tesseractResolution.configuredPath || ''}`
-            : `Configured TESSERACT_PATH not found at ${tesseractResolution.configuredPath || ''}`
+            : 'Resolved tesseract binary on PATH is not executable (permission denied).'
+        ),
+        failureClassification: 'OCR_ENGINE_FAILURE',
+        executionDurationMs: getElapsedMs(),
+        detectedFrames: [],
+        allExtractedText: []
+      };
+    } else if (tesseractResolution.configured) {
+      return {
+        status: 'ANALYSIS_UNAVAILABLE',
+        executionStatus: 'UNAVAILABLE',
+        framesInspected: 0,
+        totalCandidateFrames: 0,
+        coverageRatio: 0,
+        timelineCoverageStatus: 'NOT_VERIFIED',
+        timelineCoverageRatio: null,
+        samplingCoverageRatio: null,
+        ocrExecutionSuccessRatio: null,
+        plannedTimestamps: [],
+        extractedTimestamps: [],
+        succeededTimestamps: [],
+        framesTargeted: 0,
+        framesExtracted: 0,
+        framesExtractionFailed: 0,
+        framesAttempted: 0,
+        framesSucceeded: 0,
+        framesFailed: 0,
+        framesOcrFailed: 0,
+        framesSkipped: 0,
+        isPartial: false,
+        limitations: 'OCR engine path configured but executable is missing on disk.',
+        failureReason: sanitizeOcrDiagnostic(
+          `Configured TESSERACT_PATH not found at ${tesseractResolution.configuredPath || ''}`
         ),
         failureClassification: 'OCR_ENGINE_FAILURE',
         executionDurationMs: getElapsedMs(),
@@ -2754,6 +2815,7 @@ export class VideoProcessor {
     if (!executable) {
       return {
         status: 'NOT_ASSESSED',
+        executionStatus: 'NOT_ASSESSED',
         framesInspected: 0,
         totalCandidateFrames: 0,
         coverageRatio: 0,
@@ -2764,6 +2826,15 @@ export class VideoProcessor {
         plannedTimestamps: [],
         extractedTimestamps: [],
         succeededTimestamps: [],
+        framesTargeted: 0,
+        framesExtracted: 0,
+        framesExtractionFailed: 0,
+        framesAttempted: 0,
+        framesSucceeded: 0,
+        framesFailed: 0,
+        framesOcrFailed: 0,
+        framesSkipped: 0,
+        isPartial: false,
         limitations: 'Local visual OCR engine (TESSERACT_PATH) not configured or installed. Full-video on-screen text overlays are not assessed.',
         executionDurationMs: 0,
         detectedFrames: [],
@@ -3004,6 +3075,7 @@ export class VideoProcessor {
         : null;
 
       if (framesExtracted === 0) {
+        const extractionTimedOut = overallTimedOut || perFrameTimedOut;
         const errorSummary = extractionErrors.length > 0
           ? extractionErrors.slice(0, 3).map(e => `[${e.category}] ${e.reason}`).join('; ')
           : '';
@@ -3012,14 +3084,19 @@ export class VideoProcessor {
               `Overall OCR execution budget (${timeoutMs}ms) exhausted before OCR execution${errorSummary ? `: ${errorSummary}` : '.'}`,
               240
             )
-          : sanitizeOcrDiagnostic(
-              `FFmpeg frame extraction yielded 0 readable candidate frames (${framesExtractionFailed} attempt(s) failed)${errorSummary ? `: ${errorSummary}` : '.'}`,
-              240
-            );
+          : perFrameTimedOut
+            ? sanitizeOcrDiagnostic(
+                `Per-frame execution timeout (${perFrameTimeoutMs}ms) exhausted during frame extraction${errorSummary ? `: ${errorSummary}` : '.'}`,
+                240
+              )
+            : sanitizeOcrDiagnostic(
+                `FFmpeg frame extraction yielded 0 readable candidate frames (${framesExtractionFailed} attempt(s) failed)${errorSummary ? `: ${errorSummary}` : '.'}`,
+                240
+              );
         return {
-          status: overallTimedOut ? 'INSUFFICIENT_EVIDENCE' : 'ANALYSIS_UNAVAILABLE',
-          executionStatus: overallTimedOut ? 'FAILED' : 'UNAVAILABLE',
-          failureClassification: overallTimedOut ? 'OCR_TIMEOUT' : 'OCR_INPUT_FAILURE',
+          status: extractionTimedOut ? 'INSUFFICIENT_EVIDENCE' : 'ANALYSIS_UNAVAILABLE',
+          executionStatus: extractionTimedOut ? 'FAILED' : 'UNAVAILABLE',
+          failureClassification: extractionTimedOut ? 'OCR_TIMEOUT' : 'OCR_INPUT_FAILURE',
           framesInspected: 0,
           totalCandidateFrames,
           coverageRatio: 0,
@@ -3043,7 +3120,9 @@ export class VideoProcessor {
           isPartial: true,
           limitations: overallTimedOut
             ? `Overall OCR execution budget (${timeoutMs}ms) expired before any frames completed analysis; continuous temporal interval coverage not verified.`
-            : 'Failed to extract valid PNG video frames for OCR analysis; continuous temporal interval coverage not verified.',
+            : perFrameTimedOut
+              ? `Per-frame execution timeout (${perFrameTimeoutMs}ms) expired during frame extraction; continuous temporal interval coverage not verified.`
+              : 'Failed to extract valid PNG video frames for OCR analysis; continuous temporal interval coverage not verified.',
           failureReason: zeroExtractedFailure,
           executionDurationMs: getElapsedMs(),
           detectedFrames: [],

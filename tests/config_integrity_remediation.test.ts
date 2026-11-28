@@ -443,7 +443,10 @@ export async function runConfigIntegrityRemediationTests(): Promise<void> {
       const thumbNonExecRes = await ocrAdapter.extractText(sampleThumbPath, 1280, 720);
       assert.strictEqual(thumbNonExecRes.status, 'ANALYSIS_UNAVAILABLE');
       const videoNonExecRes = await videoProc.performVideoOcr(sampleVideoPath, mediaMeta, { maxFrames: 1 });
-      assert.strictEqual(videoNonExecRes.status, 'ANALYSIS_UNAVAILABLE');
+      assert.strictEqual(videoNonExecRes.executionStatus, 'FAILED');
+      assert.strictEqual(videoNonExecRes.status, 'INSUFFICIENT_EVIDENCE');
+      assert.strictEqual(videoNonExecRes.framesSucceeded, 0);
+      assert.strictEqual(videoNonExecRes.failureClassification, 'OCR_ENGINE_FAILURE');
 
       // 4. Unset TESSERACT_PATH falls back to PATH
       delete process.env.TESSERACT_PATH;
